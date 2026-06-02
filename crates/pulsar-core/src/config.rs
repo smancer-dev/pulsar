@@ -105,7 +105,10 @@ mod tests {
 		let c = Config::default();
 		assert_eq!(c.network_mode, NetworkMode::Auto);
 		assert_eq!(c.language, Language::Tr);
-		assert!(c.relay_is_valid(), "default relay should be valid host:port");
+		assert!(
+			c.relay_is_valid(),
+			"default relay should be valid host:port"
+		);
 	}
 
 	#[test]

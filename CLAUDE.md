@@ -9,8 +9,11 @@ Cross-platform (Windows/macOS/Linux) remote-desktop + game-streaming app. See
 
 > `cargo` here is a rustup proxy that honors `../rust-toolchain.toml`, so it
 > resolves to current stable automatically (run `rustup update stable` once if you
-> hit an edition-2024 error). Use **`npm run tauri dev`** to run the app — `cargo
+> hit an edition-2024 error). Use **`bun run tauri dev`** to run the app — `cargo
 > tauri` would need a separately-installed `cargo-tauri`.
+
+> **Package manager: bun, not npm** (project-wide — see the root `CLAUDE.md`).
+> The Tauri config's `beforeDevCommand`/`beforeBuildCommand` call `bun run …`.
 
 ## Layout
 
@@ -48,15 +51,22 @@ desktop-app/
 ## Run & build
 
 ```bash
-npm install
-npm run tauri dev      # run the real app (Rust + webview). NOT `cargo tauri` —
+bun install
+bun run tauri dev      # run the real app (Rust + webview). NOT `cargo tauri` —
                        # that needs a separately-installed cargo-tauri binary;
                        # we ship the JS CLI via @tauri-apps/cli.
-npm run tauri build    # package installers
+bun run tauri build    # package installers (bundles ffmpeg — see below)
 
-npm run dev            # UI only in a browser (uses the mock)
-npm run build          # static SPA → build/ (Tauri frontendDist)
+bun run dev            # UI only in a browser (uses the mock)
+bun run build          # static SPA → build/ (Tauri frontendDist)
 ```
+
+> **Bundled ffmpeg:** the host captures+encodes the screen with ffmpeg, which is
+> **shipped inside the app** (no user install, works offline). The binary lives at
+> `src-tauri/resources/ffmpeg[.exe]` — git-ignored and fetched per-platform by
+> `scripts/fetch-ffmpeg.mjs` (run it once before `tauri build`; CI runs it
+> automatically). At runtime `ffmpeg_bin()` (in `src-tauri/src/lib.rs`) resolves the
+> bundled copy first, falling back to a system `ffmpeg` on PATH.
 
 > Plain `cargo` here is a rustup proxy that honors `../rust-toolchain.toml`, so it
 > already resolves to stable (≥1.85). If you ever see an edition-2024 error, run
@@ -68,7 +78,7 @@ npm run build          # static SPA → build/ (Tauri frontendDist)
 # Rust core (fast, headless): connection, crypto, controllers, media, e2e
 cargo test -p pulsar-core
 # UI components
-npm run test:unit
+bun run test:unit
 # Tauri bridge compiles against the core
 cargo check -p pulsar-tauri
 ```

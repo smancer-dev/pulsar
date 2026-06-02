@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use pulsar_core::media::{
-	CollectingSink, EncodedPacket, FrameSink, FrameSource, RleDecoder, RleEncoder, SolidColorSource,
-	VideoDecoder, VideoEncoder,
+	CollectingSink, EncodedPacket, FrameSink, FrameSource, RleDecoder, RleEncoder,
+	SolidColorSource, VideoDecoder, VideoEncoder,
 };
 use pulsar_core::{NetworkMode, Node};
 use pulsar_relay::Relay;
@@ -72,5 +72,8 @@ async fn frames_stream_over_an_encrypted_session() {
 
 	let received = recv_task.await.unwrap();
 	assert_eq!(received.len(), N as usize, "all frames should arrive");
-	assert_eq!(received, sent, "frames decode losslessly after the round trip");
+	assert_eq!(
+		received, sent,
+		"frames decode losslessly after the round trip"
+	);
 }

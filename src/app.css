@@ -340,6 +340,14 @@ h4 {
 	background: var(--accent-soft);
 	color: var(--accent-press);
 }
+.badge.pending {
+	background: var(--accent-soft);
+	color: var(--accent-press);
+}
+.badge.off {
+	background: var(--surface-3);
+	color: var(--text-faint);
+}
 
 /* toggle */
 .toggle {

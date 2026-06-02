@@ -1,13 +1,13 @@
 {
 	"$schema": "https://schema.tauri.app/config/2",
 	"productName": "Pulsar",
-	"version": "1.0.0",
+	"version": "0.0.0",
 	"identifier": "dev.pulsar.app",
 	"build": {
 		"frontendDist": "../build",
 		"devUrl": "http://localhost:5173",
-		"beforeDevCommand": "npm run dev",
-		"beforeBuildCommand": "npm run build"
+		"beforeDevCommand": "bun run dev",
+		"beforeBuildCommand": "bun run build"
 	},
 	"app": {
 		"macOSPrivateApi": true,

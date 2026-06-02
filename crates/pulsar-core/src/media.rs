@@ -112,7 +112,11 @@ impl SolidColorSource {
 			frames,
 			emitted: 0,
 			pts: 0,
-			frame_interval_micros: if fps == 0 { 16_666 } else { 1_000_000 / fps as u64 },
+			frame_interval_micros: if fps == 0 {
+				16_666
+			} else {
+				1_000_000 / fps as u64
+			},
 		}
 	}
 }

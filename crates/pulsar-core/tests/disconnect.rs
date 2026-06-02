@@ -20,8 +20,12 @@ async fn host_detects_silent_client_death() {
 	let relay_addr: SocketAddr = relay.local_addr().unwrap();
 	tokio::spawn(relay.run());
 
-	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
-	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
+	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
 	host.register().await.unwrap();
 	client.register().await.unwrap();
 	let host_id = host.self_id().await.unwrap();
@@ -40,7 +44,9 @@ async fn host_detects_silent_client_death() {
 	}
 
 	let mut sess = client.connect(host_id).await.unwrap();
-	send_input(&mut sess, &InputEvent::PointerMotion { x: 0.5, y: 0.5 }).await.unwrap();
+	send_input(&mut sess, &InputEvent::PointerMotion { x: 0.5, y: 0.5 })
+		.await
+		.unwrap();
 
 	// Simulate the client dying: drop the session and the whole client node, with
 	// no Bye and no further keepalives.
@@ -57,5 +63,8 @@ async fn host_detects_silent_client_death() {
 		}
 	})
 	.await;
-	assert!(detected.is_ok(), "host must detect the dead client and serve() must return");
+	assert!(
+		detected.is_ok(),
+		"host must detect the dead client and serve() must return"
+	);
 }

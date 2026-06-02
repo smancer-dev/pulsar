@@ -1,13 +1,16 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { recentPeers } from '$lib/peers.svelte';
-	import { api, copyText, type GameInfo } from '$lib/api';
+	import { recentPeers, addPeer } from '$lib/peers.svelte';
+	import { api, copyText, type GameInfo, type LanDevice } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
 	type Target = { name: string; id: string };
 	type Props = {
 		selfId: string;
 		selfPw?: string;
+		online?: boolean;
+		connecting?: boolean;
 		mode: 'remote' | 'game';
 		hostSessions: { peer: string; since: number }[];
 		activity: string[];
@@ -20,6 +23,8 @@
 	let {
 		selfId,
 		selfPw = '',
+		online = false,
+		connecting = false,
 		mode,
 		hostSessions,
 		activity,
@@ -31,6 +36,22 @@
 	}: Props = $props();
 
 	const recents = $derived(recentPeers(3));
+
+	// LAN auto-discovery: poll the core for Pulsar devices announcing on this
+	// network (the multicast beacon). Works even offline (relay-less).
+	let lan = $state<LanDevice[]>([]);
+	async function refreshLan() {
+		try {
+			lan = await api.lanDevices();
+		} catch {
+			/* core not bound yet — keep the last list */
+		}
+	}
+	onMount(() => {
+		refreshLan();
+		const timer = setInterval(refreshLan, 2000);
+		return () => clearInterval(timer);
+	});
 
 	let target = $state('');
 	let copied = $state(false);
@@ -102,7 +123,10 @@
 	<div class="card">
 		<div class="row sb">
 			<span class="eyebrow mono">{t('home.allowThis')}</span>
-			<span class="badge online"><span class="dot"></span>{t('home.ready')}</span>
+			<span class="badge" class:online class:pending={connecting && !online} class:off={!online && !connecting}>
+				<span class="dot"></span>
+				{#if connecting}{t('status.connecting')}{:else if online}{t('home.ready')}{:else}{t('status.offline')}{/if}
+			</span>
 		</div>
 		<div class="lab">{t('home.deviceId')}</div>
 		<div class="row">
@@ -114,12 +138,17 @@
 		<div class="sep"></div>
 		<div class="lab">{t('home.otp')}</div>
 		<div class="row">
-			<span class="pw mono">{selfPw || '—'}</span>
-			<button class="icon-btn push" title={t('home.refresh')} aria-label={t('home.refreshPw')} onclick={onRefreshPw}>
+			<span class="pw mono">{online ? selfPw || '—' : '—'}</span>
+			<button
+				class="icon-btn push"
+				title={t('home.refresh')}
+				aria-label={t('home.refreshPw')}
+				onclick={onRefreshPw}
+				disabled={!online}
+			>
 				<Icon name="refresh" size={16} />
 			</button>
 		</div>
-		<p class="help">{t('home.help')}</p>
 		<div class="sep"></div>
 		<div class="connhdr">{t('home.connectedHdr')}</div>
 		{#if hostSessions.length === 0}
@@ -203,6 +232,35 @@
 	</div>
 </div>
 
+<section class="lan">
+	<div class="lanhdr"><span class="lpulse"></span>{t('devices.lanTitle')}</div>
+	{#if lan.length === 0}
+		<div class="lanempty">{t('devices.lanScanning')}</div>
+	{:else}
+		<div class="langrid">
+			{#each lan as d (d.addr + '|' + d.id)}
+				<div class="device-tile">
+					<span class="ravatar lavatar">{initials(d.name)}</span>
+					<div class="lmeta">
+						<div class="lname">{d.name}</div>
+						<div class="lsub mono">{d.id || d.addr}</div>
+					</div>
+					{#if d.has_id}
+						<div class="lactions">
+							<button class="btn btn-primary lbtn" onclick={() => onConnect({ name: d.name, id: d.id }, mode)}>
+								{t('home.connect')}
+							</button>
+							<button class="btn btn-ghost lbtn" onclick={() => addPeer(d.name, d.id, 'pc')}>
+								{t('devices.lanSave')}
+							</button>
+						</div>
+					{/if}
+				</div>
+			{/each}
+		</div>
+	{/if}
+</section>
+
 <style>
 	.head {
 		display: flex;
@@ -240,6 +298,10 @@
 	.push {
 		margin-left: auto;
 	}
+	.icon-btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+	}
 	.eyebrow {
 		font-size: 11px;
 		letter-spacing: 0.1em;
@@ -270,12 +332,6 @@
 		height: 1px;
 		background: var(--border);
 		margin: 20px 0;
-	}
-	.help {
-		font-size: 12.5px;
-		color: var(--text-faint);
-		margin-top: 16px;
-		line-height: 1.5;
 	}
 	.connhdr {
 		font-size: 11.5px;
@@ -400,5 +456,78 @@
 	.rid {
 		font-size: 11px;
 		color: var(--text-faint);
+	}
+	/* LAN auto-discovery section */
+	.lan {
+		margin-top: 22px;
+	}
+	.lanhdr {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 11px;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		color: var(--text-faint);
+		margin-bottom: 12px;
+	}
+	.lpulse {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--ok);
+		flex: none;
+		animation: lpulse 1.8s ease-out infinite;
+	}
+	@keyframes lpulse {
+		0% {
+			box-shadow: 0 0 0 0 color-mix(in oklch, var(--ok) 55%, transparent);
+		}
+		70% {
+			box-shadow: 0 0 0 7px transparent;
+		}
+		100% {
+			box-shadow: 0 0 0 0 transparent;
+		}
+	}
+	.lanempty {
+		font-size: 12.5px;
+		color: var(--text-faint);
+		padding: 14px 16px;
+		border: 1px dashed var(--border);
+		border-radius: var(--r-sm);
+	}
+	.langrid {
+		display: grid;
+		grid-template-columns: repeat(2, 1fr);
+		gap: 12px;
+	}
+	.lavatar {
+		flex: none;
+	}
+	.lmeta {
+		flex: 1;
+		min-width: 0;
+	}
+	.lname {
+		font-size: 14px;
+		font-weight: 600;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.lsub {
+		font-size: 11.5px;
+		color: var(--text-faint);
+		margin-top: 3px;
+	}
+	.lactions {
+		display: flex;
+		gap: 6px;
+		flex: none;
+	}
+	.lbtn {
+		padding: 7px 12px;
+		font-size: 13px;
 	}
 </style>

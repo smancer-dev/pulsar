@@ -149,7 +149,12 @@ impl Node {
 		timeout(REGISTER_TIMEOUT, self.registered.notified())
 			.await
 			.map_err(|_| ConnError::RelayTimeout)?;
-		let id = self.inner.lock().await.self_id.ok_or(ConnError::RelayTimeout)?;
+		let id = self
+			.inner
+			.lock()
+			.await
+			.self_id
+			.ok_or(ConnError::RelayTimeout)?;
 		// Keep the registration alive: the relay drops devices that go silent for
 		// `DEVICE_TTL`, after which `connect()` would fail with `BadToken`.
 		tokio::spawn(heartbeat_loop(Arc::downgrade(self)));
@@ -491,10 +496,7 @@ impl Session {
 	pub async fn send(&self, payload: &[u8]) -> Result<(), ConnError> {
 		let (frame, dest_relay, peer_addr, transport) = {
 			let mut g = self.node.inner.lock().await;
-			let s = g
-				.sessions
-				.get_mut(&self.id)
-				.ok_or(ConnError::P2pFailed)?;
+			let s = g.sessions.get_mut(&self.id).ok_or(ConnError::P2pFailed)?;
 			let seq = s.send_seq;
 			s.send_seq += 1;
 			let ct = s.crypto.seal(seq, payload);
@@ -546,7 +548,13 @@ impl Session {
 			.await
 			.sessions
 			.get(&self.id)
-			.map(|s| if s.direct_ok { Transport::Direct } else { s.transport })
+			.map(|s| {
+				if s.direct_ok {
+					Transport::Direct
+				} else {
+					s.transport
+				}
+			})
 			.unwrap_or(self.transport)
 	}
 

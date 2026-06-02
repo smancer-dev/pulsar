@@ -1,7 +1,7 @@
 {
 	"name": "pulsar-desktop",
 	"private": true,
-	"version": "1.0.0",
+	"version": "0.0.0",
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
@@ -10,7 +10,8 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"test:unit": "vitest run",
 		"test:unit:watch": "vitest",
-		"tauri": "tauri"
+		"tauri": "tauri",
+		"fetch:ffmpeg": "node scripts/fetch-ffmpeg.mjs"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-static": "^3.0.10",

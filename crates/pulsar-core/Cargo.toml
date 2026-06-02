@@ -10,6 +10,8 @@ description = "Pulsar desktop core — connection orchestration (P2P + relay fal
 [dependencies]
 pulsar-proto.workspace = true
 tokio.workspace = true
+socket2.workspace = true
+whoami.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true

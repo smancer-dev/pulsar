@@ -66,7 +66,11 @@ pub enum DataMsg {
 	/// A chat line.
 	Chat(String),
 	/// Start of a file: name + total byte length + number of chunks to expect.
-	FileBegin { name: String, size: u64, chunks: u32 },
+	FileBegin {
+		name: String,
+		size: u64,
+		chunks: u32,
+	},
 	/// One file chunk with its 0-based index (for gap detection).
 	FileChunk { index: u32, data: Vec<u8> },
 	/// All chunks for the current file have been sent.
@@ -313,7 +317,15 @@ pub async fn serve(
 	on_stream: impl FnMut(StreamReq, SocketAddr),
 	on_input: impl FnMut(InputEvent),
 ) {
-	serve_with(session, games, on_launch, on_stream, on_input, DataHandlers::default()).await;
+	serve_with(
+		session,
+		games,
+		on_launch,
+		on_stream,
+		on_input,
+		DataHandlers::default(),
+	)
+	.await;
 }
 
 /// Like [`serve`], but also drives the bidirectional side channels: inbound

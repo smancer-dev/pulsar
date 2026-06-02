@@ -17,8 +17,12 @@ async fn client_lists_and_launches_host_games() {
 	let relay_addr: SocketAddr = relay.local_addr().unwrap();
 	tokio::spawn(relay.run());
 
-	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
-	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
+	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
 	host.register().await.unwrap();
 	client.register().await.unwrap();
 	let host_id = host.self_id().await.unwrap();
@@ -32,8 +36,16 @@ async fn client_lists_and_launches_host_games() {
 			if let Some(session) = host.next_incoming().await {
 				let games = || {
 					vec![
-						GameInfo { id: "g1".into(), title: "Elden Ring".into(), kind: "program".into() },
-						GameInfo { id: "g2".into(), title: "Hades II".into(), kind: "program".into() },
+						GameInfo {
+							id: "g1".into(),
+							title: "Elden Ring".into(),
+							kind: "program".into(),
+						},
+						GameInfo {
+							id: "g2".into(),
+							title: "Hades II".into(),
+							kind: "program".into(),
+						},
 					]
 				};
 				serve(

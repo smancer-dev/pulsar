@@ -19,8 +19,12 @@ async fn controller_frames_reach_the_host() {
 	let relay_addr: SocketAddr = relay.local_addr().unwrap();
 	tokio::spawn(relay.run());
 
-	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
-	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
+	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
 	host.register().await.unwrap();
 	client.register().await.unwrap();
 	let host_id = host.self_id().await.unwrap();
@@ -52,7 +56,9 @@ async fn controller_frames_reach_the_host() {
 	frame.set(button::A, true);
 	frame.left_x = -12000;
 	frame.right_trigger = 200;
-	send_input(&mut sess, &InputEvent::Gamepad(frame)).await.unwrap();
+	send_input(&mut sess, &InputEvent::Gamepad(frame))
+		.await
+		.unwrap();
 
 	// wait for the host to process the frame
 	let got = timeout(Duration::from_secs(2), async {

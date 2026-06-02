@@ -16,6 +16,19 @@ export interface GameInfo {
 	kind: string;
 }
 
+/** A Pulsar device auto-discovered on the local network (multicast beacon). */
+export interface LanDevice {
+	/** Grouped relay id (e.g. `482 913 056`), or empty if the peer is relay-less. */
+	id: string;
+	/** Whether `id` can be used to connect via the normal flow. */
+	has_id: boolean;
+	name: string;
+	/** `ip:port` the peer announced. */
+	addr: string;
+	/** `windows` / `linux` / `macos`. */
+	platform: string;
+}
+
 /** Result of starting a remote-play session. */
 export interface PlayInfo {
 	/** Play/tab id — used to address input + stop for this session. */
@@ -69,6 +82,12 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 			const transport = mockConfig.network_mode === 'relay-only' ? 'relay' : 'direct';
 			return Promise.resolve({ transport, peer: String(args?.target ?? '') } as unknown as T);
 		}
+		case 'lan_devices':
+			// Sample devices so the browser preview shows the discovery section.
+			return Promise.resolve([
+				{ id: '719 204 663', has_id: true, name: 'Salon PC', addr: '192.168.1.42:50311', platform: 'windows' },
+				{ id: '305 881 027', has_id: true, name: 'OrangePi', addr: '192.168.1.77:50990', platform: 'linux' }
+			] as unknown as T);
 		case 'controllers':
 			return Promise.resolve([] as unknown as T);
 		case 'scan_folder':
@@ -115,6 +134,8 @@ export const api = {
 	/** Bind the node and register with the relay; returns this device's ID. */
 	goOnline: () => invoke<string>('go_online'),
 	connect: (target: string) => invoke<ConnInfo>('connect', { target }),
+	/** Pulsar devices auto-discovered on the local network (multicast beacon). */
+	lanDevices: () => invoke<LanDevice[]>('lan_devices'),
 	controllers: () => invoke<ControllerInfo[]>('controllers'),
 	/** Scan a folder for launchable apps (host side). */
 	scanFolder: (path: string) => invoke<ScannedApp[]>('scan_folder', { path }),

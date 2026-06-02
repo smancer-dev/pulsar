@@ -70,17 +70,35 @@ impl CaptureMethod {
 		let size = format!("{}x{}", plan.width, plan.height);
 		match self {
 			Self::X11grab => vec![
-				s("-f"), s("x11grab"), s("-framerate"), fps, s("-video_size"), size, s("-i"),
+				s("-f"),
+				s("x11grab"),
+				s("-framerate"),
+				fps,
+				s("-video_size"),
+				size,
+				s("-i"),
 				plan.display.clone(),
 			],
 			Self::Kmsgrab => vec![s("-f"), s("kmsgrab"), s("-framerate"), fps, s("-i"), s("-")],
 			Self::Gdigrab => vec![
-				s("-f"), s("gdigrab"), s("-framerate"), fps, s("-video_size"), size, s("-i"),
+				s("-f"),
+				s("gdigrab"),
+				s("-framerate"),
+				fps,
+				s("-video_size"),
+				size,
+				s("-i"),
 				s("desktop"),
 			],
 			Self::AvFoundation => vec![
-				s("-f"), s("avfoundation"), s("-framerate"), fps, s("-capture_cursor"), s("1"),
-				s("-i"), format!("{}:none", plan.display),
+				s("-f"),
+				s("avfoundation"),
+				s("-framerate"),
+				fps,
+				s("-capture_cursor"),
+				s("1"),
+				s("-i"),
+				format!("{}:none", plan.display),
 			],
 		}
 	}
@@ -217,8 +235,17 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		(plan.fps * 2).to_string(),
 	]);
 	match plan.encoder {
-		HwEncoder::Nvenc => a.extend([s("-preset"), s("p1"), s("-tune"), s("ull"), s("-delay"), s("0")]),
-		HwEncoder::Software => a.extend([s("-preset"), s("ultrafast"), s("-tune"), s("zerolatency")]),
+		HwEncoder::Nvenc => a.extend([
+			s("-preset"),
+			s("p1"),
+			s("-tune"),
+			s("ull"),
+			s("-delay"),
+			s("0"),
+		]),
+		HwEncoder::Software => {
+			a.extend([s("-preset"), s("ultrafast"), s("-tune"), s("zerolatency")])
+		}
 		HwEncoder::Qsv => a.extend([s("-preset"), s("veryfast"), s("-low_power"), s("1")]),
 		_ => {}
 	}
@@ -304,9 +331,18 @@ mod tests {
 
 	#[test]
 	fn encoder_names_per_codec() {
-		assert_eq!(HwEncoder::Nvenc.ffmpeg_name(VCodec::H265), Some("hevc_nvenc"));
-		assert_eq!(HwEncoder::Vaapi.ffmpeg_name(VCodec::H264), Some("h264_vaapi"));
-		assert_eq!(HwEncoder::Software.ffmpeg_name(VCodec::Av1), Some("libsvtav1"));
+		assert_eq!(
+			HwEncoder::Nvenc.ffmpeg_name(VCodec::H265),
+			Some("hevc_nvenc")
+		);
+		assert_eq!(
+			HwEncoder::Vaapi.ffmpeg_name(VCodec::H264),
+			Some("h264_vaapi")
+		);
+		assert_eq!(
+			HwEncoder::Software.ffmpeg_name(VCodec::Av1),
+			Some("libsvtav1")
+		);
 		assert_eq!(HwEncoder::Auto.ffmpeg_name(VCodec::H264), None);
 	}
 

@@ -121,6 +121,7 @@
 
 	// Roll a fresh one-time password (host side).
 	async function refreshPw() {
+		if (!online) return; // no relay session → nothing to authenticate, don't mint a password
 		try {
 			selfPw = await api.newPassword();
 		} catch {
@@ -390,7 +391,7 @@
 							</div>
 							{#if !online && !connecting}
 								<button class="reconnect" onclick={goOnline} title={connError}>{t('status.goOnline')}</button>
-								{#if connError}<div class="connerr">{connError}</div>{/if}
+								{#if connError}<div class="connerr" title={connError}>{t('status.netError')}</div>{/if}
 							{/if}
 						</div>
 					</div>
@@ -412,6 +413,8 @@
 					<Home
 						{selfId}
 						{selfPw}
+						{online}
+						{connecting}
 						{mode}
 						{hostSessions}
 						{activity}

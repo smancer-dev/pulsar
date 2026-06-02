@@ -31,7 +31,10 @@ async fn registering_without_a_relay_yields_no_id() {
 	let node = Node::bind(LOCAL.parse().unwrap(), dead, NetworkMode::Auto)
 		.await
 		.unwrap();
-	assert!(node.register().await.is_err(), "register must fail with no relay");
+	assert!(
+		node.register().await.is_err(),
+		"register must fail with no relay"
+	);
 	assert!(node.self_id().await.is_none(), "no ID without a relay");
 }
 
@@ -40,8 +43,12 @@ async fn registering_without_a_relay_yields_no_id() {
 async fn exchange(mode: NetworkMode) -> (Transport, Transport) {
 	let (relay, _h) = start_relay().await;
 
-	let host = Node::bind(LOCAL.parse().unwrap(), relay, mode).await.unwrap();
-	let client = Node::bind(LOCAL.parse().unwrap(), relay, mode).await.unwrap();
+	let host = Node::bind(LOCAL.parse().unwrap(), relay, mode)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay, mode)
+		.await
+		.unwrap();
 	host.register().await.unwrap();
 	client.register().await.unwrap();
 	let host_id = host.self_id().await.unwrap();
@@ -117,7 +124,10 @@ async fn direct_p2p_survives_the_relay_being_taken_down() {
 	relay_handle.abort();
 	tokio::time::sleep(Duration::from_millis(50)).await;
 
-	client_sess.send(b"relay yokken bile calisir").await.unwrap();
+	client_sess
+		.send(b"relay yokken bile calisir")
+		.await
+		.unwrap();
 	let got = timeout(Duration::from_secs(2), host_sess.recv())
 		.await
 		.unwrap()

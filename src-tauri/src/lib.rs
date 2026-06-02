@@ -23,7 +23,7 @@ use pulsar_core::service::{
 	send_keepalive, serve_with, ClientAuth, DataHandlers, DataMsg, GameInfo, HostAuth, InputEvent,
 	StreamReq,
 };
-use pulsar_core::{Node, Transport};
+use pulsar_core::{Discovery, Node, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
@@ -34,6 +34,9 @@ mod viewer;
 struct AppState {
 	node: Mutex<Option<Arc<Node>>>,
 	config: Mutex<Config>,
+	/// LAN auto-discovery beacon (announces this device + collects peers on the
+	/// local network). Started on `go_online`, replaced on reconnect.
+	discovery: Mutex<Option<Arc<Discovery>>>,
 	/// Games this host publishes to clients (set from the UI via `publish_games`).
 	games: Arc<Mutex<Vec<HostGame>>>,
 	/// Host stream settings (resolution/fps/bitrate/encoder/display).
@@ -142,9 +145,9 @@ fn codec_from_str(s: &str) -> VCodec {
 	}
 }
 
-/// Run `ffmpeg -encoders` and return the hardware encoders available.
-fn detect_encoders() -> Vec<HwEncoder> {
-	match std::process::Command::new("ffmpeg")
+/// Run `ffmpeg -encoders` (the bundled binary) and return the hardware encoders available.
+fn detect_encoders(ffmpeg: &str) -> Vec<HwEncoder> {
+	match std::process::Command::new(ffmpeg)
 		.args(["-hide_banner", "-encoders"])
 		.output()
 	{
@@ -157,7 +160,11 @@ fn detect_encoders() -> Vec<HwEncoder> {
 }
 
 /// Spawn a process and remember it so it can be stopped later.
-fn spawn_tracked(procs: &Arc<Mutex<Vec<Child>>>, program: &str, args: &[String]) -> Result<(), String> {
+fn spawn_tracked(
+	procs: &Arc<Mutex<Vec<Child>>>,
+	program: &str,
+	args: &[String],
+) -> Result<(), String> {
 	match std::process::Command::new(program).args(args).spawn() {
 		Ok(child) => {
 			procs.lock().unwrap().push(child);
@@ -226,6 +233,34 @@ fn config_path(app: &AppHandle) -> PathBuf {
 		.app_config_dir()
 		.unwrap_or_else(|_| PathBuf::from("."))
 		.join("config.json")
+}
+
+/// Resolve the ffmpeg binary the host uses to capture + encode the screen. Pulsar
+/// **bundles** ffmpeg so streaming works out of the box — nothing for the user to
+/// install, and it works offline. Prefers the bundled copy (the installed app's
+/// resource dir, or next to the executable for portable / `tauri dev` builds), and
+/// only falls back to a system `ffmpeg` on PATH if no bundled copy is present.
+fn ffmpeg_bin(app: &AppHandle) -> String {
+	let name = if cfg!(windows) {
+		"ffmpeg.exe"
+	} else {
+		"ffmpeg"
+	};
+	if let Ok(dir) = app.path().resource_dir() {
+		for cand in [dir.join(name), dir.join("resources").join(name)] {
+			if cand.is_file() {
+				return cand.to_string_lossy().into_owned();
+			}
+		}
+	}
+	if let Ok(exe) = std::env::current_exe() {
+		if let Some(p) = exe.parent().map(|d| d.join(name)) {
+			if p.is_file() {
+				return p.to_string_lossy().into_owned();
+			}
+		}
+	}
+	"ffmpeg".to_string()
 }
 
 /// Resolve a user-entered `host:port` (IP or DNS name) to a socket address.
@@ -338,14 +373,26 @@ fn spawn_audio_player() -> Option<(Child, std::process::ChildStdin)> {
 		("paplay", AUDIO_ARGS.iter().map(|s| s.to_string()).collect()),
 		(
 			"pw-cat",
-			["--playback", "--rate", "48000", "--channels", "1", "--format", "s16", "-"]
-				.iter()
-				.map(|s| s.to_string())
-				.collect(),
+			[
+				"--playback",
+				"--rate",
+				"48000",
+				"--channels",
+				"1",
+				"--format",
+				"s16",
+				"-",
+			]
+			.iter()
+			.map(|s| s.to_string())
+			.collect(),
 		),
 		(
 			"aplay",
-			["-q", "-f", "S16_LE", "-r", "48000", "-c", "1"].iter().map(|s| s.to_string()).collect(),
+			["-q", "-f", "S16_LE", "-r", "48000", "-c", "1"]
+				.iter()
+				.map(|s| s.to_string())
+				.collect(),
 		),
 	];
 	for (prog, args) in candidates {
@@ -369,7 +416,10 @@ fn spawn_audio_player() -> Option<(Child, std::process::ChildStdin)> {
 /// stdout. `None` if no recorder is available.
 fn spawn_mic_recorder() -> Option<Child> {
 	let candidates: [(&str, Vec<String>); 3] = [
-		("parecord", AUDIO_ARGS.iter().map(|s| s.to_string()).collect()),
+		(
+			"parecord",
+			AUDIO_ARGS.iter().map(|s| s.to_string()).collect(),
+		),
 		(
 			"pw-record",
 			["--rate", "48000", "--channels", "1", "--format", "s16", "-"]
@@ -379,7 +429,10 @@ fn spawn_mic_recorder() -> Option<Child> {
 		),
 		(
 			"arecord",
-			["-q", "-f", "S16_LE", "-r", "48000", "-c", "1"].iter().map(|s| s.to_string()).collect(),
+			["-q", "-f", "S16_LE", "-r", "48000", "-c", "1"]
+				.iter()
+				.map(|s| s.to_string())
+				.collect(),
 		),
 	];
 	for (prog, args) in candidates {
@@ -410,15 +463,19 @@ fn open_approval_window(app: &AppHandle, id: u64, peer: &str, pw_status: &str) {
 	// Inject the request details before the page loads (more reliable than a query
 	// string surviving the asset URL).
 	let init = format!("window.__APPROVE__={{id:{id},peer:\"{peer_q}\",pw:\"{pw_status}\"}};");
-	match WebviewWindowBuilder::new(app, format!("approve-{id}"), WebviewUrl::App("index.html".into()))
-		.initialization_script(&init)
-		.title("Pulsar — Bağlantı isteği")
-		.inner_size(400.0, 300.0)
-		.resizable(false)
-		.always_on_top(true)
-		.center()
-		.focused(true)
-		.build()
+	match WebviewWindowBuilder::new(
+		app,
+		format!("approve-{id}"),
+		WebviewUrl::App("index.html".into()),
+	)
+	.initialization_script(&init)
+	.title("Pulsar — Bağlantı isteği")
+	.inner_size(400.0, 300.0)
+	.resizable(false)
+	.always_on_top(true)
+	.center()
+	.focused(true)
+	.build()
 	{
 		Ok(win) => {
 			let _ = win.request_user_attention(Some(tauri::UserAttentionType::Critical));
@@ -452,7 +509,11 @@ async fn race_host_auth(
 	pending.lock().unwrap().insert(id, tx);
 	let _ = app.emit(
 		"session",
-		SessionEvent { kind: "request".into(), peer: peer.into(), detail: "wait".into() },
+		SessionEvent {
+			kind: "request".into(),
+			peer: peer.into(),
+			detail: "wait".into(),
+		},
 	);
 	open_approval_window(app, id, peer, "wait");
 
@@ -489,7 +550,13 @@ fn open_pw_prompt(
 	let id = next_auth.fetch_add(1, Ordering::SeqCst);
 	let (tx, rx) = oneshot::channel::<Option<String>>();
 	pw_pending.lock().unwrap().insert(id, tx);
-	let _ = app.emit("auth-prompt", AuthPrompt { req: id, peer: peer.into() });
+	let _ = app.emit(
+		"auth-prompt",
+		AuthPrompt {
+			req: id,
+			peer: peer.into(),
+		},
+	);
 	(id, rx)
 }
 
@@ -552,7 +619,11 @@ async fn client_authenticate(
 
 /// The client password prompt replies here (`null` = cancelled).
 #[tauri::command]
-async fn submit_password(state: State<'_, AppState>, req: u64, password: Option<String>) -> Result<(), String> {
+async fn submit_password(
+	state: State<'_, AppState>,
+	req: u64,
+	password: Option<String>,
+) -> Result<(), String> {
 	if let Some(tx) = state.pw_pending.lock().unwrap().remove(&req) {
 		let _ = tx.send(password);
 	}
@@ -579,16 +650,62 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 		.ok_or_else(|| format!("relay çözümlenemedi: {}", cfg.relay))?;
 	tracing::info!(%relay, "go_online: binding node + registering");
 	let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
-	let node = Node::bind_named(local, relay, cfg.network_mode, cfg.device_name.clone())
+	// Identity advertised on the network: the user's chosen device name, or — when
+	// it's the generic default — the OS user's name, so relay-less peers are still
+	// recognizable ("Ahmet Enes Duruer" instead of "Pulsar Cihazı").
+	let announce_name = {
+		let n = cfg.device_name.trim();
+		if n.is_empty() || n == "Pulsar Cihazı" {
+			pulsar_core::discovery::os_display_name()
+		} else {
+			n.to_string()
+		}
+	};
+	let node = Node::bind_named(local, relay, cfg.network_mode, announce_name.clone())
 		.await
 		.map_err(|e| e.to_string())?;
-	let id = node.register().await.map_err(|e| e.to_string())?;
+
+	// Start LAN discovery BEFORE registering so it works even when the relay is
+	// unreachable (offline mode): we announce ourselves (id-less) and find peers on
+	// the local network regardless of relay state. Replaces any prior beacon.
+	let node_port = node.local_addr().map(|a| a.port()).unwrap_or(0);
+	let discovery =
+		match Discovery::start(announce_name.clone(), node_port, node.public_key(), None).await {
+			Ok(d) => {
+				tracing::info!(port = node_port, name = %announce_name, "LAN discovery beacon started");
+				*state.discovery.lock().unwrap() = Some(d.clone());
+				Some(d)
+			}
+			Err(e) => {
+				tracing::warn!(%e, "LAN discovery failed to start");
+				None
+			}
+		};
+
+	// Register with the relay. If it's unreachable we stay "offline" but keep the
+	// node + LAN discovery running so same-network devices still appear.
+	let id = match node.register().await {
+		Ok(id) => id,
+		Err(e) => {
+			tracing::info!(error = %e, "relay unreachable — staying offline, LAN discovery still active");
+			*state.node.lock().unwrap() = Some(node);
+			return Err(e.to_string());
+		}
+	};
 	tracing::info!(%id, "go_online: registered with relay");
+	// Now that we have a relay id, advertise it on the LAN too.
+	if let Some(d) = &discovery {
+		d.set_id(Some(id)).await;
+	}
 
 	// Issue a fresh one-time password for this online session (unless unattended
 	// access is on, in which case no password is required).
 	let require_auth = !cfg.unattended_access;
-	let password = if require_auth { gen_password() } else { String::new() };
+	let password = if require_auth {
+		gen_password()
+	} else {
+		String::new()
+	};
 	*state.password.lock().unwrap() = password;
 
 	// Host role: serve published games, start streams, and surface activity.
@@ -638,7 +755,8 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 						true
 					} else {
 						let _ = need_password(&mut session).await;
-						race_host_auth(&mut session, &app_h, &pending, &next_req, &peer, &host_pw).await
+						race_host_auth(&mut session, &app_h, &pending, &next_req, &peer, &host_pw)
+							.await
 					}
 				} else {
 					true
@@ -648,7 +766,11 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 					tracing::info!(%peer, "connection rejected");
 					let _ = app_h.emit(
 						"session",
-						SessionEvent { kind: "rejected".into(), peer: peer.clone(), detail: String::new() },
+						SessionEvent {
+							kind: "rejected".into(),
+							peer: peer.clone(),
+							detail: String::new(),
+						},
 					);
 					return;
 				}
@@ -656,7 +778,11 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 				tracing::info!(%peer, "incoming session connected");
 				let _ = app_h.emit(
 					"session",
-					SessionEvent { kind: "connected".into(), peer: peer.clone(), detail: String::new() },
+					SessionEvent {
+						kind: "connected".into(),
+						peer: peer.clone(),
+						detail: String::new(),
+					},
 				);
 				// Allow the host UI to kick this client (`disconnect_peer`).
 				let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
@@ -697,7 +823,11 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 						if let Some(g) = found {
 							let _ = app_h.emit(
 								"session",
-								SessionEvent { kind: "launch".into(), peer: peer.clone(), detail: g.title.clone() },
+								SessionEvent {
+									kind: "launch".into(),
+									peer: peer.clone(),
+									detail: g.title.clone(),
+								},
 							);
 							launch_host_game(&g);
 						}
@@ -728,7 +858,11 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 							let app_h = app_h.clone();
 							let peer = peer.clone();
 							tokio::spawn(async move {
-								match pulsar_core::capture::start(&ip, port, &codec, bitrate, fps, token).await {
+								match pulsar_core::capture::start(
+									&ip, port, &codec, bitrate, fps, token,
+								)
+								.await
+								{
 									Ok((cap, new_token)) => {
 										if let Some(t) = new_token {
 											*restore_token.lock().unwrap() = Some(t);
@@ -758,7 +892,11 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 							return;
 						}
 
-						let encoder = pipeline::resolve(encoder_from_str(&cfg.encoder), &detect_encoders());
+						let ffmpeg = ffmpeg_bin(&app_h);
+						let encoder = pipeline::resolve(
+							encoder_from_str(&cfg.encoder),
+							&detect_encoders(&ffmpeg),
+						);
 						let plan = StreamPlan {
 							encoder,
 							codec: codec_from_str(&req.codec),
@@ -771,18 +909,27 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 							vaapi_device: cfg.vaapi_device.clone(),
 							dest: format!("rtp://{}:{}", addr.ip(), req.port),
 						};
-						let (program, args) = pipeline::encode_command(&plan);
+						// Use the bundled ffmpeg rather than relying on PATH. For the NVENC
+						// `prime-run` wrapper, swap its inner "ffmpeg" arg for the bundled path.
+						let (program, mut args) = pipeline::encode_command(&plan);
+						let (program, args) = if program == "ffmpeg" {
+							(ffmpeg.clone(), args)
+						} else {
+							if let Some(first) = args.first_mut() {
+								if first == "ffmpeg" {
+									*first = ffmpeg.clone();
+								}
+							}
+							(program, args)
+						};
 						let started = spawn_tracked(&procs, &program, &args).is_ok();
 						let _ = app_h.emit(
 							"session",
 							SessionEvent {
 								kind: "stream".into(),
 								peer: peer.clone(),
-								detail: format!(
-									"{} · {}p",
-									encoder.label(),
-									cfg.height
-								) + if started { "" } else { " (ffmpeg başlamadı)" },
+								detail: format!("{} · {}p", encoder.label(), cfg.height)
+									+ if started { "" } else { " (ffmpeg başlamadı)" },
 							},
 						);
 					}
@@ -809,7 +956,9 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 							if let Some(d) = desktop.as_mut() {
 								match other {
 									InputEvent::PointerMotion { x, y } => d.pointer(x, y),
-									InputEvent::PointerButton { button, down } => d.button(button, down),
+									InputEvent::PointerButton { button, down } => {
+										d.button(button, down)
+									}
 									InputEvent::Scroll { dx, dy } => d.scroll(dx, dy),
 									InputEvent::Key { code, down } => d.key(code, down),
 									InputEvent::Gamepad(_) => {}
@@ -823,14 +972,26 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 					let app_h = app_h.clone();
 					let peer = peer.clone();
 					move |text: String| {
-						let _ = app_h.emit("clipboard", DataPayload { peer: peer.clone(), text });
+						let _ = app_h.emit(
+							"clipboard",
+							DataPayload {
+								peer: peer.clone(),
+								text,
+							},
+						);
 					}
 				};
 				let on_chat = {
 					let app_h = app_h.clone();
 					let peer = peer.clone();
 					move |text: String| {
-						let _ = app_h.emit("host-chat", DataPayload { peer: peer.clone(), text });
+						let _ = app_h.emit(
+							"host-chat",
+							DataPayload {
+								peer: peer.clone(),
+								text,
+							},
+						);
 					}
 				};
 				let on_file = {
@@ -843,7 +1004,11 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 					let mut expected = 0u32;
 					let mut gap = false;
 					move |m: DataMsg| match m {
-						DataMsg::FileBegin { name: n, size, chunks } => {
+						DataMsg::FileBegin {
+							name: n,
+							size,
+							chunks,
+						} => {
 							name = sanitize_filename(&n);
 							buf = Vec::with_capacity(size as usize);
 							next = 0;
@@ -859,11 +1024,20 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 						}
 						DataMsg::FileEnd => {
 							let complete = !gap && next == expected;
-							let saved = if complete { save_received_file(&name, &buf) } else { None };
+							let saved = if complete {
+								save_received_file(&name, &buf)
+							} else {
+								None
+							};
 							let ok = saved.is_some();
 							let _ = app_h.emit(
 								"file-recv",
-								FilePayload { peer: peer.clone(), name: name.clone(), bytes: buf.len() as u64, ok },
+								FilePayload {
+									peer: peer.clone(),
+									name: name.clone(),
+									bytes: buf.len() as u64,
+									ok,
+								},
 							);
 							if ok {
 								let _ = app_h.emit(
@@ -935,7 +1109,11 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 				}
 				let _ = app_h.emit(
 					"session",
-					SessionEvent { kind: "disconnected".into(), peer, detail: String::new() },
+					SessionEvent {
+						kind: "disconnected".into(),
+						peer,
+						detail: String::new(),
+					},
 				);
 			});
 		}
@@ -947,8 +1125,8 @@ async fn go_online(app: AppHandle, state: State<'_, AppState>) -> Result<String,
 
 /// Available hardware encoders detected via ffmpeg (kebab-case values).
 #[tauri::command]
-async fn available_encoders() -> Vec<String> {
-	detect_encoders()
+async fn available_encoders(app: AppHandle) -> Vec<String> {
+	detect_encoders(&ffmpeg_bin(&app))
 		.into_iter()
 		.map(|e| {
 			match e {
@@ -998,12 +1176,25 @@ async fn start_remote_play(
 	encoder: String,
 	gamepad: bool,
 ) -> Result<PlayInfo, String> {
-	let node = state.node.lock().unwrap().clone().ok_or("önce çevrimiçi ol")?;
+	let node = state
+		.node
+		.lock()
+		.unwrap()
+		.clone()
+		.ok_or("önce çevrimiçi ol")?;
 	let target_id = DeviceId::parse(&target).ok_or("geçersiz kimlik")?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 
 	let mut sess = node.connect(target_id).await.map_err(|e| e.to_string())?;
-	if !client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &target_id.grouped()).await? {
+	if !client_authenticate(
+		&mut sess,
+		&app,
+		&pw_pending,
+		&next_auth,
+		&target_id.grouped(),
+	)
+	.await?
+	{
 		return Err("Bağlantı reddedildi.".into());
 	}
 	let transport = match sess.transport() {
@@ -1013,19 +1204,33 @@ async fn start_remote_play(
 	.to_string();
 	// Same machine? (loopback P2P) → control would feed back, so flag it.
 	let local = matches!(sess.transport(), Transport::Direct)
-		&& sess.peer_addr().await.map(|a| a.ip().is_loopback()).unwrap_or(false);
+		&& sess
+			.peer_addr()
+			.await
+			.map(|a| a.ip().is_loopback())
+			.unwrap_or(false);
 
 	// Start the local RTP→WebSocket viewer only after auth (don't bind ports for a
 	// rejected connection). The host streams to the viewer's ephemeral UDP port.
-	let view = viewer::start().await.map_err(|e| format!("video alıcı başlatılamadı: {e}"))?;
+	let view = viewer::start()
+		.await
+		.map_err(|e| format!("video alıcı başlatılamadı: {e}"))?;
 	let ws_port = view.ws_port;
 	let media_port = view.media_port;
 
 	if !game_id.is_empty() {
-		request_launch(&mut sess, &game_id).await.map_err(|e| e.to_string())?;
+		request_launch(&mut sess, &game_id)
+			.await
+			.map_err(|e| e.to_string())?;
 	}
-	let req = StreamReq { port: media_port, codec, encoder };
-	request_stream(&mut sess, &req).await.map_err(|e| e.to_string())?;
+	let req = StreamReq {
+		port: media_port,
+		codec,
+		encoder,
+	};
+	request_stream(&mut sess, &req)
+		.await
+		.map_err(|e| e.to_string())?;
 
 	// Register this play session (one per connected-host tab).
 	let id = state.next_play.fetch_add(1, Ordering::SeqCst);
@@ -1037,7 +1242,9 @@ async fn start_remote_play(
 		let reader_flag = running.clone();
 		let gtx = input_tx.clone();
 		tokio::task::spawn_blocking(move || {
-			let Ok(mut hub) = ControllerHub::new() else { return };
+			let Ok(mut hub) = ControllerHub::new() else {
+				return;
+			};
 			while reader_flag.load(Ordering::SeqCst) {
 				if let Some((_, st)) = hub.snapshot().into_iter().next() {
 					let _ = gtx.blocking_send(InputEvent::Gamepad(st));
@@ -1092,12 +1299,22 @@ async fn start_remote_play(
 		drop(sess);
 	});
 
-	state
-		.plays
-		.lock()
-		.unwrap()
-		.insert(id, PlaySession { viewer: view, input_tx, data_tx, mic, running });
-	Ok(PlayInfo { id, transport, ws_port, local })
+	state.plays.lock().unwrap().insert(
+		id,
+		PlaySession {
+			viewer: view,
+			input_tx,
+			data_tx,
+			mic,
+			running,
+		},
+	);
+	Ok(PlayInfo {
+		id,
+		transport,
+		ws_port,
+		local,
+	})
 }
 
 /// Stop one remote-play session (tab): closes its control session (the host sees a
@@ -1145,7 +1362,11 @@ async fn send_chat(state: State<'_, AppState>, id: u64, text: String) -> Result<
 
 /// Host → client: reply to a connected peer's chat.
 #[tauri::command]
-async fn host_send_chat(state: State<'_, AppState>, peer: String, text: String) -> Result<(), String> {
+async fn host_send_chat(
+	state: State<'_, AppState>,
+	peer: String,
+	text: String,
+) -> Result<(), String> {
 	let tx = state.host_out.lock().unwrap().get(&peer).cloned();
 	tx.ok_or_else(|| "cihaz bağlı değil".to_string())?
 		.send(DataMsg::Chat(text))
@@ -1164,15 +1385,24 @@ async fn send_file(
 	const CHUNK: usize = 16 * 1024;
 	let tx = data_sender(&state, id)?;
 	let chunks = data.len().div_ceil(CHUNK) as u32;
-	tx.send(DataMsg::FileBegin { name, size: data.len() as u64, chunks })
+	tx.send(DataMsg::FileBegin {
+		name,
+		size: data.len() as u64,
+		chunks,
+	})
+	.await
+	.map_err(|_| "dosya gönderilemedi".to_string())?;
+	for (i, ch) in data.chunks(CHUNK).enumerate() {
+		tx.send(DataMsg::FileChunk {
+			index: i as u32,
+			data: ch.to_vec(),
+		})
 		.await
 		.map_err(|_| "dosya gönderilemedi".to_string())?;
-	for (i, ch) in data.chunks(CHUNK).enumerate() {
-		tx.send(DataMsg::FileChunk { index: i as u32, data: ch.to_vec() })
-			.await
-			.map_err(|_| "dosya gönderilemedi".to_string())?;
 	}
-	tx.send(DataMsg::FileEnd).await.map_err(|_| "dosya gönderilemedi".to_string())
+	tx.send(DataMsg::FileEnd)
+		.await
+		.map_err(|_| "dosya gönderilemedi".to_string())
 }
 
 /// Client: start streaming the microphone to the host (raw PCM over the session).
@@ -1241,7 +1471,12 @@ async fn input_pointer(state: State<'_, AppState>, id: u64, x: f64, y: f64) -> R
 
 /// Client: forward a mouse button (0=left, 1=right, 2=middle) press/release.
 #[tauri::command]
-async fn input_button(state: State<'_, AppState>, id: u64, button: u8, down: bool) -> Result<(), String> {
+async fn input_button(
+	state: State<'_, AppState>,
+	id: u64,
+	button: u8,
+	down: bool,
+) -> Result<(), String> {
 	forward(&state, id, InputEvent::PointerButton { button, down });
 	Ok(())
 }
@@ -1255,7 +1490,12 @@ async fn input_scroll(state: State<'_, AppState>, id: u64, dx: f64, dy: f64) -> 
 
 /// Client: forward a keyboard evdev keycode press/release.
 #[tauri::command]
-async fn input_key(state: State<'_, AppState>, id: u64, code: u32, down: bool) -> Result<(), String> {
+async fn input_key(
+	state: State<'_, AppState>,
+	id: u64,
+	code: u32,
+	down: bool,
+) -> Result<(), String> {
 	forward(&state, id, InputEvent::Key { code, down });
 	Ok(())
 }
@@ -1289,11 +1529,24 @@ async fn list_remote_games(
 	state: State<'_, AppState>,
 	target: String,
 ) -> Result<Vec<GameInfo>, String> {
-	let node = state.node.lock().unwrap().clone().ok_or("önce çevrimiçi ol")?;
+	let node = state
+		.node
+		.lock()
+		.unwrap()
+		.clone()
+		.ok_or("önce çevrimiçi ol")?;
 	let target_id = DeviceId::parse(&target).ok_or("geçersiz kimlik")?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let mut sess = node.connect(target_id).await.map_err(|e| e.to_string())?;
-	if !client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &target_id.grouped()).await? {
+	if !client_authenticate(
+		&mut sess,
+		&app,
+		&pw_pending,
+		&next_auth,
+		&target_id.grouped(),
+	)
+	.await?
+	{
 		return Err("Bağlantı reddedildi.".into());
 	}
 	request_games(&mut sess).await.map_err(|e| e.to_string())
@@ -1307,14 +1560,29 @@ async fn launch_remote_game(
 	target: String,
 	game_id: String,
 ) -> Result<(), String> {
-	let node = state.node.lock().unwrap().clone().ok_or("önce çevrimiçi ol")?;
+	let node = state
+		.node
+		.lock()
+		.unwrap()
+		.clone()
+		.ok_or("önce çevrimiçi ol")?;
 	let target_id = DeviceId::parse(&target).ok_or("geçersiz kimlik")?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let mut sess = node.connect(target_id).await.map_err(|e| e.to_string())?;
-	if !client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &target_id.grouped()).await? {
+	if !client_authenticate(
+		&mut sess,
+		&app,
+		&pw_pending,
+		&next_auth,
+		&target_id.grouped(),
+	)
+	.await?
+	{
 		return Err("Bağlantı reddedildi.".into());
 	}
-	request_launch(&mut sess, &game_id).await.map_err(|e| e.to_string())
+	request_launch(&mut sess, &game_id)
+		.await
+		.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1335,6 +1603,42 @@ async fn connect(state: State<'_, AppState>, target: String) -> Result<ConnInfo,
 		transport: transport.to_string(),
 		peer: target_id.grouped(),
 	})
+}
+
+/// A Pulsar device found on the local network (via the multicast beacon).
+#[derive(Serialize)]
+struct LanDevice {
+	/// Grouped relay id (e.g. `482 913 056`), or empty if the peer is relay-less.
+	id: String,
+	/// Whether `id` is usable to connect via the normal flow.
+	has_id: bool,
+	name: String,
+	/// `ip:port` the peer announced.
+	addr: String,
+	/// `windows` / `linux` / `macos`.
+	platform: String,
+}
+
+/// Devices auto-discovered on the local network. Empty until `go_online` starts
+/// the beacon. Polled by the Devices screen.
+#[tauri::command]
+async fn lan_devices(state: State<'_, AppState>) -> Result<Vec<LanDevice>, String> {
+	let disc = state.discovery.lock().unwrap().clone();
+	let Some(disc) = disc else {
+		return Ok(Vec::new());
+	};
+	Ok(disc
+		.peers()
+		.await
+		.into_iter()
+		.map(|p| LanDevice {
+			id: p.id.map(|d| d.grouped()).unwrap_or_default(),
+			has_id: p.id.is_some(),
+			name: p.name,
+			addr: p.addr.to_string(),
+			platform: p.platform,
+		})
+		.collect())
 }
 
 /// Detected physical controllers (DS3/DS4/DS5/Xbox/standard). Best-effort: an
@@ -1370,10 +1674,17 @@ async fn scan_folder(path: String) -> Result<Vec<ScannedApp>, String> {
 		return Err(format!("klasör bulunamadı: {path}"));
 	}
 	let mut apps = Vec::new();
-	for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+	for entry in std::fs::read_dir(&dir)
+		.map_err(|e| e.to_string())?
+		.flatten()
+	{
 		let p = entry.path();
 		if p.is_file() && is_executable(&p) {
-			let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("app").to_string();
+			let name = p
+				.file_stem()
+				.and_then(|s| s.to_str())
+				.unwrap_or("app")
+				.to_string();
 			apps.push(ScannedApp {
 				name,
 				path: p.to_string_lossy().into_owned(),
@@ -1387,7 +1698,10 @@ async fn scan_folder(path: String) -> Result<Vec<ScannedApp>, String> {
 #[cfg(windows)]
 fn is_executable(p: &std::path::Path) -> bool {
 	matches!(
-		p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
+		p.extension()
+			.and_then(|e| e.to_str())
+			.map(|e| e.to_lowercase())
+			.as_deref(),
 		Some("exe") | Some("bat") | Some("cmd") | Some("lnk")
 	)
 }
@@ -1409,9 +1723,13 @@ async fn run_command(command: String) -> Result<(), String> {
 		return Ok(());
 	}
 	#[cfg(windows)]
-	let spawn = std::process::Command::new("cmd").args(["/C", &command]).spawn();
+	let spawn = std::process::Command::new("cmd")
+		.args(["/C", &command])
+		.spawn();
 	#[cfg(not(windows))]
-	let spawn = std::process::Command::new("sh").args(["-c", &command]).spawn();
+	let spawn = std::process::Command::new("sh")
+		.args(["-c", &command])
+		.spawn();
 	spawn.map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -1439,6 +1757,7 @@ pub fn run() {
 			set_config,
 			go_online,
 			connect,
+			lan_devices,
 			controllers,
 			scan_folder,
 			run_command,

@@ -83,7 +83,11 @@ pub async fn start() -> std::io::Result<Viewer> {
 		}
 	});
 
-	Ok(Viewer { media_port, ws_port, tasks: vec![t_udp, t_ws] })
+	Ok(Viewer {
+		media_port,
+		ws_port,
+		tasks: vec![t_udp, t_ws],
+	})
 }
 
 #[cfg(test)]
@@ -95,15 +99,17 @@ mod tests {
 	#[tokio::test]
 	async fn forwards_udp_datagrams_to_the_websocket() {
 		let v = start().await.unwrap();
-		let (mut ws, _) =
-			tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", v.ws_port))
-				.await
-				.unwrap();
+		let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", v.ws_port))
+			.await
+			.unwrap();
 
 		// Let the WS connection subscribe to the broadcast before sending.
 		tokio::time::sleep(Duration::from_millis(150)).await;
 		let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-		sender.send_to(b"rtp-payload", ("127.0.0.1", v.media_port)).await.unwrap();
+		sender
+			.send_to(b"rtp-payload", ("127.0.0.1", v.media_port))
+			.await
+			.unwrap();
 
 		let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
 			.await

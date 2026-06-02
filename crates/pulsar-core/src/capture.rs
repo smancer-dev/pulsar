@@ -22,8 +22,12 @@ use ashpd::WindowIdentifier;
 /// True when running under Wayland, where `x11grab` would capture a black
 /// (rootless Xwayland) screen and we must use the portal instead.
 pub fn is_wayland() -> bool {
-	std::env::var("XDG_SESSION_TYPE").map(|v| v.eq_ignore_ascii_case("wayland")).unwrap_or(false)
-		|| std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+	std::env::var("XDG_SESSION_TYPE")
+		.map(|v| v.eq_ignore_ascii_case("wayland"))
+		.unwrap_or(false)
+		|| std::env::var("WAYLAND_DISPLAY")
+			.map(|v| !v.is_empty())
+			.unwrap_or(false)
 }
 
 /// A running portal capture: the GStreamer child streaming to the client, the
@@ -83,7 +87,10 @@ pub async fn start(
 			PersistMode::Application,
 		)
 		.await?;
-	let response = proxy.start(&session, &WindowIdentifier::default()).await?.response()?;
+	let response = proxy
+		.start(&session, &WindowIdentifier::default())
+		.await?
+		.response()?;
 	let stream = response
 		.streams()
 		.first()
@@ -119,7 +126,13 @@ pub async fn start(
 	unsafe {
 		cmd.pre_exec(|| {
 			// SAFETY: async-signal-safe libc calls only.
-			libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+			libc::prctl(
+				libc::PR_SET_PDEATHSIG,
+				libc::SIGKILL as libc::c_ulong,
+				0,
+				0,
+				0,
+			);
 			if libc::getppid() == 1 {
 				libc::_exit(0); // parent already gone between fork and here
 			}
@@ -130,5 +143,12 @@ pub async fn start(
 		.spawn()
 		.map_err(|e| anyhow::anyhow!("gst-launch-1.0 başlatılamadı (gstreamer kurulu mu?): {e}"))?;
 
-	Ok((WaylandCapture { child, session, _pw_fd: pw_fd }, token))
+	Ok((
+		WaylandCapture {
+			child,
+			session,
+			_pw_fd: pw_fd,
+		},
+		token,
+	))
 }

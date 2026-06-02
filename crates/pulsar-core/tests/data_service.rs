@@ -6,9 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pulsar_core::service::{
-	decode_data, send_data, serve_with, DataHandlers, DataMsg,
-};
+use pulsar_core::service::{decode_data, send_data, serve_with, DataHandlers, DataMsg};
 use pulsar_core::{NetworkMode, Node};
 use pulsar_relay::Relay;
 use tokio::sync::mpsc;
@@ -22,8 +20,12 @@ async fn side_channels_round_trip() {
 	let relay_addr: SocketAddr = relay.local_addr().unwrap();
 	tokio::spawn(relay.run());
 
-	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
-	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto).await.unwrap();
+	let host = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
 	host.register().await.unwrap();
 	client.register().await.unwrap();
 	let host_id = host.self_id().await.unwrap();
@@ -50,8 +52,12 @@ async fn side_channels_round_trip() {
 	}
 
 	let mut sess = client.connect(host_id).await.unwrap();
-	send_data(&sess, &DataMsg::Chat("merhaba".into())).await.unwrap();
-	send_data(&sess, &DataMsg::Clipboard("gizli-sifre".into())).await.unwrap();
+	send_data(&sess, &DataMsg::Chat("merhaba".into()))
+		.await
+		.unwrap();
+	send_data(&sess, &DataMsg::Clipboard("gizli-sifre".into()))
+		.await
+		.unwrap();
 
 	// Host received both.
 	let got = timeout(Duration::from_secs(2), async {
@@ -68,7 +74,10 @@ async fn side_channels_round_trip() {
 	assert_eq!(clips.lock().unwrap().first().unwrap(), "gizli-sifre");
 
 	// Host pushes a chat reply to the client.
-	out_tx.send(DataMsg::Chat("hosttan-cevap".into())).await.unwrap();
+	out_tx
+		.send(DataMsg::Chat("hosttan-cevap".into()))
+		.await
+		.unwrap();
 	let reply = timeout(Duration::from_secs(2), async {
 		loop {
 			if let Some(bytes) = sess.recv().await {

@@ -169,7 +169,9 @@ pub fn create_virtual_pad(kind: GamepadKind) -> Box<dyn VirtualGamepad> {
 	{
 		match uinput_backend::UinputGamepad::new(kind) {
 			Ok(pad) => return Box::new(pad),
-			Err(e) => tracing::warn!("uinput virtual pad unavailable ({e}); using recording backend"),
+			Err(e) => {
+				tracing::warn!("uinput virtual pad unavailable ({e}); using recording backend")
+			}
 		}
 	}
 	Box::new(RecordingPad::new(kind))
@@ -219,7 +221,12 @@ mod uinput_backend {
 			for (_, key) in evdev_buttons() {
 				keys.insert(key);
 			}
-			let stick = |axis| UinputAbsSetup::new(axis, AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 1));
+			let stick = |axis| {
+				UinputAbsSetup::new(
+					axis,
+					AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 1),
+				)
+			};
 			let trig = |axis| UinputAbsSetup::new(axis, AbsInfo::new(0, 0, 255, 0, 0, 1));
 			let dev = VirtualDeviceBuilder::new()?
 				.name("Pulsar Virtual Gamepad")
@@ -245,7 +252,8 @@ mod uinput_backend {
 				let val = if state.is_pressed(bit) { 1 } else { 0 };
 				events.push(InputEvent::new(EventType::KEY, key.code(), val));
 			}
-			let abs = |axis: AbsoluteAxisType, v: i32| InputEvent::new(EventType::ABSOLUTE, axis.0, v);
+			let abs =
+				|axis: AbsoluteAxisType, v: i32| InputEvent::new(EventType::ABSOLUTE, axis.0, v);
 			events.push(abs(AbsoluteAxisType::ABS_X, state.left_x as i32));
 			// evdev Y points down; gamepad up is +, so invert.
 			events.push(abs(AbsoluteAxisType::ABS_Y, -(state.left_y as i32)));
@@ -320,7 +328,9 @@ mod uinput_backend {
 				2 => Key::BTN_MIDDLE,
 				_ => Key::BTN_LEFT,
 			};
-			let _ = self.pointer.emit(&[InputEvent::new(EventType::KEY, key.code(), down as i32)]);
+			let _ = self
+				.pointer
+				.emit(&[InputEvent::new(EventType::KEY, key.code(), down as i32)]);
 		}
 
 		/// Scroll by a delta (browser wheel pixels → wheel clicks).
@@ -329,10 +339,18 @@ mod uinput_backend {
 			let h = (dx / 100.0).round() as i32;
 			let mut ev = Vec::new();
 			if v != 0 {
-				ev.push(InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_WHEEL.0, v));
+				ev.push(InputEvent::new(
+					EventType::RELATIVE,
+					RelativeAxisType::REL_WHEEL.0,
+					v,
+				));
 			}
 			if h != 0 {
-				ev.push(InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_HWHEEL.0, h));
+				ev.push(InputEvent::new(
+					EventType::RELATIVE,
+					RelativeAxisType::REL_HWHEEL.0,
+					h,
+				));
 			}
 			if !ev.is_empty() {
 				let _ = self.pointer.emit(&ev);
@@ -344,7 +362,9 @@ mod uinput_backend {
 			if code == 0 || code > 248 {
 				return;
 			}
-			let _ = self.keyboard.emit(&[InputEvent::new(EventType::KEY, code as u16, down as i32)]);
+			let _ =
+				self.keyboard
+					.emit(&[InputEvent::new(EventType::KEY, code as u16, down as i32)]);
 		}
 	}
 }
@@ -372,7 +392,9 @@ pub use hub::ControllerHub;
 /// Live controller reading via `gilrs`. Always compiled (the dep is small), but
 /// only useful where physical controllers exist.
 pub mod hub {
-	use super::{button, axis_to_i16, trigger_to_u8, vid_pid_from_sdl_guid, GamepadKind, GamepadState};
+	use super::{
+		axis_to_i16, button, trigger_to_u8, vid_pid_from_sdl_guid, GamepadKind, GamepadState,
+	};
 	use gilrs::{Axis, Button, Gamepad, Gilrs};
 
 	/// Map a `gilrs` button to our bitmask value (analog triggers excluded — they
@@ -473,14 +495,21 @@ mod tests {
 		assert_eq!(GamepadKind::from_vid_pid(0x054C, 0x09CC), GamepadKind::Ds4);
 		assert_eq!(GamepadKind::from_vid_pid(0x054C, 0x0CE6), GamepadKind::Ds5);
 		assert_eq!(GamepadKind::from_vid_pid(0x045E, 0x028E), GamepadKind::Xbox); // 360
-		assert_eq!(GamepadKind::from_vid_pid(0x045E, 0x0B12), GamepadKind::Xbox); // Series
+		assert_eq!(GamepadKind::from_vid_pid(0x045E, 0x0B12), GamepadKind::Xbox);
+		// Series
 	}
 
 	#[test]
 	fn unknown_and_generic_fallbacks() {
 		assert_eq!(GamepadKind::from_vid_pid(0, 0), GamepadKind::Unknown);
-		assert_eq!(GamepadKind::from_vid_pid(0x1234, 0x5678), GamepadKind::Standard);
-		assert_eq!(GamepadKind::from_vid_pid(0x054C, 0xFFFF), GamepadKind::Standard);
+		assert_eq!(
+			GamepadKind::from_vid_pid(0x1234, 0x5678),
+			GamepadKind::Standard
+		);
+		assert_eq!(
+			GamepadKind::from_vid_pid(0x054C, 0xFFFF),
+			GamepadKind::Standard
+		);
 	}
 
 	#[test]
@@ -492,10 +521,7 @@ mod tests {
 		guid[8] = 0xC4;
 		guid[9] = 0x05;
 		assert_eq!(vid_pid_from_sdl_guid(guid), (0x054C, 0x05C4));
-		assert_eq!(
-			GamepadKind::from_vid_pid(0x054C, 0x05C4),
-			GamepadKind::Ds4
-		);
+		assert_eq!(GamepadKind::from_vid_pid(0x054C, 0x05C4), GamepadKind::Ds4);
 	}
 
 	#[test]
@@ -557,8 +583,14 @@ mod tests {
 		use super::evdev_buttons;
 		let map = evdev_buttons();
 		assert_eq!(map.len(), 15);
-		assert!(map.iter().any(|(b, k)| *b == button::A && *k == evdev::Key::BTN_SOUTH));
-		assert!(map.iter().any(|(b, k)| *b == button::START && *k == evdev::Key::BTN_START));
-		assert!(map.iter().any(|(b, k)| *b == button::DPAD_UP && *k == evdev::Key::BTN_DPAD_UP));
+		assert!(map
+			.iter()
+			.any(|(b, k)| *b == button::A && *k == evdev::Key::BTN_SOUTH));
+		assert!(map
+			.iter()
+			.any(|(b, k)| *b == button::START && *k == evdev::Key::BTN_START));
+		assert!(map
+			.iter()
+			.any(|(b, k)| *b == button::DPAD_UP && *k == evdev::Key::BTN_DPAD_UP));
 	}
 }
