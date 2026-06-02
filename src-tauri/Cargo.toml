@@ -1,0 +1,23 @@
+[package]
+name = "pulsar-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pulsar desktop app — Tauri shell bridging the SvelteKit UI to pulsar-core."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+pulsar-core = { path = "../crates/pulsar-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Local UDP(RTP) → WebSocket relay that feeds the webview's WebCodecs decoder.
+tokio-tungstenite = "0.21"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

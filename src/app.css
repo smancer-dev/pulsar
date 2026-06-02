@@ -1,0 +1,433 @@
+/* ===========================================================================
+   PULSAR Desktop — tokens (light + dark) + shared atoms.
+   Ported from the design handoff (assets/tokens.css + Pulsar App.html).
+   =========================================================================== */
+
+:root {
+	--bg: oklch(0.992 0.003 255);
+	--bg-tint: oklch(0.975 0.006 262);
+	--surface: oklch(1 0 0);
+	--surface-2: oklch(0.978 0.005 258);
+	--surface-3: oklch(0.962 0.007 260);
+	--border: oklch(0.918 0.006 262);
+	--border-strong: oklch(0.862 0.009 262);
+
+	--text: oklch(0.235 0.018 268);
+	--text-muted: oklch(0.505 0.014 266);
+	--text-faint: oklch(0.635 0.011 264);
+	--text-on-accent: oklch(0.99 0.01 272);
+
+	--accent: oklch(0.555 0.205 272);
+	--accent-hover: oklch(0.505 0.215 272);
+	--accent-press: oklch(0.455 0.205 272);
+	--accent-soft: oklch(0.955 0.035 272);
+	--accent-soft-2: oklch(0.915 0.06 272);
+	--accent-ring: oklch(0.555 0.205 272 / 0.35);
+	--cyan: oklch(0.62 0.15 215);
+	--cyan-soft: oklch(0.955 0.035 215);
+
+	--ok: oklch(0.63 0.15 158);
+	--ok-soft: oklch(0.95 0.04 158);
+	--warn: oklch(0.72 0.15 75);
+	--warn-soft: oklch(0.96 0.05 75);
+	--danger: oklch(0.575 0.205 25);
+	--danger-soft: oklch(0.955 0.035 25);
+
+	--font-display: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+	--font-sans: 'Hanken Grotesk', ui-sans-serif, system-ui, -apple-system, sans-serif;
+	--font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+	--r-xs: 6px;
+	--r-sm: 9px;
+	--r: 13px;
+	--r-lg: 18px;
+	--r-xl: 26px;
+	--r-pill: 999px;
+
+	--shadow-xs: 0 1px 2px oklch(0.3 0.04 268 / 0.05);
+	--shadow-sm: 0 1px 2px oklch(0.3 0.04 268 / 0.05), 0 2px 6px oklch(0.3 0.04 268 / 0.05);
+	--shadow: 0 2px 4px oklch(0.3 0.04 268 / 0.04), 0 8px 24px oklch(0.3 0.04 268 / 0.08);
+	--shadow-lg: 0 4px 8px oklch(0.3 0.04 268 / 0.05), 0 24px 60px -12px oklch(0.28 0.06 268 / 0.2);
+	--shadow-accent: 0 8px 30px -8px oklch(0.555 0.205 272 / 0.45);
+
+	--ease: cubic-bezier(0.22, 1, 0.36, 1);
+	--ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+	--dur: 220ms;
+}
+
+:root[data-theme='dark'] {
+	--bg: oklch(0.17 0.012 265);
+	--bg-tint: oklch(0.2 0.015 265);
+	--surface: oklch(0.215 0.013 265);
+	--surface-2: oklch(0.245 0.013 265);
+	--surface-3: oklch(0.29 0.015 265);
+	--border: oklch(0.32 0.014 265);
+	--border-strong: oklch(0.42 0.016 265);
+	--text: oklch(0.95 0.008 265);
+	--text-muted: oklch(0.72 0.012 265);
+	--text-faint: oklch(0.56 0.012 265);
+	--accent-soft: oklch(0.32 0.07 272);
+	--accent-soft-2: oklch(0.4 0.1 272);
+	--shadow-xs: 0 1px 2px oklch(0 0 0 / 0.3);
+	--shadow-sm: 0 1px 2px oklch(0 0 0 / 0.3), 0 2px 6px oklch(0 0 0 / 0.3);
+	--shadow: 0 2px 4px oklch(0 0 0 / 0.3), 0 8px 24px oklch(0 0 0 / 0.4);
+	--shadow-lg: 0 4px 8px oklch(0 0 0 / 0.3), 0 24px 60px -12px oklch(0 0 0 / 0.6);
+}
+
+* {
+	box-sizing: border-box;
+}
+html,
+body {
+	height: 100%;
+	background: transparent;
+}
+body {
+	margin: 0;
+	font-family: var(--font-sans);
+	color: var(--text);
+	/* Transparent so the window's rounded corners reveal the desktop, not a band. */
+	background: transparent;
+	overflow: hidden;
+	-webkit-font-smoothing: antialiased;
+}
+h1,
+h2,
+h3,
+h4 {
+	font-family: var(--font-display);
+	font-weight: 600;
+	letter-spacing: -0.02em;
+	line-height: 1.05;
+	margin: 0;
+}
+.mono {
+	font-family: var(--font-mono);
+}
+::selection {
+	background: var(--accent-soft-2);
+	color: var(--accent-press);
+}
+
+/* buttons */
+.btn {
+	font-family: var(--font-sans);
+	font-weight: 600;
+	font-size: 15px;
+	border: 1px solid transparent;
+	border-radius: var(--r-sm);
+	padding: 11px 18px;
+	cursor: pointer;
+	display: inline-flex;
+	align-items: center;
+	gap: 9px;
+	white-space: nowrap;
+	text-decoration: none;
+	transition:
+		background var(--dur) var(--ease),
+		border-color var(--dur) var(--ease),
+		transform var(--dur) var(--ease),
+		box-shadow var(--dur) var(--ease),
+		color var(--dur) var(--ease);
+}
+.btn:active {
+	transform: translateY(1px);
+}
+.btn:disabled {
+	cursor: not-allowed;
+}
+.btn-primary {
+	background: var(--accent);
+	color: var(--text-on-accent);
+	box-shadow: var(--shadow-accent);
+}
+.btn-primary:hover:not(:disabled) {
+	background: var(--accent-hover);
+}
+.btn-ghost {
+	background: var(--surface);
+	color: var(--text);
+	border-color: var(--border);
+	box-shadow: var(--shadow-xs);
+}
+.btn-ghost:hover:not(:disabled) {
+	background: var(--surface-2);
+	border-color: var(--border-strong);
+}
+.pulsar-mark {
+	display: inline-block;
+	flex: none;
+}
+
+/* window chrome */
+.desktop {
+	width: 100%;
+	height: 100vh;
+}
+.window {
+	width: 100%;
+	height: 100vh;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: 14px;
+	box-shadow: none;
+	overflow: hidden;
+	display: flex;
+	flex-direction: column;
+	position: relative; /* positioning context for the session overlay */
+}
+.content {
+	flex: 1;
+	position: relative;
+	overflow: auto;
+	padding: 32px;
+	background: var(--bg);
+}
+:root[data-density='compact'] .content {
+	padding: 22px;
+}
+:root[data-density='comfy'] .content {
+	padding: 42px;
+}
+.content::-webkit-scrollbar {
+	width: 10px;
+}
+.content::-webkit-scrollbar-thumb {
+	background: var(--border-strong);
+	border-radius: 6px;
+	border: 3px solid var(--bg);
+}
+
+/* form atoms */
+.field {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	border: 1px solid var(--border-strong);
+	border-radius: var(--r);
+	padding: 11px 13px;
+	background: var(--surface);
+	transition:
+		border-color var(--dur),
+		box-shadow var(--dur);
+}
+.field:focus-within {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.field input {
+	border: none;
+	outline: none;
+	background: transparent;
+	width: 100%;
+	color: var(--text);
+	font-family: inherit;
+}
+.icon-btn {
+	width: 34px;
+	height: 34px;
+	display: grid;
+	place-items: center;
+	border: 1px solid var(--border);
+	background: var(--surface);
+	border-radius: var(--r-sm);
+	cursor: pointer;
+	color: var(--text-muted);
+	transition: all var(--dur) var(--ease);
+}
+.icon-btn:hover {
+	border-color: var(--border-strong);
+	color: var(--text);
+	background: var(--surface-2);
+}
+.card {
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: var(--r-lg);
+	box-shadow: var(--shadow-sm);
+	padding: 24px;
+}
+.recent-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 10px;
+	border: 1px solid transparent;
+	border-radius: var(--r-sm);
+	cursor: pointer;
+	background: var(--surface-2);
+	width: 100%;
+	transition: all var(--dur) var(--ease);
+	color: inherit;
+	text-align: left;
+}
+.recent-row:hover {
+	background: var(--surface);
+	border-color: var(--border);
+	box-shadow: var(--shadow-xs);
+}
+.device-tile {
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	padding: 16px;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: var(--r-lg);
+	box-shadow: var(--shadow-xs);
+	transition:
+		transform var(--dur) var(--ease),
+		box-shadow var(--dur) var(--ease),
+		border-color var(--dur);
+}
+.device-tile:hover {
+	transform: translateY(-2px);
+	box-shadow: var(--shadow-sm);
+	border-color: var(--border-strong);
+}
+
+/* segmented control */
+.seg {
+	display: inline-flex;
+	background: var(--surface-3);
+	border-radius: var(--r-sm);
+	padding: 3px;
+	gap: 2px;
+}
+.seg button {
+	border: none;
+	cursor: pointer;
+	font-family: var(--font-sans);
+	font-weight: 600;
+	font-size: 13px;
+	padding: 6px 13px;
+	border-radius: 7px;
+	background: transparent;
+	color: var(--text-muted);
+	transition: all var(--dur) var(--ease);
+}
+.seg button.active {
+	background: var(--surface);
+	color: var(--text);
+	box-shadow: var(--shadow-xs);
+}
+
+/* badges */
+.badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12.5px;
+	font-weight: 600;
+	padding: 4px 10px;
+	border-radius: var(--r-pill);
+}
+.badge .dot {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: currentColor;
+}
+.badge.online {
+	background: var(--ok-soft);
+	color: var(--ok);
+}
+.badge.stream {
+	background: var(--cyan-soft);
+	color: var(--cyan);
+}
+.badge.accent {
+	background: var(--accent-soft);
+	color: var(--accent-press);
+}
+
+/* toggle */
+.toggle {
+	width: 42px;
+	height: 25px;
+	border-radius: 999px;
+	border: none;
+	cursor: pointer;
+	padding: 3px;
+	background: var(--border-strong);
+	transition: background var(--dur) var(--ease);
+	display: flex;
+	justify-content: flex-start;
+}
+.toggle.on {
+	background: var(--accent);
+	justify-content: flex-end;
+}
+.toggle .knob {
+	width: 19px;
+	height: 19px;
+	border-radius: 50%;
+	background: #fff;
+	display: block;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+/* connecting rings */
+.cring {
+	position: absolute;
+	width: 64px;
+	height: 64px;
+	border: 1.5px solid var(--accent);
+	border-radius: 50%;
+	opacity: 0;
+	animation: cringe 2.7s ease-out infinite;
+}
+@keyframes cringe {
+	0% {
+		transform: scale(1);
+		opacity: 0.5;
+	}
+	100% {
+		transform: scale(3);
+		opacity: 0;
+	}
+}
+.spin {
+	animation: spin 0.8s linear infinite;
+	display: block;
+}
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+/* range slider */
+.prange {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 100%;
+	height: 5px;
+	border-radius: 3px;
+	background: var(--surface-3);
+	margin-top: 6px;
+	cursor: pointer;
+}
+.prange::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	width: 17px;
+	height: 17px;
+	border-radius: 50%;
+	background: var(--accent);
+	border: 2.5px solid var(--surface);
+	box-shadow: var(--shadow-xs);
+	cursor: pointer;
+}
+.prange::-moz-range-thumb {
+	width: 14px;
+	height: 14px;
+	border-radius: 50%;
+	background: var(--accent);
+	border: 2.5px solid var(--surface);
+	cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}

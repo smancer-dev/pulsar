@@ -1,0 +1,33 @@
+[package]
+name = "pulsar-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pulsar desktop core — connection orchestration (P2P + relay fallback), E2E crypto, controller input, and the streaming pipeline. Consumed by the Tauri app."
+
+[dependencies]
+pulsar-proto.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+x25519-dalek = { workspace = true, features = ["static_secrets"] }
+chacha20poly1305.workspace = true
+sha2.workspace = true
+gilrs.workspace = true
+
+# Host-side virtual gamepad injection on Linux (uinput) + Wayland screen capture
+# via the XDG ScreenCast desktop portal (x11grab can't see a Wayland desktop).
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }
+pulsar-relay = { path = "../../../relay" }
