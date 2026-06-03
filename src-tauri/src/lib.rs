@@ -1733,6 +1733,42 @@ async fn run_command(command: String) -> Result<(), String> {
 	spawn.map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Run as a headless relay / rendezvous server instead of the GUI, so the same
+/// install can self-host a relay: `pulsar --relay [--bind H:P | --host H --port P]`
+/// (defaults to `0.0.0.0:21116`). Reuses the `pulsar-relay` crate.
+///
+/// Note: on Windows the app is built with the GUI subsystem (no console), so relay
+/// logs won't show in a terminal — use the standalone `pulsar-relay` binary there.
+pub fn run_relay(args: &[String]) {
+	let flag = |name: &str| {
+		args.iter()
+			.position(|a| a == name)
+			.and_then(|i| args.get(i + 1))
+			.cloned()
+	};
+	let addr: SocketAddr = match flag("--bind") {
+		Some(b) => b.parse().expect("invalid --bind address (expected host:port)"),
+		None => {
+			let host = flag("--host").unwrap_or_else(|| "0.0.0.0".into());
+			let port = flag("--port")
+				.unwrap_or_else(|| pulsar_core::proto::DEFAULT_RELAY_PORT.to_string());
+			format!("{host}:{port}").parse().expect("invalid --host/--port")
+		}
+	};
+	tracing_subscriber::fmt()
+		.with_env_filter(
+			tracing_subscriber::EnvFilter::try_from_default_env()
+				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+		)
+		.init();
+	let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+	rt.block_on(async move {
+		let relay = pulsar_relay::Relay::bind(addr).await.expect("relay failed to bind");
+		tracing::info!(%addr, "Pulsar relay listening (UDP) — headless --relay mode");
+		relay.run().await.expect("relay loop exited with error");
+	});
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
 	tracing_subscriber::fmt()

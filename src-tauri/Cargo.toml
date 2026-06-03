@@ -13,6 +13,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api"] }
 pulsar-core = { path = "../crates/pulsar-core" }
+# Lets the same binary double as a headless relay: `pulsar --relay` (see run_relay).
+pulsar-relay = { path = "../../relay" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
