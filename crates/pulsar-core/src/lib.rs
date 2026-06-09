@@ -9,6 +9,7 @@
 #[doc(inline)]
 pub use pulsar_proto as proto;
 
+pub mod audio;
 #[cfg(target_os = "linux")]
 pub mod capture;
 pub mod config;
@@ -27,4 +28,4 @@ pub use discovery::{DiscoveredPeer, Discovery};
 pub use input::{GamepadKind, GamepadState, VirtualGamepad};
 pub use media::{Codec, EncodedPacket, RawFrame, StreamStats};
 pub use pipeline::{HwEncoder, StreamPlan, VCodec};
-pub use service::GameInfo;
+pub use service::{GameInfo, QualityPref};

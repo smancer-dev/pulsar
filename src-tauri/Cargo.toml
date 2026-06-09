@@ -11,15 +11,61 @@ description = "Pulsar desktop app — Tauri shell bridging the SvelteKit UI to p
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 pulsar-core = { path = "../crates/pulsar-core" }
 # Lets the same binary double as a headless relay: `pulsar --relay` (see run_relay).
 pulsar-relay = { path = "../../relay" }
 tokio = { workspace = true }
+socket2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Load the (bundled) Interception driver's user-mode DLL at runtime, for keyboard
+# capture below the OS hook layer (works where WH_KEYBOARD_LL is bypassed, e.g.
+# ASTER multiseat). Optional at runtime — falls back to WH_KEYBOARD_LL if absent.
+libloading = "0.8"
 # Local UDP(RTP) → WebSocket relay that feeds the webview's WebCodecs decoder.
 tokio-tungstenite = "0.21"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+# Raw Win32 for true taskbar-covering fullscreen (borderless-fullscreen via SetWindowPos).
+[target.'cfg(windows)'.dependencies]
+# Native host capture+encode (DXGI Desktop Duplication + NVENC SDK → RTP, Sunshine-technique).
+# Replaces the ffmpeg ddagrab hot path on Windows/NVENC; ffmpeg stays as the fallback.
+pulsar-capture = { path = "../crates/pulsar-capture" }
+windows-sys = { version = "0.59", features = [
+	"Win32_Foundation",
+	"Win32_Graphics_Gdi",
+	"Win32_UI_WindowsAndMessaging",
+	"Win32_System_Threading", # also load-bearing for JOBOBJECT_EXTENDED_LIMIT_INFORMATION (IO_COUNTERS)
+	"Win32_System_JobObjects", # job.rs: kill orphaned ffmpeg/ffplay when Pulsar dies (needs Threading + Security)
+	"Win32_System_LibraryLoader",
+	"Win32_Security", # SECURITY_ATTRIBUTES (CreateMutexW single-instance); also CreateJobObjectW
+] }
+
+# Linux/X11: resolve the Pulsar window's X11 id so the native mpv renderer embeds INSIDE
+# the app window via `--wid` (in-app HW-decoded video, no webview hop). Versions match
+# the gtk3 stack tauri/wry already pull in (gtk/gdk/gdkx11 0.18.2 in Cargo.lock).
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+gtk = "0.18"
+gdk = "0.18"
+gdkx11 = "0.18"
+
+# Linux client-side input capture: grab the local keyboard+mouse (evdev) and forward to
+# the host while the embedded native renderer covers the webview (the Linux analog of the
+# Windows kbdhook/Interception path). evdev/libc are already in Cargo.lock via pulsar-core.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"
+libc = "0.2"
+# Layout-aware keyboard forwarding (WYSIWYG): resolve a grabbed evdev keycode → the Unicode
+# char the user's OWN active layout (e.g. Turkish-Q) produces, via libxkbcommon, so the host
+# types the exact char regardless of ITS layout. Links the system libxkbcommon (libxkbcommon-dev).
+xkbcommon = "0.7"
+# Single-surface renderer: libmpv RENDER API (client API v1 → links the system libmpv.so.1,
+# NOT libmpv2-sys) draws rkmpp-decoded frames into a GtkGLArea; the webview composites on
+# top. GL fns are resolved at runtime from libepoxy via the existing `libloading` dep.
+libmpv-sys = "3.1.0"
+# Pinned to wry 0.55's resolved version so PlatformWebview::inner() is the same WebView type
+# (for set_background_color transparency over the GLArea).
+webkit2gtk = "=2.0.2"

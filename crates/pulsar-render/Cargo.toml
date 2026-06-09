@@ -1,0 +1,63 @@
+# Pulsar native renderer + overlay (separate process, spawned by the Tauri app).
+#
+# Why a separate binary and not a module in pulsar-tauri: linking EGL/GL into the
+# Tauri binary wedges WebKitGTK's compositor on Linux (see HANDOFF §3 / memory
+# native-renderer-all-platforms). As its own process it links GPU libs freely and
+# renders into a child window of the Tauri window (the --wid the C vidsink used).
+#
+# The overlay UI (`overlay.rs`) is egui and backend-agnostic, so every platform
+# draws the IDENTICAL overlay. Linux uses egui's GL backend (egui_glow) over the
+# proven EGL/rkmpp DRM_PRIME path; Windows/macOS will use egui-wgpu (D3D12/Metal).
+[package]
+name = "pulsar-render"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "pulsar-render"
+path = "src/main.rs"
+
+[dependencies]
+egui = "0.29"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+egui_glow = { version = "0.29", default-features = false }
+glow = "0.14"
+khronos-egl = { version = "6", features = ["static"] }
+x11 = { version = "2.21", features = ["xlib"] }
+libc = "0.2"
+# Video decode (rkmpp → DRM_PRIME) for the single-surface renderer: video + egui overlay in ONE
+# GL context/window so the overlay is a child of the app window (moves/clips/stacks with it).
+ffmpeg-sys-next = "4.4"
+
+# Windows: native zero-copy renderer, Moonlight-style. Media Foundation HW decoder (DXVA →
+# ID3D11Texture2D, no ffmpeg/libclang needed) → ID3D11VideoProcessor NV12→RGB → DXGI swapchain
+# present on a CHILD HWND of the Tauri window (the Win32 analogue of Linux's X11 `--wid`). The
+# SAME `overlay.rs` egui UI is drawn on the swapchain via egui-directx11. All COM via the
+# `windows` crate (consistent with pulsar-capture's D3D11/NVENC host path).
+# NOTE: egui-directx11 forces egui 0.31 + windows 0.61 (conflicts with our egui 0.29 / windows
+# 0.58 and would ripple to the Linux egui_glow path), so the overlay is painted by our own
+# minimal D3D11 egui painter (`win/egui_paint.rs`) at egui 0.29 / windows 0.58 — no version bump.
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_Media_MediaFoundation",
+]
+
+# macOS still uses egui's winit+wgpu stack (Metal) for the overlay; native VideoToolbox→Metal
+# child-NSView video is a later phase (Task 10). Same overlay.rs UI.
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.29", default-features = false, features = ["wgpu"] }

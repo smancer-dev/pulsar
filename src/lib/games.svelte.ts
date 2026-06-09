@@ -42,10 +42,45 @@ interface Store {
 	games: Game[];
 	host: HostSettings;
 	scan: ScanConfig;
+	/** True once the Steam default has been seeded, so deleting it sticks (we don't
+	 * keep re-adding it on every launch). */
+	seededSteam?: boolean;
 }
 
 const KEY = 'pulsar.games.v1';
 const hasLS = typeof localStorage !== 'undefined';
+
+/** Always-present built-in: streams the host **desktop** in game mode (direct
+ * desktop access, like Moonlight's "Desktop"). Non-deletable, but editable. */
+export const DESKTOP_ID = 'desktop';
+
+/** Built-ins can be edited but not removed. */
+export function isBuiltin(id: string): boolean {
+	return id === DESKTOP_ID;
+}
+
+function desktopEntry(): Game {
+	// type 'image' = "launch nothing, just stream" — i.e. the live desktop.
+	return {
+		id: DESKTOP_ID,
+		title: 'Masaüstü',
+		type: 'image',
+		path: '',
+		args: '',
+		command: '',
+		image: '',
+		cmdStart: '',
+		cmdStop: ''
+	};
+}
+
+/** Guarantee the Desktop entry exists (first), so the user can always game-stream
+ * the desktop. */
+function ensureDesktop(s: Store) {
+	if (!s.games.some((g) => g.id === DESKTOP_ID)) {
+		s.games.unshift(desktopEntry());
+	}
+}
 
 function defaults(): Store {
 	return {
@@ -56,12 +91,20 @@ function defaults(): Store {
 }
 
 function load(): Store {
-	if (!hasLS) return defaults();
+	if (!hasLS) {
+		const d = defaults();
+		ensureDesktop(d);
+		return d;
+	}
 	try {
 		const raw = localStorage.getItem(KEY);
-		return raw ? { ...defaults(), ...(JSON.parse(raw) as Partial<Store>) } : defaults();
+		const s = raw ? { ...defaults(), ...(JSON.parse(raw) as Partial<Store>) } : defaults();
+		ensureDesktop(s);
+		return s;
 	} catch {
-		return defaults();
+		const d = defaults();
+		ensureDesktop(d);
+		return d;
 	}
 }
 
@@ -92,11 +135,33 @@ export function updateGame(id: string, patch: Partial<Game>) {
 }
 
 export function removeGame(id: string) {
+	if (isBuiltin(id)) return; // Desktop is permanent (editable, not removable)
 	const i = gameStore.games.findIndex((x) => x.id === id);
 	if (i >= 0) {
 		gameStore.games.splice(i, 1);
 		saveGames();
 	}
+}
+
+/** Seed a deletable **Steam** default if Steam is installed (`steamPath` from the
+ * `steam_path` command). Added once — deleting it sticks (we don't re-add). */
+export function ensureSteamDefault(steamPath: string) {
+	if (!steamPath || gameStore.seededSteam) return;
+	gameStore.seededSteam = true;
+	if (!gameStore.games.some((g) => g.id === 'steam' || g.path === steamPath)) {
+		gameStore.games.push({
+			id: 'steam',
+			title: 'Steam',
+			type: 'program',
+			path: steamPath,
+			args: '-bigpicture',
+			command: '',
+			image: '',
+			cmdStart: '',
+			cmdStop: ''
+		});
+	}
+	saveGames();
 }
 
 /** Add a program discovered by a folder scan (deduped by path). */
@@ -122,7 +187,8 @@ export function removeFolder(p: string) {
 	}
 }
 
-/** Test helper. */
+/** Test helper. Resets to the default state — which still includes the built-in
+ * Desktop entry (it's always present). */
 export function _reset() {
 	const d = defaults();
 	gameStore.games.splice(0, gameStore.games.length);
@@ -130,5 +196,7 @@ export function _reset() {
 	gameStore.host = d.host;
 	gameStore.scan.autoScan = false;
 	gameStore.scan.intervalMin = 30;
+	gameStore.seededSteam = false;
+	ensureDesktop(gameStore);
 	if (hasLS) localStorage.removeItem(KEY);
 }

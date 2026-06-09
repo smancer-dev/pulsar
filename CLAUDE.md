@@ -120,6 +120,150 @@ The remote screen renders **inside the app**, not a separate `ffplay` window:
   is undefined even with `enable-webrtc`). WebCodecs gives equivalent low latency.
   Verified: a real RTP/H.264 stream decoded 60/60 frames, 0 errors, in the webview.
 
+## Windows drivers: keyboard capture + virtual gamepad
+
+Two host/client features need kernel drivers on Windows; both are **bundled and
+auto-installed** so the user never installs anything by hand (the GPLv3 build is
+license-clear to redistribute them — see below).
+
+- **Keyboard capture under ASTER** (`src-tauri/src/kbdhook.rs`). The client must
+  capture OS-reserved keys (Win, Alt+Tab, Ctrl+Esc) to forward + suppress them.
+  `WH_KEYBOARD_LL` works on normal machines but **ASTER multiseat injects physical
+  keys below the LL-hook chain**, so it's bypassed there. We load the
+  **Interception** driver's `interception.dll` at runtime (via `libloading`) and
+  capture below the hook layer (proven to see ASTER's physical keys). It's the
+  primary path when the driver is present; otherwise we fall back to
+  `WH_KEYBOARD_LL`. Set-1 scancodes → evdev via `scancode_to_evdev`; the
+  Ctrl+Alt+Shift leave combo + suppress/forward logic is shared (`handle_key`) with
+  the hook path. Interception is **LGPL-3.0 for non-commercial use with explicit
+  redistribution rights for the driver+installer** — fine for GPLv3 Pulsar; a
+  commercial Pulsar would need Interception's commercial license.
+- **Virtual gamepad** (`pulsar-core::input`, `vigem_backend`). The host replays the
+  client's controller via **ViGEmBus** (Xbox 360 emulation, read through XInput by
+  every game), using the pure-Rust `vigem-client`. Linux uses uinput; macOS + ARM
+  Windows fall back to a recording stub. Buttons map through `xinput_buttons`
+  (XInput bitmask) — pure + unit-tested.
+
+**Driver bundling / auto-install:** `interception.dll` is shipped next to the exe
+(loaded at runtime). The **NSIS installer** runs the Interception + ViGEmBus
+silent installers during Pulsar's install (it already elevates) and shows a
+**"restart required"** notice (kernel drivers need one reboot). Driver payloads are
+fetched by `scripts/fetch-drivers.mjs` (like `fetch-ffmpeg.mjs`) into
+`src-tauri/resources/` so a dev clone + CI build needs no manual step.
+
+## Audio streaming (host → client)
+
+A second Opus/RTP stream runs **parallel to the video** (not over the JSON control
+channel, which would bloat with PCM): the host captures its system audio, encodes
+**Opus**, and sends **RTP** to a second UDP port. `viewer.rs` relays it over a second
+loopback WebSocket; `src/lib/opus-audio.ts` decodes with WebCodecs `AudioDecoder` and
+plays via WebAudio (degrades to silent video if the webview lacks audio WebCodecs).
+
+Capture has two paths:
+
+- **Windows (default): WASAPI loopback** of the *default render endpoint*
+  (`audio::run_loopback_capture` — `IAudioClient` + `AUDCLNT_STREAMFLAGS_LOOPBACK`),
+  the OBS/Sunshine approach. It taps whatever is playing on the host's output, so it
+  **works with no `virtual-audio-capturer` / Stereo Mix device installed** (the old
+  dshow default silently produced nothing on machines lacking that device). A Rust
+  thread writes the endpoint's raw mix PCM into an ffmpeg reading `pipe:0`
+  (`spawn_loopback_audio` in `src-tauri/src/lib.rs`); ffmpeg does the Opus/RTP encode
+  (`audio::opus_rtp_output`, shared with the dshow path). Silence is filled so the
+  audio timeline tracks wall-clock and never drifts ahead of the video.
+- **dshow / Pulse `.monitor` / AVFoundation** (`audio::audio_command`): used on
+  Linux/macOS, and on Windows when the user names a specific capture device in
+  Settings (`Config::audio_input` non-empty → `audio_loopback()` is false).
+
+Two `Config` toggles drive it: `transmit_audio` (send host→client) and
+`mute_host_audio` (silence the host's local output via Core Audio on Windows /
+`pactl` on Linux — `audio::set_host_muted`). **Game mode forces both on**
+(`AudioSettings::policy`, unit-tested) so a remote game's sound moves entirely to
+the player; the host is un-muted on session teardown.
+
+## Stable device ID (identity persistence)
+
+The relay assigns the 9-digit ID, but it now **maps pubkey → id** (`by_pubkey` in
+`relay/src/lib.rs`) so a returning device keeps the same ID. The client persists
+its X25519 identity per-user via `Identity::load_or_create` (in
+`<app_config_dir>/identity.key`), passed to `Node::bind_with_identity`. Result: the
+ID is **stable across restarts** and **distinct per OS user** (ASTER seats keep
+separate IDs). A per-session single-instance guard (Windows `Local\` named mutex)
+stops a second Pulsar per user while still allowing one per seat/user.
+
+## Two usage modes (product direction — keep consistent everywhere)
+
+Pulsar is ONE app with **two mode-aware personalities**, chosen at connect time
+(`startConnect(target, mode: 'remote' | 'game')`). The mode drives **menu content,
+overlay content, the look, and the encode profile**:
+
+| | **Remote Desktop** (AnyDesk/RustDesk) | **Game Streaming** (Moonlight/Parsec) |
+| - | - | - |
+| Focus | general remote control + management | lowest latency, gaming |
+| Menu | **full**: resolution/quality · codec/encoder · **file transfer · clipboard · multi-monitor** · chat · mic · reverse-direction · settings | **slim, game-only**: codec · bitrate (Mbit) · **fps** · resolution · quality/perf · encoder/decoder · controllers · end. **NO file/clipboard/mic/multi-monitor** (irrelevant in-game) |
+| Overlay | thin info strip (connection/transport) | perf HUD (latency/fps/bitrate) + controller status + leave-combo hint |
+| Look | neutral/general | gaming (cyan accent, minimal, immersive — `data-gaming`) |
+| Encode | quality-focused | low-latency (already mode-aware on the host) |
+
+Established earlier with the maintainer: **entering game streaming makes the whole
+app gaming-focused; remote desktop makes it general remote-control-focused.**
+
+## CLI / headless start (kiosk / appliance — esp. Orange Pi)
+
+`pulsar --connect <id|ip> [--connect-pw <pw>]` auto-connects on launch — **splash
+shows, but NO home screen**; it goes straight into the connection (headless-style;
+already wired via `AppState.auto_connect` + `+page.svelte` onMount). Today this starts
+in **remote** mode. PLANNED CLI surface:
+- a **mode** flag so the CLI can start a **game** session (default is **remote**);
+- for game mode, a **target app** to launch — **default is "Desktop"**. *Desktop is
+  always present and is NOT deletable* (established earlier — every host always exposes
+  a "Desktop" entry to stream the whole desktop).
+
+## Gaming overlay (in-session, game mode)
+
+The advanced overlay is **hidden by default and opened with a key combo** (so it never
+clutters gameplay). When open it shows a **rich, game-focused menu** — encoder/decoder
+selection, codec, **fps**, quality/performance, **bitrate (Mbit)**, etc. — and
+explicitly **NOT** file manager / mic / clipboard (those are remote-desktop-only).
+While the overlay is open the **video may pause/freeze and resume after** — acceptable;
+the priority is **Moonlight-class low latency + performance** during play. The overlay
+may even be *injected* onto the video to display it **as long as it costs no
+performance**.
+
+## Linux / RK3588 (Orange Pi 5) renderer — the reality (IMPORTANT)
+
+On Linux the webview path is NOT viable for video and the in-app overlay differs from
+Windows — keep this straight:
+
+- **WebKitGTK can't hardware-decode** the stream (no usable WebCodecs HW path on RK3588;
+  it would software-decode + glitch). So on Linux the video MUST be **native**:
+  **mpv with `--hwdec` → `h264_rkmpp`/`hevc_rkmpp`** (zero-copy EGL), the same decode
+  Moonlight uses. Default is embedded **`mpv --wid=<app window XID>`** (renders inside the
+  Pulsar window). `--untimed --no-correct-pts --video-sync=desync` are load-bearing for
+  low latency — RTP has no usable PTS, so without them mpv paces to a made-up 30fps
+  (adds latency). `native_view.rs::spawn_mpv`.
+- **The webview can NOT be composited transparently over the native video** on this
+  GTK3/WebKitGTK stack (the reparented wry webview renders OPAQUE black over a GtkGLArea
+  even with `set_background_color(0)` + an RGBA window visual — a fresh webview works,
+  wry's drops alpha). Proven with a magenta-clear probe. **So do NOT build a "rich webview
+  UI over the live video" path on Linux.** Follow **Moonlight's model** (verified in
+  `_ref/moonlight-qt`): one native renderer for *both* windowed and fullscreen (just a
+  window flag), and the overlay is **drawn natively on the video** (`OverlayManager` →
+  `renderOverlay()`), NOT a rich UI composite. The rich menu is a separate screen you
+  toggle to (video pauses) — exactly the gaming-overlay-via-combo above.
+  - A libmpv-render-API → `GtkGLArea` "single surface" is implemented but gated **opt-in**
+    behind `PULSAR_SINGLE_SURFACE=1` (it renders rkmpp + controls, but the webview-overlay
+    is blocked by the transparency wall above).
+  - **Windows/macOS keep the in-webview WebCodecs path** (WebView2/WKWebView HW-decode), so
+    there the rich menu CAN live over the video. The two-mode UX is shared; only the
+    video+overlay *mechanism* is platform-specific.
+- **Control on Linux** = `kbdhook.rs` Linux module: grabs local keyboard+mouse via
+  **evdev (EVIOCGRAB)**, hotplug-aware, forwards `InputEvent` to the host (analog of the
+  Windows Interception path). **Leave combo: Ctrl+Shift+Q** (F12 is unreliable — media-mode
+  keyboards like Logitech MX Keys don't emit `KEY_F12`).
+- **Rendezvous gotcha:** a host that serves LAN clients must register with the relay using
+  its **LAN IP**, not `127.0.0.1` — otherwise the relay hands clients a loopback address and
+  P2P/auth never completes (`Config.relay`).
+
 ## What's complete vs. scaffolded
 
 **Complete + tested:** relay protocol, register→ID→P2P→relay-fallback (incl.

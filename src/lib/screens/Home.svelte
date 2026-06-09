@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { recentPeers, addPeer } from '$lib/peers.svelte';
-	import { api, copyText, type GameInfo, type LanDevice } from '$lib/api';
+	import { historyPeers } from '$lib/peers.svelte';
+	import { api, type GameInfo } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
+	import SelfCard from './Home/SelfCard.svelte';
+	import LanDevices from './Home/LanDevices.svelte';
 
 	type Target = { name: string; id: string };
 	type Props = {
@@ -35,26 +37,16 @@
 		onConnect
 	}: Props = $props();
 
-	const recents = $derived(recentPeers(3));
+	let showAllHistory = $state(false);
+	const allHistory = $derived(historyPeers());
+	const recents = $derived(showAllHistory ? allHistory : allHistory.slice(0, 3));
 
-	// LAN auto-discovery: poll the core for Pulsar devices announcing on this
-	// network (the multicast beacon). Works even offline (relay-less).
-	let lan = $state<LanDevice[]>([]);
-	async function refreshLan() {
-		try {
-			lan = await api.lanDevices();
-		} catch {
-			/* core not bound yet — keep the last list */
-		}
-	}
+	let localIp = $state('');
 	onMount(() => {
-		refreshLan();
-		const timer = setInterval(refreshLan, 2000);
-		return () => clearInterval(timer);
+		api.localIp().then((ip) => (localIp = ip)).catch(() => {});
 	});
 
 	let target = $state('');
-	let copied = $state(false);
 
 	// client → game mode: fetch the host's published games
 	let hostGames = $state<GameInfo[] | null>(null);
@@ -63,7 +55,7 @@
 
 	// Auth (password / host approval) is handled by the connect flow via events.
 	async function fetchGames() {
-		if (digits.length < 6) return;
+		if (!canConnect) return;
 		loadingGames = true;
 		gamesErr = '';
 		hostGames = null;
@@ -79,24 +71,23 @@
 		onConnect({ name: g.title, id: fmt(target) }, 'game', g.id);
 	}
 
+	// A target is either a 9-digit relay ID (grouped) or an IP / IP:port (has '.'/':').
+	const isAddr = (v: string) => /[.:]/.test(v);
 	const fmt = (v: string) =>
-		v
-			.replace(/\D/g, '')
-			.slice(0, 9)
-			.replace(/(\d{3})(?=\d)/g, '$1 ')
-			.trim();
+		isAddr(v)
+			? v.replace(/[^0-9.:]/g, '').slice(0, 21)
+			: v
+					.replace(/\D/g, '')
+					.slice(0, 9)
+					.replace(/(\d{3})(?=\d)/g, '$1 ')
+					.trim();
 	const digits = $derived(target.replace(/\D/g, ''));
+	const ipRe = /^\d{1,3}(\.\d{1,3}){3}(:\d{1,5})?$/;
+	const canConnect = $derived(isAddr(target) ? ipRe.test(target.trim()) : digits.length >= 6);
 
-	async function copyId() {
-		const ok = await copyText(selfId.replace(/\s/g, ''));
-		if (ok) {
-			copied = true;
-			setTimeout(() => (copied = false), 1400);
-		}
-	}
 	function go() {
 		// No password up front — startConnect prompts via a popup if the host asks.
-		if (digits.length >= 6) onConnect({ name: t('home.remoteDevice'), id: fmt(target) }, mode);
+		if (canConnect) onConnect({ name: t('home.remoteDevice'), id: fmt(target) }, mode);
 	}
 	function initials(name: string) {
 		return name
@@ -120,55 +111,18 @@
 </div>
 
 <div class="grid">
-	<div class="card">
-		<div class="row sb">
-			<span class="eyebrow mono">{t('home.allowThis')}</span>
-			<span class="badge" class:online class:pending={connecting && !online} class:off={!online && !connecting}>
-				<span class="dot"></span>
-				{#if connecting}{t('status.connecting')}{:else if online}{t('home.ready')}{:else}{t('status.offline')}{/if}
-			</span>
-		</div>
-		<div class="lab">{t('home.deviceId')}</div>
-		<div class="row">
-			<span class="bigid mono">{selfId}</span>
-			<button class="icon-btn push" onclick={copyId} title={t('home.copy')} aria-label={t('home.copyId')}>
-				<Icon name={copied ? 'check' : 'copy'} size={17} />
-			</button>
-		</div>
-		<div class="sep"></div>
-		<div class="lab">{t('home.otp')}</div>
-		<div class="row">
-			<span class="pw mono">{online ? selfPw || '—' : '—'}</span>
-			<button
-				class="icon-btn push"
-				title={t('home.refresh')}
-				aria-label={t('home.refreshPw')}
-				onclick={onRefreshPw}
-				disabled={!online}
-			>
-				<Icon name="refresh" size={16} />
-			</button>
-		</div>
-		<div class="sep"></div>
-		<div class="connhdr">{t('home.connectedHdr')}</div>
-		{#if hostSessions.length === 0}
-			<div class="connempty">{t('home.noConnected')}</div>
-		{:else}
-			{#each hostSessions as s (s.peer)}
-				<div class="connrow">
-					<span class="cdot"></span><span class="mono">{s.peer}</span>
-					<button class="kick" onclick={() => onDisconnect(s.peer)} title={t('home.kick')}>
-						<Icon name="x" size={12} />{t('home.kickLabel')}
-					</button>
-				</div>
-			{/each}
-		{/if}
-		{#if debug && activity.length > 0}
-			<div class="actlog">
-				{#each activity as line, i (i)}<div class="actline">{line}</div>{/each}
-			</div>
-		{/if}
-	</div>
+	<SelfCard
+		{selfId}
+		{selfPw}
+		{online}
+		{connecting}
+		{hostSessions}
+		{activity}
+		{debug}
+		{localIp}
+		{onRefreshPw}
+		{onDisconnect}
+	/>
 
 	<div class="card col">
 		<span class="eyebrow mono">{mode === 'game' ? t('home.startGameSession') : t('home.connectRemote')}</span>
@@ -180,13 +134,13 @@
 				oninput={(e) => (target = fmt(e.currentTarget.value))}
 				onkeydown={(e) => e.key === 'Enter' && go()}
 				placeholder="000 000 000"
-				inputmode="numeric"
 				aria-label={t('home.targetAria')}
 				style="font-family:var(--font-mono);font-size:19px;letter-spacing:0.06em"
 			/>
 		</div>
+		<div style="font-size:12px;color:var(--text-faint);margin-top:7px">{t('home.idOrIp')}</div>
 		{#if mode === 'game'}
-			<button class="btn btn-primary go" disabled={digits.length < 6 || loadingGames} onclick={() => fetchGames()}>
+			<button class="btn btn-primary go" disabled={!canConnect || loadingGames} onclick={() => fetchGames()}>
 				<Icon name="gaming" size={17} />
 				{loadingGames ? t('home.fetching') : t('home.fetchGames')}
 			</button>
@@ -207,13 +161,24 @@
 				{/if}
 			{/if}
 		{:else}
-			<button class="btn btn-primary go" disabled={digits.length < 6} onclick={go}>
+			<button class="btn btn-primary go" disabled={!canConnect} onclick={go}>
 				<Icon name="connect" size={17} />{t('home.connect')}
 			</button>
 		{/if}
 
 		<div class="recents">
-			<div class="rlab">{t('home.recents')}</div>
+			<div class="rlab" style="display:flex;align-items:center;gap:8px">
+				<span>{t('home.recents')}</span>
+				{#if allHistory.length > 3}
+					<button
+						type="button"
+						onclick={() => (showAllHistory = !showAllHistory)}
+						style="margin-left:auto;background:none;border:none;color:var(--accent-press);font:inherit;font-size:12px;cursor:pointer"
+					>
+						{showAllHistory ? t('home.showLess') : t('home.seeAll')}
+					</button>
+				{/if}
+			</div>
 			{#if recents.length === 0}
 				<div class="empty">{t('home.noRecents')}</div>
 			{:else}
@@ -232,34 +197,7 @@
 	</div>
 </div>
 
-<section class="lan">
-	<div class="lanhdr"><span class="lpulse"></span>{t('devices.lanTitle')}</div>
-	{#if lan.length === 0}
-		<div class="lanempty">{t('devices.lanScanning')}</div>
-	{:else}
-		<div class="langrid">
-			{#each lan as d (d.addr + '|' + d.id)}
-				<div class="device-tile">
-					<span class="ravatar lavatar">{initials(d.name)}</span>
-					<div class="lmeta">
-						<div class="lname">{d.name}</div>
-						<div class="lsub mono">{d.id || d.addr}</div>
-					</div>
-					{#if d.has_id}
-						<div class="lactions">
-							<button class="btn btn-primary lbtn" onclick={() => onConnect({ name: d.name, id: d.id }, mode)}>
-								{t('home.connect')}
-							</button>
-							<button class="btn btn-ghost lbtn" onclick={() => addPeer(d.name, d.id, 'pc')}>
-								{t('devices.lanSave')}
-							</button>
-						</div>
-					{/if}
-				</div>
-			{/each}
-		</div>
-	{/if}
-</section>
+<LanDevices {mode} {onConnect} />
 
 <style>
 	.head {
@@ -286,22 +224,6 @@
 		display: flex;
 		flex-direction: column;
 	}
-	.row {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-	}
-	.row.sb {
-		justify-content: space-between;
-		margin-bottom: 18px;
-	}
-	.push {
-		margin-left: auto;
-	}
-	.icon-btn:disabled {
-		opacity: 0.4;
-		cursor: not-allowed;
-	}
 	.eyebrow {
 		font-size: 11px;
 		letter-spacing: 0.1em;
@@ -316,77 +238,6 @@
 	}
 	.lab.mt {
 		margin-top: 18px;
-	}
-	.bigid {
-		font-size: 27px;
-		font-weight: 500;
-		letter-spacing: 0.04em;
-		white-space: nowrap;
-	}
-	.pw {
-		font-size: 22px;
-		font-weight: 500;
-		letter-spacing: 0.12em;
-	}
-	.sep {
-		height: 1px;
-		background: var(--border);
-		margin: 20px 0;
-	}
-	.connhdr {
-		font-size: 11.5px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.08em;
-		color: var(--text-faint);
-		margin-bottom: 8px;
-	}
-	.connempty {
-		font-size: 12.5px;
-		color: var(--text-faint);
-	}
-	.connrow {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 4px 0;
-		font-size: 13px;
-	}
-	.cdot {
-		width: 7px;
-		height: 7px;
-		border-radius: 50%;
-		background: var(--ok);
-		flex: none;
-	}
-	.kick {
-		margin-left: auto;
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		font-size: 11px;
-		font-weight: 600;
-		padding: 3px 8px;
-		border-radius: var(--r-sm);
-		border: 1px solid color-mix(in oklch, var(--danger) 35%, var(--border));
-		background: color-mix(in oklch, var(--danger) 10%, transparent);
-		color: var(--danger);
-		cursor: pointer;
-	}
-	.kick:hover {
-		background: color-mix(in oklch, var(--danger) 20%, transparent);
-	}
-	.actlog {
-		margin-top: 10px;
-		border-top: 1px solid var(--border);
-		padding-top: 8px;
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-	.actline {
-		font-size: 11.5px;
-		color: var(--text-faint);
 	}
 	.go {
 		justify-content: center;
@@ -456,78 +307,5 @@
 	.rid {
 		font-size: 11px;
 		color: var(--text-faint);
-	}
-	/* LAN auto-discovery section */
-	.lan {
-		margin-top: 22px;
-	}
-	.lanhdr {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		font-size: 11px;
-		letter-spacing: 0.1em;
-		text-transform: uppercase;
-		color: var(--text-faint);
-		margin-bottom: 12px;
-	}
-	.lpulse {
-		width: 7px;
-		height: 7px;
-		border-radius: 50%;
-		background: var(--ok);
-		flex: none;
-		animation: lpulse 1.8s ease-out infinite;
-	}
-	@keyframes lpulse {
-		0% {
-			box-shadow: 0 0 0 0 color-mix(in oklch, var(--ok) 55%, transparent);
-		}
-		70% {
-			box-shadow: 0 0 0 7px transparent;
-		}
-		100% {
-			box-shadow: 0 0 0 0 transparent;
-		}
-	}
-	.lanempty {
-		font-size: 12.5px;
-		color: var(--text-faint);
-		padding: 14px 16px;
-		border: 1px dashed var(--border);
-		border-radius: var(--r-sm);
-	}
-	.langrid {
-		display: grid;
-		grid-template-columns: repeat(2, 1fr);
-		gap: 12px;
-	}
-	.lavatar {
-		flex: none;
-	}
-	.lmeta {
-		flex: 1;
-		min-width: 0;
-	}
-	.lname {
-		font-size: 14px;
-		font-weight: 600;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.lsub {
-		font-size: 11.5px;
-		color: var(--text-faint);
-		margin-top: 3px;
-	}
-	.lactions {
-		display: flex;
-		gap: 6px;
-		flex: none;
-	}
-	.lbtn {
-		padding: 7px 12px;
-		font-size: 13px;
 	}
 </style>

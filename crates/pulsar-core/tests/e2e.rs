@@ -134,3 +134,52 @@ async fn direct_p2p_survives_the_relay_being_taken_down() {
 		.unwrap();
 	assert_eq!(got, b"relay yokken bile calisir");
 }
+
+#[tokio::test]
+async fn direct_ip_connect_without_a_relay() {
+	// A dead relay address proves the relay is never used on the direct-IP path.
+	let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+	let host = Node::bind(LOCAL.parse().unwrap(), dead, NetworkMode::P2pOnly)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), dead, NetworkMode::P2pOnly)
+		.await
+		.unwrap();
+	let host_addr = host.local_addr().unwrap();
+
+	// In-band handshake (the host's key is learned via Hello/HelloAck).
+	let mut c = client.connect_direct(host_addr, None).await.unwrap();
+	let mut h = timeout(Duration::from_secs(2), host.next_incoming())
+		.await
+		.unwrap()
+		.unwrap();
+	c.send(b"merhaba host").await.unwrap();
+	let got = timeout(Duration::from_secs(2), h.recv())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(got, b"merhaba host");
+	h.send(b"merhaba client").await.unwrap();
+	let got = timeout(Duration::from_secs(2), c.recv())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(got, b"merhaba client");
+	assert_eq!(c.transport(), Transport::Direct);
+
+	// Beacon shortcut: the host's public key is already known up front.
+	let mut c2 = client
+		.connect_direct(host_addr, Some(host.public_key()))
+		.await
+		.unwrap();
+	let mut h2 = timeout(Duration::from_secs(2), host.next_incoming())
+		.await
+		.unwrap()
+		.unwrap();
+	c2.send(b"ping").await.unwrap();
+	let got = timeout(Duration::from_secs(2), h2.recv())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(got, b"ping");
+}

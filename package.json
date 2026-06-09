@@ -11,7 +11,8 @@
 		"test:unit": "vitest run",
 		"test:unit:watch": "vitest",
 		"tauri": "tauri",
-		"fetch:ffmpeg": "node scripts/fetch-ffmpeg.mjs"
+		"fetch:ffmpeg": "node scripts/fetch-ffmpeg.mjs",
+		"fetch:drivers": "node scripts/fetch-drivers.mjs"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-static": "^3.0.10",

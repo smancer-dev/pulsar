@@ -1,0 +1,67 @@
+# Pulsar native host capture+encode crate (Windows-only).
+#
+# Replaces the host ffmpeg `ddagrab → h264_nvenc` hot path with a native
+# DXGI Desktop Duplication capture + NVENC SDK encode → hand-rolled RTP pipeline
+# (Sunshine technique). ffmpeg stays as the fallback (see src-tauri/src/lib.rs
+# `on_stream`): `start_capture_encode` does ALL fallible init inside its thread
+# and reports Ok/Err over a bounded handshake, so the host falls back cleanly
+# when DXGI/NVENC init fails on the running hardware.
+#
+# The whole crate is Windows-only: on non-Windows targets every public item is a
+# no-op stub returning an error (see lib.rs cfg-gating), so the workspace still
+# builds everywhere — only the `[target.'cfg(windows)'.dependencies]` GPU libs
+# link on Windows.
+[package]
+name = "pulsar-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Windows native DXGI Desktop Duplication capture + zero-copy h264_nvenc → RTP (Sunshine-technique). Replaces the host ffmpeg ddagrab path; ffmpeg stays as fallback."
+publish = false
+
+[dependencies]
+# Random SSRC + initial sequence number for the pure-Rust RTP packetizer (rtp.rs).
+# Workspace pin (rand 0.8) — same as pulsar-core. The only cross-platform dep:
+# encode.rs (NVENC) is Windows-only and links nothing at build time (the NVENC
+# SDK is runtime-loaded via libloading below — no ffmpeg / pkg-config / SDK).
+rand.workspace = true
+# Cross-platform setsockopt for SO_SNDBUF on the RTP socket (rtp.rs): a large send
+# buffer absorbs the keyframe/IDR packet burst so a blocking send() never stalls the
+# capture thread (the ~110 ms periodic delivery gap — "fix B"). Already in the lock.
+socket2 = "0.5"
+
+# Windows GPU stack (DXGI duplication + D3D11 + high-res pacing). Same `windows`
+# 0.59 pin used elsewhere in the desktop app (pulsar-core).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.59", features = [
+	"Win32_Foundation",                 # HANDLE, RECT, BOOL, CloseHandle, WAIT_OBJECT_0, GetLastError
+	"Win32_Graphics_Dxgi",              # IDXGIFactory1/Adapter1/Output/Output1/Output5/Output6,
+	                                    #   IDXGIOutputDuplication, IDXGIResource/Resource1,
+	                                    #   IDXGIKeyedMutex, DXGI_OUTDUPL_*, DXGI_ERROR_*
+	"Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT_*, DXGI_MODE_*, DXGI_RATIONAL, DXGI_SAMPLE_DESC
+	"Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE_*, D3D_FEATURE_LEVEL_*, ID3DBlob,
+	                                    #   D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+	"Win32_Graphics_Direct3D_Fxc",      # D3DCompile + D3DCOMPILE_ENABLE_STRICTNESS (runtime
+	                                    #   HLSL compile of the cursor blit shaders)
+	"Win32_Graphics_Direct3D11",        # D3D11CreateDevice, ID3D11Device/Device1/DeviceContext,
+	                                    #   ID3D11Texture2D, ID3D11VideoDevice/VideoContext/
+	                                    #   VideoProcessor*, D3D11_TEXTURE2D_DESC, blend/RTV types
+	"Win32_System_Threading",           # CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+	                                    #   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+	                                    #   SetThreadPriority, GetCurrentThread
+	"Win32_Security",                   # SECURITY_ATTRIBUTES — CreateWaitableTimerExW's first arg
+	                                    #   is gated behind this feature in windows 0.59
+	"Win32_System_Performance",         # QueryPerformanceCounter/Frequency (QPC→Instant for pacing)
+	"Win32_System_Power",               # SetThreadExecutionState (keep display awake)
+	"Win32_Graphics_Gdi",               # HMONITOR in DXGI_OUTPUT_DESC → IDXGIOutput::GetDesc()
+	"Win32_UI_WindowsAndMessaging",     # GetCursorInfo + CURSORINFO + CURSOR_SHOWING (live cursor pos)
+] }
+# Interface (.cast::<T>()), Result, Error, GUID — used pervasively in the unsafe FFI
+# (GUID is reused for the NVENC codec/preset/profile GUID literals).
+windows-core = "0.59"
+# Runtime-load nvEncodeAPI64.dll (no NVIDIA SDK / link step). encode.rs resolves
+# NvEncodeAPICreateInstance and fills the fn-pointer table; a missing DLL / driver
+# is just an Err → the host falls back to ffmpeg.
+libloading = "0.8"

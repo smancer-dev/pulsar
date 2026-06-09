@@ -1,0 +1,118 @@
+// The Tauri invoke bridge + the deterministic browser/test mock. When running
+// outside Tauri (e.g. `vite dev` in a browser, or component tests) it falls back
+// to a mock so the UI is fully usable without the native shell.
+
+import type { Config } from './types';
+
+export const isTauri =
+	typeof window !== 'undefined' &&
+	'__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
+
+const DEFAULT_CONFIG: Config = {
+	relay: '127.0.0.1:21116',
+	network_mode: 'auto',
+	device_name: 'Bu Cihaz',
+	language: 'tr',
+	unattended_access: false,
+	transmit_audio: true,
+	mute_host_audio: false,
+	audio_input: '',
+	node_port: 0,
+	avatar_mode: 'user',
+	native_player: false
+};
+
+let mockConfig: Config = { ...DEFAULT_CONFIG };
+
+export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	if (isTauri) {
+		const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
+		return tauriInvoke<T>(cmd, args);
+	}
+	return mock<T>(cmd, args);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	switch (cmd) {
+		case 'get_config':
+			return Promise.resolve(mockConfig as unknown as T);
+		case 'set_config':
+			mockConfig = args?.config as Config;
+			return Promise.resolve(undefined as unknown as T);
+		case 'go_online':
+			return Promise.resolve('482 913 056' as unknown as T);
+		case 'session_password':
+			return Promise.resolve('7yf2-qk' as unknown as T);
+		case 'new_password':
+			return Promise.resolve('m4kp-zd' as unknown as T);
+		case 'connect': {
+			// Mirror the core's behavior: relay-only tunnels, otherwise direct.
+			const transport = mockConfig.network_mode === 'relay-only' ? 'relay' : 'direct';
+			return Promise.resolve({ transport, peer: String(args?.target ?? '') } as unknown as T);
+		}
+		case 'lan_devices':
+			// Sample devices so the browser preview shows the discovery section.
+			return Promise.resolve([
+				{ id: '719 204 663', has_id: true, name: 'Salon PC', addr: '192.168.1.42:50311', platform: 'windows' },
+				{ id: '305 881 027', has_id: true, name: 'OrangePi', addr: '192.168.1.77:50990', platform: 'linux' }
+			] as unknown as T);
+		case 'controllers':
+			return Promise.resolve([] as unknown as T);
+		case 'local_ip':
+			return Promise.resolve('192.168.1.42' as unknown as T);
+		case 'steam_path':
+			return Promise.resolve('' as unknown as T);
+		case 'scan_folder':
+			// No real filesystem in the browser mock.
+			return Promise.resolve([] as unknown as T);
+		case 'run_command':
+			return Promise.resolve(undefined as unknown as T);
+		case 'publish_games':
+			return Promise.resolve(undefined as unknown as T);
+		case 'list_remote_games':
+			// No real host in the browser mock.
+			return Promise.resolve([] as unknown as T);
+		case 'launch_remote_game':
+			return Promise.resolve(undefined as unknown as T);
+		case 'available_encoders':
+			return Promise.resolve(['software'] as unknown as T);
+		case 'start_remote_play':
+			return Promise.resolve({ id: 0, transport: 'direct', ws_port: 0, audio_ws_port: 0, local: false, native: false, embedded: false } as unknown as T);
+		case 'auto_connect_target':
+			// No CLI auto-connect target in the browser mock (silences the reject log).
+			return Promise.resolve(null as unknown as T);
+		case 'list_connections':
+			return Promise.resolve([] as unknown as T);
+		case 'respond_request':
+		case 'submit_password':
+		case 'disconnect_peer':
+		case 'show_connections':
+		case 'relaunch_to_home':
+			return Promise.resolve(undefined as unknown as T);
+		case 'set_stream_settings':
+		case 'stop_stream':
+		case 'set_play_resolution':
+		case 'set_overlay':
+		case 'set_play_bitrate':
+		case 'set_play_quality':
+		case 'set_frame_pacing':
+		case 'reverse_play':
+		case 'set_window_fullscreen':
+		case 'input_pointer':
+		case 'input_button':
+		case 'input_scroll':
+		case 'input_key':
+		case 'kbd_capture_start':
+		case 'kbd_capture_stop':
+		case 'send_clipboard':
+		case 'send_chat':
+		case 'host_send_chat':
+		case 'send_file':
+		case 'mic_start':
+		case 'mic_stop':
+			return Promise.resolve(undefined as unknown as T);
+		default:
+			return Promise.reject(new Error(`unknown command: ${cmd}`));
+	}
+}

@@ -55,6 +55,23 @@
 	--dur: 220ms;
 }
 
+/* Game-stream mode: shift the whole accent family from electric indigo to the
+   brand cyan (hue 215) so the app takes on a gaming feel while a game session is
+   active. Removed on exit, reverting to the normal indigo look. */
+:root[data-gaming] {
+	--accent: oklch(0.62 0.15 215);
+	--accent-hover: oklch(0.57 0.16 215);
+	--accent-press: oklch(0.5 0.15 215);
+	--accent-soft: oklch(0.955 0.035 215);
+	--accent-soft-2: oklch(0.9 0.07 215);
+	--accent-ring: oklch(0.62 0.15 215 / 0.35);
+	--shadow-accent: 0 8px 30px -8px oklch(0.62 0.15 215 / 0.45);
+}
+:root[data-gaming][data-theme='dark'] {
+	--accent-soft: oklch(0.32 0.07 215);
+	--accent-soft-2: oklch(0.4 0.1 215);
+}
+
 :root[data-theme='dark'] {
 	--bg: oklch(0.17 0.012 265);
 	--bg-tint: oklch(0.2 0.015 265);
@@ -86,8 +103,9 @@ body {
 	margin: 0;
 	font-family: var(--font-sans);
 	color: var(--text);
-	/* Transparent so the window's rounded corners reveal the desktop, not a band. */
-	background: transparent;
+	/* Native OS decorations now draw the frame, so the window is opaque (no rounded-corner
+	   desktop reveal). Match the app surface to avoid any flash behind the content. */
+	background: var(--surface);
 	overflow: hidden;
 	-webkit-font-smoothing: antialiased;
 }
@@ -168,13 +186,84 @@ h4 {
 	width: 100%;
 	height: 100vh;
 	background: var(--surface);
-	border: 1px solid var(--border);
-	border-radius: 14px;
+	/* Native OS decorations draw the title bar + frame now, so the app content fills the
+	   window flush (no custom rounded border — that was the frameless look). */
+	border: none;
+	border-radius: 0;
 	box-shadow: none;
 	overflow: hidden;
 	display: flex;
 	flex-direction: column;
 	position: relative; /* positioning context for the session overlay */
+}
+/* Single-surface renderer (Linux): the rkmpp video is a GtkGLArea BEHIND this webview, so
+   the app frame must be transparent over the session area for it to show through. The
+   chrome bar and the session dock/menu keep their own (semi-opaque) backgrounds on top. */
+:root[data-embedded] .window {
+	background: transparent;
+	border-color: transparent;
+}
+/* Clear every shell container in the render path behind the session layer so the GLArea
+   shows through. The session dock/menu/hints keep their own (semi-opaque) backgrounds. */
+:root[data-embedded],
+:root[data-embedded] .desktop,
+:root[data-embedded] .body,
+:root[data-embedded] .content,
+:root[data-embedded] .sidebar,
+:root[data-embedded] main,
+:root[data-embedded] .stage,
+:root[data-embedded] .layer {
+	background: transparent !important;
+}
+/* Fullscreen: square + borderless so the window fills the monitor edge-to-edge
+   (rounded corners / the 1px border otherwise leak the desktop at the edges). */
+.window.fullscreen {
+	border: none;
+	border-radius: 0;
+}
+/* Launch splash: covers the window (clipped by its overflow:hidden + radius) while the
+   app boots, so the first visible frame is branded, not an empty frame. Fades out. */
+.splash {
+	position: absolute;
+	inset: 0;
+	z-index: 200;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 18px;
+	background: var(--bg);
+	border-radius: 14px;
+	/* Opaque from the very first frame — DON'T fade in (a fade-in would let the UI show
+	   through behind the splash for a moment, which read as "UI first, then splash"). Only
+	   the fade-OUT animates. */
+	opacity: 1;
+	transition: opacity 0.45s ease;
+}
+.splash.gone {
+	opacity: 0;
+	pointer-events: none;
+}
+.splash-mark {
+	animation: splash-pulse 1.6s ease-in-out infinite;
+}
+.splash-word {
+	font-family: var(--font-display, inherit);
+	font-size: 26px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	color: var(--accent);
+}
+@keyframes splash-pulse {
+	0%,
+	100% {
+		transform: scale(1);
+		opacity: 0.82;
+	}
+	50% {
+		transform: scale(1.08);
+		opacity: 1;
+	}
 }
 .content {
 	flex: 1;

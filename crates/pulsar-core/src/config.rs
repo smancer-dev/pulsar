@@ -47,6 +47,45 @@ pub struct Config {
 	pub language: Language,
 	/// Allow unattended (gözetimsiz) access to this host.
 	pub unattended_access: bool,
+	/// Stream this host's audio to the client (host → client). When off, the
+	/// session is video-only. See [`crate::audio`] for how game mode overrides this.
+	/// `#[serde(default)]` so configs written before this field still load.
+	#[serde(default = "default_true")]
+	pub transmit_audio: bool,
+	/// Silence this host's *local* speakers while streaming (the sound then plays
+	/// only on the client). Independent of [`Self::transmit_audio`]; game mode
+	/// forces both on so audio moves entirely to the player.
+	#[serde(default)]
+	pub mute_host_audio: bool,
+	/// Audio capture source override (empty = platform default). Windows: a
+	/// DirectShow device name (a loopback / "Stereo Mix" / virtual cable); Linux: a
+	/// PulseAudio/PipeWire source (typically a sink `.monitor`); macOS: an
+	/// AVFoundation device index. Configurable because the right loopback device is
+	/// machine-specific.
+	#[serde(default)]
+	pub audio_input: String,
+	/// Local node listen port for direct/P2P connections (`0` = pick automatically).
+	/// Set a fixed port to make port-forwarding to this host predictable.
+	#[serde(default)]
+	pub node_port: u16,
+	/// What identity to present to a peer when connecting: the OS account photo
+	/// (`user`), the desktop wallpaper (`wallpaper`), or nothing (`anonymous`).
+	/// The display name shown alongside is [`Self::device_name`].
+	#[serde(default = "default_avatar_mode")]
+	pub avatar_mode: String,
+	/// Use the **native renderer** (a bundled ffplay window, hardware-decoded) for
+	/// incoming video instead of the in-webview WebCodecs canvas. Far lighter on
+	/// CPU/GPU; Windows-only, opt-in, falls back to the webview if ffplay won't run.
+	#[serde(default)]
+	pub native_player: bool,
+}
+
+fn default_avatar_mode() -> String {
+	"user".to_string()
+}
+
+fn default_true() -> bool {
+	true
 }
 
 impl Default for Config {
@@ -57,6 +96,12 @@ impl Default for Config {
 			device_name: default_device_name(),
 			language: Language::Tr,
 			unattended_access: false,
+			transmit_audio: true,
+			mute_host_audio: false,
+			audio_input: String::new(),
+			node_port: 0,
+			avatar_mode: default_avatar_mode(),
+			native_player: false,
 		}
 	}
 }
@@ -80,6 +125,42 @@ impl Config {
 		std::fs::write(path, json)
 	}
 
+	/// The audio toggles as an [`crate::audio::AudioSettings`] for policy resolution.
+	pub fn audio_settings(&self) -> crate::audio::AudioSettings {
+		crate::audio::AudioSettings {
+			transmit: self.transmit_audio,
+			mute_host: self.mute_host_audio,
+		}
+	}
+
+	/// The configured capture source as an [`crate::audio::AudioInput`]; an empty
+	/// override resolves to the platform default.
+	pub fn audio_input(&self) -> crate::audio::AudioInput {
+		let dev = self.audio_input.trim();
+		if dev.is_empty() {
+			crate::audio::AudioInput::default_for_os()
+		} else if cfg!(windows) {
+			crate::audio::AudioInput::Dshow(dev.to_string())
+		} else if cfg!(target_os = "macos") {
+			crate::audio::AudioInput::AvFoundation(dev.parse().unwrap_or(0))
+		} else {
+			crate::audio::AudioInput::Pulse(dev.to_string())
+		}
+	}
+
+	/// Windows only: capture system audio via **WASAPI loopback** (the default render
+	/// endpoint) rather than an ffmpeg dshow device. True when no explicit device is set
+	/// or it's the `loopback`/`wasapi` sentinel — so audio streams out of the box without
+	/// a `virtual-audio-capturer` / Stereo Mix device installed. A named device opts back
+	/// into the dshow path ([`Self::audio_input`]).
+	pub fn audio_loopback(&self) -> bool {
+		if !cfg!(windows) {
+			return false;
+		}
+		let d = self.audio_input.trim();
+		d.is_empty() || d.eq_ignore_ascii_case("loopback") || d.eq_ignore_ascii_case("wasapi")
+	}
+
 	/// Returns true if the relay endpoint looks like a usable `host:port`.
 	pub fn relay_is_valid(&self) -> bool {
 		match self.relay.rsplit_once(':') {
@@ -90,9 +171,13 @@ impl Config {
 }
 
 fn default_device_name() -> String {
-	std::env::var("HOSTNAME")
+	// Use the real OS hostname cross-platform (whoami handles Windows/Linux/macOS).
+	// `$HOSTNAME` is normally unset on Windows (the name lives in COMPUTERNAME) and
+	// often unexported to GUI sessions on Linux, so reading it gave the generic
+	// placeholder on most fresh installs.
+	whoami::fallible::hostname()
 		.ok()
-		.filter(|h| !h.is_empty())
+		.filter(|h| !h.trim().is_empty())
 		.unwrap_or_else(|| "Pulsar Cihazı".to_string())
 }
 
@@ -132,6 +217,41 @@ mod tests {
 		assert!(!c.relay_is_valid());
 		c.relay = "127.0.0.1:21116".into();
 		assert!(c.relay_is_valid());
+	}
+
+	#[test]
+	fn audio_defaults_transmit_without_muting() {
+		let c = Config::default();
+		assert!(c.transmit_audio);
+		assert!(!c.mute_host_audio);
+		let s = c.audio_settings();
+		assert!(s.transmit && !s.mute_host);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn audio_loopback_is_windows_default_until_a_device_is_named() {
+		let mut c = Config::default();
+		// Empty (the default) → WASAPI loopback, so audio works with no capture device installed.
+		assert!(c.audio_loopback());
+		c.audio_input = "loopback".into();
+		assert!(c.audio_loopback());
+		// A named dshow device opts back out of loopback.
+		c.audio_input = "Stereo Mix".into();
+		assert!(!c.audio_loopback());
+	}
+
+	#[test]
+	fn old_config_without_audio_fields_still_loads() {
+		// A config written before the audio fields existed must still deserialize
+		// (serde defaults fill them) rather than resetting every other setting.
+		let json = r#"{"relay":"1.2.3.4:21116","network_mode":"relay-only",
+			"device_name":"Eski PC","language":"en","unattended_access":true}"#;
+		let c: Config = serde_json::from_str(json).expect("loads with serde defaults");
+		assert_eq!(c.device_name, "Eski PC");
+		assert!(c.unattended_access);
+		assert!(c.transmit_audio); // default-true
+		assert!(!c.mute_host_audio); // default-false
 	}
 
 	#[test]

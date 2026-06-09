@@ -9,7 +9,14 @@
 
 	let busy = $state(false);
 
-	const grouped = $derived(peer.replace(/(\d{3})(?=\d)/g, '$1 ').trim());
+	// Only space-group a 9-digit relay id ("482913056" → "482 913 056"). A direct
+	// (relay-less) connect's peer is an address (e.g. "192.168.1.5:9000") — show it
+	// as-is instead of mangling its digit runs.
+	const grouped = $derived(
+		/^\d{9}$/.test(peer.replace(/\s/g, ''))
+			? peer.replace(/\s/g, '').replace(/(\d{3})(?=\d)/g, '$1 ').trim()
+			: peer
+	);
 	const pwLabel = $derived(
 		pw === 'ok'
 			? { text: t('approve.pwOk'), cls: 'ok', icon: 'check' }

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Icon from '$lib/Icon.svelte';
 	import Modal from '$lib/Modal.svelte';
-	import { allPeers, addPeer, removePeer, toggleFav, type PeerCategory } from '$lib/peers.svelte';
+	import { savedPeers, addPeer, removePeer, toggleFav, type PeerCategory } from '$lib/peers.svelte';
 	import { t } from '$lib/i18n.svelte';
 
 	type Target = { name: string; id: string };
@@ -28,7 +28,7 @@
 	const CATS: PeerCategory[] = ['pc', 'server', 'console'];
 	const FILTERS = ['all', 'pc', 'server', 'console'] as const;
 
-	const peers = $derived(allPeers());
+	const peers = $derived(savedPeers());
 	const filtered = $derived(
 		peers.filter(
 			(d) =>

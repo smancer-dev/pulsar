@@ -17,11 +17,14 @@
 				"title": "Pulsar",
 				"width": 1200,
 				"height": 780,
+				"center": true,
 				"minWidth": 940,
 				"minHeight": 600,
-				"decorations": false,
-				"transparent": true,
-				"resizable": true
+				"decorations": true,
+				"transparent": false,
+				"resizable": true,
+				"maximizable": true,
+				"visible": false
 			}
 		],
 		"security": {

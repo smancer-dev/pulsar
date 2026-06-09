@@ -1,32 +1,48 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import PulsarMark from '$lib/PulsarMark.svelte';
+	import { onConnPhase } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
 	type Target = { name: string; id: string };
 	type Props = {
 		target: Target;
 		mode: 'remote' | 'game';
+		/** True once the host has been reached and we're waiting on its approval /
+		 * the user's one-time password (a real milestone, driven by the parent). */
+		awaitingApproval?: boolean;
 		onCancel: () => void;
 	};
-	let { target, mode, onCancel }: Props = $props();
+	let { target, mode, awaitingApproval = false, onCancel }: Props = $props();
 
-	// The session only becomes "active" when the host actually approves and the
-	// stream starts (driven by the parent), so we stop on the last step and wait.
-	const steps = $derived([
-		t('connecting.step1'),
-		t('connecting.step2'),
-		t('connecting.step3'),
-		t('connecting.step4')
-	]);
-	let step = $state(0);
-
-	onMount(() => {
-		const a = setInterval(() => {
-			step = Math.min(step + 1, steps.length - 1);
-		}, 480);
-		return () => clearInterval(a);
+	// Real milestones only (no faked "peer found"): we show "reaching out", then the
+	// ACTUAL transport once the core establishes it (direct P2P vs relay), then
+	// "awaiting host approval" when the parent says a prompt is pending.
+	let transport = $state('');
+	$effect(() => {
+		let un: (() => void) | undefined;
+		let dead = false;
+		onConnPhase((e) => {
+			if (e.target === target.id) transport = e.transport;
+		}).then((u) => {
+			// If the effect already tore down before listen() resolved, unlisten immediately
+			// (otherwise the cleanup ran the initial no-op and this real unlisten would leak).
+			if (dead) u();
+			else un = u;
+		});
+		return () => {
+			dead = true;
+			un?.();
+		};
 	});
+	const status = $derived(
+		awaitingApproval
+			? t('connecting.awaiting')
+			: transport === 'direct'
+				? t('connecting.p2p')
+				: transport === 'relay'
+					? t('connecting.relay')
+					: t('connecting.reaching')
+	);
 </script>
 
 <div class="overlay">
@@ -38,13 +54,7 @@
 	</div>
 	<h2>{target.name}</h2>
 	<div class="tid mono">{target.id} · {mode === 'game' ? t('connecting.modeGame') : t('connecting.modeRemote')}</div>
-	<div class="steps">
-		{#each steps as s, i (s)}
-			<div class="step" class:done={i < step} class:active={i === step}>
-				<span class="bullet"></span>{s}
-			</div>
-		{/each}
-	</div>
+	<div class="status"><span class="spin"></span>{status}</div>
 	<button class="btn btn-ghost" onclick={onCancel}>{t('connecting.cancel')}</button>
 </div>
 
@@ -76,38 +86,26 @@
 		font-size: 12.5px;
 		color: var(--text-faint);
 	}
-	.steps {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		margin: 14px 0 6px;
-		text-align: left;
-		width: 320px;
-	}
-	.step {
+	.status {
 		display: flex;
 		align-items: center;
 		gap: 10px;
-		font-size: 13px;
-		color: var(--text-faint);
+		font-size: 13.5px;
+		color: var(--text-muted);
+		margin: 16px 0 8px;
 	}
-	.step.active {
-		color: var(--text);
-	}
-	.step.done {
-		color: var(--ok);
-	}
-	.bullet {
-		width: 7px;
-		height: 7px;
+	.spin {
+		width: 13px;
+		height: 13px;
 		border-radius: 50%;
-		background: var(--border-strong);
+		border: 2px solid var(--border-strong);
+		border-top-color: var(--accent);
+		animation: spin 0.8s linear infinite;
 		flex: none;
 	}
-	.step.active .bullet {
-		background: var(--accent);
-	}
-	.step.done .bullet {
-		background: var(--ok);
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 </style>

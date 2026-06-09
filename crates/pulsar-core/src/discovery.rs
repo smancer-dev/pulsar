@@ -12,7 +12,7 @@
 //! and broadcast is filtered out on many networks.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -95,6 +95,10 @@ struct Inner {
 pub struct Discovery {
 	sock: Arc<UdpSocket>,
 	group: SocketAddr,
+	/// Every real LAN NIC. We multicast the beacon out of EACH (not just the OS default
+	/// multicast interface, which on a multi-homed machine is often a dead APIPA/virtual
+	/// adapter), so peers on any reachable NIC hear us.
+	ifaces: Vec<Ipv4Addr>,
 	inner: Mutex<Inner>,
 	cancel: Arc<Notify>,
 }
@@ -120,7 +124,8 @@ impl Discovery {
 		pubkey: [u8; 32],
 		id: Option<DeviceId>,
 	) -> std::io::Result<Arc<Self>> {
-		let sock = Arc::new(bind_multicast(group, port)?);
+		let ifaces = lan_ifaces_v4();
+		let sock = Arc::new(bind_multicast(group, port, &ifaces)?);
 		let announce = Announce {
 			magic: MAGIC,
 			version: ANNOUNCE_VERSION,
@@ -134,6 +139,7 @@ impl Discovery {
 		let disc = Arc::new(Self {
 			sock: sock.clone(),
 			group: SocketAddr::V4(SocketAddrV4::new(group, port)),
+			ifaces,
 			inner: Mutex::new(Inner {
 				announce,
 				peers: HashMap::new(),
@@ -163,7 +169,21 @@ impl Discovery {
 
 	async fn send_announce(&self) {
 		let bytes = encode(&self.inner.lock().await.announce);
-		let _ = self.sock.send_to(&bytes, self.group).await;
+		// No enumerable NIC → fall back to the OS default multicast interface.
+		if self.ifaces.is_empty() {
+			let _ = self.sock.send_to(&bytes, self.group).await;
+			return;
+		}
+		// Send one copy out of EACH real NIC by pinning IP_MULTICAST_IF per send. A short-lived
+		// socket2 socket keeps this off the shared recv socket (whose multicast_if we'd otherwise
+		// race). Peers dedup by nonce, so a host on two NICs of the same LAN getting two copies is
+		// harmless. The cost is trivial at the 2 s announce cadence.
+		for ip in &self.ifaces {
+			if let Ok(s) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+				let _ = s.set_multicast_if_v4(ip);
+				let _ = s.send_to(&bytes, &self.group.into());
+			}
+		}
 	}
 
 	async fn on_datagram(&self, buf: &[u8], from: SocketAddr) {
@@ -196,16 +216,45 @@ impl Drop for Discovery {
 	}
 }
 
+/// Every usable local IPv4 NIC address (excludes loopback + link-local APIPA `169.254/16`).
+///
+/// LAN discovery must join/send the multicast group on ALL of these, not just the OS default
+/// multicast interface: that default is, on a multi-homed machine (Hyper-V `vEthernet`,
+/// ZeroTier, WiFi + Ethernet, libvirt `virbr*`), frequently a dead APIPA/virtual adapter, so
+/// the beacon never reaches the shared LAN. Worse, even with a good default, a peer's beacon
+/// can ARRIVE on a *different* NIC than the default route (confirmed in the field: a Pi sent
+/// from its Ethernet, the multi-homed host received it on its WiFi NIC, but the host had joined
+/// the group only on its Ethernet → it silently never saw the Pi). Joining every NIC fixes both.
+fn lan_ifaces_v4() -> Vec<Ipv4Addr> {
+	if_addrs::get_if_addrs()
+		.map(|ifs| {
+			ifs.into_iter()
+				.filter_map(|i| match i.addr.ip() {
+					IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => Some(v4),
+					_ => None,
+				})
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
 /// Build a UDP socket that can co-exist with other instances on this host and
 /// receive its own host's multicast (both needed for the same-PC two-instance case).
-fn bind_multicast(group: Ipv4Addr, port: u16) -> std::io::Result<UdpSocket> {
+fn bind_multicast(group: Ipv4Addr, port: u16, ifaces: &[Ipv4Addr]) -> std::io::Result<UdpSocket> {
 	let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 	sock.set_reuse_address(true)?;
 	#[cfg(unix)]
 	sock.set_reuse_port(true)?;
 	sock.bind(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port).into())?;
 	sock.set_multicast_loop_v4(true)?;
+	// Join on the unspecified iface (covers the same-host two-instance loopback case)…
 	sock.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
+	// …and explicitly on EVERY real NIC, so a peer's beacon is received no matter which NIC the
+	// network delivers it on (see `lan_ifaces_v4`). A NIC already covered by the unspecified join
+	// just errors → ignore.
+	for ip in ifaces {
+		let _ = sock.join_multicast_v4(&group, ip);
+	}
 	sock.set_nonblocking(true)?;
 	UdpSocket::from_std(sock.into())
 }
