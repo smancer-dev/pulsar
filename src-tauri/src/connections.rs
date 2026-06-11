@@ -38,7 +38,7 @@ pub(crate) fn open_or_update(app: &AppHandle, bring_forward: bool) {
 		}
 		match WebviewWindowBuilder::new(&handle, LABEL, WebviewUrl::App("index.html".into()))
 			.initialization_script("window.__CONNECTIONS__=true;")
-			.title("Pulsar — Bağlantılar")
+			.title(crate::i18n::t("title.connections"))
 			.inner_size(360.0, 440.0)
 			.min_inner_size(300.0, 240.0)
 			.resizable(true)

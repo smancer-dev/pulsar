@@ -6,6 +6,8 @@
 // into a WebAudio `AudioContext` with a small jitter buffer. Best-effort: if the
 // webview lacks `AudioDecoder` we degrade to silence (the video still plays).
 
+import { t } from '$lib/i18n.svelte';
+
 export type AudioSink = {
 	/** Feed one RTP packet. */
 	push: (pkt: Uint8Array) => void;
@@ -24,7 +26,7 @@ export function startOpusAudio(onError?: (msg: string) => void): AudioSink {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const W = window as any;
 	if (!W.AudioDecoder || !W.EncodedAudioChunk || !(W.AudioContext || W.webkitAudioContext)) {
-		onError?.('Bu webview WebCodecs ses çözmeyi desteklemiyor (ses kapalı).');
+		onError?.(t('audio.noWebcodecs'));
 		return { push: () => {}, close: () => {} };
 	}
 
@@ -66,13 +68,13 @@ export function startOpusAudio(onError?: (msg: string) => void): AudioSink {
 			playHead += buf.duration;
 		},
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		error: (e: any) => onError?.('ses çöz: ' + e)
+		error: (e: any) => onError?.(t('audio.decodeErr') + e)
 	});
 
 	try {
 		decoder.configure({ codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS });
 	} catch (e) {
-		onError?.('ses ayarı: ' + e);
+		onError?.(t('audio.configErr') + e);
 		return { push: () => {}, close: () => {} };
 	}
 

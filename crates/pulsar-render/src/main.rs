@@ -9,7 +9,22 @@
 //! Usage: pulsar-render <stream.sdp> --wid 0x<parent-xid> [--mode game|remote]
 //! SIGUSR1/2 toggle the overlay (open/close), like the C vidsink.
 
+mod i18n;
 mod overlay;
+
+/// `--lang tr|en` (from the app's `Config.language`) — picks the native UI language
+/// for the overlay/hints (the renderer can't share the webview's i18n tables; the
+/// catalogs live in `lang/tr.json` + `lang/en.json`, see `i18n.rs`).
+fn apply_lang() {
+	let mut args = std::env::args();
+	while let Some(a) = args.next() {
+		if a == "--lang" {
+			if let Some(v) = args.next() {
+				i18n::set_english(v.starts_with("en"));
+			}
+		}
+	}
+}
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod decode;
@@ -40,16 +55,19 @@ fn main() {
 		println!("{}", decode::probe_json());
 		return;
 	}
+	apply_lang();
 	linux::run();
 }
 
 #[cfg(target_os = "windows")]
 fn main() {
+	apply_lang();
 	win::run();
 }
 
 #[cfg(target_os = "macos")]
 fn main() {
+	apply_lang();
 	desktop::run();
 }
 

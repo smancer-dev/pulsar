@@ -153,45 +153,54 @@ pub enum OverlayCmd {
 	FsSend(String),
 }
 
-const CODECS: &[(&str, &str)] = &[
-	("auto", "Otomatik"),
-	("h264", "H.264"),
-	("h265", "H.265"),
-	("av1", "AV1"),
-];
-const ENCODERS: &[(&str, &str)] = &[
-	("auto", "Otomatik"),
-	("nvenc", "NVIDIA NVENC"),
-	("qsv", "Intel QuickSync"),
-	("amf", "AMD AMF"),
-	("videotoolbox", "Apple VideoToolbox"),
-	("vaapi", "VA-API"),
-	("rkmpp", "Rockchip MPP"),
-	("software", "Yazılım (CPU)"),
-];
-const RES: &[(&str, &str)] = &[
-	("auto", "Otomatik"),
-	("1080p", "1080p"),
-	("1440p", "1440p"),
-	("4K", "4K"),
-];
-const FPS: &[(&str, &str)] = &[
-	("auto", "Otomatik"),
-	("30", "30"),
-	("60", "60"),
-	("120", "120"),
-];
-const BITRATE: &[(&str, &str)] = &[
-	("0", "Otomatik"),
-	("10", "10 Mbit"),
-	("20", "20 Mbit"),
-	("30", "30 Mbit"),
-	("50", "50 Mbit"),
-	("100", "100 Mbit"),
-];
+fn codecs_opts() -> [(&'static str, &'static str); 4] {
+	[
+		("auto", t("auto")),
+		("h264", "H.264"),
+		("h265", "H.265"),
+		("av1", "AV1"),
+	]
+}
+fn encoders_opts() -> [(&'static str, &'static str); 8] {
+	[
+		("auto", t("auto")),
+		("nvenc", "NVIDIA NVENC"),
+		("qsv", "Intel QuickSync"),
+		("amf", "AMD AMF"),
+		("videotoolbox", "Apple VideoToolbox"),
+		("vaapi", "VA-API"),
+		("rkmpp", "Rockchip MPP"),
+		("software", t("software")),
+	]
+}
+fn res_opts() -> [(&'static str, &'static str); 4] {
+	[
+		("auto", t("auto")),
+		("1080p", "1080p"),
+		("1440p", "1440p"),
+		("4K", "4K"),
+	]
+}
+fn fps_opts() -> [(&'static str, &'static str); 4] {
+	[("auto", t("auto")), ("30", "30"), ("60", "60"), ("120", "120")]
+}
+fn bitrate_opts() -> [(&'static str, &'static str); 6] {
+	[
+		("0", t("auto")),
+		("10", "10 Mbit"),
+		("20", "20 Mbit"),
+		("30", "30 Mbit"),
+		("50", "50 Mbit"),
+		("100", "100 Mbit"),
+	]
+}
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 110, 245); // electric indigo
 const CYAN: egui::Color32 = egui::Color32::from_rgb(120, 200, 240);
+
+/// All overlay strings come from the central language catalogs (`lang/*.json`)
+/// through the keyed lookup — see `i18n.rs`.
+use crate::i18n::t;
 
 /// Apply the Pulsar dark theme to an egui context (call once at startup).
 pub fn apply_theme(ctx: &egui::Context) {
@@ -256,21 +265,23 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 					}
 				}
 				ui.heading(egui::RichText::new("Pulsar").color(CYAN).strong());
-				let label = match (ui_state.view, st.mode) {
-					(View::Stream, _) => "Yayın",
-					(View::Display, _) => "Görüntü",
-					(View::Audio, _) => "Ses",
-					(View::Tools, _) => "Araçlar",
-					(View::Chat, _) => "Sohbet",
-					(View::Files, _) => "Dosyalar",
-					(View::Gauges, _) => "Göstergeler",
-					(View::Root, Mode::Game) => "Oyun",
-					(View::Root, Mode::Remote) => "Uzak Masaüstü",
+				let (icon, key) = match (ui_state.view, st.mode) {
+					(View::Stream, _) => ("📡", "view.stream"),
+					(View::Display, _) => ("🖥", "view.display"),
+					(View::Audio, _) => ("🔊", "view.audio"),
+					(View::Tools, _) => ("🛠", "view.tools"),
+					(View::Chat, _) => ("💬", "view.chat"),
+					(View::Files, _) => ("📁", "view.files"),
+					(View::Gauges, _) => ("📊", "view.gauges"),
+					(View::Root, Mode::Game) => ("🎮", "mode.game"),
+					(View::Root, Mode::Remote) => ("🖥", "mode.remote"),
 				};
-				ui.label(egui::RichText::new(label).color(egui::Color32::GRAY));
+				ui.label(
+					egui::RichText::new(format!("{icon} {}", t(key))).color(egui::Color32::GRAY),
+				);
 				ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
 					ui.label(
-						egui::RichText::new(&st.conn_label)
+						egui::RichText::new(format!("🔗 {}", st.conn_label))
 							.monospace()
 							.color(egui::Color32::from_rgb(150, 155, 170)),
 					);
@@ -290,10 +301,10 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 			}
 			ui.add_space(6.0);
 			ui.label(
-				egui::RichText::new("Ctrl+Shift+M kapat · Ctrl+Alt+Z bırak · Ctrl+Shift+Q çık")
-					.monospace()
-					.small()
-					.color(egui::Color32::from_rgb(120, 125, 140)),
+				egui::RichText::new(t("shortcuts"))
+				.monospace()
+				.small()
+				.color(egui::Color32::from_rgb(120, 125, 140)),
 			);
 		});
 	cmds
@@ -305,42 +316,44 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 	let bw = fmt_mbps(st.mbps);
 	// Two compact tile rows: RTT · fps · encode / decode · BITRATE target · bandwidth.
 	ui.horizontal(|ui| {
-		stat_tile(ui, &format!("{:.0}", st.latency_ms), "Gecikme ms");
-		stat_tile(ui, &format!("{:.0}", st.fps), "FPS");
+		stat_tile(ui, &format!("{:.0}", st.latency_ms), "📡", t("stat.latency"));
+		stat_tile(ui, &format!("{:.0}", st.fps), "🎬", "FPS");
 		stat_tile(
 			ui,
 			&enc_ms.map_or("—".into(), |v: f32| format!("{v:.1}")),
-			"Kodlama ms",
+			"🖥",
+			t("stat.encode"),
 		);
 	});
 	ui.horizontal(|ui| {
-		stat_tile(ui, &format!("{:.1}", st.decode_ms), "Çözme ms");
+		stat_tile(ui, &format!("{:.1}", st.decode_ms), "⚡", t("stat.decode"));
 		stat_tile(
 			ui,
 			&target_mbit.map_or("—".into(), |v: f32| format!("{v:.0}")),
+			"🎯",
 			"Bitrate Mbps",
 		);
-		stat_tile(ui, &bw, "Bant Mbps");
+		stat_tile(ui, &bw, "📶", t("stat.band"));
 	});
 	ui.add_space(8.0);
 
 	// Category boxes, 2 per row (AnyDesk-style hub). Chat + Files are NATIVE views
 	// now — the webview session menu is gone on Linux (it lived under the video).
-	let boxes: [(&str, View); 7] = [
-		("Yayın", View::Stream),
-		("Görüntü", View::Display),
-		("Ses", View::Audio),
-		("Sohbet", View::Chat),
-		("Dosyalar", View::Files),
-		("Araçlar", View::Tools),
-		("Göstergeler", View::Gauges),
+	let boxes: [(&str, &str, View); 7] = [
+		("📡", t("view.stream"), View::Stream),
+		("🖥", t("view.display"), View::Display),
+		("🔊", t("view.audio"), View::Audio),
+		("💬", t("view.chat"), View::Chat),
+		("📁", t("view.files"), View::Files),
+		("🛠", t("view.tools"), View::Tools),
+		("📊", t("view.gauges"), View::Gauges),
 	];
 	egui::Grid::new("ov_boxes")
 		.num_columns(2)
 		.spacing(egui::vec2(8.0, 8.0))
 		.show(ui, |ui| {
-			for (i, (label, v)) in boxes.iter().enumerate() {
-				if cat_box(ui, label) {
+			for (i, (icon, label, v)) in boxes.iter().enumerate() {
+				if cat_box(ui, icon, label) {
 					*view = *v;
 				}
 				if i % 2 == 1 {
@@ -351,7 +364,9 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 	ui.add_space(10.0);
 	if ui
 		.add(
-			egui::Button::new(egui::RichText::new("Oturumu Bitir").color(egui::Color32::WHITE))
+			egui::Button::new(
+				egui::RichText::new(format!("✖  {}", t("end"))).color(egui::Color32::WHITE),
+			)
 				.fill(egui::Color32::from_rgb(200, 60, 70))
 				.min_size(egui::vec2(ui.available_width(), 32.0)),
 		)
@@ -367,22 +382,22 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 	let act = |i: usize| parts.get(i).copied().unwrap_or("").to_string();
 	let bw = fmt_mbps(st.mbps);
 	let act_bitrate = if parts.len() > 4 {
-		format!("limit {} · kullanılan {bw} Mbps", act(4))
+		format!("{} {} · {} {bw} Mbps", t("limit"), act(4), t("used"))
 	} else if st.mbps > 0.0 {
-		format!("kullanılan {bw} Mbps")
+		format!("{} {bw} Mbps", t("used"))
 	} else {
 		String::new()
 	};
 	// Capability gating: only offer what the HOST really has (empty = unknown
 	// host → show everything, it degrades gracefully server-side anyway).
-	let codecs: Vec<(&str, &str)> = CODECS
+	let codecs: Vec<(&str, &str)> = codecs_opts()
 		.iter()
 		.filter(|(v, _)| {
 			*v == "auto" || st.host_codecs.is_empty() || st.host_codecs.iter().any(|c| c == v)
 		})
 		.copied()
 		.collect();
-	let encoders: Vec<(&str, &str)> = ENCODERS
+	let encoders: Vec<(&str, &str)> = encoders_opts()
 		.iter()
 		.filter(|(v, _)| {
 			*v == "auto" || st.host_encoders.is_empty() || st.host_encoders.iter().any(|c| c == v)
@@ -408,26 +423,26 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 			);
 			ui.label(
 				egui::RichText::new(if st.decoder.is_empty() {
-					"Otomatik".to_string()
+					t("auto").to_string()
 				} else {
 					st.decoder.clone()
 				})
 				.size(12.0),
 			);
 			ui.end_row();
-			if let Some(v) = combo(ui, "Çözünürlük", "res", &st.res, RES, &act(2)) {
+			if let Some(v) = combo(ui, t("res"), "res", &st.res, &res_opts(), &act(2)) {
 				cmds.push(OverlayCmd::Set("res", v));
 			}
-			if let Some(v) = combo(ui, "FPS", "fps", &st.fps_sel, FPS, &act(3)) {
+			if let Some(v) = combo(ui, "FPS", "fps", &st.fps_sel, &fps_opts(), &act(3)) {
 				cmds.push(OverlayCmd::Set("fps", v));
 			}
 			ui.end_row();
 			if let Some(v) = combo(
 				ui,
-				"Bant genişliği limiti",
+				t("bwlimit"),
 				"bitrate",
 				&st.bitrate,
-				BITRATE,
+				&bitrate_opts(),
 				&act_bitrate,
 			) {
 				cmds.push(OverlayCmd::Set("bitrate", v));
@@ -436,20 +451,20 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 		});
 	ui.add_space(8.0);
 	ui.horizontal(|ui| {
-		ui.label("Kalite");
-		if seg(ui, st.quality == "latency", "Düşük gecikme") {
+		ui.label(t("quality"));
+		if seg(ui, st.quality == "latency", t("lowlat")) {
 			cmds.push(OverlayCmd::Set("quality", "latency".into()));
 		}
-		if seg(ui, st.quality == "quality", "Kalite") {
+		if seg(ui, st.quality == "quality", t("quality")) {
 			cmds.push(OverlayCmd::Set("quality", "quality".into()));
 		}
 	});
 	ui.horizontal(|ui| {
-		ui.label("Kare eşitleme");
-		if seg(ui, st.pace, "Açık") {
+		ui.label(t("pacing"));
+		if seg(ui, st.pace, t("on")) {
 			cmds.push(OverlayCmd::Set("pace", "on".into()));
 		}
-		if seg(ui, !st.pace, "Kapalı") {
+		if seg(ui, !st.pace, t("off")) {
 			cmds.push(OverlayCmd::Set("pace", "off".into()));
 		}
 	});
@@ -458,28 +473,26 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 /// Display section: AnyDesk-style view-fit modes (renderer-local, instant).
 fn draw_display(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
 	ui.label(
-		egui::RichText::new("Ekran sığdırma")
+		egui::RichText::new(format!("🖥 {}", t("fit.title")))
 			.small()
 			.color(egui::Color32::GRAY),
 	);
 	ui.horizontal(|ui| {
-		if seg(ui, st.fit == "fit", "Sığdır") {
+		if seg(ui, st.fit == "fit", t("fit.fit")) {
 			cmds.push(OverlayCmd::Set("fit", "fit".into()));
 		}
-		if seg(ui, st.fit == "stretch", "Genişlet") {
+		if seg(ui, st.fit == "stretch", t("fit.stretch")) {
 			cmds.push(OverlayCmd::Set("fit", "stretch".into()));
 		}
-		if seg(ui, st.fit == "original", "Birebir") {
+		if seg(ui, st.fit == "original", t("fit.original")) {
 			cmds.push(OverlayCmd::Set("fit", "original".into()));
 		}
 	});
 	ui.add_space(4.0);
 	ui.label(
-		egui::RichText::new(
-			"Sığdır: en-boy korunur · Genişlet: pencereyi doldurur · Birebir: kaynak piksel",
-		)
-		.size(10.0)
-		.color(egui::Color32::from_gray(110)),
+		egui::RichText::new(t("fit.help"))
+			.size(10.0)
+			.color(egui::Color32::from_gray(110)),
 	);
 }
 
@@ -489,39 +502,39 @@ fn draw_audio(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) 
 	// the host already plays inbound mic audio, so this is just a paired toggle.
 	let call_on = st.mic_on && st.audio_tx;
 	ui.horizontal(|ui| {
-		ui.label("Sesli görüşme");
-		if seg(ui, call_on, "Açık") {
+		ui.label(format!("📞 {}", t("audio.call")));
+		if seg(ui, call_on, t("on")) {
 			cmds.push(OverlayCmd::Set("call", "on".into()));
 		}
-		if seg(ui, !call_on, "Kapalı") {
+		if seg(ui, !call_on, t("off")) {
 			cmds.push(OverlayCmd::Set("call", "off".into()));
 		}
 	});
 	ui.add_space(4.0);
 	ui.horizontal(|ui| {
-		ui.label("Host sesi");
-		if seg(ui, st.audio_tx, "Açık") {
+		ui.label(format!("🎵 {}", t("audio.host")));
+		if seg(ui, st.audio_tx, t("on")) {
 			cmds.push(OverlayCmd::Set("atx", "on".into()));
 		}
-		if seg(ui, !st.audio_tx, "Kapalı") {
+		if seg(ui, !st.audio_tx, t("off")) {
 			cmds.push(OverlayCmd::Set("atx", "off".into()));
 		}
 	});
 	ui.horizontal(|ui| {
-		ui.label("Host hoparlörü");
-		if seg(ui, !st.audio_mute, "Açık") {
+		ui.label(format!("🔊 {}", t("audio.speakers")));
+		if seg(ui, !st.audio_mute, t("on")) {
 			cmds.push(OverlayCmd::Set("amute", "off".into()));
 		}
-		if seg(ui, st.audio_mute, "Sessiz") {
+		if seg(ui, st.audio_mute, t("muted")) {
 			cmds.push(OverlayCmd::Set("amute", "on".into()));
 		}
 	});
 	ui.horizontal(|ui| {
-		ui.label("Mikrofon");
-		if seg(ui, st.mic_on, "Açık") {
+		ui.label(format!("🎤 {}", t("audio.mic")));
+		if seg(ui, st.mic_on, t("on")) {
 			cmds.push(OverlayCmd::Set("mic", "on".into()));
 		}
-		if seg(ui, !st.mic_on, "Kapalı") {
+		if seg(ui, !st.mic_on, t("off")) {
 			cmds.push(OverlayCmd::Set("mic", "off".into()));
 		}
 	});
@@ -532,26 +545,29 @@ fn draw_audio(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) 
 fn draw_tools(ui: &mut egui::Ui, view: &mut View, cmds: &mut Vec<OverlayCmd>) {
 	let w = ui.available_width();
 	if ui
-		.add(egui::Button::new("Panoyu karşıya gönder").min_size(egui::vec2(w, 30.0)))
+		.add(egui::Button::new(format!("📋  {}", t("tools.clip"))).min_size(egui::vec2(w, 30.0)))
 		.clicked()
 	{
 		cmds.push(OverlayCmd::Set("sendclip", "1".into()));
 	}
 	if ui
-		.add(egui::Button::new("Dosya seç + gönder").min_size(egui::vec2(w, 30.0)))
+		.add(egui::Button::new(format!("📁  {}", t("tools.file"))).min_size(egui::vec2(w, 30.0)))
 		.clicked()
 	{
 		// The OS file dialog is its own toplevel — visible over the video.
 		cmds.push(OverlayCmd::Set("pickfile", "1".into()));
 	}
 	if ui
-		.add(egui::Button::new("Yön değiştir (bana bağlansın)").min_size(egui::vec2(w, 30.0)))
+		.add(egui::Button::new(format!("🔁  {}", t("tools.reverse"))).min_size(egui::vec2(w, 30.0)))
 		.clicked()
 	{
 		cmds.push(OverlayCmd::Set("reverse", "1".into()));
 	}
 	if ui
-		.add(egui::Button::new("Tam ekran aç/kapat").min_size(egui::vec2(w, 30.0)))
+		.add(
+			egui::Button::new(format!("🖥  {}", t("tools.fullscreen")))
+				.min_size(egui::vec2(w, 30.0)),
+		)
 		.clicked()
 	{
 		cmds.push(OverlayCmd::Set("fullscreen", "1".into()));
@@ -573,8 +589,7 @@ fn draw_chat(ui: &mut egui::Ui, st: &OverlayState, input: &mut String, cmds: &mu
 				ui.add_space(90.0);
 				ui.vertical_centered(|ui| {
 					ui.label(
-						egui::RichText::new("Bu oturumda henüz mesaj yok")
-							.color(egui::Color32::from_gray(120)),
+						egui::RichText::new(t("chat.empty")).color(egui::Color32::from_gray(120)),
 					);
 				});
 				return;
@@ -612,12 +627,12 @@ fn draw_chat(ui: &mut egui::Ui, st: &OverlayState, input: &mut String, cmds: &mu
 	ui.horizontal(|ui| {
 		let resp = ui.add_sized(
 			egui::vec2(ui.available_width() - 76.0, 28.0),
-			egui::TextEdit::singleline(input).hint_text("Mesaj yaz…"),
+			egui::TextEdit::singleline(input).hint_text(t("chat.placeholder")),
 		);
 		// Keep the composer focused while this view is up so relayed Text events land.
 		resp.request_focus();
 		let clicked = ui
-			.add(egui::Button::new("Gönder").min_size(egui::vec2(68.0, 28.0)))
+			.add(egui::Button::new(t("chat.send")).min_size(egui::vec2(68.0, 28.0)))
 			.clicked();
 		if (clicked || send_now) && !input.trim().is_empty() {
 			cmds.push(OverlayCmd::Chat(input.trim().to_string()));
@@ -646,7 +661,7 @@ fn draw_files(ui: &mut egui::Ui, st: &OverlayState, us: &mut UiState, cmds: &mut
 		ui.vertical(|ui| {
 			ui.set_width(pane_w);
 			ui.label(
-				egui::RichText::new(format!("Bu cihaz · ~/{}", us.local_path))
+				egui::RichText::new(format!("{} · ~/{}", t("files.local"), us.local_path))
 					.small()
 					.color(egui::Color32::GRAY),
 			);
@@ -657,7 +672,9 @@ fn draw_files(ui: &mut egui::Ui, st: &OverlayState, us: &mut UiState, cmds: &mut
 				.max_height(220.0)
 				.auto_shrink([false, false])
 				.show(ui, |ui| {
-					if !us.local_path.is_empty() && fs_row(ui, "⬆ üst klasör", true, 0, None) {
+					if !us.local_path.is_empty()
+						&& fs_row(ui, &format!("⬆ {}", t("files.up")), true, 0, None)
+					{
 						let mut p = us.local_path.clone();
 						if let Some(i) = p.rfind('/') {
 							p.truncate(i);
@@ -693,16 +710,17 @@ fn draw_files(ui: &mut egui::Ui, st: &OverlayState, us: &mut UiState, cmds: &mut
 		ui.vertical(|ui| {
 			ui.set_width(pane_w);
 			ui.label(
-				egui::RichText::new(format!("Karşı taraf · ~/{}", st.fs_remote_path))
-					.small()
-					.color(egui::Color32::GRAY),
+				egui::RichText::new(format!("{} · ~/{}", t("files.remote"), st.fs_remote_path))
+				.small()
+				.color(egui::Color32::GRAY),
 			);
 			egui::ScrollArea::vertical()
 				.id_salt("fs_remote")
 				.max_height(220.0)
 				.auto_shrink([false, false])
 				.show(ui, |ui| {
-					if !st.fs_remote_path.is_empty() && fs_row(ui, "⬆ üst klasör", true, 0, None)
+					if !st.fs_remote_path.is_empty()
+						&& fs_row(ui, &format!("⬆ {}", t("files.up")), true, 0, None)
 					{
 						let mut p = st.fs_remote_path.clone();
 						if let Some(i) = p.rfind('/') {
@@ -728,9 +746,9 @@ fn draw_files(ui: &mut egui::Ui, st: &OverlayState, us: &mut UiState, cmds: &mut
 	});
 	ui.add_space(4.0);
 	ui.label(
-		egui::RichText::new("Klasöre tıkla: gir · → gönder · ↓ indir (\"Pulsar Alınanlar\")")
-			.size(10.0)
-			.color(egui::Color32::from_gray(110)),
+		egui::RichText::new(t("files.help"))
+		.size(10.0)
+		.color(egui::Color32::from_gray(110)),
 	);
 }
 
@@ -811,20 +829,20 @@ fn load_local(us: &mut UiState) {
 /// Gauges section: the always-on HUD + the Parsec-style open button toggles.
 fn draw_gauges(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
 	ui.horizontal(|ui| {
-		ui.label("İstatistikler (sürekli)");
-		if seg(ui, st.stats_hud, "Açık") {
+		ui.label(t("gauges.statshud"));
+		if seg(ui, st.stats_hud, t("on")) {
 			cmds.push(OverlayCmd::Set("statshud", "on".into()));
 		}
-		if seg(ui, !st.stats_hud, "Kapalı") {
+		if seg(ui, !st.stats_hud, t("off")) {
 			cmds.push(OverlayCmd::Set("statshud", "off".into()));
 		}
 	});
 	ui.horizontal(|ui| {
-		ui.label("Overlay düğmesi");
-		if seg(ui, st.overlay_btn, "Açık") {
+		ui.label(t("gauges.ovbtn"));
+		if seg(ui, st.overlay_btn, t("on")) {
 			cmds.push(OverlayCmd::Set("ovbtn", "on".into()));
 		}
-		if seg(ui, !st.overlay_btn, "Kapalı") {
+		if seg(ui, !st.overlay_btn, t("off")) {
 			cmds.push(OverlayCmd::Set("ovbtn", "off".into()));
 		}
 	});
@@ -852,7 +870,7 @@ fn fmt_mbps(mbps: f32) -> String {
 }
 
 /// A clickable category box (the root hub's grid cells).
-fn cat_box(ui: &mut egui::Ui, label: &str) -> bool {
+fn cat_box(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
 	let size = egui::vec2((ui.available_width() / 2.0 - 6.0).max(140.0), 40.0);
 	let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
 	let fill = if resp.hovered() {
@@ -861,9 +879,18 @@ fn cat_box(ui: &mut egui::Ui, label: &str) -> bool {
 		egui::Color32::from_rgb(28, 30, 42)
 	};
 	ui.painter().rect_filled(rect, 8.0, fill);
+	// Icon (cyan, left) + label — left-aligned with a fixed icon column so the
+	// labels line up across boxes instead of wandering with the icon width.
 	ui.painter().text(
-		rect.center(),
-		egui::Align2::CENTER_CENTER,
+		egui::pos2(rect.left() + 14.0, rect.center().y),
+		egui::Align2::LEFT_CENTER,
+		icon,
+		egui::FontId::proportional(16.0),
+		CYAN,
+	);
+	ui.painter().text(
+		egui::pos2(rect.left() + 42.0, rect.center().y),
+		egui::Align2::LEFT_CENTER,
 		label,
 		egui::FontId::proportional(13.0),
 		egui::Color32::from_rgb(228, 230, 240),
@@ -871,7 +898,7 @@ fn cat_box(ui: &mut egui::Ui, label: &str) -> bool {
 	resp.clicked()
 }
 
-fn stat_tile(ui: &mut egui::Ui, value: &str, label: &str) {
+fn stat_tile(ui: &mut egui::Ui, value: &str, icon: &str, label: &str) {
 	egui::Frame::none()
 		.fill(egui::Color32::from_rgb(22, 24, 34))
 		.rounding(8.0)
@@ -880,7 +907,7 @@ fn stat_tile(ui: &mut egui::Ui, value: &str, label: &str) {
 			ui.vertical(|ui| {
 				ui.label(egui::RichText::new(value).size(18.0).strong().color(CYAN));
 				ui.label(
-					egui::RichText::new(label)
+					egui::RichText::new(format!("{icon} {label}"))
 						.small()
 						.color(egui::Color32::GRAY),
 				);
@@ -906,8 +933,11 @@ pub fn draw_hud(ctx: &egui::Context, st: &OverlayState) {
 					ui.add(
 						egui::Label::new(
 							egui::RichText::new(format!(
-								"{:.0} fps · {:.0} ms · çözme {:.1} ms · {bw} Mbps",
-								st.fps, st.latency_ms, st.decode_ms
+								"{:.0} fps · {:.0} ms · {} {:.1} ms · {bw} Mbps",
+								st.fps,
+								st.latency_ms,
+								t("hud.decode"),
+								st.decode_ms
 							))
 							.monospace()
 							.size(12.0)

@@ -442,7 +442,7 @@ pub fn spawn_tracked(
 			procs.lock().unwrap().push(child);
 			Ok(())
 		}
-		Err(e) => Err(format!("{program} başlatılamadı: {e}")),
+		Err(e) => Err(format!("{program} {}: {e}", crate::i18n::t("err.spawn"))),
 	}
 }
 
@@ -498,7 +498,7 @@ pub fn spawn_tracked_enc_paced(
 			procs.lock().unwrap().push(child);
 			Ok(())
 		}
-		Err(e) => Err(format!("{program} başlatılamadı: {e}")),
+		Err(e) => Err(format!("{program} {}: {e}", crate::i18n::t("err.spawn"))),
 	}
 }
 

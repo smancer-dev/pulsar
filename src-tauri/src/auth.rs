@@ -39,7 +39,7 @@ pub(crate) fn open_approval_window(app: &AppHandle, id: u64, peer: &str, pw_stat
 		WebviewUrl::App("index.html".into()),
 	)
 	.initialization_script(&init)
-	.title("Pulsar — Bağlantı isteği")
+	.title(crate::i18n::t("title.approve"))
 	.inner_size(400.0, 300.0)
 	.resizable(false)
 	.always_on_top(true)

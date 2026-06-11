@@ -1,0 +1,18 @@
+{
+	"err.online": "go online first",
+	"err.denied": "Connection denied.",
+	"err.folder": "folder not found",
+	"err.clipboard": "couldn't send the clipboard",
+	"err.message": "couldn't send the message",
+	"err.file": "couldn't send the file",
+	"err.session": "session not found",
+	"err.micRecorder": "no microphone recorder found (parecord/pw-record/arecord)",
+	"err.micOutput": "couldn't open the microphone output",
+	"err.videoRecv": "couldn't start the video receiver",
+	"err.spawn": "failed to start",
+	"stream.fpsRequested": "requested",
+	"title.approve": "Pulsar — Connection request",
+	"title.connections": "Pulsar — Connections",
+	"tray.show": "Show Pulsar",
+	"tray.quit": "Quit"
+}

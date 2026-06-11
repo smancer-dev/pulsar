@@ -1,0 +1,18 @@
+{
+	"err.online": "önce çevrimiçi ol",
+	"err.denied": "Bağlantı reddedildi.",
+	"err.folder": "klasör bulunamadı",
+	"err.clipboard": "pano gönderilemedi",
+	"err.message": "mesaj gönderilemedi",
+	"err.file": "dosya gönderilemedi",
+	"err.session": "oturum bulunamadı",
+	"err.micRecorder": "mikrofon kaydedici bulunamadı (parecord/pw-record/arecord)",
+	"err.micOutput": "mikrofon çıkışı alınamadı",
+	"err.videoRecv": "video alıcı başlatılamadı",
+	"err.spawn": "başlatılamadı",
+	"stream.fpsRequested": "istenen",
+	"title.approve": "Pulsar — Bağlantı isteği",
+	"title.connections": "Pulsar — Bağlantılar",
+	"tray.show": "Pulsar'ı Göster",
+	"tray.quit": "Çıkış"
+}

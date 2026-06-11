@@ -22,6 +22,7 @@ mod commands;
 mod connections;
 mod events;
 mod files;
+mod i18n;
 mod fs_browse;
 mod host;
 mod io_cmds;
@@ -263,13 +264,15 @@ pub fn run() {
 			// Load persisted config (relay endpoint, network mode, etc.).
 			let cfg = pulsar_core::config::Config::load(util::config_path(app.handle()));
 			tracing::info!(relay = %cfg.relay, "config loaded");
+			crate::i18n::set_lang(&cfg.language);
 			*app.state::<AppState>().config.lock().unwrap() = cfg;
 
 			// System tray: once launched, Pulsar stays resident in the tray. Closing
 			// the window hides it (see on_window_event); the only full exit is the
-			// tray's "Çıkış" item.
-			let show = MenuItem::with_id(app, "show", "Pulsar'ı Göster", true, None::<&str>)?;
-			let quit = MenuItem::with_id(app, "quit", "Çıkış", true, None::<&str>)?;
+			// tray's quit item. (Tray labels pick the language at startup — a language
+			// change applies to them after a restart.)
+			let show = MenuItem::with_id(app, "show", crate::i18n::t("tray.show"), true, None::<&str>)?;
+			let quit = MenuItem::with_id(app, "quit", crate::i18n::t("tray.quit"), true, None::<&str>)?;
 			let menu = Menu::with_items(app, &[&show, &quit])?;
 			let mut tray = TrayIconBuilder::with_id("main")
 				.tooltip("Pulsar")

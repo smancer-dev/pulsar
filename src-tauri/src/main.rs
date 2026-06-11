@@ -29,6 +29,22 @@ fn main() {
 	if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
 		std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
 	}
+	// Windows: the native video child fully OCCLUDES the webview during a session, and
+	// WebView2's native-window occlusion detection then THROTTLES the page (timers +
+	// event handling lag by seconds) — Ctrl+Shift combos, the session top bar and the
+	// viewrect reports all arrived late. Disable the occlusion calculation; the session
+	// UI must keep running at full speed behind the video. An existing env wins.
+	#[cfg(windows)]
+	{
+		const FLAG: &str = "--disable-features=CalculateNativeWinOcclusion";
+		match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+			Ok(cur) if !cur.contains("CalculateNativeWinOcclusion") => {
+				std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", format!("{cur} {FLAG}"));
+			}
+			Err(_) => std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", FLAG),
+			_ => {}
+		}
+	}
 	// `pulsar --relay …` runs a headless relay/rendezvous server instead of the GUI,
 	// so the same install can self-host a relay.
 	let args: Vec<String> = std::env::args().collect();

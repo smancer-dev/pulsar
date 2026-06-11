@@ -28,6 +28,7 @@ pub(crate) async fn set_config(
 	state: State<'_, AppState>,
 	config: Config,
 ) -> Result<(), String> {
+	crate::i18n::set_lang(&config.language);
 	*state.config.lock().unwrap() = config.clone();
 	config.save(config_path(&app)).map_err(|e| e.to_string())
 }
@@ -98,14 +99,15 @@ pub(crate) async fn list_remote_games(
 		.lock()
 		.unwrap()
 		.clone()
-		.ok_or("önce çevrimiçi ol")?;
+		.ok_or(crate::i18n::t("err.online"))?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let disc = state.discovery.lock().unwrap().clone();
-	let (mut sess, peer_label) = connect_target(&node, disc, &target).await?;
+	let net_mode = state.config.lock().unwrap().network_mode;
+	let (mut sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
 	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
 		.await?
 	{
-		return Err("Bağlantı reddedildi.".into());
+		return Err(crate::i18n::t("err.denied").into());
 	}
 	request_games(&mut sess).await.map_err(|e| e.to_string())
 }
@@ -123,14 +125,15 @@ pub(crate) async fn launch_remote_game(
 		.lock()
 		.unwrap()
 		.clone()
-		.ok_or("önce çevrimiçi ol")?;
+		.ok_or(crate::i18n::t("err.online"))?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let disc = state.discovery.lock().unwrap().clone();
-	let (mut sess, peer_label) = connect_target(&node, disc, &target).await?;
+	let net_mode = state.config.lock().unwrap().network_mode;
+	let (mut sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
 	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
 		.await?
 	{
-		return Err("Bağlantı reddedildi.".into());
+		return Err(crate::i18n::t("err.denied").into());
 	}
 	request_launch(&mut sess, &game_id)
 		.await
@@ -147,9 +150,10 @@ pub(crate) async fn connect(
 		.lock()
 		.unwrap()
 		.clone()
-		.ok_or("önce çevrimiçi ol")?;
+		.ok_or(crate::i18n::t("err.online"))?;
 	let disc = state.discovery.lock().unwrap().clone();
-	let (sess, peer_label) = connect_target(&node, disc, &target).await?;
+	let net_mode = state.config.lock().unwrap().network_mode;
+	let (sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
 	let transport = match sess.transport() {
 		Transport::Direct => "direct",
 		Transport::Relay => "relay",
@@ -263,7 +267,7 @@ pub(crate) async fn steam_path() -> Result<String, String> {
 pub(crate) async fn scan_folder(path: String) -> Result<Vec<ScannedApp>, String> {
 	let dir = std::path::PathBuf::from(&path);
 	if !dir.is_dir() {
-		return Err(format!("klasör bulunamadı: {path}"));
+		return Err(format!("{}: {path}", crate::i18n::t("err.folder")));
 	}
 	let mut apps = Vec::new();
 	for entry in std::fs::read_dir(&dir)
