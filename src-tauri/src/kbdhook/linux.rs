@@ -205,6 +205,9 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 		let mut diag_at = std::time::Instant::now();
 		let (mut diag_events, mut diag_fwd) = (0u32, 0u32);
 		let mut grabbed: Vec<evdev::Device> = Vec::new();
+		// Event node of grabbed[i] (parallel array) — needed to purge a VANISHED device's
+		// entry so a later device reusing the same event number can be grabbed again.
+		let mut grabbed_nodes: Vec<std::path::PathBuf> = Vec::new();
 		let mut grabbed_paths: std::collections::HashSet<std::path::PathBuf> =
 			std::collections::HashSet::new();
 		let mut pfds: Vec<libc::pollfd> = Vec::new();
@@ -262,6 +265,25 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 								.map_or(false, |n| n.starts_with("event"))
 						})
 						.collect();
+				// Nodes also VANISH (unplug, a closed virtual device) and the kernel REUSES
+				// their event numbers: purge the stale bookkeeping first, or a later device
+				// on a reused node looks "already seen/grabbed" and is never grabbed again
+				// (a replugged/KVM-switched keyboard stayed dead until the next re-arm).
+				let mut purged = false;
+				if seen_nodes.iter().any(|p| !cur_nodes.contains(p)) {
+					let mut i = 0;
+					while i < grabbed_nodes.len() {
+						if cur_nodes.contains(&grabbed_nodes[i]) {
+							i += 1;
+						} else {
+							grabbed_paths.remove(&grabbed_nodes[i]);
+							grabbed_nodes.remove(i);
+							drop(grabbed.remove(i)); // closes the dead fd
+							purged = true;
+						}
+					}
+					seen_nodes.retain(|p| cur_nodes.contains(p));
+				}
 				let new_devs: Vec<(std::path::PathBuf, evdev::Device)> =
 					if cur_nodes.is_subset(&seen_nodes) {
 						Vec::new()
@@ -285,7 +307,8 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 						if SUSPENDED.load(Ordering::SeqCst) {
 							let _ = d.ungrab();
 						}
-						grabbed_paths.insert(path);
+						grabbed_paths.insert(path.clone());
+						grabbed_nodes.push(path);
 						grabbed.push(d);
 					} else {
 						// Grab refused (EBUSY — e.g. a just-superseded capture thread
@@ -295,7 +318,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 						seen_nodes.remove(&path);
 					}
 				}
-				if grabbed.len() != before {
+				if purged || grabbed.len() != before {
 					pfds = grabbed
 						.iter()
 						.map(|d| libc::pollfd {
