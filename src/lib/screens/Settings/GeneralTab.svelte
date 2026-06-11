@@ -3,7 +3,7 @@
 	import type { Config } from '$lib/types';
 	import { ui, saveUi } from '$lib/settings.svelte';
 	import { t } from '$lib/i18n.svelte';
-	import { isTauri } from '$lib/api';
+	import { api, isTauri } from '$lib/api';
 	import pkg from '../../../../package.json';
 
 	let {
@@ -25,6 +25,22 @@
 			.then((v) => (version = v))
 			.catch(() => {});
 	}
+
+	// Display name defaults: an unset name falls back to the OS user's name on the
+	// wire (host.rs/play.rs already do this), so the input mirrors that — the OS
+	// name is the PLACEHOLDER, and a value equal to it (or the legacy "Pulsar
+	// Cihazı" default) renders as empty instead of looking like a custom choice.
+	let userName = $state('');
+	api.deviceUserName().then((n) => (userName = n)).catch(() => {});
+	const shownName = $derived.by(() => {
+		const v = config?.device_name ?? '';
+		return v === userName || v === 'Pulsar Cihazı' ? '' : v;
+	});
+	function onNameChange(e: Event) {
+		if (!config) return;
+		config.device_name = (e.currentTarget as HTMLInputElement).value.trim();
+		saveConfig();
+	}
 </script>
 
 <div class="srow">
@@ -32,7 +48,12 @@
 	<div class="field" style="width:220px">
 		<Icon name="devices" size={15} />
 		{#if config}
-			<input bind:value={config.device_name} onchange={saveConfig} aria-label={t('settings.displayName')} />
+			<input
+				value={shownName}
+				placeholder={userName}
+				onchange={onNameChange}
+				aria-label={t('settings.displayName')}
+			/>
 		{/if}
 	</div>
 </div>

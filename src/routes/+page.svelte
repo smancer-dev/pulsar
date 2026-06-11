@@ -426,6 +426,7 @@
 					activeTab={sm.activeTab}
 					onSelect={(tab) => (sm.activeTab = tab)}
 					onEnd={sm.endSession}
+					onRename={sm.renameTab}
 				/>
 			{/if}
 		{/if}

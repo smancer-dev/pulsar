@@ -139,6 +139,7 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'fs_get':
 		case 'mic_start':
 		case 'mic_stop':
+		case 'set_language':
 			return Promise.resolve(undefined as unknown as T);
 		case 'local_ls':
 			// Deterministic sample listing so the file panel is browsable in the

@@ -33,6 +33,34 @@ pub(crate) async fn set_config(
 	config.save(config_path(&app)).map_err(|e| e.to_string())
 }
 
+/// Set the UI language from the frontend's switcher. The webview's i18n lives in
+/// localStorage and was never reflected here, so everything Rust renders (tray,
+/// host strings, the native overlay's `--lang`) stayed on `Config.language`'s
+/// default — an English UI still got a Turkish in-session overlay. Persisted into
+/// the config so child processes and the next launch agree.
+#[tauri::command]
+pub(crate) async fn set_language(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	lang: String,
+) -> Result<(), String> {
+	let language = if lang == "en" {
+		pulsar_core::config::Language::En
+	} else {
+		pulsar_core::config::Language::Tr
+	};
+	crate::i18n::set_lang(&language);
+	let cfg = {
+		let mut g = state.config.lock().unwrap();
+		if g.language == language {
+			return Ok(()); // no change — skip the disk write
+		}
+		g.language = language;
+		g.clone()
+	};
+	cfg.save(config_path(&app)).map_err(|e| e.to_string())
+}
+
 /// Available hardware encoders detected via ffmpeg (kebab-case values).
 #[tauri::command]
 pub(crate) async fn available_encoders(app: AppHandle) -> Vec<String> {

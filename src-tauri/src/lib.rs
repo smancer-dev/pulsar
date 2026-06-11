@@ -54,7 +54,8 @@ use avatar::{device_user_name, self_avatar};
 use commands::{
 	auto_connect_target, available_encoders, connect, controllers, get_config, lan_devices,
 	launch_remote_game, list_remote_games, local_ip, new_password, node_port, publish_games,
-	relaunch_to_home, run_command, scan_folder, session_password, set_config, set_stream_settings,
+	relaunch_to_home, run_command, scan_folder, session_password, set_config, set_language,
+	set_stream_settings,
 	steam_path,
 };
 use connections::{list_connections, set_view_only, show_connections};
@@ -370,6 +371,7 @@ pub fn run() {
 		.invoke_handler(tauri::generate_handler![
 			get_config,
 			set_config,
+			set_language,
 			go_online,
 			connect,
 			lan_devices,

@@ -38,17 +38,36 @@
 			un?.();
 		};
 	});
-	const status = $derived(
-		preparing
-			? t('connecting.preparing')
-			: awaitingApproval
-				? t('connecting.awaiting')
-				: transport === 'direct'
-					? t('connecting.p2p')
-					: transport === 'relay'
-						? t('connecting.relay')
-						: t('connecting.reaching')
-	);
+	// Step list (replaces the single status line): each REAL milestone is a row
+	// that turns green when passed — reach (→ the actual transport), authorization,
+	// then stream start. Driven only by signals we truly have (no faked progress).
+	type StepState = 'pending' | 'active' | 'done';
+	const steps = $derived.by((): { label: string; state: StepState }[] => {
+		const reached = transport !== '';
+		const authDone = preparing;
+		return [
+			{
+				label: reached
+					? transport === 'relay'
+						? t('connecting.stepReachedRelay')
+						: t('connecting.stepReachedP2p')
+					: t('connecting.reaching'),
+				state: reached ? 'done' : 'active'
+			},
+			{
+				label: authDone
+					? t('connecting.stepAuthDone')
+					: awaitingApproval
+						? t('connecting.awaiting')
+						: t('connecting.stepAuth'),
+				state: authDone ? 'done' : reached ? 'active' : 'pending'
+			},
+			{
+				label: t('connecting.preparing'),
+				state: preparing ? 'active' : 'pending'
+			}
+		];
+	});
 
 	// A connect stuck this long usually means an offline host or a blocking
 	// firewall — surface a hint instead of spinning silently forever.
@@ -68,7 +87,20 @@
 	</div>
 	<h2>{target.name}</h2>
 	<div class="tid mono">{target.id} · {mode === 'game' ? t('connecting.modeGame') : t('connecting.modeRemote')}</div>
-	<div class="status"><span class="spin"></span>{status}</div>
+	<div class="steps">
+		{#each steps as s, i (i)}
+			<div class="step" class:done={s.state === 'done'} class:dim={s.state === 'pending'}>
+				{#if s.state === 'done'}
+					<span class="sicon ok"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12l5 5L20 6"/></svg></span>
+				{:else if s.state === 'active'}
+					<span class="sicon spin"></span>
+				{:else}
+					<span class="sicon hollow"></span>
+				{/if}
+				<span class="slabel">{s.label}</span>
+			</div>
+		{/each}
+	</div>
 	{#if slow && !preparing}
 		<div class="slowhint">{t('connecting.slowHint')}</div>
 	{/if}
@@ -103,13 +135,52 @@
 		font-size: 12.5px;
 		color: var(--text-faint);
 	}
-	.status {
+	.steps {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 9px;
+		margin: 16px 0 8px;
+	}
+	.step {
 		display: flex;
 		align-items: center;
 		gap: 10px;
 		font-size: 13.5px;
 		color: var(--text-muted);
-		margin: 16px 0 8px;
+		transition: color 0.25s;
+	}
+	.step.done {
+		color: var(--ok);
+	}
+	.step.dim {
+		color: var(--text-faint);
+		opacity: 0.65;
+	}
+	.sicon {
+		width: 15px;
+		height: 15px;
+		display: grid;
+		place-items: center;
+		flex: none;
+	}
+	.sicon.ok {
+		border-radius: 50%;
+		background: color-mix(in oklab, var(--ok) 18%, transparent);
+		color: var(--ok);
+		animation: pop 0.25s ease-out;
+	}
+	.sicon.hollow {
+		border-radius: 50%;
+		border: 2px solid var(--border-strong);
+		width: 11px;
+		height: 11px;
+	}
+	@keyframes pop {
+		from {
+			transform: scale(0.5);
+			opacity: 0;
+		}
 	}
 	.slowhint {
 		font-size: 12.5px;

@@ -18,6 +18,9 @@ export type Session = {
 	 * actually painting over the webview. Drives the occlusion repaint-suspend. */
 	ready?: boolean;
 	target: Target;
+	/** User-renamed tab title (session-scoped, via the tab's edit button); falls
+	 * back to `target.name` when unset. */
+	label?: string;
 	mode: 'remote' | 'game';
 	conn: 'direct' | 'relay';
 	wsPort: number;
@@ -174,6 +177,12 @@ export class SessionManager {
 	};
 
 	// Close a tab: stop its stream (host sees a disconnect) and drop it.
+	/** Rename a session tab for this session only (empty name restores the default). */
+	renameTab = (tabId: number, name: string) => {
+		const label = name.trim();
+		this.#patch(tabId, { label: label || undefined });
+	};
+
 	endSession = (tabId: number) => {
 		const s = this.sessions.find((x) => x.tabId === tabId);
 		if (s) {

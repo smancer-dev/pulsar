@@ -37,6 +37,7 @@
 		speaker: '<path d="M11 5L6 9H3v6h3l5 4z"/><path d="M16 9a4 4 0 010 6M19 6a8 8 0 010 12"/>',
 		globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.6 3.8 5.7 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z"/>',
 		menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
+		edit: '<path d="M17 3a2.8 2.8 0 014 4L7.5 20.5 3 21l.5-4.5z"/>',
 		grip: '<circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/>'
 	};
 </script>

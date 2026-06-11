@@ -9,6 +9,7 @@
 
 import { catalogs } from './i18n.catalogs';
 import type { Lang } from './i18n.catalogs';
+import { invoke, isTauri } from './api.invoke';
 
 export type { Lang };
 
@@ -45,7 +46,18 @@ export const i18n = $state<{ lang: Lang }>({ lang: load() });
 export function setLang(l: Lang) {
 	i18n.lang = l;
 	if (typeof localStorage !== 'undefined') localStorage.setItem(KEY, l);
+	syncBackend(l);
 }
+
+// The Rust side has its OWN language state (Config.language → tray labels, host
+// strings, and the native overlay's --lang). It used to be set only from the config
+// file, never from this switcher — so the in-session overlay stayed Turkish for a
+// user running the UI in English. Push every change (and the startup value, below).
+function syncBackend(l: Lang) {
+	if (!isTauri) return;
+	invoke<void>('set_language', { lang: l }).catch(() => {});
+}
+syncBackend(i18n.lang);
 
 /** Toggle to the next language in `LANGS` (currently just tr ⇄ en). */
 export function cycleLang() {

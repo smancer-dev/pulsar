@@ -50,5 +50,10 @@
 	"gauges.ovbtn": "Overlay button",
 	"hud.decode": "decode",
 	"hint.engage": "Release: Ctrl+Alt+Z · Quit: Ctrl+Shift+Q",
-	"hint.click": "Click the screen to take control"
+	"hint.click": "Click the screen to take control",
+	"info.pacing": "Frame pacing: buffers 1-2 frames to smooth network/decode jitter and presents at a steady cadence. On = smoother (adds a little latency), Off = lowest latency.",
+	"info.quality": "Low latency: the encoder favors speed (for gaming). Quality: better picture at the same bandwidth, slightly more latency.",
+	"info.call": "Voice call: opens your microphone to the host and the host's audio to you (two-way audio).",
+	"info.statshud": "Shows a small fps/latency strip at the top of the screen even while the overlay is closed.",
+	"info.ovbtn": "A small draggable button on the video that opens the overlay (Parsec-style)."
 }

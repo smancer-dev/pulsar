@@ -92,6 +92,11 @@ pub struct FsRow {
 #[derive(Default)]
 pub struct UiState {
 	pub view: View,
+	/// Mirror of `view` from the previous frame + a bump counter: a mismatch marks
+	/// the frame a section was entered, (re)starting the fade/slide-in animation
+	/// (the counter keys a fresh egui animation id per transition).
+	pub anim_view: View,
+	pub anim_gen: u64,
 	pub chat_input: String,
 	pub local_path: String, // HOME-relative ("" = home)
 	pub local_rows: Vec<FsRow>,
@@ -257,12 +262,25 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 			// Header: brand + mode + back arrow when inside a section.
 			ui.horizontal(|ui| {
 				if ui_state.view != View::Root {
-					if ui
-						.add(egui::Button::new(egui::RichText::new("←").size(16.0)).frame(false))
-						.clicked()
-					{
+					// PAINTED back arrow — the "←" glyph is missing from egui's bundled
+					// fonts (it rendered as a tofu box, i.e. "no icon" to the user).
+					let (rect, resp) =
+						ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+					let col = if resp.hovered() {
+						egui::Color32::WHITE
+					} else {
+						egui::Color32::from_rgb(150, 155, 170)
+					};
+					let c = rect.center();
+					let s = egui::Stroke::new(2.0, col);
+					let p = ui.painter();
+					p.line_segment([c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)], s);
+					p.line_segment([c + egui::vec2(-6.0, 0.0), c + egui::vec2(-1.0, -5.0)], s);
+					p.line_segment([c + egui::vec2(-6.0, 0.0), c + egui::vec2(-1.0, 5.0)], s);
+					if resp.clicked() {
 						ui_state.view = View::Root;
 					}
+					resp.on_hover_cursor(egui::CursorIcon::PointingHand);
 				}
 				ui.heading(egui::RichText::new("Pulsar").color(CYAN).strong());
 				let (icon, key) = match (ui_state.view, st.mode) {
@@ -289,16 +307,37 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 			});
 			ui.add_space(6.0);
 
-			match ui_state.view {
-				View::Root => draw_root(ui, st, &mut ui_state.view, &mut cmds),
-				View::Stream => draw_stream(ui, st, &mut cmds),
-				View::Display => draw_display(ui, st, &mut cmds),
-				View::Audio => draw_audio(ui, st, &mut cmds),
-				View::Tools => draw_tools(ui, &mut ui_state.view, &mut cmds),
-				View::Chat => draw_chat(ui, st, &mut ui_state.chat_input, &mut cmds),
-				View::Files => draw_files(ui, st, ui_state, &mut cmds),
-				View::Gauges => draw_gauges(ui, st, &mut cmds),
+			// Section enter/leave animation: a quick fade + downward slide-in instead of
+			// the old instant swap. The transition restarts on every view change (the
+			// bumped counter keys a fresh animation id, primed at 0 the first frame).
+			if ui_state.anim_view != ui_state.view {
+				ui_state.anim_view = ui_state.view;
+				ui_state.anim_gen = ui_state.anim_gen.wrapping_add(1);
+				ui.ctx().animate_value_with_time(
+					egui::Id::new(("ov-view-fade", ui_state.anim_gen)),
+					0.0,
+					0.0,
+				);
 			}
+			let fade = ui.ctx().animate_value_with_time(
+				egui::Id::new(("ov-view-fade", ui_state.anim_gen)),
+				1.0,
+				0.16,
+			);
+			ui.scope(|ui| {
+				ui.set_opacity(fade);
+				ui.add_space((1.0 - fade) * 8.0);
+				match ui_state.view {
+					View::Root => draw_root(ui, st, &mut ui_state.view, &mut cmds),
+					View::Stream => draw_stream(ui, st, &mut cmds),
+					View::Display => draw_display(ui, st, &mut cmds),
+					View::Audio => draw_audio(ui, st, &mut cmds),
+					View::Tools => draw_tools(ui, &mut ui_state.view, &mut cmds),
+					View::Chat => draw_chat(ui, st, &mut ui_state.chat_input, &mut cmds),
+					View::Files => draw_files(ui, st, ui_state, &mut cmds),
+					View::Gauges => draw_gauges(ui, st, &mut cmds),
+				}
+			});
 			ui.add_space(6.0);
 			ui.label(
 				egui::RichText::new(t("shortcuts"))
@@ -452,6 +491,7 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 	ui.add_space(8.0);
 	ui.horizontal(|ui| {
 		ui.label(t("quality"));
+		info(ui, t("info.quality"));
 		if seg(ui, st.quality == "latency", t("lowlat")) {
 			cmds.push(OverlayCmd::Set("quality", "latency".into()));
 		}
@@ -461,6 +501,7 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 	});
 	ui.horizontal(|ui| {
 		ui.label(t("pacing"));
+		info(ui, t("info.pacing"));
 		if seg(ui, st.pace, t("on")) {
 			cmds.push(OverlayCmd::Set("pace", "on".into()));
 		}
@@ -503,6 +544,7 @@ fn draw_audio(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) 
 	let call_on = st.mic_on && st.audio_tx;
 	ui.horizontal(|ui| {
 		ui.label(format!("📞 {}", t("audio.call")));
+		info(ui, t("info.call"));
 		if seg(ui, call_on, t("on")) {
 			cmds.push(OverlayCmd::Set("call", "on".into()));
 		}
@@ -830,6 +872,7 @@ fn load_local(us: &mut UiState) {
 fn draw_gauges(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
 	ui.horizontal(|ui| {
 		ui.label(t("gauges.statshud"));
+		info(ui, t("info.statshud"));
 		if seg(ui, st.stats_hud, t("on")) {
 			cmds.push(OverlayCmd::Set("statshud", "on".into()));
 		}
@@ -839,6 +882,7 @@ fn draw_gauges(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 	});
 	ui.horizontal(|ui| {
 		ui.label(t("gauges.ovbtn"));
+		info(ui, t("info.ovbtn"));
 		if seg(ui, st.overlay_btn, t("on")) {
 			cmds.push(OverlayCmd::Set("ovbtn", "on".into()));
 		}
@@ -1083,4 +1127,26 @@ fn seg(ui: &mut egui::Ui, on: bool, label: &str) -> bool {
 		egui::Color32::from_rgb(28, 30, 42)
 	};
 	ui.add(egui::Button::new(label).fill(fill)).clicked() && !on
+}
+
+/// Small painted ⓘ marker with a hover tooltip — for options whose name alone
+/// doesn't explain them (e.g. frame pacing). Painted (circle + dot + stem)
+/// because egui's bundled fonts lack a clean info glyph; the tooltip itself
+/// fades in via egui's built-in popup animation.
+fn info(ui: &mut egui::Ui, text: &str) {
+	let (rect, resp) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+	let col = if resp.hovered() {
+		CYAN
+	} else {
+		egui::Color32::from_rgb(110, 115, 130)
+	};
+	let c = rect.center();
+	let p = ui.painter();
+	p.circle_stroke(c, 6.0, egui::Stroke::new(1.3, col));
+	p.circle_filled(c + egui::vec2(0.0, -2.8), 0.9, col);
+	p.line_segment(
+		[c + egui::vec2(0.0, -0.4), c + egui::vec2(0.0, 3.0)],
+		egui::Stroke::new(1.5, col),
+	);
+	resp.on_hover_text(egui::RichText::new(text).size(12.0));
 }
