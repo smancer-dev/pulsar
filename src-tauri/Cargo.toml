@@ -55,6 +55,9 @@ windows-sys = { version = "0.59", features = [
 	"Win32_System_LibraryLoader",
 	"Win32_Security", # SECURITY_ATTRIBUTES (CreateMutexW single-instance); also CreateJobObjectW
 ] }
+# Self-avatar resolution (avatar.rs): decode the account picture / wallpaper, center-crop
+# + downscale (same pipeline as the Linux block below).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 
 # Linux/X11: resolve the Pulsar window's X11 id so the native mpv renderer embeds INSIDE
 # the app window via `--wid` (in-app HW-decoded video, no webview hop). Versions match
@@ -74,10 +77,14 @@ libc = "0.2"
 # Windows kbdhook/Interception path). evdev/libc are already in Cargo.lock via pulsar-core.
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.12"
+# Host cursor side-channel (cursor.rs): read the X pointer position (XFixes) + shape so the
+# client draws it over the cursorless KMS-captured video (Moonlight model). `xlib` for the
+# display/query-pointer, `xfixes` for the cursor image+hotspot. Same `x11` 2.21 the renderer uses.
+x11 = { version = "2.21", features = ["xlib", "xfixes"] }
 # Self-avatar resolution (avatar.rs): decode the account photo / wallpaper, center-crop
 # + downscale to a 96×96 PNG. Decode-only features kept minimal (png/jpeg/webp/bmp cover
-# AccountsService icons, ~/.face and GNOME wallpapers); Linux-only until the Windows/macOS
-# account-image lookups are implemented.
+# AccountsService icons, ~/.face and GNOME wallpapers); Windows has its own block above,
+# macOS lookup not implemented yet.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 # Layout-aware keyboard forwarding (WYSIWYG): resolve a grabbed evdev keycode → the Unicode
 # char the user's OWN active layout (e.g. Turkish-Q) produces, via libxkbcommon, so the host
