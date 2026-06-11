@@ -156,44 +156,51 @@ fn probe_decoders(app: &AppHandle, platform: &str) -> Vec<DecoderCap> {
 			})
 			.collect();
 	}
-	let render = crate::process::render_bin(app);
-	let out = std::process::Command::new(&render)
-		.arg("--probe")
-		.stderr(std::process::Stdio::null())
-		.output();
-	let Ok(out) = out else {
-		// Renderer missing: software ffmpeg decode still exists inside it when present;
-		// report nothing rather than guessing.
-		return Vec::new();
-	};
-	let text = String::from_utf8_lossy(&out.stdout);
-	let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-		return Vec::new();
-	};
-	parsed
-		.as_array()
-		.map(|arr| {
-			arr.iter()
-				.filter_map(|e| {
-					Some(DecoderCap {
-						codec: e.get("codec")?.as_str()?.to_string(),
-						ok: e.get("ok")?.as_bool()?,
-						name: e
-							.get("decoder")
-							.and_then(|v| v.as_str())
-							.unwrap_or("")
-							.to_string(),
-						hw: e.get("hw").and_then(|v| v.as_bool()).unwrap_or(false),
-						tier: e
-							.get("tier")
-							.and_then(|v| v.as_str())
-							.unwrap_or("")
-							.to_string(),
+	// macOS returned above (mpv client, no probeable backend) — `render_bin` is
+	// configured out there, so the renderer probe only compiles where it exists.
+	#[cfg(not(target_os = "macos"))]
+	{
+		let render = crate::process::render_bin(app);
+		let out = std::process::Command::new(&render)
+			.arg("--probe")
+			.stderr(std::process::Stdio::null())
+			.output();
+		let Ok(out) = out else {
+			// Renderer missing: software ffmpeg decode still exists inside it when present;
+			// report nothing rather than guessing.
+			return Vec::new();
+		};
+		let text = String::from_utf8_lossy(&out.stdout);
+		let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+			return Vec::new();
+		};
+		parsed
+			.as_array()
+			.map(|arr| {
+				arr.iter()
+					.filter_map(|e| {
+						Some(DecoderCap {
+							codec: e.get("codec")?.as_str()?.to_string(),
+							ok: e.get("ok")?.as_bool()?,
+							name: e
+								.get("decoder")
+								.and_then(|v| v.as_str())
+								.unwrap_or("")
+								.to_string(),
+							hw: e.get("hw").and_then(|v| v.as_bool()).unwrap_or(false),
+							tier: e
+								.get("tier")
+								.and_then(|v| v.as_str())
+								.unwrap_or("")
+								.to_string(),
+						})
 					})
-				})
-				.collect()
-		})
-		.unwrap_or_default()
+					.collect()
+			})
+			.unwrap_or_default()
+	}
+	#[cfg(target_os = "macos")]
+	Vec::new()
 }
 
 /// Spawn the startup probe: runs in the background, stores the result in AppState and

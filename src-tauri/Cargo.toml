@@ -64,12 +64,16 @@ gtk = "0.18"
 gdk = "0.18"
 gdkx11 = "0.18"
 
+# Unix process control (kill/SIGTERM for graceful renderer teardown, PDEATHSIG on
+# Linux): needed on macOS too — `stop_render_child` is cfg(unix).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Linux client-side input capture: grab the local keyboard+mouse (evdev) and forward to
 # the host while the embedded native renderer covers the webview (the Linux analog of the
 # Windows kbdhook/Interception path). evdev/libc are already in Cargo.lock via pulsar-core.
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.12"
-libc = "0.2"
 # Self-avatar resolution (avatar.rs): decode the account photo / wallpaper, center-crop
 # + downscale to a 96×96 PNG. Decode-only features kept minimal (png/jpeg/webp/bmp cover
 # AccountsService icons, ~/.face and GNOME wallpapers); Linux-only until the Windows/macOS
