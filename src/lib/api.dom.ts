@@ -6,6 +6,17 @@ import { invoke, isTauri } from './api.invoke';
 /** Copy text to the clipboard. Uses the async Clipboard API, falling back to a
  * hidden textarea + execCommand for webviews that block it. Returns success. */
 export async function copyText(text: string): Promise<boolean> {
+	// App-side first: the DOM Clipboard API silently fails in an occluded/unfocused
+	// WebKitGTK (the Linux native-video path), so in Tauri the OS clipboard is owned
+	// by Rust (io_cmds.rs). The DOM paths remain for browser dev.
+	if (isTauri) {
+		try {
+			await invoke<void>('write_clipboard_text', { text });
+			return true;
+		} catch {
+			/* fall through to the DOM paths */
+		}
+	}
 	try {
 		if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
 			await navigator.clipboard.writeText(text);
@@ -41,6 +52,14 @@ export async function setFullscreen(on: boolean): Promise<void> {
 
 /** Read the local clipboard text (for "paste to remote"). */
 export async function readClipboard(): Promise<string> {
+	// App-side first — see copyText (the DOM read is dead in occluded WebKitGTK).
+	if (isTauri) {
+		try {
+			return await invoke<string>('read_clipboard_text');
+		} catch {
+			/* fall through to the DOM path */
+		}
+	}
 	try {
 		if (typeof navigator !== 'undefined' && navigator.clipboard?.readText) {
 			return await navigator.clipboard.readText();

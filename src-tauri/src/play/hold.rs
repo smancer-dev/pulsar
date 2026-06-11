@@ -405,7 +405,11 @@ pub(super) async fn hold_session(
 							cur_bitrate = if b > 0 { b } else { base_kbps };
 						}
 						Restream::Quality(q) => { cur_quality = q; }
-						Restream::Audio(t, m) => { cur_transmit = t; cur_mute = m; }
+						Restream::Audio(t, m) => {
+							tracing::info!(transmit = t, mute = m, "audio restream requested");
+							cur_transmit = t;
+							cur_mute = m;
+						}
 					}
 					let req = StreamReq {
 						port: video_port,

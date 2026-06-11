@@ -82,6 +82,7 @@ fn set_mute_request(sid: u64, want: bool) {
 		owners.remove(&sid);
 	}
 	let now = !owners.is_empty();
+	tracing::info!(sid, want, owners = ?owners, "host mute request");
 	if was != now {
 		if let Err(e) = pulsar_core::audio::set_host_muted(now) {
 			tracing::warn!("host mute toggle failed: {e}");

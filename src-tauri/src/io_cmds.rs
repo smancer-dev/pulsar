@@ -174,9 +174,43 @@ pub(crate) async fn mic_stop(state: State<'_, AppState>, id: u64) -> Result<(), 
 	};
 	if let Some(mut c) = mic_slot.lock().unwrap().take() {
 		let _ = c.kill();
+		// Reap immediately — kill() alone leaves the recorder as a zombie until
+		// session teardown (visible as a defunct parecord for the session's life).
+		let _ = c.wait();
 	}
 	let _ = tx.send(DataMsg::AudioEnd).await;
 	Ok(())
+}
+
+/// Long-lived OS clipboard handle. On X11 pasted data is served BY the owning
+/// process — a per-call `Clipboard::new()` dropped at return would make every
+/// `write_clipboard_text` evaporate immediately, so one instance lives for the
+/// app's lifetime.
+static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+
+fn with_clipboard<R>(
+	f: impl FnOnce(&mut arboard::Clipboard) -> Result<R, arboard::Error>,
+) -> Result<R, String> {
+	let mut g = CLIPBOARD.lock().unwrap();
+	if g.is_none() {
+		*g = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+	}
+	f(g.as_mut().unwrap()).map_err(|e| e.to_string())
+}
+
+/// Read the OS clipboard app-side. The webview's `navigator.clipboard.readText()`
+/// silently fails on the Linux native-video path (occluded/unfocused WebKitGTK), so
+/// the overlay's "Panoyu karşıya gönder" reads here instead.
+#[tauri::command]
+pub(crate) fn read_clipboard_text() -> Result<String, String> {
+	with_clipboard(|c| c.get_text())
+}
+
+/// Write the OS clipboard app-side (inbound host clipboard / copy actions) — same
+/// WebKitGTK constraint as `read_clipboard_text`.
+#[tauri::command]
+pub(crate) fn write_clipboard_text(text: String) -> Result<(), String> {
+	with_clipboard(|c| c.set_text(text))
 }
 
 /// Client: forward absolute pointer motion (normalized 0..1) to the host.

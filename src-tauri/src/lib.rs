@@ -63,7 +63,8 @@ use host::go_online;
 use io_cmds::{
 	chat_log, host_send_chat, input_button, input_key, input_pointer, input_scroll,
 	kbd_capture_start, kbd_capture_stop, kbd_engage, mic_start, mic_stop, native_view_rect,
-	send_chat, send_clipboard, send_file, send_file_path, set_window_fullscreen,
+	read_clipboard_text, send_chat, send_clipboard, send_file, send_file_path,
+	set_window_fullscreen, write_clipboard_text,
 };
 use play::{start_remote_play, stop_stream};
 use session_cmds::{
@@ -426,6 +427,8 @@ pub fn run() {
 			kbd_capture_start,
 			kbd_capture_stop,
 			send_clipboard,
+			read_clipboard_text,
+			write_clipboard_text,
 			send_chat,
 			host_send_chat,
 			chat_log,
