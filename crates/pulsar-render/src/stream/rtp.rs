@@ -434,7 +434,16 @@ pub fn recv_loop(
 	use std::sync::atomic::Ordering;
 	use std::time::Duration;
 
-	let sock = match UdpSocket::bind(("0.0.0.0", port)) {
+	// BIG receive buffer: the OS default (64 KiB on Windows) overflows on IDR bursts
+	// at high fps — the depacketizer then waits for a keyframe that never arrives
+	// whole. 4 MiB matches the app's node socket (pulsar-core node.rs).
+	let sock = (|| -> std::io::Result<UdpSocket> {
+		let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+		let _ = s.set_recv_buffer_size(4 * 1024 * 1024);
+		s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+		Ok(s.into())
+	})();
+	let sock = match sock {
 		Ok(s) => s,
 		Err(e) => {
 			eprintln!("pulsar-render(win): rtp bind 0.0.0.0:{port} failed: {e}");
