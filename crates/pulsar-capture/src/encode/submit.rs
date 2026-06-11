@@ -134,6 +134,12 @@ impl Encoder {
 			let data_ptr = lock.bitstreamBufferPtr as *const u8;
 			if size > 0 && !data_ptr.is_null() {
 				let annexb = std::slice::from_raw_parts(data_ptr, size);
+				// DEBUG knob (env-gated, default off): tee the raw Annex-B access unit — exactly the
+				// bytes the packetizer is about to fragment — to PULSAR_DUMP_BITSTREAM=<path> so a
+				// dump can be inspected NAL-by-NAL (layer_id / nal_unit_type) off the wire. Appends
+				// every AU; a non-zero layer_id or a bogus NAL type in the dump implicates the
+				// encoder config, a clean dump implicates the packetizer (rtp.rs).
+				dump_bitstream(annexb);
 				// Rescale pts (frame index, 1/fps units) → 90 kHz RTP ticks. Truncate/wrap;
 				// the client tolerates it (it uses ts only for AU grouping/jitter).
 				let pts_90k = ((pts as i128 * 90_000) / self.fps as i128) as u32;
@@ -248,5 +254,27 @@ impl Encoder {
 		std::mem::ManuallyDrop::drop(&mut stream.pInputSurfaceRight);
 		blt.map_err(|e| format!("VideoProcessorBlt: {e}"))?;
 		Ok(())
+	}
+}
+
+/// DEBUG: append the raw Annex-B access unit to the file named by `PULSAR_DUMP_BITSTREAM` (if set).
+/// Default OFF — a no-op when the env var is unset, so it costs nothing in normal runs. Best-effort:
+/// a failed open/write is silently ignored (a diagnostic must never break the encode path). The
+/// resulting file is a concatenated Annex-B elementary stream playable/inspectable as `.h265`/`.h264`
+/// (e.g. `ffmpeg -i dump.h265`, or a NAL walker that prints each `nal_unit_type` + `nuh_layer_id`).
+fn dump_bitstream(annexb: &[u8]) {
+	use std::io::Write;
+	let Ok(path) = std::env::var("PULSAR_DUMP_BITSTREAM") else {
+		return;
+	};
+	if path.is_empty() {
+		return;
+	}
+	if let Ok(mut f) = std::fs::OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(&path)
+	{
+		let _ = f.write_all(annexb);
 	}
 }

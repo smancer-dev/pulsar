@@ -44,6 +44,7 @@
 //! this packetizer needs no special parameter-set handling — they fall out of
 //! the generic NAL split below.
 
+use crate::Codec;
 use rand::Rng;
 use std::collections::VecDeque;
 use std::io;
@@ -60,8 +61,12 @@ const PAYLOAD_TYPE: u8 = 96;
 /// RTP fixed header length (no CSRCs, no extension).
 const RTP_HEADER_LEN: usize = 12;
 
-/// FU-A NAL unit type (RFC 6184 §5.8).
+/// FU-A NAL unit type (RFC 6184 §5.8) — H.264.
 const NAL_FU_A: u8 = 28;
+
+/// HEVC fragmentation-unit NAL unit type (RFC 7798 §4.4.3). Carried in the 2-byte HEVC NAL
+/// header's `nal_unit_type` field (bits 1..=6 of byte 0), NOT the low 5 bits like H.264.
+const HEVC_NAL_FU: u8 = 49;
 
 /// Per-packet UDP payload budget. 1200 keeps a whole RTP packet inside a typical
 /// 1500-byte Ethernet MTU with comfortable room for IPv4/IPv6 + UDP headers (the
@@ -76,11 +81,22 @@ const MAX_SINGLE_NAL: usize = MTU - RTP_HEADER_LEN;
 /// 2-byte FU indicator + FU header.
 const MAX_FU_PAYLOAD: usize = MTU - RTP_HEADER_LEN - 2;
 
+/// Per-HEVC-FU-fragment NAL payload budget: MTU minus the RTP header (12) minus the 3-byte
+/// HEVC FU prefix (2-byte PayloadHdr + 1-byte FU header).
+const MAX_FU_HEVC_PAYLOAD: usize = MTU - RTP_HEADER_LEN - 3;
+
 /// An RTP/H.264 sender bound to one UDP socket, `connect()`ed to the client so
 /// `send()` needs no destination per call. Holds the rolling sequence number and
 /// the random SSRC for the lifetime of the stream.
 pub struct RtpSender {
 	socket: UdpSocket,
+	/// Codec of the stream — selects the FU fragmentation rules. H.264 uses RFC 6184 FU-A
+	/// (1-byte NAL header, type 28); HEVC uses RFC 7798 FU (2-byte NAL header, type 49). Using
+	/// the H.264 rules for an HEVC NAL corrupts the 2-byte header (the FU indicator overwrites
+	/// `nal_unit_type` → the decoder sees a bogus NAL type 30 / "Multi-layer HEVC" and the IDR
+	/// never reassembles), which is exactly the "h265 freezes" bug. AV1 is an OBU stream (no
+	/// Annex-B NALs) and is not fragmented through this path.
+	codec: Codec,
 	ssrc: u32,
 	seq: u16,
 	/// Scratch buffer reused for every packet to avoid per-packet allocation.
@@ -108,6 +124,12 @@ impl RtpSender {
 	/// datagram goes to `dest` (the client's RTP port). A random non-zero SSRC and
 	/// a random initial sequence number are chosen per RFC 3550 §5.1.
 	pub fn new(dest: SocketAddr) -> io::Result<Self> {
+		Self::new_with_codec(dest, Codec::H264)
+	}
+
+	/// Like `new` but selects the FU fragmentation rules for `codec` (HEVC needs RFC 7798 FU,
+	/// not the H.264 FU-A used for `Codec::H264`).
+	pub fn new_with_codec(dest: SocketAddr, codec: Codec) -> io::Result<Self> {
 		// Bind a wildcard address of the same family as the destination so the
 		// socket can reach it (an IPv4 dest needs an IPv4-bound socket).
 		let bind_addr: SocketAddr = if dest.is_ipv4() {
@@ -141,6 +163,7 @@ impl RtpSender {
 
 		Ok(Self {
 			socket,
+			codec,
 			ssrc,
 			seq,
 			buf: Vec::with_capacity(MTU),
@@ -224,7 +247,7 @@ impl RtpSender {
 		// so a big IDR is dripped over one frame's air-time (no link saturation) while small
 		// P-frames go at the stream rate — and nothing ever adds more than ~1 frame of latency.
 		if self.pace {
-			let total = count_packets(&nals).max(1);
+			let total = count_packets(&nals, self.codec).max(1);
 			let now = Instant::now();
 			self.pace_frame_start = self.next_frame_start.map_or(now, |t| t.max(now));
 			let bps = (self.bitrate_kbps.load(Ordering::Relaxed).max(1) as f64) * 1000.0;
@@ -242,10 +265,14 @@ impl RtpSender {
 			}
 			let is_last_nal = i == last_idx;
 			if nal.len() <= MAX_SINGLE_NAL {
-				// Single-NAL: payload is the NAL verbatim. Marker on the AU's last NAL.
+				// Single-NAL: payload is the NAL verbatim (its 1-byte H.264 / 2-byte HEVC header
+				// passes through untouched). Marker on the AU's last NAL.
 				self.send_packet(nal, pts_90k, is_last_nal)?;
 				sent += 1;
+			} else if self.codec == Codec::H265 {
+				sent += self.send_fu_hevc(nal, pts_90k, is_last_nal)?;
 			} else {
+				// H.264 (and AV1, which never reaches here — its OBU stream has no >MTU Annex-B NALs).
 				sent += self.send_fu_a(nal, pts_90k, is_last_nal)?;
 			}
 		}
@@ -292,6 +319,62 @@ impl RtpSender {
 			self.buf.clear();
 			self.write_rtp_header(pts_90k, marker);
 			self.buf.push(fu_indicator);
+			self.buf.push(fu_header);
+			self.buf.extend_from_slice(&rbsp[off..end]);
+			self.pace_gate();
+			self.socket.send(&self.buf)?;
+			self.seq = self.seq.wrapping_add(1);
+
+			off = end;
+			sent += 1;
+		}
+		Ok(sent)
+	}
+
+	/// FU fragment a single HEVC NAL that exceeds the MTU (RFC 7798 §4.4.3). HEVC NALs carry a
+	/// **2-byte** header `nal[0..2]` = `forbidden(1) type(6) layer_id(6) tid_plus1(3)`. The FU
+	/// payload header is the original 2-byte header with `nal_unit_type` rewritten to 49 (FU),
+	/// keeping `nuh_layer_id` + `nuh_temporal_id_plus1` intact; a 1-byte FU header
+	/// `(S<<7)|(E<<6)|orig_type` follows. The RBSP `nal[2..]` (both header bytes stripped) is
+	/// sliced into MTU-sized fragments. Mirrors the depacketizer in
+	/// `pulsar-render/src/stream/rtp.rs::push_h265` (type 49) and `src/lib/h265.ts`.
+	fn send_fu_hevc(&mut self, nal: &[u8], pts_90k: u32, is_last_nal: bool) -> io::Result<usize> {
+		// A NAL > MTU always has its 2-byte header (length >> 2); guard anyway.
+		if nal.len() < 2 {
+			return self.send_fu_a(nal, pts_90k, is_last_nal);
+		}
+		let b0 = nal[0];
+		let b1 = nal[1];
+		let orig_type = (b0 >> 1) & 0x3f; // HEVC nal_unit_type (bits 1..=6 of byte 0)
+		// FU PayloadHdr = original 2-byte header with nal_unit_type replaced by 49 (FU). Preserve
+		// forbidden_zero_bit + the layer_id bit in b0 and the whole b1 (layer_id low + tid+1).
+		let ph0 = (b0 & 0x81) | (HEVC_NAL_FU << 1); // keep forbidden(bit7) + layer_id MSB(bit0)
+		let ph1 = b1; // nuh_layer_id low 5 bits + nuh_temporal_id_plus1 — unchanged
+
+		let rbsp = &nal[2..]; // FU does NOT resend the 2-byte NAL header
+		let total = rbsp.len();
+		let mut off = 0;
+		let mut sent = 0;
+		while off < total {
+			let end = (off + MAX_FU_HEVC_PAYLOAD).min(total);
+			let is_first_frag = off == 0;
+			let is_last_frag = end == total;
+
+			let mut fu_header = orig_type;
+			if is_first_frag {
+				fu_header |= 0x80; // S bit
+			}
+			if is_last_frag {
+				fu_header |= 0x40; // E bit
+			}
+
+			// Marker only on the last packet of the AU = last fragment of last NAL.
+			let marker = is_last_nal && is_last_frag;
+
+			self.buf.clear();
+			self.write_rtp_header(pts_90k, marker);
+			self.buf.push(ph0);
+			self.buf.push(ph1);
 			self.buf.push(fu_header);
 			self.buf.extend_from_slice(&rbsp[off..end]);
 			self.pace_gate();
@@ -393,8 +476,13 @@ impl RtpEgress {
 	/// Bind the RTP socket (unchanged `RtpSender::new`) and, unless `PULSAR_RTP_INLINE=1`,
 	/// spawn the sender thread that drains the mailbox. `PULSAR_RTP_QCAP` overrides the
 	/// mailbox depth (default 16 access units).
-	pub fn spawn(dest: SocketAddr, fps: u32, bitrate_kbps: Arc<AtomicU32>) -> io::Result<Self> {
-		let mut sender = RtpSender::new(dest)?;
+	pub fn spawn(
+		dest: SocketAddr,
+		codec: Codec,
+		fps: u32,
+		bitrate_kbps: Arc<AtomicU32>,
+	) -> io::Result<Self> {
+		let mut sender = RtpSender::new_with_codec(dest, codec)?;
 		// Bound a blocked send so a wedged socket can never hang teardown: the sender thread
 		// checks `stop` between AUs, and the write timeout caps any in-flight send. 250 ms is
 		// far longer than any healthy AU send yet imperceptible on stop. On timeout the rest of
@@ -533,7 +621,13 @@ impl Drop for RtpEgress {
 /// Count how many RTP packets `send_access_unit` will emit for these NALs (single-NAL = 1 each,
 /// else `ceil(rbsp_len / MAX_FU_PAYLOAD)` FU-A fragments). Used to clamp the pacing rate so an AU
 /// is never spread beyond ~one frame interval.
-fn count_packets(nals: &[&[u8]]) -> u32 {
+fn count_packets(nals: &[&[u8]], codec: Codec) -> u32 {
+	// HEVC strips a 2-byte NAL header and uses a 3-byte FU prefix; H.264 strips 1 byte / 2-byte prefix.
+	let (hdr, budget) = if codec == Codec::H265 {
+		(2usize, MAX_FU_HEVC_PAYLOAD)
+	} else {
+		(1usize, MAX_FU_PAYLOAD)
+	};
 	nals.iter()
 		.map(|nal| {
 			if nal.is_empty() {
@@ -541,8 +635,8 @@ fn count_packets(nals: &[&[u8]]) -> u32 {
 			} else if nal.len() <= MAX_SINGLE_NAL {
 				1
 			} else {
-				// FU-A fragments the RBSP (nal[1..]); ceil-divide by the per-fragment budget.
-				((nal.len() - 1 + MAX_FU_PAYLOAD - 1) / MAX_FU_PAYLOAD) as u32
+				// FU fragments the RBSP (nal[hdr..]); ceil-divide by the per-fragment budget.
+				((nal.len() - hdr + budget - 1) / budget) as u32
 			}
 		})
 		.sum()
@@ -683,9 +777,13 @@ mod tests {
 	/// Capture what `send_access_unit` puts on the wire by reading from a paired
 	/// loopback socket.
 	fn roundtrip(annexb: &[u8], pts: u32) -> Vec<Vec<u8>> {
+		roundtrip_codec(annexb, pts, Codec::H264)
+	}
+
+	fn roundtrip_codec(annexb: &[u8], pts: u32, codec: Codec) -> Vec<Vec<u8>> {
 		let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
 		let dest = recv.local_addr().unwrap();
-		let mut sender = RtpSender::new(dest).unwrap();
+		let mut sender = RtpSender::new_with_codec(dest, codec).unwrap();
 		let sent = sender.send_access_unit(annexb, pts).unwrap();
 
 		let mut pkts = Vec::new();
@@ -766,6 +864,108 @@ mod tests {
 		assert_eq!(wire_ssrc, ssrc);
 	}
 
+	/// Build the Annex-B for one HEVC NAL: a 2-byte header `forbidden(1) type(6) layer_id(6)
+	/// tid+1(3)` + `rbsp_len` body bytes, prefixed by a 4-byte start code.
+	fn annexb_hevc_nal(nal_type: u8, layer_id: u8, tid_plus1: u8, rbsp_len: usize) -> Vec<u8> {
+		let b0 = ((nal_type & 0x3f) << 1) | ((layer_id >> 5) & 0x01);
+		let b1 = ((layer_id & 0x1f) << 3) | (tid_plus1 & 0x07);
+		let mut v = vec![0, 0, 0, 1, b0, b1];
+		v.extend(std::iter::repeat(0xCD).take(rbsp_len));
+		v
+	}
+
+	/// Reassemble HEVC NALs from RTP packets, mirroring `pulsar-render/src/stream/rtp.rs::push_h265`
+	/// (single NAL ≤47, AP 48, FU 49) — the real Pi depacketizer. Asserts marker/PT/ts invariants.
+	fn depacketize_hevc(pkts: &[Vec<u8>], expect_ts: u32) -> Vec<Vec<u8>> {
+		let mut nals: Vec<Vec<u8>> = Vec::new();
+		let mut fu: Option<Vec<u8>> = None;
+		let mut last_seq: Option<u16> = None;
+		for pkt in pkts {
+			let (_marker, pt, seq, ts, _ssrc) = parse_header(pkt);
+			assert_eq!(pt, PAYLOAD_TYPE);
+			assert_eq!(ts, expect_ts, "timestamp constant across the AU");
+			if let Some(prev) = last_seq {
+				assert_eq!(seq, prev.wrapping_add(1), "sequence increments by 1");
+			}
+			last_seq = Some(seq);
+			let pl = &pkt[RTP_HEADER_LEN..];
+			let nal_type = (pl[0] >> 1) & 0x3f;
+			if nal_type <= 47 {
+				nals.push(pl.to_vec());
+			} else if nal_type == 49 {
+				let fu_hdr0 = pl[0];
+				let fu_hdr1 = pl[1];
+				let fuhdr = pl[2];
+				let start = (fuhdr & 0x80) != 0;
+				let endb = (fuhdr & 0x40) != 0;
+				let fu_type = fuhdr & 0x3f;
+				let layer_id = ((fu_hdr0 & 0x01) << 5) | ((fu_hdr1 >> 3) & 0x1f);
+				let tid = fu_hdr1 & 0x07;
+				if start {
+					let h0 = (fu_type << 1) | ((layer_id >> 5) & 0x01);
+					let h1 = ((layer_id & 0x1f) << 3) | (tid & 0x07);
+					fu = Some(vec![h0, h1]);
+				}
+				if let Some(acc) = fu.as_mut() {
+					acc.extend_from_slice(&pl[3..]);
+					if endb {
+						nals.push(fu.take().unwrap());
+					}
+				}
+			} else {
+				panic!("unexpected HEVC RTP NAL type {nal_type} (H.264 FU-A leaked into an HEVC stream?)");
+			}
+		}
+		nals
+	}
+
+	#[test]
+	fn hevc_small_nal_passes_2byte_header_through() {
+		// A small HEVC NAL (≤ MTU) must be a single-NAL packet with its 2-byte header intact —
+		// no FU-A corruption of nal_unit_type. IDR_W_RADL=19, layer_id=0, tid+1=1.
+		let au = annexb_hevc_nal(19, 0, 1, 100);
+		let pkts = roundtrip_codec(&au, 7, Codec::H265);
+		assert_eq!(pkts.len(), 1);
+		let nals = depacketize_hevc(&pkts, 7);
+		assert_eq!(nals.len(), 1);
+		assert_eq!(nals[0], &au[4..], "2-byte header + RBSP preserved verbatim");
+		assert_eq!((nals[0][0] >> 1) & 0x3f, 19, "nal_unit_type stays 19, not 30");
+	}
+
+	#[test]
+	fn hevc_large_idr_fu_reassembles_to_type_19_not_30() {
+		// The regression: a >MTU HEVC IDR used to be FU-A-fragmented with H.264 rules, which
+		// overwrote nal_unit_type → the Pi saw NAL type 30 ("Multi-layer HEVC" / "Skipping NAL
+		// unit 30") and the IDR never reassembled. With RFC 7798 FU it must rebuild to type 19,
+		// layer_id 0, with the EXACT original bytes.
+		let au = annexb_hevc_nal(19, 0, 1, MTU * 3);
+		let pkts = roundtrip_codec(&au, 4242, Codec::H265);
+		assert!(pkts.len() > 3, "a >3·MTU NAL must fragment into several FU packets");
+		// Every packet must be an HEVC FU (49), never an H.264 FU-A (28 → type 30 here).
+		for pkt in &pkts {
+			let nt = (pkt[RTP_HEADER_LEN] >> 1) & 0x3f;
+			assert_eq!(nt, 49, "fragments must be HEVC FU (type 49), got {nt}");
+		}
+		let nals = depacketize_hevc(&pkts, 4242);
+		assert_eq!(nals.len(), 1, "all fragments reassemble into one NAL");
+		assert_eq!(nals[0], &au[4..], "reassembled NAL == original (header + RBSP)");
+		assert_eq!((nals[0][0] >> 1) & 0x3f, 19, "reassembled nal_unit_type is 19 (IDR), not 30");
+	}
+
+	#[test]
+	fn hevc_preserves_layer_id_and_tid() {
+		// nuh_layer_id + nuh_temporal_id_plus1 must survive fragmentation untouched (a layer_id
+		// corruption is what made ffmpeg report "Multi-layer HEVC coding is not implemented").
+		let au = annexb_hevc_nal(21, 0, 2, MTU * 2); // CRA=21, tid+1=2
+		let pkts = roundtrip_codec(&au, 1, Codec::H265);
+		let nals = depacketize_hevc(&pkts, 1);
+		assert_eq!(nals.len(), 1);
+		let layer_id = ((nals[0][0] & 0x01) << 5) | ((nals[0][1] >> 3) & 0x1f);
+		let tid = nals[0][1] & 0x07;
+		assert_eq!(layer_id, 0, "nuh_layer_id stays 0 (single-layer)");
+		assert_eq!(tid, 2, "nuh_temporal_id_plus1 preserved");
+	}
+
 	#[test]
 	fn egress_thread_delivers_identical_bytes() {
 		// The decoupled `RtpEgress` (sender thread) must put the SAME bytes on the wire as a
@@ -775,7 +975,8 @@ mod tests {
 			.unwrap();
 		let dest = recv.local_addr().unwrap();
 		let au = annexb_nal(1, 2, 100); // single-NAL → exactly one packet, marker set
-		let egress = RtpEgress::spawn(dest, 60, Arc::new(AtomicU32::new(20_000))).unwrap();
+		let egress =
+			RtpEgress::spawn(dest, Codec::H264, 60, Arc::new(AtomicU32::new(20_000))).unwrap();
 		egress.send_access_unit(&au, 4242);
 		let mut buf = [0u8; 2048];
 		let m = recv.recv(&mut buf).unwrap(); // blocks until the sender thread delivers it

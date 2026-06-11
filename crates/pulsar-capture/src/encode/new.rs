@@ -154,7 +154,7 @@ impl Encoder {
 		// Shared live bitrate (kbps): seeded from the request, read by the RtpEgress pacing
 		// thread (Stage 1) and updated by Stage-3 adaptive bitrate.
 		let bitrate_kbps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(p.bitrate_kbps));
-		let rtp = RtpEgress::spawn(addr, fps, bitrate_kbps.clone())
+		let rtp = RtpEgress::spawn(addr, p.codec, fps, bitrate_kbps.clone())
 			.map_err(|e| format!("rtp bind: {e}"))?;
 
 		// -- 4. Load NVENC and create the function-pointer table. ANY failure → Err so
