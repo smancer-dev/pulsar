@@ -53,6 +53,10 @@ static THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 static ENGAGED: AtomicBool = AtomicBool::new(false);
 /// CLI kiosk (`--connect`) auto-engages on the next `enable()` (same as Linux).
 static KIOSK_ENGAGE: AtomicBool = AtomicBool::new(false);
+/// True for the lifetime of a kiosk-started session: focus loss must NOT disengage
+/// (the appliance runs nothing else, and the auto-launched window may never get
+/// focus at all under focus-stealing prevention). Cleared on `disable()`.
+static KIOSK_SESSION: AtomicBool = AtomicBool::new(false);
 /// Any app window focused (from the Tauri focus map via `set_focused`) — gates the
 /// disengaged-state combos (Ctrl+Shift+M) so a GLOBAL hook never reacts while the
 /// user is in another application.
@@ -462,8 +466,12 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 		g.rctrl_presses.clear();
 	}
 	// Sessions start DISENGAGED (click-to-engage) — except a kiosk `--connect` start,
-	// which engages immediately like the Linux evdev path.
-	if KIOSK_ENGAGE.swap(false, Ordering::SeqCst) {
+	// which engages immediately like the Linux evdev path. KIOSK_ENGAGE is LATCHED
+	// (not consumed): the frontend re-arms capture on tab-activation churn, and a
+	// one-shot left that second enable() disengaged (see kbdhook/linux.rs).
+	let kiosk = KIOSK_ENGAGE.load(Ordering::SeqCst);
+	KIOSK_SESSION.store(kiosk, Ordering::SeqCst);
+	if kiosk {
 		engage(&app);
 	} else {
 		ENGAGED.store(false, Ordering::SeqCst);
@@ -502,6 +510,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 pub fn disable() {
 	ENABLED.store(false, Ordering::SeqCst);
 	ENGAGED.store(false, Ordering::SeqCst);
+	KIOSK_SESSION.store(false, Ordering::SeqCst);
 	// Interception: drop the filter so we stop capturing (frees keys for any other
 	// instance + the local OS).
 	set_capture_filter(false);
@@ -532,6 +541,10 @@ pub fn overlay_suspend(_suspend: bool) {}
 pub fn set_focused(focused: bool) {
 	tracing::info!(focused, "app focus changed");
 	APP_FOCUSED.store(focused, Ordering::SeqCst);
+	// Kiosk sessions ignore focus loss entirely (see KIOSK_SESSION).
+	if KIOSK_SESSION.load(Ordering::SeqCst) {
+		return;
+	}
 	if !focused && ENGAGED.load(Ordering::SeqCst) {
 		let app = globals().lock().unwrap().app.clone();
 		match app {

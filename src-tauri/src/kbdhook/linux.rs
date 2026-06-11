@@ -35,6 +35,12 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// wrong — `app.restart()` preserves argv, so it stays `Some` for every later MANUAL
 /// session in the process, which then started with the keyboard/mouse grabbed.
 static KIOSK_ENGAGE: AtomicBool = AtomicBool::new(false);
+/// True for the LIFETIME of a kiosk-started session (cleared on `disable()`). A kiosk
+/// appliance has no local desktop to protect, so capture RE-engages whenever focus
+/// returns — without this, GNOME's focus-stealing prevention left the auto-launched
+/// window unfocused at startup, the 200 ms debounce below cleared the one-shot
+/// engage, and the "auto-connect controls immediately" promise silently broke.
+static KIOSK_SESSION: AtomicBool = AtomicBool::new(false);
 /// True while the Pulsar window is focused. Capture (grab + forward + the overlay/leave
 /// combos) is active ONLY when focused — the evdev grab is global, so an unfocused window
 /// must not steal input or fire combos. Driven by `set_focused()` (Tauri focus event).
@@ -59,8 +65,14 @@ static ENGAGED: AtomicBool = AtomicBool::new(false);
 static RENDER_FOCUSED: AtomicBool = AtomicBool::new(false);
 
 /// Effective focus: the Tauri window OR the standalone render window has focus.
+// A KIOSK session counts as always-focused: the appliance runs nothing else, and
+// GNOME's focus-stealing prevention may never focus the auto-launched window at
+// all (no user click) — the focus gate would otherwise keep capture disengaged
+// forever and silently break "auto-connect controls immediately".
 fn is_focused() -> bool {
-	FOCUSED.load(Ordering::SeqCst) || RENDER_FOCUSED.load(Ordering::SeqCst)
+	FOCUSED.load(Ordering::SeqCst)
+		|| RENDER_FOCUSED.load(Ordering::SeqCst)
+		|| KIOSK_SESSION.load(Ordering::SeqCst)
 }
 
 /// Build an xkb keyboard state from the X session's ACTIVE layout (e.g. Turkish-Q), so a grabbed
@@ -173,13 +185,25 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 	// e.g. the Orange Pi player) starts ENGAGED: there is no local desktop to
 	// protect and the remote should be controllable immediately. One-shot — only
 	// the session the auto-connect actually starts may take it (see KIOSK_ENGAGE).
-	let kiosk = KIOSK_ENGAGE.swap(false, Ordering::SeqCst);
+	// KIOSK_ENGAGE is LATCHED for the process lifetime, not consumed once: the
+	// frontend re-arms capture (kbdCaptureStop→Start on an `active` toggle) shortly
+	// after the auto-connect, and a one-shot left that SECOND session disengaged
+	// (events flowed, forwarded=0). arm_kiosk_engage() is only called on a genuine
+	// auto-connect launch (lib.rs gates on AUTO_CONNECT + no `.skip-autoconnect`
+	// marker), so every enable() in this process belongs to the kiosk session —
+	// re-engaging them all is correct (an appliance has no manual sessions).
+	let kiosk = KIOSK_ENGAGE.load(Ordering::SeqCst);
+	KIOSK_SESSION.store(kiosk, Ordering::SeqCst);
 	ENGAGED.store(kiosk, Ordering::SeqCst);
+	tracing::info!(gen, kiosk, "evdev capture armed");
 	if kiosk {
 		// Keep the frontend's engage hint in sync with the auto-engage.
 		let _ = app.emit("kbd-engaged", ());
 	}
 	std::thread::spawn(move || {
+		// 1 Hz loop telemetry (see the "evdev capture state" log below).
+		let mut diag_at = std::time::Instant::now();
+		let (mut diag_events, mut diag_fwd) = (0u32, 0u32);
 		let mut grabbed: Vec<evdev::Device> = Vec::new();
 		let mut grabbed_paths: std::collections::HashSet<std::path::PathBuf> =
 			std::collections::HashSet::new();
@@ -300,6 +324,11 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 			// unfocused state (200 ms) clears the latch.
 			if is_focused() {
 				unfocused_since = None;
+				// Kiosk sessions RE-engage on focus (appliance: no local desktop to
+				// protect) — see KIOSK_SESSION for why the one-shot wasn't enough.
+				if KIOSK_SESSION.load(Ordering::SeqCst) && !SUSPENDED.load(Ordering::SeqCst) {
+					ENGAGED.store(true, Ordering::SeqCst);
+				}
 			} else {
 				let t = *unfocused_since.get_or_insert_with(std::time::Instant::now);
 				if t.elapsed() >= std::time::Duration::from_millis(200) {
@@ -348,6 +377,21 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 				applied_suspend = want_suspend;
 			}
 
+			// 1 Hz state telemetry: the capture loop was a black box during the
+			// "grabbed but nothing forwards" kiosk debugging — keep it observable.
+			if diag_at.elapsed().as_secs() >= 1 {
+				tracing::info!(
+					engaged = ENGAGED.load(Ordering::SeqCst),
+					focused = is_focused(),
+					suspended = applied_suspend,
+					grabbed = grabbed.len(),
+					events = diag_events,
+					forwarded = diag_fwd,
+					"evdev capture state"
+				);
+				(diag_events, diag_fwd) = (0, 0);
+				diag_at = std::time::Instant::now();
+			}
 			if pfds.is_empty() {
 				std::thread::sleep(std::time::Duration::from_millis(200));
 				continue;
@@ -373,6 +417,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 					Err(_) => continue,
 				};
 				for ev in events {
+					diag_events += 1;
 					match ev.kind() {
 						InputEventKind::Key(key) => {
 							let code = key.code();
@@ -564,6 +609,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 					}
 				}
 				if adx != 0.0 || ady != 0.0 {
+					diag_fwd += 1;
 					fwd(&tx, InputEvent::PointerRelative { dx: adx, dy: ady });
 				}
 			}
@@ -582,6 +628,9 @@ pub fn disable() {
 	SUSPENDED.store(false, Ordering::SeqCst);
 	ENGAGED.store(false, Ordering::SeqCst);
 	RENDER_FOCUSED.store(false, Ordering::SeqCst);
+	// KIOSK_SESSION is NOT cleared here — it is recomputed from the latched
+	// KIOSK_ENGAGE on every enable(), and clearing it on a stop→start re-arm was
+	// exactly what disengaged the kiosk's second session.
 }
 
 /// Arm the one-shot kiosk auto-engage (see [`KIOSK_ENGAGE`]). Called from `lib.rs`
