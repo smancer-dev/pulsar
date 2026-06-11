@@ -39,17 +39,35 @@ pub use linux::{
 	set_focused, set_render_focused,
 };
 
-// The click-to-engage + standalone-render-window focus channels are Linux-only (the evdev
-// capture); elsewhere these are no-ops so callers stay portable.
+// Windows now has the same click-to-engage lifecycle as Linux: the hook is armed for
+// the whole native session but inert until `engage` (video click → renderer
+// `ov engage`); 3×RightCtrl disengages, Ctrl+Shift+Q ends (see imp::handle_key).
+#[cfg(windows)]
+pub fn engage(app: &AppHandle) {
+	imp::engage(app)
+}
+#[cfg(windows)]
+pub fn engage_render(app: &AppHandle) {
+	imp::engage(app)
+}
+#[cfg(windows)]
+pub fn release(app: &AppHandle) {
+	imp::release_engage(app)
+}
+#[cfg(windows)]
+pub fn arm_kiosk_engage() {
+	imp::arm_kiosk()
+}
+// The standalone-render-window focus channel is Linux-only (evdev focus gate).
 #[cfg(not(target_os = "linux"))]
 pub fn set_render_focused(_focused: bool) {}
-#[cfg(not(target_os = "linux"))]
+
+// macOS: no client-side capture — all lifecycle hooks are no-ops.
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn engage(_app: &AppHandle) {}
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn engage_render(_app: &AppHandle) {}
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn release(_app: &AppHandle) {}
-// Kiosk auto-engage (CLI --connect starts controlling immediately) only exists for
-// the Linux evdev capture; elsewhere arming it is a no-op.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn arm_kiosk_engage() {}

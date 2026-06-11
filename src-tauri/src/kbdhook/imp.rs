@@ -32,12 +32,31 @@ struct Globals {
 	ctrl_down: bool,
 	alt_down: bool,
 	shift_down: bool,
+	/// Recent RightCtrl press times for the 3×RightCtrl release combo (≤1 s window).
+	rctrl_presses: Vec<std::time::Instant>,
+	/// Every key currently held DOWN on the host (forwarded down, no up yet). Flushed
+	/// as up-strokes whenever the gate closes (disengage/disable) — otherwise a combo
+	/// like Ctrl+Shift+M leaves Ctrl+Shift stuck on the host (their up-strokes arrive
+	/// after the gate closed and are never forwarded).
+	held: std::collections::HashSet<u32>,
 }
 
 static GLOBALS: OnceLock<Mutex<Globals>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Set once the hook thread has installed the hook + recorded its thread id.
 static THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+/// Click-to-engage gate (parity with the Linux evdev capture): the hook is ARMED
+/// (ENABLED) for the whole native session, but until the user clicks the video it
+/// neither forwards nor suppresses anything — the local desktop stays usable, and a
+/// broken session can't trap the keyboard. Set by `engage()` (video click → renderer
+/// `ov engage` line), cleared by `release_engage()` / the 3×RightCtrl combo.
+static ENGAGED: AtomicBool = AtomicBool::new(false);
+/// CLI kiosk (`--connect`) auto-engages on the next `enable()` (same as Linux).
+static KIOSK_ENGAGE: AtomicBool = AtomicBool::new(false);
+/// Any app window focused (from the Tauri focus map via `set_focused`) — gates the
+/// disengaged-state combos (Ctrl+Shift+M) so a GLOBAL hook never reacts while the
+/// user is in another application.
+static APP_FOCUSED: AtomicBool = AtomicBool::new(true);
 
 fn globals() -> &'static Mutex<Globals> {
 	GLOBALS.get_or_init(|| {
@@ -48,8 +67,47 @@ fn globals() -> &'static Mutex<Globals> {
 			ctrl_down: false,
 			alt_down: false,
 			shift_down: false,
+			rctrl_presses: Vec::new(),
+			held: std::collections::HashSet::new(),
 		})
 	})
+}
+
+/// Send up-strokes for every key still held on the host and clear the set — called
+/// whenever forwarding stops (disengage, disable) so no modifier stays stuck remotely.
+fn flush_held(g: &mut Globals) {
+	if let Some(tx) = &g.tx {
+		for code in g.held.drain() {
+			let _ = tx.try_send(InputEvent::Key { code, down: false });
+		}
+	} else {
+		g.held.clear();
+	}
+}
+
+/// Arm kiosk auto-engage: the next `enable()` engages immediately (CLI `--connect`).
+pub(super) fn arm_kiosk() {
+	KIOSK_ENGAGE.store(true, Ordering::SeqCst);
+}
+
+/// Take control: start forwarding + suppressing input. Idempotent; emits
+/// `kbd-engaged` on the rising edge (drives the UI hint + renderer cursor state).
+pub(super) fn engage(app: &AppHandle) {
+	if !ENGAGED.swap(true, Ordering::SeqCst) {
+		tracing::info!("kbd capture ENGAGED");
+		let _ = app.emit("kbd-engaged", ());
+	}
+}
+
+/// Drop control WITHOUT ending the session (the user keeps the video and can click
+/// back in). Emits `kbd-released` on the falling edge and releases any keys still
+/// held on the host.
+pub(super) fn release_engage(app: &AppHandle) {
+	if ENGAGED.swap(false, Ordering::SeqCst) {
+		tracing::info!("kbd capture RELEASED");
+		flush_held(&mut globals().lock().unwrap());
+		let _ = app.emit("kbd-released", ());
+	}
 }
 
 // ─────────────────────────── Interception path ───────────────────────────
@@ -201,28 +259,108 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 		42 | 54 => g.shift_down = down, // L/R Shift
 		_ => {}
 	}
-	// Overlay-toggle combo: Ctrl+Shift+M (evdev 50). Same frontend handler as
-	// Linux — opens the game menu — but Windows keeps capture ON (the webview
-	// HW-decodes and the overlay floats over the live canvas; no ungrab). Suppress
-	// the M so it never leaks into the game. Does NOT end the session.
-	if down && evdev == 50 && g.ctrl_down && g.shift_down {
+	// Overlay-toggle combo: Ctrl+Shift+M — must work BOTH engaged and merely
+	// app-focused (disengaged): the user released control but still wants the menu.
+	// Never fires while another app has focus (the hook is global).
+	if down
+		&& evdev == 50
+		&& g.ctrl_down
+		&& g.shift_down
+		&& (ENGAGED.load(Ordering::SeqCst) || APP_FOCUSED.load(Ordering::SeqCst))
+	{
+		// Release control RIGHT HERE, synchronously. The overlay's own release
+		// (set_overlay → kbdhook::release) arrives over a webview IPC roundtrip that
+		// can lag SECONDS while the video child occludes the webview (WebView2
+		// occlusion throttling) — until it landed, the user's next click was still
+		// captured and went to the host ("first click swallowed").
+		if ENGAGED.swap(false, Ordering::SeqCst) {
+			tracing::info!("kbd capture RELEASED (overlay combo, immediate)");
+			flush_held(&mut g);
+			if let Some(app) = &g.app {
+				let _ = app.emit("kbd-released", ());
+			}
+		}
 		if let Some(app) = &g.app {
 			let _ = app.emit("overlay-toggle", ());
 		}
 		return true;
 	}
-	// The webview never sees these keys (suppressed first), so the leave combo must
-	// be detected here. F12 (evdev 88) while Ctrl+Shift are held → drop control;
-	// tell the UI via an event.
-	if down && evdev == 88 && g.ctrl_down && g.shift_down {
+	// End combo: Ctrl+Shift+Q — ends the session. Like the overlay combo it must work
+	// BOTH engaged and merely app-focused (the user released control, video still up).
+	if down
+		&& evdev == 16
+		&& g.ctrl_down
+		&& g.shift_down
+		&& (ENGAGED.load(Ordering::SeqCst) || APP_FOCUSED.load(Ordering::SeqCst))
+	{
+		flush_held(&mut g); // un-stick the chord on the (still-alive) host
 		if let Some(app) = &g.app {
 			let _ = app.emit("kbd-leave", ());
 		}
+		return true; // never leak the Q locally
+	}
+	// Fullscreen combo: Ctrl+Shift+F12 — toggles the window's fullscreen state; the
+	// session AND control state stay as they are (this is NOT the leave combo).
+	if down
+		&& evdev == 88
+		&& g.ctrl_down
+		&& g.shift_down
+		&& (ENGAGED.load(Ordering::SeqCst) || APP_FOCUSED.load(Ordering::SeqCst))
+	{
+		if let Some(app) = &g.app {
+			let _ = app.emit("fullscreen-toggle", ());
+		}
+		return true;
+	}
+	// Click-to-engage gate: armed but not engaged → behave as if no hook were
+	// installed (no forward, no suppress) so local typing is unaffected.
+	if !ENGAGED.load(Ordering::SeqCst) {
 		return false;
 	}
-	if let Some(tx) = &g.tx {
+	// Release combo (matches the on-screen hint): 3×RightCtrl within 1 s DISENGAGES
+	// capture (session stays alive; click the video to take control again).
+	if down && evdev == 97 {
+		let now = std::time::Instant::now();
+		g.rctrl_presses
+			.retain(|t| now.duration_since(*t).as_millis() < 1000);
+		g.rctrl_presses.push(now);
+		if g.rctrl_presses.len() >= 3 {
+			g.rctrl_presses.clear();
+			// The combo's own down-stroke is on the host too — count it, then flush
+			// everything held so nothing stays stuck remotely.
+			g.held.insert(97);
+			flush_held(&mut g);
+			ENGAGED.store(false, Ordering::SeqCst);
+			if let Some(app) = &g.app {
+				let _ = app.emit("kbd-released", ());
+			}
+			return true;
+		}
+	}
+	// Release combo #2 (the one the engage hint advertises): Ctrl+Alt+Z (evdev 44)
+	// — Parsec's detach shortcut, same behavior as 3×RightCtrl above.
+	if down && evdev == 44 && g.ctrl_down && g.alt_down {
+		ENGAGED.store(false, Ordering::SeqCst);
+		// Un-stick everything held on the host (the chord's up-strokes won't be forwarded).
+		flush_held(&mut g);
+		if let Some(app) = &g.app {
+			let _ = app.emit("kbd-released", ());
+		}
+		return true; // never leak the Z locally
+	}
+	if g.tx.is_some() {
 		// Key repeat re-fires down=true; forward each (the host de-dupes).
-		let _ = tx.try_send(InputEvent::Key { code: evdev, down });
+		let _ = g
+			.tx
+			.as_ref()
+			.unwrap()
+			.try_send(InputEvent::Key { code: evdev, down });
+		// Track held-on-host keys for the disengage flush.
+		if down {
+			g.held.insert(evdev);
+		} else {
+			g.held.remove(&evdev);
+		}
 		return true;
 	}
 	false
@@ -232,7 +370,49 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 /// motion + buttons + wheel, and suppress it locally (cursor lock — the mouse only
 /// drives the remote). Returns true (suppress) whenever a session is active.
 fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
-	let g = globals().lock().unwrap();
+	// Same click-to-engage gate as handle_key: not engaged → local mouse untouched.
+	if !ENGAGED.load(Ordering::SeqCst) {
+		return false;
+	}
+	let mut g = globals().lock().unwrap();
+	if g.tx.is_none() {
+		return false;
+	}
+	// A physical click while the LOCAL cursor sits OUTSIDE every Pulsar window must not
+	// go to the host — the user is clicking another application. (This happens when the
+	// device's MOVES bypass the driver capture — e.g. precision-touchpad pointer
+	// injection — so the cursor roams freely while buttons are still intercepted.)
+	// Implicit release, Parsec-style: disengage and pass the click through, so the
+	// FIRST click switches apps instead of silently clicking the remote.
+	if state & (0x001 | 0x004 | 0x010) != 0 {
+		use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+		use windows_sys::Win32::UI::WindowsAndMessaging::{
+			GetAncestor, GetCursorPos, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT,
+		};
+		let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+		if unsafe { GetCursorPos(&mut pt) } != 0 {
+			let hw = unsafe { WindowFromPoint(pt) };
+			// Compare the TOP-LEVEL ancestor's process: the window under the cursor over
+			// the video is the pulsar-render CHILD (a different process), but its root is
+			// our Tauri window — only a root owned by another app counts as "outside".
+			let root = if hw.is_null() {
+				hw
+			} else {
+				unsafe { GetAncestor(hw, GA_ROOT) }
+			};
+			let mut pid = 0u32;
+			unsafe { GetWindowThreadProcessId(root, &mut pid) };
+			if !root.is_null() && pid != unsafe { GetCurrentProcessId() } {
+				tracing::info!("click outside Pulsar while engaged → implicit release, click passes through");
+				ENGAGED.store(false, Ordering::SeqCst);
+				flush_held(&mut g);
+				if let Some(app) = &g.app {
+					let _ = app.emit("kbd-released", ());
+				}
+				return false; // the click acts locally (activates the other app)
+			}
+		}
+	}
 	let Some(tx) = &g.tx else { return false };
 	// Relative movement (skip absolute-coordinate mice — 0x001 = ABSOLUTE flag).
 	if flags & 0x001 == 0 && (x != 0 || y != 0) {
@@ -251,6 +431,10 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 		(0x020, 2, false),
 	] {
 		if state & bit != 0 {
+			if down {
+				// Diagnostic: every locally-SUPPRESSED physical click while engaged.
+				tracing::info!(button, "physical click suppressed (engaged) → forwarded to host");
+			}
 			let _ = tx.try_send(InputEvent::PointerButton { button, down });
 		}
 	}
@@ -271,10 +455,18 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 	{
 		let mut g = globals().lock().unwrap();
 		g.tx = Some(tx);
-		g.app = Some(app);
+		g.app = Some(app.clone());
 		g.ctrl_down = false;
 		g.alt_down = false;
 		g.shift_down = false;
+		g.rctrl_presses.clear();
+	}
+	// Sessions start DISENGAGED (click-to-engage) — except a kiosk `--connect` start,
+	// which engages immediately like the Linux evdev path.
+	if KIOSK_ENGAGE.swap(false, Ordering::SeqCst) {
+		engage(&app);
+	} else {
+		ENGAGED.store(false, Ordering::SeqCst);
 	}
 	// Native-renderer sessions also capture the mouse (relative); webview sessions
 	// read the pointer from the canvas instead, so keep mouse capture off there.
@@ -309,11 +501,13 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 /// thread down cleanly (posts WM_QUIT, which exits the pump and unhooks).
 pub fn disable() {
 	ENABLED.store(false, Ordering::SeqCst);
+	ENGAGED.store(false, Ordering::SeqCst);
 	// Interception: drop the filter so we stop capturing (frees keys for any other
 	// instance + the local OS).
 	set_capture_filter(false);
 	let tid = {
 		let mut g = globals().lock().unwrap();
+		flush_held(&mut g); // un-stick anything still held on the host
 		g.tx = None;
 		g.ctrl_down = false;
 		g.alt_down = false;
@@ -331,9 +525,21 @@ pub fn disable() {
 /// (Ctrl+Shift+M only opens the menu; see `handle_key`). No-op for grab state.
 pub fn overlay_suspend(_suspend: bool) {}
 
-/// Window focus changed. Windows uses a global LL/Interception hook with its own
-/// focus handling; no-op here (the Linux evdev-grab focus gate is the one that matters).
-pub fn set_focused(_focused: bool) {}
+/// Window focus changed. Losing ALL app focus while engaged must DISENGAGE the
+/// capture (Linux parity): a global LL/Interception hook otherwise keeps eating the
+/// keyboard while the user is in another app — the mouse looked free (they clicked
+/// away) but every keystroke still went to the remote.
+pub fn set_focused(focused: bool) {
+	tracing::info!(focused, "app focus changed");
+	APP_FOCUSED.store(focused, Ordering::SeqCst);
+	if !focused && ENGAGED.load(Ordering::SeqCst) {
+		let app = globals().lock().unwrap().app.clone();
+		match app {
+			Some(app) => release_engage(&app),
+			None => ENGAGED.store(false, Ordering::SeqCst),
+		}
+	}
+}
 
 /// Owns the hook for its lifetime: install → pump messages → uninstall.
 fn hook_thread() {
