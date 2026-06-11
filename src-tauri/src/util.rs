@@ -85,9 +85,12 @@ pub(crate) async fn connect_target(
 	node: &Arc<Node>,
 	discovery: Option<Arc<pulsar_core::discovery::Discovery>>,
 	target: &str,
+	network_mode: pulsar_core::config::NetworkMode,
 ) -> Result<(pulsar_core::Session, String), String> {
 	let s = target.trim();
 	if let Some(addr) = parse_target_addr(s) {
+		// An explicit IP target IS a direct connect by definition — honored even in
+		// relay-only mode (there is no relay route to a raw address).
 		let sess = node
 			.connect_direct(addr, None)
 			.await
@@ -95,7 +98,13 @@ pub(crate) async fn connect_target(
 		return Ok((sess, addr.to_string()));
 	}
 	let id = DeviceId::parse(s).ok_or("geçersiz kimlik veya IP")?;
-	if let Some(disc) = discovery {
+	// Relay-only must NOT take the same-LAN direct shortcut — the whole point of
+	// that mode is that traffic goes through the relay (policy/diagnostics).
+	let lan_allowed = !matches!(
+		network_mode,
+		pulsar_core::config::NetworkMode::RelayOnly
+	);
+	if let Some(disc) = discovery.filter(|_| lan_allowed) {
 		let lan = disc
 			.peers()
 			.await
@@ -134,7 +143,7 @@ pub(crate) fn data_sender(
 		.unwrap()
 		.get(&id)
 		.map(|p| p.data_tx.clone())
-		.ok_or_else(|| "oturum bulunamadı".into())
+		.ok_or_else(|| crate::i18n::t("err.session").into())
 }
 
 /// Forward an input event to a specific play session's host.
@@ -216,6 +225,68 @@ fn display_rotation_detect() -> u32 {
 #[cfg(not(windows))]
 fn display_rotation_detect() -> u32 {
 	0
+}
+
+/// Host: the primary display's refresh rate in Hz, or `None` if unknown. Used to NEGOTIATE the
+/// stream fps so the host never encodes faster than its own panel can scan out — a client that
+/// asks for 120 fps on a 60 Hz host gets capped to 60 (no point encoding duplicate frames; and the
+/// extra load was the user-visible "120 seçtim, değişmiyor" symptom). `PULSAR_HOST_HZ` forces a
+/// value (override if the auto-detect is wrong, or to test). Windows reads `dmDisplayFrequency`
+/// (same DEVMODE the rotation detect uses); Linux parses the active `xrandr` mode's `*` rate;
+/// other host OSes return `None` and the caller leaves the requested fps as-is.
+pub(crate) fn host_panel_hz() -> Option<u32> {
+	if let Some(h) = std::env::var("PULSAR_HOST_HZ")
+		.ok()
+		.and_then(|s| s.parse::<u32>().ok())
+		.filter(|h| *h > 0)
+	{
+		return Some(h);
+	}
+	host_panel_hz_detect()
+}
+
+#[cfg(windows)]
+fn host_panel_hz_detect() -> Option<u32> {
+	use windows_sys::Win32::Graphics::Gdi::{
+		EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+	};
+	unsafe {
+		let mut dm: DEVMODEW = std::mem::zeroed();
+		dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+		if EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) != 0 {
+			// dmDisplayFrequency: 0 or 1 mean "default/unknown" (per the Win32 docs) — treat as
+			// unknown so the caller doesn't clamp to a bogus 1 Hz.
+			let hz = dm.dmDisplayFrequency;
+			return (hz > 1).then_some(hz);
+		}
+	}
+	None
+}
+
+#[cfg(target_os = "linux")]
+fn host_panel_hz_detect() -> Option<u32> {
+	let out = std::process::Command::new("xrandr").output().ok()?;
+	let text = String::from_utf8_lossy(&out.stdout);
+	// The active mode line carries the current rate marked with a trailing `*`, e.g.
+	// "   1920x1080     60.00*+   59.94    50.00". Take the first `*`-marked token.
+	for line in text.lines() {
+		for tok in line.split_whitespace() {
+			if let Some(rate) = tok.strip_suffix('*').or_else(|| tok.strip_suffix("*+")) {
+				if let Ok(hz) = rate.parse::<f64>() {
+					let hz = hz.round() as u32;
+					if hz > 1 {
+						return Some(hz);
+					}
+				}
+			}
+		}
+	}
+	None
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn host_panel_hz_detect() -> Option<u32> {
+	None
 }
 
 /// Host: the primary display's pixel size `(width, height)`, or `None` if unknown. Used to clamp

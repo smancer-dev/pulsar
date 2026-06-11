@@ -24,6 +24,19 @@ use crate::viewer;
 
 mod hold;
 
+/// Whether this client advertises the cursor side-channel ([`StreamReq::cursor_external`]):
+/// it tells the host the client can draw the host pointer itself, so the host may use the
+/// cursorless KMS zero-copy capture and stream the pointer out-of-band. Opt-in behind
+/// `PULSAR_CURSOR_SC=1` while it's being proven on the Pi; default OFF preserves the
+/// embedded-cursor behavior. Only meaningful with the native renderer (the only client
+/// that can draw a side-channel cursor over the video).
+fn cursor_external_enabled() -> bool {
+	matches!(
+		std::env::var("PULSAR_CURSOR_SC").as_deref(),
+		Ok("1") | Ok("on") | Ok("true")
+	)
+}
+
 /// Tear down the viewer relay + any native renderer child spawned before the play
 /// session was registered. Called on the `request_launch`/`request_stream` early
 /// returns so a connect that fails after auth (but before `state.plays` insert)
@@ -77,7 +90,7 @@ pub(crate) async fn start_remote_play(
 		.lock()
 		.unwrap()
 		.clone()
-		.ok_or("önce çevrimiçi ol")?;
+		.ok_or(crate::i18n::t("err.online"))?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 
 	// Testing override: `PULSAR_FORCE_CODEC=h265|av1|h264` forces the requested codec without
@@ -85,7 +98,8 @@ pub(crate) async fn start_remote_play(
 	let codec = std::env::var("PULSAR_FORCE_CODEC").unwrap_or(codec);
 
 	let disc = state.discovery.lock().unwrap().clone();
-	let (mut sess, peer_label) = connect_target(&node, disc, &target).await?;
+	let net_mode = state.config.lock().unwrap().network_mode;
+	let (mut sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
 	// Real connection phase: the transport is now actually established (direct P2P or
 	// relay). Tell the Connecting screen so it reflects the truth instead of guessing.
 	let transport = match sess.transport() {
@@ -103,7 +117,7 @@ pub(crate) async fn start_remote_play(
 	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
 		.await?
 	{
-		return Err("Bağlantı reddedildi.".into());
+		return Err(crate::i18n::t("err.denied").into());
 	}
 	// Default codec ("auto"): prefer H.265, but only when the HOST can actually encode
 	// it — asked over the session (validated, hardware-only caps) BEFORE this client
@@ -130,26 +144,51 @@ pub(crate) async fn start_remote_play(
 		.iter()
 		.any(|f| f == pulsar_core::service::media::FEAT_NACK);
 	// This client's DECODE caps (startup probe). Unknown (probe still running /
-	// macOS stub failure) → assume the universal software pair.
-	let client_codecs: Vec<String> = {
-		let probed = state.local_caps.lock().unwrap().clone();
-		match probed {
-			Some(lc) if !lc.decoders.is_empty() => lc
-				.decoders
-				.iter()
-				.filter(|d| d.ok)
-				.map(|d| d.codec.clone())
-				.collect(),
-			_ => vec!["h264".to_string(), "h265".to_string()],
-		}
+	// macOS stub failure) → assume the universal software pair. `incompat` maps a codec
+	// to the host encoder families whose REAL bitstream this client can't decode even
+	// though the codec validated against a conformant sample (the diagnosed rkmpp-HEVC ×
+	// native-NVENC case) — used to prune the negotiated set below.
+	let probed_decoders = state
+		.local_caps
+		.lock()
+		.unwrap()
+		.clone()
+		.map(|lc| lc.decoders)
+		.unwrap_or_default();
+	let client_codecs: Vec<String> = if !probed_decoders.is_empty() {
+		probed_decoders
+			.iter()
+			.filter(|d| d.ok)
+			.map(|d| d.codec.clone())
+			.collect()
+	} else {
+		vec!["h264".to_string(), "h265".to_string()]
 	};
-	// Negotiated set = host-encodable ∩ client-decodable; "auto" picks by quality
-	// (av1 > h265 > h264). The SDP is written from this AFTER the pick, so the codec
-	// on the wire and the client's decoder can never disagree.
+	let incompat = |codec: &str| -> Vec<String> {
+		probed_decoders
+			.iter()
+			.find(|d| d.ok && d.codec == codec)
+			.map(|d| d.incompatible_with.clone())
+			.unwrap_or_default()
+	};
+	// Negotiated set = host-encodable ∩ client-decodable, MINUS any codec whose client
+	// decoder is known-incompatible with an encoder family the host actually has (it WILL
+	// use its HW encoder for that codec — e.g. host nvenc → HEVC over native NVENC, which
+	// the Pi's rkmpp can't decode, so HEVC is dropped and "auto" lands on h264). "auto"
+	// picks by quality (av1 > h265 > h264). The SDP is written from this AFTER the pick,
+	// so the codec on the wire and the client's decoder can never disagree.
 	let allowed: Vec<String> = host_caps
 		.codecs
 		.iter()
 		.filter(|c| client_codecs.iter().any(|d| d == *c))
+		.filter(|c| {
+			let bad = incompat(c);
+			let blocked = bad.iter().any(|f| host_caps.encoders.iter().any(|e| e == f));
+			if blocked {
+				tracing::info!(codec = %c, ?bad, "codec dropped: client decoder incompatible with host encoder family");
+			}
+			!blocked
+		})
 		.cloned()
 		.collect();
 	let codec = if codec.is_empty() || codec == "auto" {
@@ -177,7 +216,7 @@ pub(crate) async fn start_remote_play(
 	#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 	let mut view = viewer::start(mos)
 		.await
-		.map_err(|e| format!("video alıcı başlatılamadı: {e}"))?;
+		.map_err(|e| format!("{}: {e}", crate::i18n::t("err.videoRecv")))?;
 	let ws_port = view.ws_port;
 	let media_port = view.media_port;
 	// Audio flows as a second RTP stream to its own port; the host streams to it
@@ -256,8 +295,12 @@ pub(crate) async fn start_remote_play(
 								h,
 								game_mode,
 								pace_default,
+								crate::i18n::lang(),
 							),
-							None => None,
+							None => {
+								tracing::warn!("native render skipped: main window HWND unavailable");
+								None
+							}
 						};
 						if let Some(c) = rc.as_mut() {
 							if let Some(out) = c.stdout.take() {
@@ -268,14 +311,42 @@ pub(crate) async fn start_remote_play(
 							}
 						}
 						if let Some(c) = rc {
+							tracing::info!(pid = c.id(), port = vport, "native renderer (pulsar-render) spawned");
 							render_child = Some(c);
 							video_port = vport;
+							// Seed the egui overlay (same as the Linux branch): host caps filter
+							// the codec/encoder rows; the audio line seeds the Ses toggles.
+							{
+								use std::io::Write as _;
+								let enc = if encoder.is_empty() { "auto" } else { &encoder };
+								let line = format!(
+									"caps codecs={} encoders={} codec={} encoder={} conn={}",
+									allowed.join(","),
+									host_caps.encoders.join(","),
+									codec,
+									enc,
+									if transport == "relay" { "Relay" } else { "P2P" }
+								);
+								if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
+									let _ = writeln!(si, "{line}");
+									let _ = writeln!(
+										si,
+										"audio tx=1 mute={} mic=0",
+										if game_mode { 1 } else { 0 }
+									);
+								}
+								*caps_line.lock().unwrap() = line;
+								render_seed.lock().unwrap().audio = Some((true, game_mode, false));
+							}
 						} else if let Some(c) =
 							native_view::spawn_ffplay(&process::ffplay_bin(&app), &sdp)
 						{
 							// Fallback: separate fullscreen ffplay window.
+							tracing::warn!(pid = c.id(), port = vport, "pulsar-render failed → ffplay fallback window");
 							native_child = Some(c);
 							video_port = vport;
+						} else {
+							tracing::error!("both pulsar-render and ffplay failed to spawn — no video renderer");
 						}
 					}
 					#[cfg(all(unix, not(target_os = "macos")))]
@@ -336,7 +407,14 @@ pub(crate) async fn start_remote_play(
 							let mut rc = if std::env::var_os("PULSAR_USE_MPV").is_some() {
 								None
 							} else {
-								native_view::spawn_render(&rbin, &sdp, wid, game_mode, pace_default)
+								native_view::spawn_render(
+									&rbin,
+									&sdp,
+									wid,
+									game_mode,
+									pace_default,
+									crate::i18n::lang(),
+								)
 							};
 							if let Some(c) = rc.as_mut() {
 								if let Some(out) = c.stdout.take() {
@@ -516,6 +594,12 @@ pub(crate) async fn start_remote_play(
 		yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
 		decode_codecs: client_codecs.clone(),
 		media_over_session: mos,
+		// Cursor side-channel: the native renderer can draw the host pointer itself
+		// (so the host may use the cursorless KMS zero-copy capture and stream the
+		// pointer out-of-band). Opt-in behind PULSAR_CURSOR_SC=1 while it's proven on
+		// the Pi; default OFF keeps the embedded-cursor behavior. The webview client
+		// never sets it (no native overlay to draw the pointer into).
+		cursor_external: cursor_external_enabled(),
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
 		// Clean up the viewer + native renderer we already brought up before bailing.
@@ -635,6 +719,7 @@ pub(crate) async fn start_remote_play(
 		req_h,
 		req_fps,
 		req_kbps,
+		req.cursor_external,
 	));
 
 	state.plays.lock().unwrap().insert(

@@ -147,12 +147,26 @@ async fn respawn_render_for_codec(
 		.unwrap_or(true);
 	let rbin = crate::process::render_bin(app);
 	#[cfg(not(windows))]
-	let mut rc = crate::native_view::spawn_render(&rbin, &sdp, wid, game_mode, pace_default);
+	let mut rc = crate::native_view::spawn_render(
+		&rbin,
+		&sdp,
+		wid,
+		game_mode,
+		pace_default,
+		crate::i18n::lang(),
+	);
 	#[cfg(windows)]
 	let mut rc = {
 		let _ = wid; // X11 container XID — Linux-only; the HWND is re-resolved fresh
 		crate::process::window_hwnd(app).and_then(|h| {
-			crate::native_view::spawn_render_win(&rbin, &sdp, h, game_mode, pace_default)
+			crate::native_view::spawn_render_win(
+				&rbin,
+				&sdp,
+				h,
+				game_mode,
+				pace_default,
+				crate::i18n::lang(),
+			)
 		})
 	};
 	if let Some(c) = rc.as_mut() {

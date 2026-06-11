@@ -150,7 +150,16 @@ fn spawn_media_forwarders(
 ) -> Option<(u16, u16)> {
 	use pulsar_core::service::media;
 	let bind = || -> Option<(tokio::net::UdpSocket, u16)> {
-		let s = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+		// BIG receive buffer (like pulsar-core node.rs): the encoder bursts a whole
+		// IDR into this loopback intake at once, and the OS default (64 KiB on
+		// Windows) overflows instantly at high fps — at 1080p120 NVENC virtually
+		// every packet was dropped here (the client saw a 1 fps green stream).
+		let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).ok()?;
+		let _ = s.set_recv_buffer_size(4 * 1024 * 1024);
+		let _ = s.set_send_buffer_size(4 * 1024 * 1024);
+		s.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+			.ok()?;
+		let s: std::net::UdpSocket = s.into();
 		let port = s.local_addr().ok()?.port();
 		s.set_nonblocking(true).ok()?;
 		Some((tokio::net::UdpSocket::from_std(s).ok()?, port))
@@ -167,16 +176,41 @@ fn spawn_media_forwarders(
 		let mut ring: std::collections::VecDeque<(u16, Vec<u8>)> =
 			std::collections::VecDeque::with_capacity(NACK_RING);
 		let mut buf = vec![0u8; 2048];
+		// 1 Hz throughput meter (intake pkts/bytes + session send failures) — the
+		// "video reaches the client mangled/not at all" debugging needs to know
+		// WHERE the chain loses data, and this stage was silent.
+		let (mut m_pkts, mut m_bytes, mut m_gaps) = (0u64, 0u64, 0u64);
+		let mut m_last_seq: Option<u16> = None;
+		let mut m_at = std::time::Instant::now();
 		loop {
 			tokio::select! {
 				r = vsock.recv(&mut buf) => {
 					let Ok(n) = r else { break };
 					let rtp = &buf[..n];
 					if let Some(seq) = media::rtp_seq(rtp) {
+						if let Some(last) = m_last_seq {
+							let d = media::seq_forward(last, seq);
+							if d > 1 && d < 0x8000 {
+								m_gaps += (d - 1) as u64;
+							}
+						}
+						m_last_seq = Some(seq);
 						if ring.len() == NACK_RING {
 							ring.pop_front();
 						}
 						ring.push_back((seq, rtp.to_vec()));
+					}
+					m_pkts += 1;
+					m_bytes += n as u64;
+					if m_at.elapsed().as_secs() >= 1 {
+						tracing::info!(
+							pkts = m_pkts,
+							mbit = (m_bytes * 8) / 1_000_000,
+							gaps_before_intake = m_gaps,
+							"mos video forwarder throughput"
+						);
+						(m_pkts, m_bytes, m_gaps) = (0, 0, 0);
+						m_at = std::time::Instant::now();
 					}
 					if vtx.send(&media::frame(media::TAG_VIDEO, rtp)).await.is_err() {
 						break; // session gone
@@ -242,8 +276,19 @@ pub(super) fn make_on_stream(
 ) -> impl FnMut(StreamReq, SocketAddr) + Send + 'static {
 	let mut announced = false;
 	let mut stop_tx = Some(stop_tx);
+	// Cursor side-channel poller's liveness flag (Linux KMS path). Held across re-streams so a
+	// re-stream can stop the prior poller before (maybe) starting a new one — avoids stacking
+	// pollers when a session re-requests while still on the cursorless KMS capture.
+	#[cfg(target_os = "linux")]
+	let mut cursor_alive: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
 	move |req: StreamReq, addr: SocketAddr| {
 		let cfg = stream_cfg.lock().unwrap().clone();
+		// A (re-)stream supersedes any prior cursor poller; the (maybe) new KMS branch below
+		// starts a fresh one. Stopping here keeps it at most one per session.
+		#[cfg(target_os = "linux")]
+		if let Some(flag) = cursor_alive.take() {
+			flag.store(false, std::sync::atomic::Ordering::SeqCst);
+		}
 
 		// Media destinations. Legacy: plain UDP straight to the client's ports.
 		// Media-over-session (client opted in + this host advertised `mos`): the
@@ -349,7 +394,20 @@ pub(super) fn make_on_stream(
 			} else {
 				cfg.bitrate_kbps
 			};
-			let eff_fps = if req.fps > 0 { req.fps } else { cfg.fps };
+			let req_fps = if req.fps > 0 { req.fps } else { cfg.fps };
+			// Negotiate against the host panel (see the main path below for the rationale).
+			let panel_hz = crate::util::host_panel_hz();
+			let eff_fps = match panel_hz {
+				Some(hz) => req_fps.min(hz),
+				None => req_fps,
+			};
+			tracing::info!(
+				req_fps,
+				cfg_fps = cfg.fps,
+				panel_hz = panel_hz.unwrap_or(0),
+				eff_fps,
+				"host stream fps resolved (wayland)"
+			);
 			let (bitrate, fps) = (eff_bitrate, eff_fps);
 			// Pick the gst encoder family + codec from what THIS box validated
 			// (mpp/vaapi/nv hardware first, x264 terminal) honoring the request.
@@ -375,11 +433,16 @@ pub(super) fn make_on_stream(
 				});
 			// Encode summary for the client's stats panel (the Wayland path never sent
 			// one before, so the panel showed nothing).
+			let fps_part = if eff_fps != req_fps {
+				format!("{}fps ({} {})", fps, crate::i18n::t("stream.fpsRequested"), req_fps)
+			} else {
+				format!("{}fps", fps)
+			};
 			let _ = stats_out.try_send(DataMsg::Stats(format!(
-				"{} · {} · — · {}fps · {} Mbit hedef",
+				"{} · {} · — · {} · {} Mbit hedef",
 				vcodec_label(gcodec),
 				genc.label(),
-				fps,
+				fps_part,
 				(bitrate as f32 / 1000.0).round() as u32
 			)));
 			let token = restore_token.lock().unwrap().clone();
@@ -482,7 +545,30 @@ pub(super) fn make_on_stream(
 		} else {
 			cfg.height
 		};
-		let eff_fps = if req.fps > 0 { req.fps } else { cfg.fps };
+		let req_fps = if req.fps > 0 { req.fps } else { cfg.fps };
+		// Negotiate against the host panel: encoding above the host's own refresh just
+		// produces duplicate frames at extra cost (the user-visible "120 seçtim,
+		// değişmiyor" was a 120-req on a slower panel), so clamp to it when known.
+		let panel_hz = crate::util::host_panel_hz();
+		let eff_fps = match panel_hz {
+			Some(hz) => req_fps.min(hz),
+			None => req_fps,
+		};
+		// Diagnostic ceiling (`PULSAR_MAX_FPS`): bisect client-decoder fps limits live.
+		let eff_fps = match std::env::var("PULSAR_MAX_FPS")
+			.ok()
+			.and_then(|v| v.parse::<u32>().ok())
+		{
+			Some(m) => eff_fps.min(m),
+			None => eff_fps,
+		};
+		tracing::info!(
+			req_fps,
+			cfg_fps = cfg.fps,
+			panel_hz = panel_hz.unwrap_or(0),
+			eff_fps,
+			"host stream fps resolved"
+		);
 		let eff_bitrate = if req.bitrate_kbps > 0 {
 			req.bitrate_kbps
 		} else {
@@ -576,15 +662,32 @@ pub(super) fn make_on_stream(
 						// unusable for remote desktop. Probed, never assumed.
 						// `PULSAR_KMS`: 0 = never (bisect back to ximagesrc), 1 = force even
 						// for remote sessions (testing / hosts running a software cursor),
-						// unset = game-mode-gated default.
+						// unset = game-mode-gated default — EXTENDED so a remote session can
+						// also use KMS when the client draws the cursor itself
+						// (`cursor_external`): the missing hardware cursor is then supplied
+						// out-of-band (see `cursor.rs`), which was the only thing that pinned
+						// KMS to game mode. The cursor side-channel + PULSAR_KMS=1 stay the
+						// safety net (side-channel down / explicit force → old behavior).
 						let kms_mode = match std::env::var("PULSAR_KMS").as_deref() {
 							Ok("0") => false,
 							Ok("1") => true,
-							_ => req.game_mode,
+							_ => req.game_mode || req.cursor_external,
 						};
 						let kms = kms_mode
 							&& genc == pipeline::gst::GstEncoder::Mpp
 							&& crate::process::kms_encode_ok(genc, gcodec);
+						// Cursor side-channel: the KMS scan-out frame has NO hardware cursor
+						// (own DRM plane), so when the client asked to draw it itself
+						// (`cursor_external`) start the X pointer poller that streams the cursor
+						// position+shape out-of-band. The poller stops when `stats_out` closes
+						// (session teardown) — a re-stream that drops KMS simply doesn't start a
+						// new one and the old one self-stops with the prior session.
+						if kms && req.cursor_external {
+							let flag =
+								std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+							cursor_alive = Some(flag.clone());
+							crate::host::cursor::spawn(stats_out.clone(), flag);
+						}
 						// MPP eats BGRx via the RGA blitter — skip the CPU convert.
 						let direct_bgrx = genc == pipeline::gst::GstEncoder::Mpp;
 						let pipeline_str = if kms {
@@ -604,13 +707,36 @@ pub(super) fn make_on_stream(
 								direct_bgrx,
 							)
 						};
+						let fps_part = if eff_fps != req_fps {
+							format!(
+								"{}fps ({} {})",
+								eff_fps,
+								crate::i18n::t("stream.fpsRequested"),
+								req_fps
+							)
+						} else {
+							format!("{}fps", eff_fps)
+						};
+						// Resolution part: surface a host-clamped request ("1080p (istenen
+						// 1440p)") so the overlay res "Aktif:" line reads as a negotiation —
+						// same pattern as `fps_part`. eff_h was clamped to the host screen above.
+						let res_part = if req.height > 0 && req.height != eff_h {
+							format!(
+								"{}p ({} {}p)",
+								eff_h,
+								crate::i18n::t("stream.fpsRequested"),
+								req.height
+							)
+						} else {
+							format!("{}p", eff_h)
+						};
 						let base_label = format!(
-							"{} · {}{} · {}p · {}fps · {} Mbit hedef",
+							"{} · {}{} · {} · {} · {} Mbit hedef",
 							vcodec_label(gcodec),
 							genc.label(),
 							if kms { " (KMS)" } else { "" },
-							eff_h,
-							eff_fps,
+							res_part,
+							fps_part,
 							(eff_bitrate as f32 / 1000.0).round() as u32
 						);
 						let stats_enc = stats_out.clone();
@@ -785,12 +911,29 @@ pub(super) fn make_on_stream(
 		// part from the encode-pace meter below.
 		// Reflect the RESOLVED codec (after `resolve_codec` fallback), not the request —
 		// the client uses this to pick its decoder, so it must match what we actually send.
+		// The fps part is the overlay's FPS-combo "Aktif:" truth line (overlay.rs act(3)).
+		// When the host clamped the request to its panel, surface BOTH so "120 seçtim,
+		// değişmiyor" reads as a negotiation, not a bug: "60fps (istenen 120)".
+		let fps_part = if eff_fps != req_fps {
+			format!("{}fps ({} {})", eff_fps, crate::i18n::t("stream.fpsRequested"), req_fps)
+		} else {
+			format!("{}fps", eff_fps)
+		};
+		// Resolution part: when the client asked for a height the host couldn't honor
+		// (clamped to the host screen / config), surface BOTH so the overlay's res
+		// "Aktif:" line reads as a negotiation ("1080p (istenen 1440p)"), not a bug —
+		// same pattern as `fps_part` above.
+		let res_part = if req.height > 0 && req.height != eff_h {
+			format!("{}p ({} {}p)", eff_h, crate::i18n::t("stream.fpsRequested"), req.height)
+		} else {
+			format!("{}p", eff_h)
+		};
 		let base_label = format!(
-			"{} · {} · {}p · {}fps · {} Mbit hedef",
+			"{} · {} · {} · {} · {} Mbit hedef",
 			vcodec_label(codec),
 			encoder.label(),
-			eff_h,
-			eff_fps,
+			res_part,
+			fps_part,
 			(eff_bitrate as f32 / 1000.0).round() as u32
 		);
 		// encode_command always yields ("ffmpeg", args); run the bundled
@@ -962,7 +1105,7 @@ fn spawn_gst_paced_locked(
 			procs.push(child);
 			Ok((pid, ticked))
 		}
-		Err(e) => Err(format!("gst-launch-1.0 başlatılamadı: {e}")),
+		Err(e) => Err(format!("gst-launch-1.0 {}: {e}", crate::i18n::t("err.spawn"))),
 	}
 }
 
@@ -995,7 +1138,7 @@ fn spawn_gst_tracked(procs: &Arc<Mutex<Vec<Child>>>, pipeline: &str) -> Result<(
 			procs.lock().unwrap().push(child);
 			Ok(())
 		}
-		Err(e) => Err(format!("gst-launch-1.0 başlatılamadı: {e}")),
+		Err(e) => Err(format!("gst-launch-1.0 {}: {e}", crate::i18n::t("err.spawn"))),
 	}
 }
 
