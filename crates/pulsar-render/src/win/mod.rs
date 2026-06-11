@@ -41,8 +41,8 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
 	CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, PeekMessageW, RegisterClassW,
-	SetWindowPos, TranslateMessage, CW_USEDEFAULT, HMENU, MSG, PM_REMOVE, SWP_NOACTIVATE,
-	SWP_NOZORDER, WNDCLASSW, WS_CHILD, WS_VISIBLE,
+	SetWindowPos, TranslateMessage, CW_USEDEFAULT, HMENU, HWND_TOP, MSG, PM_REMOVE,
+	SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 
 // ---- shared control state (host → renderer over stdin) ---------------------------------
@@ -51,6 +51,12 @@ static PACE: AtomicBool = AtomicBool::new(true);
 static STATS: Mutex<[f32; 4]> = Mutex::new([0.0; 4]); // fps, latency_ms, decode_ms, mbps
 /// Parent (Tauri) HWND passed via `--wid`; the child window is created under it.
 static PARENT: AtomicU64 = AtomicU64::new(0);
+/// In-app embed rect (stdin `viewrect <x> <y> <w> <h>`, PHYSICAL px in the parent's
+/// client space): the frontend reports the session tab's content area so the video
+/// renders INSIDE the app — chrome/tabs stay visible, like the Linux native container.
+/// None = no report yet → fill the whole parent client area. A 0×0 rect hides the
+/// child (tab inactive / session screen unmounted).
+static VIEW_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 
 // ---- Win32 → egui input plumbing -------------------------------------------------------
 // `wndproc` (a free fn) collects input into these statics; `paint_overlay` drains them into a
@@ -66,6 +72,46 @@ static FS_REMOTE: Mutex<(String, Vec<crate::overlay::FsRow>)> =
 	Mutex::new((String::new(), Vec::new()));
 /// Relayed Enter (`kin k enter`) — consumed by the Chat composer as "send".
 static ENTER_IN: AtomicBool = AtomicBool::new(false);
+/// Network RTT in tenths of ms (app stdin `rtt <ms>`, from the keepalive ping/pong) —
+/// the overlay's "Gecikme" tile (same as linux.rs RTT_DMS).
+static RTT_DMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// ---- closed-state chrome (Linux parity: linux.rs statics of the same names) ----
+/// Always-on mini stats HUD while the overlay is closed (`statshud 0|1` / caps seed).
+static STATS_HUD: AtomicBool = AtomicBool::new(false);
+/// Parsec-style overlay-open button while closed (`ovbtn 0|1` / caps seed). Default ON
+/// like linux.rs — the frontend only sends `ovbtn` when the user turned it OFF.
+static OVERLAY_BTN: AtomicBool = AtomicBool::new(true);
+/// Overlay-open button top-left in egui POINTS (`ovbtnpos x y` / caps `btnpos=`).
+static OVBTN_POS: Mutex<(f32, f32)> = Mutex::new(crate::overlay::BTN_POS_DEFAULT);
+/// Live engage state from the app (`engaged 0|1`) — drives cursor visibility.
+static ENGAGED_R: AtomicBool = AtomicBool::new(false);
+/// Transient helper tooltip / toast: (text, armed-at, visible-secs).
+static HINT: Mutex<Option<(String, std::time::Instant, f32)>> = Mutex::new(None);
+/// Host's active encode summary (`hostenc <label>` stdin) — the overlay's per-field
+/// host stats ("kodlama ms", target Mbit) parse out of this (overlay::host_parts).
+static HOST_ENC: Mutex<String> = Mutex::new(String::new());
+/// Caps line payload (codecs, encoders, active codec, active encoder, conn label) —
+/// applied to the overlay state on the next paint.
+#[allow(clippy::type_complexity)]
+static CAPS_SEED: Mutex<Option<(Vec<String>, Vec<String>, String, String, String)>> =
+	Mutex::new(None);
+/// Live overlay-button drag (closed state): (down.x, down.y, btn0.x, btn0.y, moved) in
+/// egui points. The webview drag hotspot is buried under this child on Windows, so the
+/// renderer owns the drag: ≤3 pt = click (toggle), more = move + persist via
+/// `ov set btnpos x,y`.
+static BTN_DRAG: Mutex<Option<(f32, f32, f32, f32, bool)>> = Mutex::new(None);
+const HINT_SECS: f32 = 3.0;
+const HINT_FADE: f32 = 0.5;
+const TOAST_SECS: f32 = 6.0;
+
+fn arm_hint(kind: &str) {
+	let text = crate::i18n::t(if kind == "engage" {
+		"hint.engage"
+	} else {
+		"hint.click"
+	});
+	*HINT.lock().unwrap() = Some((text.to_string(), std::time::Instant::now(), HINT_SECS));
+}
 
 /// Overlay scale (egui points-per-physical-pixel). MUST match the Linux backend (`linux.rs`
 /// ppp=1.25) so the overlay is the IDENTICAL physical size + look on every platform.
@@ -101,6 +147,78 @@ fn stdin_control() {
 			}
 		} else if let Some(rest) = l.strip_prefix("pace ") {
 			PACE.store(rest.trim() != "0", Ordering::SeqCst);
+		} else if let Some(rest) = l.strip_prefix("engaged ") {
+			// Live engage state (cursor visibility) — app-side edges, like linux.rs.
+			let v = rest.trim();
+			ENGAGED_R.store(v == "1" || v == "on" || v == "true", Ordering::SeqCst);
+		} else if let Some(rest) = l.strip_prefix("hint ") {
+			arm_hint(rest.trim());
+		} else if let Some(rest) = l.strip_prefix("toast ") {
+			let rest = rest.trim();
+			if !rest.is_empty() {
+				*HINT.lock().unwrap() =
+					Some((rest.to_string(), std::time::Instant::now(), TOAST_SECS));
+			}
+		} else if let Some(rest) = l.strip_prefix("hostenc ") {
+			*HOST_ENC.lock().unwrap() = rest.trim().to_string();
+		} else if let Some(rest) = l.strip_prefix("statshud ") {
+			let v = rest.trim();
+			STATS_HUD.store(v == "1" || v == "on" || v == "true", Ordering::SeqCst);
+		} else if let Some(rest) = l.strip_prefix("ovbtn ") {
+			let v = rest.trim();
+			OVERLAY_BTN.store(v == "1" || v == "on" || v == "true", Ordering::SeqCst);
+		} else if let Some(rest) = l.strip_prefix("ovbtnpos ") {
+			let v: Vec<f32> = rest
+				.split_whitespace()
+				.filter_map(|x| x.parse().ok())
+				.collect();
+			if v.len() >= 2 {
+				*OVBTN_POS.lock().unwrap() = (v[0], v[1]);
+			}
+		} else if let Some(rest) = l.strip_prefix("caps ") {
+			// Host caps + active request + persisted chrome seeds — same fields as
+			// linux.rs: codecs/encoders filter the overlay menu rows, codec/encoder
+			// preselect, conn labels the transport, statshud/ovbtn/btnpos re-seed
+			// the closed-state chrome after a respawn.
+			let (mut codecs, mut encoders) = (Vec::new(), Vec::new());
+			let (mut codec, mut encoder, mut conn) = (String::new(), String::new(), String::new());
+			for kv in rest.split_whitespace() {
+				if let Some((k, v)) = kv.split_once('=') {
+					let on = v == "1" || v == "on" || v == "true";
+					match k {
+						"codecs" => codecs = v.split(',').map(str::to_string).collect(),
+						"encoders" => encoders = v.split(',').map(str::to_string).collect(),
+						"codec" => codec = v.to_string(),
+						"encoder" => encoder = v.to_string(),
+						"conn" => conn = v.to_string(),
+						"statshud" => STATS_HUD.store(on, Ordering::SeqCst),
+						"ovbtn" => OVERLAY_BTN.store(on, Ordering::SeqCst),
+						"btnpos" => {
+							if let Some((x, y)) = v.split_once(',') {
+								if let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) {
+									*OVBTN_POS.lock().unwrap() = (x, y);
+								}
+							}
+						}
+						_ => {}
+					}
+				}
+			}
+			*CAPS_SEED.lock().unwrap() = Some((codecs, encoders, codec, encoder, conn));
+		} else if let Some(rest) = l.strip_prefix("rtt ") {
+			// Keepalive RTT from the app — overrides the latency tile (linux.rs parity).
+			if let Ok(ms) = rest.trim().parse::<f32>() {
+				RTT_DMS.store((ms * 10.0) as u32, Ordering::Relaxed);
+			}
+		} else if let Some(rest) = l.strip_prefix("viewrect ") {
+			// In-app embed rect (physical px) — see VIEW_RECT above.
+			let v: Vec<i32> = rest
+				.split_whitespace()
+				.filter_map(|x| x.parse().ok())
+				.collect();
+			if v.len() >= 4 {
+				*VIEW_RECT.lock().unwrap() = Some((v[0], v[1], v[2], v[3]));
+			}
 		} else if let Some(rest) = l.strip_prefix("chat ") {
 			// `chat in <text>` (host) / `chat out <text>` (our own, echoed by the app).
 			let mut it = rest.splitn(2, ' ');
@@ -182,6 +300,87 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 	use windows::Win32::UI::WindowsAndMessaging::{
 		WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
 	};
+	// Overlay CLOSED: hide the cursor while input is captured (engage state from the
+	// app), and treat a left-click as either the overlay-open button (hit-test — the
+	// webview hotspot is buried under this child on Windows) or click-to-engage.
+	if !OPEN.load(Ordering::SeqCst) {
+		use windows::Win32::UI::WindowsAndMessaging::{SetCursor, WM_SETCURSOR};
+		if msg == WM_SETCURSOR && ENGAGED_R.load(Ordering::SeqCst) {
+			unsafe { SetCursor(None) };
+			return LRESULT(1);
+		}
+		if msg == WM_LBUTTONDOWN {
+			use std::io::Write as _;
+			// Button hit-test in egui POINTS (same clamp as overlay::draw_open_button).
+			let p = lparam_xy(lp);
+			let mut rc = RECT::default();
+			let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+			let (sw, sh) = (
+				(rc.right - rc.left) as f32 / OVERLAY_PPP,
+				(rc.bottom - rc.top) as f32 / OVERLAY_PPP,
+			);
+			let mut hit_btn = false;
+			let (mut bx, mut by) = *OVBTN_POS.lock().unwrap();
+			if OVERLAY_BTN.load(Ordering::SeqCst) {
+				let bs = crate::overlay::BTN_SIZE;
+				bx = bx.clamp(0.0, (sw - bs).max(0.0));
+				by = by.clamp(0.0, (sh - bs).max(0.0));
+				hit_btn = p.x >= bx && p.x <= bx + bs && p.y >= by && p.y <= by + bs;
+			}
+			if hit_btn {
+				// Click vs drag is decided on the UP edge (≤3 pt = click → toggle).
+				use windows::Win32::UI::Input::KeyboardAndMouse::SetCapture;
+				unsafe { SetCapture(hwnd) };
+				*BTN_DRAG.lock().unwrap() = Some((p.x, p.y, bx, by, false));
+			} else {
+				// Click-to-engage; the engaging click is not forwarded to the host.
+				println!("ov engage");
+				let _ = std::io::stdout().flush();
+			}
+			return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+		}
+		if msg == WM_MOUSEMOVE {
+			let mut g = BTN_DRAG.lock().unwrap();
+			if let Some((dx0, dy0, bx0, by0, moved)) = g.as_mut() {
+				let p = lparam_xy(lp);
+				let (dx, dy) = (p.x - *dx0, p.y - *dy0);
+				if dx.abs() + dy.abs() > 3.0 {
+					*moved = true;
+				}
+				if *moved {
+					let mut rc = RECT::default();
+					let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+					let (sw, sh) = (
+						(rc.right - rc.left) as f32 / OVERLAY_PPP,
+						(rc.bottom - rc.top) as f32 / OVERLAY_PPP,
+					);
+					let bs = crate::overlay::BTN_SIZE;
+					let nx = (*bx0 + dx).clamp(0.0, (sw - bs).max(0.0));
+					let ny = (*by0 + dy).clamp(0.0, (sh - bs).max(0.0));
+					*OVBTN_POS.lock().unwrap() = (nx, ny); // live visual follow
+				}
+				return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+			}
+		}
+		if msg == WM_LBUTTONUP {
+			if let Some((_, _, _, _, moved)) = BTN_DRAG.lock().unwrap().take() {
+				use std::io::Write as _;
+				use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+				unsafe {
+					let _ = ReleaseCapture();
+				}
+				if moved {
+					let (x, y) = *OVBTN_POS.lock().unwrap();
+					// Persist through the app (frontend mirrors + re-seeds on respawn).
+					println!("ov set btnpos {x:.0},{y:.0}");
+				} else {
+					println!("ov toggle");
+				}
+				let _ = std::io::stdout().flush();
+				return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+			}
+		}
+	}
 	// Only collect input while the overlay is open (we hold mouse capture then).
 	if OPEN.load(Ordering::SeqCst) {
 		let mut ev = EGUI_EVENTS.lock().unwrap();
@@ -234,6 +433,9 @@ struct Renderer {
 	rtv: Option<ID3D11RenderTargetView>,
 	width: u32,
 	height: u32,
+	// Child position within the parent client area (frontend `viewrect`; 0,0 = full fill).
+	x: i32,
+	y: i32,
 	// Video chain (built lazily): MF decoder + NV12→RGB VideoProcessor.
 	decoder: Option<decode::Decoder>,
 	present: Option<present::Present>,
@@ -241,9 +443,14 @@ struct Renderer {
 	// Decoded source size (from the NV12 texture); drives the letterbox + processor rebuild.
 	src_w: u32,
 	src_h: u32,
-	// fps counter for the `vidsink-fps` HUD line.
+	// fps counter for the `vidsink-fps` HUD line + self-measured stream metrics
+	// (bytes → mbps, decode wall time → ms) so the overlay shows real numbers
+	// without an app-side echo (the stdin `stat` line never arrives on Windows).
 	frames: u32,
 	last_fps_at: std::time::Instant,
+	bytes: u64,
+	dec_ms_acc: f32,
+	dec_n: u32,
 	// egui overlay (same overlay.rs UI as Linux), painted on the swapchain after the video.
 	egui_ctx: egui::Context,
 	painter: Option<egui_paint::EguiPaint>,
@@ -321,6 +528,8 @@ impl Renderer {
 			rtv: None,
 			width: w.max(1),
 			height: h.max(1),
+			x: 0,
+			y: 0,
 			decoder: None,
 			present: None,
 			codec,
@@ -328,6 +537,9 @@ impl Renderer {
 			src_h: 0,
 			frames: 0,
 			last_fps_at: std::time::Instant::now(),
+			bytes: 0,
+			dec_ms_acc: 0.0,
+			dec_n: 0,
 			egui_ctx,
 			painter,
 			ostate,
@@ -342,29 +554,32 @@ impl Renderer {
 	/// video). Only when OPEN. Selector changes flow OUT as `ov …` stdout lines (same as Linux).
 	unsafe fn paint_overlay(&mut self) {
 		let open = OPEN.load(Ordering::SeqCst);
-		// Capture/release the mouse on the open↔close edge so clicks reach the child window.
+		// Open↔close edge bookkeeping. NO SetCapture while open: the child receives its
+		// own clicks anyway (it is the window under the cursor), and holding the mouse
+		// capture made the FIRST click on another application vanish into this window
+		// (the user had to click twice to switch apps).
 		if open != self.was_open {
-			use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 			if open {
-				let _ = SetCapture(self.hwnd);
 				// The Files view re-requests the remote listing once per overlay visit.
 				self.ov_ui.remote_requested = false;
 			} else {
-				let _ = ReleaseCapture();
 				EGUI_EVENTS.lock().unwrap().clear();
 				ENTER_IN.store(false, Ordering::SeqCst);
 			}
 			self.was_open = open;
 		}
 		if !open {
+			self.paint_closed();
 			return;
 		}
+		self.apply_caps_seed();
 		let Some(painter) = self.painter.as_mut() else {
 			return;
 		};
 		let Some(rtv) = self.rtv.clone() else { return };
 
-		// Live stats from the host (stdin `stat …`).
+		// Live stats: self-measured by tick_fps (fps/decode/mbps) — or stdin `stat …`
+		// if the app ever sends one. The latency tile prefers the keepalive RTT.
 		let s = *STATS.lock().unwrap();
 		if s[0] > 0.0 {
 			self.ostate.fps = s[0];
@@ -372,8 +587,18 @@ impl Renderer {
 			self.ostate.decode_ms = s[2];
 			self.ostate.mbps = s[3];
 		}
+		let rtt = RTT_DMS.load(Ordering::Relaxed) as f32 / 10.0;
+		if rtt > 0.0 {
+			self.ostate.latency_ms = rtt;
+		}
+		self.ostate.host_active = HOST_ENC.lock().unwrap().clone();
 		self.ostate.open = true;
 		self.ostate.pace = PACE.load(Ordering::SeqCst);
+		// Mirror the closed-state chrome toggles every frame (like linux.rs) so the
+		// overlay rows show + apply the live values (stdin echoes land here too).
+		self.ostate.stats_hud = STATS_HUD.load(Ordering::SeqCst);
+		self.ostate.overlay_btn = OVERLAY_BTN.load(Ordering::SeqCst);
+		self.ostate.btn_pos = *OVBTN_POS.lock().unwrap();
 
 		// Build RawInput (ppp = 1.0, so points == physical px). Drain the wndproc events.
 		let events = std::mem::take(&mut *EGUI_EVENTS.lock().unwrap());
@@ -417,6 +642,11 @@ impl Renderer {
 						"bitrate" => self.ostate.bitrate = val.clone(),
 						"quality" => self.ostate.quality = val.clone(),
 						"pace" => self.ostate.pace = val == "on",
+						// Local echo for the closed-state chrome toggles: flip the statics
+						// NOW so the row + HUD react instantly; the frontend's stdin echo
+						// (`statshud`/`ovbtn`) just confirms the same value later.
+						"statshud" => STATS_HUD.store(val == "on", Ordering::SeqCst),
+						"ovbtn" => OVERLAY_BTN.store(val == "on", Ordering::SeqCst),
 						_ => {}
 					}
 					println!("ov set {field} {val}");
@@ -437,6 +667,108 @@ impl Renderer {
 		let _ = std::io::stdout().flush();
 
 		// Upload texture deltas, then paint the tessellated primitives over the video.
+		let _ = painter.update_textures(&self.device, &self.context, &out.textures_delta);
+		let prims = self
+			.egui_ctx
+			.tessellate(out.shapes, self.egui_ctx.pixels_per_point());
+		let _ = painter.paint(
+			&self.device,
+			&self.context,
+			&rtv,
+			[self.width, self.height],
+			self.egui_ctx.pixels_per_point(),
+			&prims,
+		);
+	}
+
+	/// Apply a pending caps line (host codec/encoder lists + active request + conn
+	/// label) to the overlay state — one-shot per received line.
+	fn apply_caps_seed(&mut self) {
+		if let Some((codecs, encoders, codec, encoder, conn)) = CAPS_SEED.lock().unwrap().take() {
+			self.ostate.host_codecs = codecs;
+			self.ostate.host_encoders = encoders;
+			if !codec.is_empty() {
+				self.ostate.codec = codec;
+			}
+			if !encoder.is_empty() {
+				self.ostate.encoder = encoder;
+			}
+			if !conn.is_empty() {
+				self.ostate.conn_label = conn;
+			}
+		}
+	}
+
+	/// Closed-state chrome (Linux-parity with linux.rs's `else` paint branch): the mini
+	/// stats HUD, the Parsec-style overlay-open button and the transient helper tooltip,
+	/// drawn over the live video while the overlay is CLOSED. Display chrome only — the
+	/// open-button CLICK is hit-tested in `wndproc` (this child owns the pointer here).
+	unsafe fn paint_closed(&mut self) {
+		// Expire + fade the tooltip (alpha 1→0 over the last HINT_FADE seconds).
+		let hint_text: Option<(String, f32)> = {
+			let mut g = HINT.lock().unwrap();
+			let mut out = None;
+			if let Some((text, t0, secs)) = g.as_ref() {
+				let el = t0.elapsed().as_secs_f32();
+				if el >= *secs {
+					*g = None;
+				} else {
+					let alpha = ((secs - el) / HINT_FADE).min(1.0);
+					out = Some((text.clone(), alpha));
+				}
+			}
+			out
+		};
+		let stats_hud = STATS_HUD.load(Ordering::SeqCst);
+		let ovbtn = OVERLAY_BTN.load(Ordering::SeqCst);
+		if !stats_hud && !ovbtn && hint_text.is_none() {
+			return;
+		}
+		// Sync the display state (same sources as the open path).
+		let s = *STATS.lock().unwrap();
+		if s[0] > 0.0 {
+			self.ostate.fps = s[0];
+			self.ostate.latency_ms = s[1];
+			self.ostate.decode_ms = s[2];
+			self.ostate.mbps = s[3];
+		}
+		let rtt = RTT_DMS.load(Ordering::Relaxed) as f32 / 10.0;
+		if rtt > 0.0 {
+			self.ostate.latency_ms = rtt;
+		}
+		self.ostate.host_active = HOST_ENC.lock().unwrap().clone();
+		self.apply_caps_seed();
+		self.ostate.open = false;
+		self.ostate.stats_hud = stats_hud;
+		self.ostate.overlay_btn = ovbtn;
+		self.ostate.btn_pos = *OVBTN_POS.lock().unwrap();
+		let Some(painter) = self.painter.as_mut() else {
+			return;
+		};
+		let Some(rtv) = self.rtv.clone() else { return };
+		let raw = egui::RawInput {
+			screen_rect: Some(egui::Rect::from_min_size(
+				egui::pos2(0.0, 0.0),
+				egui::vec2(
+					self.width as f32 / OVERLAY_PPP,
+					self.height as f32 / OVERLAY_PPP,
+				),
+			)),
+			events: Vec::new(),
+			..Default::default()
+		};
+		let ostate = &self.ostate;
+		let out = self.egui_ctx.run(raw, |ctx| {
+			if stats_hud {
+				crate::overlay::draw_hud(ctx, ostate);
+			}
+			if ovbtn {
+				let _ = crate::overlay::draw_open_button(ctx, ostate);
+			}
+			if let Some((text, alpha)) = &hint_text {
+				crate::overlay::draw_hint(ctx, text, *alpha);
+			}
+		});
 		let _ = painter.update_textures(&self.device, &self.context, &out.textures_delta);
 		let prims = self
 			.egui_ctx
@@ -475,6 +807,8 @@ impl Renderer {
 				}
 			}
 		}
+		self.bytes += au.data.len() as u64;
+		let dec_t0 = std::time::Instant::now();
 		let texs = match self.decoder.as_mut().unwrap().decode(au) {
 			Ok(t) => t,
 			Err(e) => {
@@ -482,6 +816,8 @@ impl Renderer {
 				return;
 			}
 		};
+		self.dec_ms_acc += dec_t0.elapsed().as_secs_f32() * 1000.0;
+		self.dec_n += 1;
 		if let Some(nv12) = texs.into_iter().last() {
 			self.show_frame(&nv12);
 		}
@@ -533,10 +869,27 @@ impl Renderer {
 		let dt = self.last_fps_at.elapsed();
 		if dt.as_secs_f32() >= 1.0 {
 			let fps = self.frames as f32 / dt.as_secs_f32();
-			println!("vidsink-fps {fps:.0} {}x{}", self.src_w, self.src_h);
+			let mbps = (self.bytes as f32 * 8.0) / dt.as_secs_f32() / 1_000_000.0;
+			let dec = if self.dec_n > 0 {
+				self.dec_ms_acc / self.dec_n as f32
+			} else {
+				0.0
+			};
+			// 4-field line like the Linux backends (fps, dims, mbit, decode-ms) so the
+			// app's render_stats reader gets real values for the webview HUD too.
+			println!(
+				"vidsink-fps {fps:.0} {}x{} {mbps:.1} {dec:.1}",
+				self.src_w, self.src_h
+			);
 			use std::io::Write;
 			let _ = std::io::stdout().flush();
+			// Feed the overlay directly: no stdin `stat` echo exists on Windows; these
+			// self-measured numbers ARE the HUD source (latency comes from `rtt`).
+			*STATS.lock().unwrap() = [fps, 0.0, dec, mbps];
 			self.frames = 0;
+			self.bytes = 0;
+			self.dec_ms_acc = 0.0;
+			self.dec_n = 0;
 			self.last_fps_at = std::time::Instant::now();
 		}
 	}
@@ -554,23 +907,37 @@ impl Renderer {
 	/// Match the child window + swapchain to the parent client area (follows resize/fullscreen,
 	/// like linux.rs's XGetGeometry/XResizeWindow loop).
 	unsafe fn track_parent(&mut self) {
-		let mut rc = RECT::default();
-		if GetClientRect(self.parent, &mut rc).is_err() {
+		// Frontend-driven embed rect (stdin `viewrect`) wins: position over the session
+		// tab's CONTENT area so the app chrome/tabs stay visible (Linux-container parity).
+		// Before the first report, fill the whole parent client area as before.
+		let (x, y, w, h) = match *VIEW_RECT.lock().unwrap() {
+			Some((_, _, vw, vh)) if vw <= 0 || vh <= 0 => {
+				// Tab inactive / unmounted: park the child as 1×1 offscreen (cheap "hide" —
+				// no extra show/hide state to track; the next nonzero rect restores it).
+				(-1, -1, 1u32, 1u32)
+			}
+			Some((vx, vy, vw, vh)) => (vx, vy, vw as u32, vh as u32),
+			// No viewrect yet: stay PARKED instead of filling the parent — filling first
+			// covered the session top bar until the frontend's first report landed, so
+			// the tabs "appeared late". The frontend always reports on session mount.
+			None => (-1, -1, 1, 1),
+		};
+		if x == self.x && y == self.y && w == self.width && h == self.height {
 			return;
 		}
-		let w = (rc.right - rc.left).max(1) as u32;
-		let h = (rc.bottom - rc.top).max(1) as u32;
-		if w == self.width && h == self.height {
-			return;
-		}
+		self.x = x;
+		self.y = y;
+		// HWND_TOP (not SWP_NOZORDER): the webview sibling (WRY_WEBVIEW/Chrome_WidgetWin)
+		// otherwise sits ABOVE this child and the video is fully hidden behind the session
+		// screen — the "connected but nothing renders" Windows bug. No-op when already top.
 		let _ = SetWindowPos(
 			self.hwnd,
-			None,
-			0,
-			0,
+			HWND_TOP,
+			x,
+			y,
 			w as i32,
 			h as i32,
-			SWP_NOZORDER | SWP_NOACTIVATE,
+			SWP_NOACTIVATE,
 		);
 		// Resize the swapchain: drop the RTV first, ResizeBuffers, rebuild.
 		self.rtv = None;
@@ -709,6 +1076,9 @@ unsafe fn event_loop(
 		None,
 	)?;
 	let _ = CW_USEDEFAULT; // (kept for reference; child uses explicit geometry)
+	// Raise above the webview sibling NOW — track_parent only re-asserts on resize, and a
+	// child left below WRY_WEBVIEW renders invisibly behind the session screen.
+	let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
 
 	let mut r = Renderer::new(hwnd, parent, w0, h0, codec, mode)?;
 
@@ -741,10 +1111,28 @@ unsafe fn event_loop(
 
 	// Pump Win32 messages + drain decode + present.
 	let mut msg = MSG::default();
+	let mut cursor_hidden = false;
 	loop {
 		while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
 			let _ = TranslateMessage(&msg);
 			DispatchMessageW(&msg);
+		}
+		// Cursor visibility tracks the ENGAGE state (linux.rs parity). While engaged the
+		// Interception capture suppresses mouse messages entirely, so WM_SETCURSOR never
+		// fires — assert it from the render loop (this thread owns the window under the
+		// frozen cursor; SetCursor from here is honored).
+		{
+			use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_ARROW};
+			let hide = ENGAGED_R.load(Ordering::SeqCst) && !OPEN.load(Ordering::SeqCst);
+			if hide {
+				SetCursor(None);
+				cursor_hidden = true;
+			} else if cursor_hidden {
+				if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+					SetCursor(arrow);
+				}
+				cursor_hidden = false;
+			}
 		}
 		r.track_parent();
 		// Drain all queued AUs this tick (decode is fast; present shows the newest frame).

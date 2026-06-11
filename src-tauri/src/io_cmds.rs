@@ -22,7 +22,7 @@ pub(crate) async fn send_clipboard(
 	data_sender(&state, id)?
 		.send(DataMsg::Clipboard(text))
 		.await
-		.map_err(|_| "pano gönderilemedi".to_string())
+		.map_err(|_| crate::i18n::t("err.clipboard").to_string())
 }
 
 /// Client → host: send a chat line.
@@ -35,7 +35,7 @@ pub(crate) async fn send_chat(
 	data_sender(&state, id)?
 		.send(DataMsg::Chat(text))
 		.await
-		.map_err(|_| "mesaj gönderilemedi".to_string())
+		.map_err(|_| crate::i18n::t("err.message").to_string())
 }
 
 /// Host → client: reply to a connected peer's chat.
@@ -54,7 +54,7 @@ pub(crate) async fn host_send_chat(
 	let tx = tx.ok_or_else(|| "cihaz bağlı değil".to_string())?;
 	tx.send(DataMsg::Chat(text.clone()))
 		.await
-		.map_err(|_| "mesaj gönderilemedi".to_string())?;
+		.map_err(|_| crate::i18n::t("err.message").to_string())?;
 	// Into the backlog too: sent lines have no broadcast event of their own, so a
 	// re-opened connections window rebuilds the full conversation from here.
 	state.chat_log.lock().unwrap().push((peer, text, true));
@@ -92,18 +92,18 @@ pub(crate) async fn send_file(
 		chunks,
 	})
 	.await
-	.map_err(|_| "dosya gönderilemedi".to_string())?;
+	.map_err(|_| crate::i18n::t("err.file").to_string())?;
 	for (i, ch) in data.chunks(CHUNK).enumerate() {
 		tx.send(DataMsg::FileChunk {
 			index: i as u32,
 			data: ch.to_vec(),
 		})
 		.await
-		.map_err(|_| "dosya gönderilemedi".to_string())?;
+		.map_err(|_| crate::i18n::t("err.file").to_string())?;
 	}
 	tx.send(DataMsg::FileEnd)
 		.await
-		.map_err(|_| "dosya gönderilemedi".to_string())
+		.map_err(|_| crate::i18n::t("err.file").to_string())
 }
 
 /// Client → host: send a local file by its HOME-relative path (the file panel's
@@ -119,7 +119,7 @@ pub(crate) async fn send_file_path(
 	let tx = data_sender(&state, id)?;
 	crate::fs_browse::send_file_at(&tx, &path)
 		.await
-		.ok_or_else(|| "dosya gönderilemedi".to_string())
+		.ok_or_else(|| crate::i18n::t("err.file").to_string())
 }
 
 /// Client: start streaming the microphone to the host (raw PCM over the session).
@@ -127,7 +127,7 @@ pub(crate) async fn send_file_path(
 pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(), String> {
 	let (tx, mic_slot) = {
 		let plays = state.plays.lock().unwrap();
-		let p = plays.get(&id).ok_or("oturum bulunamadı")?;
+		let p = plays.get(&id).ok_or(crate::i18n::t("err.session"))?;
 		(p.data_tx.clone(), p.mic.clone())
 	};
 	// Hold the slot lock across check→spawn→insert (spawn_mic_recorder is
@@ -140,8 +140,8 @@ pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(),
 		return Ok(()); // already on
 	}
 	let mut child =
-		spawn_mic_recorder().ok_or("mikrofon kaydedici bulunamadı (parecord/pw-record/arecord)")?;
-	let stdout = child.stdout.take().ok_or("mikrofon çıkışı alınamadı")?;
+		spawn_mic_recorder().ok_or(crate::i18n::t("err.micRecorder"))?;
+	let stdout = child.stdout.take().ok_or(crate::i18n::t("err.micOutput"))?;
 	*slot = Some(child);
 	drop(slot);
 	// Blocking read loop on a dedicated thread; killing the child ends it.
@@ -250,7 +250,7 @@ pub(crate) async fn kbd_capture_start(
 			kbdhook::enable(app, tx, mouse);
 			Ok(())
 		}
-		None => Err("oturum bulunamadı".into()),
+		None => Err(crate::i18n::t("err.session").into()),
 	}
 }
 
@@ -271,12 +271,15 @@ pub(crate) fn kbd_engage(app: AppHandle) -> Result<(), String> {
 	Ok(())
 }
 
-/// Client (Linux native): position the in-app native-video container over the session
-/// tab's content area (viewport CSS px == GDK logical px). Zero area hides it (the
-/// tab went inactive / the session screen unmounted). No-op elsewhere.
+/// Client (native): position the in-app native video over the session tab's content
+/// area. Linux: moves the pass-through GDK container (viewport CSS px == GDK logical
+/// px). Windows: streams `viewrect` (scaled to PHYSICAL px) to the renderer child over
+/// stdin — same effect, chrome/tabs stay visible. Zero area hides it (the tab went
+/// inactive / the session screen unmounted). No-op on macOS.
 #[tauri::command]
 pub(crate) fn native_view_rect(
 	app: AppHandle,
+	state: State<'_, AppState>,
 	id: u64,
 	x: i32,
 	y: i32,
@@ -284,9 +287,28 @@ pub(crate) fn native_view_rect(
 	h: i32,
 ) -> Result<(), String> {
 	#[cfg(all(unix, not(target_os = "macos")))]
-	crate::render::native_container_rect(&app, id, x, y, w, h);
-	#[cfg(not(all(unix, not(target_os = "macos"))))]
-	let _ = (app, id, x, y, w, h);
+	{
+		let _ = &state;
+		crate::render::native_container_rect(&app, id, x, y, w, h);
+	}
+	#[cfg(windows)]
+	{
+		use tauri::Manager as _;
+		// CSS px → physical px (the Win32 child lives in physical client coords).
+		let scale = app
+			.get_webview_window("main")
+			.and_then(|w| w.scale_factor().ok())
+			.unwrap_or(1.0);
+		let px = |v: i32| (v as f64 * scale).round() as i32;
+		use std::io::Write as _;
+		if let Some(p) = state.plays.lock().unwrap().get(&id) {
+			if let Some(si) = p.render_stdin.lock().unwrap().as_mut() {
+				let _ = writeln!(si, "viewrect {} {} {} {}", px(x), px(y), px(w), px(h));
+			}
+		}
+	}
+	#[cfg(target_os = "macos")]
+	let _ = (app, state, id, x, y, w, h);
 	Ok(())
 }
 

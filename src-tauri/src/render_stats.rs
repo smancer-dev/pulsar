@@ -69,14 +69,20 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 		// First REAL frames (fps/bitrate > 0) ⇒ the stream is actually up — the UI keeps
 		// its Connecting screen until this fires (one-shot per renderer process).
 		let mut ready_sent = false;
+		let mut first_line_logged = false;
 		for line in reader.lines() {
 			let Ok(line) = line else { break };
+			if !first_line_logged {
+				first_line_logged = true;
+				tracing::info!(%line, "renderer first stdout line");
+			}
 			if let Some(rest) = line.strip_prefix("vidsink-fps ") {
 				let mut it = rest.split_whitespace();
 				let fps = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 				let _dims = it.next();
 				let mbps = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 				let ms = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+				tracing::debug!(fps, mbps, decode_ms = ms, "render stats");
 				let _ = app.emit(
 					"play-vstats",
 					PlayVStats {
