@@ -134,6 +134,14 @@ pub struct StreamReq {
 	/// (false) keeps the legacy direct flows for old peers.
 	#[serde(default)]
 	pub media_over_session: bool,
+	/// The client can draw the host pointer ITSELF from the cursor side-channel
+	/// ([`DataMsg::CursorPos`]/[`CursorShape`]) — so the host may capture without a
+	/// hardware cursor in the frame (the KMS zero-copy path) and stream the pointer
+	/// out-of-band. Only the native renderer sets this; the webview client leaves it
+	/// false (its host bakes the cursor into the video). `#[serde(default)]` (false)
+	/// keeps the embedded-cursor behavior for old peers.
+	#[serde(default)]
+	pub cursor_external: bool,
 }
 
 fn default_true() -> bool {
@@ -218,6 +226,29 @@ pub enum DataMsg {
 	/// its connections list / session UI and caches it for recents. Appended for
 	/// additive wire compat (old peers ignore it).
 	PeerName(String),
+	/// Host → client: the host pointer position, normalized 0..1 within the streamed
+	/// screen (Moonlight-style cursor side-channel). Sent at ~60 Hz when the host's
+	/// captured framebuffer does NOT carry the hardware cursor (the KMS zero-copy path
+	/// scans out without the X cursor plane) so the client can draw it over the video
+	/// itself. Tiny (two f32) — well within the datagram budget. Appended for additive
+	/// wire compat (an old peer ignores the unknown variant).
+	CursorPos { x: f32, y: f32 },
+	/// Host → client: the host pointer SHAPE, sent only when the cursor image changes
+	/// (rarely — text-caret / resize-arrow transitions). RGBA pixels are PNG-encoded
+	/// to stay small (cursors are 32–64 px → well under the avatar budget); `hot_x`/
+	/// `hot_y` are the click hotspot in pixels so the client offsets the drawn bitmap
+	/// exactly like the host. Pairs with [`DataMsg::CursorPos`]. Appended for wire compat.
+	CursorShape {
+		w: u32,
+		h: u32,
+		hot_x: u32,
+		hot_y: u32,
+		rgba_png: Vec<u8>,
+	},
+	/// Host → client: the host pointer is currently HIDDEN (e.g. a full-screen game
+	/// hid it, or it left the captured screen). The client stops drawing the
+	/// side-channel cursor until the next [`DataMsg::CursorPos`]. Appended for wire compat.
+	CursorHidden,
 }
 
 #[cfg(test)]
@@ -344,6 +375,46 @@ mod tests {
 		};
 		let json = serde_json::to_string(&empty).unwrap();
 		assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), empty);
+	}
+
+	#[test]
+	fn cursor_side_channel_roundtrip() {
+		// Locks the additive wire contract for the cursor side-channel variants:
+		// position (two f32), a PNG shape (incl. the 0x89 signature byte + hotspot),
+		// and the hidden marker all survive the JSON roundtrip intact.
+		for m in [
+			DataMsg::CursorPos { x: 0.5, y: 0.25 },
+			DataMsg::CursorShape {
+				w: 32,
+				h: 32,
+				hot_x: 4,
+				hot_y: 2,
+				rgba_png: vec![0x89, b'P', b'N', b'G', 0, 255, 13, 10],
+			},
+			DataMsg::CursorHidden,
+		] {
+			let json = serde_json::to_string(&m).unwrap();
+			assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), m);
+		}
+	}
+
+	#[test]
+	fn streamreq_missing_cursor_external_defaults_false() {
+		// A request built before the cursor side-channel existed omits the field; the
+		// appended `#[serde(default)]` must deserialize it to false (host bakes the
+		// cursor into the video, as before).
+		let json = r#"{
+			"port": 5000,
+			"codec": "h265",
+			"encoder": "auto",
+			"width": 0,
+			"height": 0
+		}"#;
+		let req: StreamReq = serde_json::from_str(json).expect("old StreamReq must deserialize");
+		assert!(
+			!req.cursor_external,
+			"missing cursor_external defaults to false (embedded cursor)"
+		);
 	}
 
 	#[test]

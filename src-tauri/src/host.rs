@@ -30,6 +30,8 @@ use crate::state::AppState;
 use crate::util::{config_path, display_rotation, identity_path, resolve_relay, DDAGRAB_ZEROCOPY};
 
 mod handlers;
+#[cfg(target_os = "linux")]
+pub(crate) mod cursor;
 use handlers::{make_on_audio, make_on_file, make_on_stream};
 
 /// Transport features this host advertises in its `StreamCaps` reply: it can carry

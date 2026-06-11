@@ -172,9 +172,22 @@ pub fn x11_pipeline(
 			 ! videoconvert ! video/x-raw,format=I420 "
 		)
 	};
+	// `PULSAR_DAMAGE=1` (opt-in, DEFAULT OFF): switch ximagesrc to damage-event capture
+	// (`use-damage=1`) and re-pace with `videorate` so the encoder still sees a steady
+	// `framerate` even though ximagesrc only emits on screen changes. The idea: a mostly
+	// static remote desktop stops spending the X-server full-frame copy on every vblank
+	// (the ~84 fps ximagesrc ceiling is that copy), so host encode CPU drops when little
+	// moves. Trade-off (why it's gated, to be measured on the Pi): `videorate` duplicates
+	// the last frame to hold the rate, which can ADD a frame of latency on motion. Default
+	// stays `use-damage=0` (full frames, steady rate) — the proven path.
+	let (damage, rate) = if std::env::var("PULSAR_DAMAGE").as_deref() == Ok("1") {
+		(1, "! videorate ")
+	} else {
+		(0, "")
+	};
 	format!(
-		"ximagesrc display-name={display} use-damage=0 show-pointer=true \
-		 {convert}\
+		"ximagesrc display-name={display} use-damage={damage} show-pointer=true \
+		 {rate}{convert}\
 		 ! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"
 	)

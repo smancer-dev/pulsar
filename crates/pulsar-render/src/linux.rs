@@ -76,11 +76,86 @@ static KEY_IN: std::sync::Mutex<Vec<egui::Event>> = std::sync::Mutex::new(Vec::n
 /// Relayed Enter — consumed by the Chat composer as "send".
 static ENTER_IN: AtomicBool = AtomicBool::new(false);
 
+/// Cursor side-channel state (Moonlight model): the host captured WITHOUT a hardware cursor
+/// (KMS zero-copy), so it streams the pointer out-of-band and WE draw it over the video. Fed by
+/// the app over stdin (`cursor <x> <y>` normalized 0..1, `cursorimg w h hx hy <b64png>`,
+/// `cursorhide`). `None` position = nothing to draw (no side-channel cursor this session).
+static CURSOR_POS: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
+/// The latest cursor SHAPE: decoded RGBA + dims + hotspot, replaced on each `cursorimg` line.
+/// `egui::TextureHandle` can't be a static (needs the ctx), so we keep raw pixels here and the
+/// render loop (re)uploads them to a texture when the generation counter changes.
+static CURSOR_IMG: std::sync::Mutex<Option<CursorImg>> = std::sync::Mutex::new(None);
+/// Bumped on every new `cursorimg` so the render loop knows to re-upload the egui texture.
+static CURSOR_IMG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone)]
+struct CursorImg {
+	w: usize,
+	h: usize,
+	hot_x: f32,
+	hot_y: f32,
+	rgba: Vec<u8>,
+}
+
+/// Decode a base64'd RGBA PNG (the cursor side-channel shape) to raw RGBA8 bytes, verifying it
+/// matches the announced `w`x`h`. Returns `None` on any malformed input — a bad cursor frame must
+/// never panic the renderer (it just keeps the previous shape / no shape).
+fn decode_cursor_png(b64: &str, w: usize, h: usize) -> Option<Vec<u8>> {
+	if w == 0 || h == 0 || w > 256 || h > 256 {
+		return None;
+	}
+	let bytes = base64_decode(b64)?;
+	let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+	let mut reader = decoder.read_info().ok()?;
+	let mut buf = vec![0u8; reader.output_buffer_size()];
+	let info = reader.next_frame(&mut buf).ok()?;
+	if info.color_type != png::ColorType::Rgba
+		|| info.width as usize != w
+		|| info.height as usize != h
+	{
+		return None;
+	}
+	buf.truncate(info.buffer_size());
+	Some(buf)
+}
+
+/// Minimal standard-base64 decoder (no padding-strictness, ignores whitespace). Kept inline so
+/// the renderer doesn't pull a base64 crate just for the tiny cursor-shape payload.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+	fn val(c: u8) -> Option<u8> {
+		match c {
+			b'A'..=b'Z' => Some(c - b'A'),
+			b'a'..=b'z' => Some(c - b'a' + 26),
+			b'0'..=b'9' => Some(c - b'0' + 52),
+			b'+' => Some(62),
+			b'/' => Some(63),
+			_ => None,
+		}
+	}
+	let mut out = Vec::with_capacity(s.len() / 4 * 3);
+	let mut acc = 0u32;
+	let mut bits = 0u32;
+	for &c in s.as_bytes() {
+		if c == b'=' || c.is_ascii_whitespace() {
+			continue;
+		}
+		let v = val(c)?;
+		acc = (acc << 6) | v as u32;
+		bits += 6;
+		if bits >= 8 {
+			bits -= 8;
+			out.push((acc >> bits) as u8);
+		}
+	}
+	Some(out)
+}
+
 fn arm_hint(kind: &str) {
-	let text = match kind {
-		"engage" => "Bırakmak için Ctrl+Alt+Z · Çıkmak için Ctrl+Shift+Q",
-		_ => "Kontrolü almak için ekrana tıklayın",
-	};
+	let text = crate::i18n::t(if kind == "engage" {
+		"hint.engage"
+	} else {
+		"hint.click"
+	});
 	*HINT.lock().unwrap() = Some((text.to_string(), std::time::Instant::now(), HINT_SECS));
 }
 
@@ -265,6 +340,39 @@ pub fn run() {
 						ENGAGED_R.store(v == "1" || v == "on" || v == "true", Ordering::SeqCst);
 					}
 				}
+				// Cursor side-channel position (normalized 0..1 in the streamed screen). The
+				// host captured without a hardware cursor (KMS), so we draw it over the video.
+				Some("cursor") => {
+					if let (Some(x), Some(y)) = (
+						it.next().and_then(|v| v.parse::<f32>().ok()),
+						it.next().and_then(|v| v.parse::<f32>().ok()),
+					) {
+						*CURSOR_POS.lock().unwrap() = Some((x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)));
+					}
+				}
+				// Cursor side-channel shape: `cursorimg w h hot_x hot_y <base64 png>`. Decode
+				// to RGBA + stash; the render loop re-uploads it to an egui texture on change.
+				Some("cursorimg") => {
+					let w = it.next().and_then(|v| v.parse::<usize>().ok());
+					let h = it.next().and_then(|v| v.parse::<usize>().ok());
+					let hx = it.next().and_then(|v| v.parse::<f32>().ok());
+					let hy = it.next().and_then(|v| v.parse::<f32>().ok());
+					let b64 = it.next().unwrap_or("");
+					if let (Some(w), Some(h), Some(hx), Some(hy)) = (w, h, hx, hy) {
+						if let Some(rgba) = decode_cursor_png(b64, w, h) {
+							*CURSOR_IMG.lock().unwrap() = Some(CursorImg {
+								w,
+								h,
+								hot_x: hx,
+								hot_y: hy,
+								rgba,
+							});
+							CURSOR_IMG_GEN.fetch_add(1, Ordering::SeqCst);
+						}
+					}
+				}
+				// The host pointer is hidden / left the screen — stop drawing the side cursor.
+				Some("cursorhide") => *CURSOR_POS.lock().unwrap() = None,
 				// Network RTT from the keepalive ping/pong (ms, the "Gecikme" tile).
 				Some("rtt") => {
 					if let Some(ms) = it.next().and_then(|v| v.parse::<f32>().ok()) {
@@ -585,6 +693,11 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 	};
 
 	let mut pointer = egui::pos2(0.0, 0.0);
+	// Cursor side-channel egui texture: (re)uploaded from CURSOR_IMG when the generation moves.
+	let mut cursor_tex: Option<egui::TextureHandle> = None;
+	let mut cursor_tex_gen = 0u64;
+	let mut cursor_hot = (0.0f32, 0.0f32);
+	let mut cursor_dims = (0.0f32, 0.0f32);
 	let mut geom_tick = 0u32;
 	let mut last_stat = std::time::Instant::now();
 	let mut prev_open = false;
@@ -877,6 +990,54 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		gl.clear(glow::COLOR_BUFFER_BIT);
 		let have_video = presenter.draw(&gl, w as i32, h as i32);
 
+		// Cursor side-channel: (re)upload the host pointer shape to an egui texture when it
+		// changed, and resolve the screen-point to draw at from the video's letterbox rect.
+		let cur_gen = CURSOR_IMG_GEN.load(Ordering::SeqCst);
+		if cur_gen != cursor_tex_gen {
+			cursor_tex_gen = cur_gen;
+			if let Some(img) = CURSOR_IMG.lock().unwrap().clone() {
+				let ci = egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba);
+				cursor_tex = Some(egui_ctx.load_texture("pulsar-cursor", ci, egui::TextureOptions::LINEAR));
+				cursor_hot = (img.hot_x, img.hot_y);
+				cursor_dims = (img.w as f32, img.h as f32);
+			}
+		}
+		// Where to draw it (egui points, top-left origin): map the normalized host pointer into
+		// the video's letterbox rect. VIDEO_RECT is in framebuffer pixels with a BOTTOM-left GL
+		// origin → flip Y. `None`/no-video/empty-rect = nothing to draw this frame.
+		let cursor_draw: Option<(egui::Pos2, egui::TextureId, egui::Vec2)> = (|| {
+			let (nx, ny) = (*CURSOR_POS.lock().unwrap())?;
+			let tex = cursor_tex.as_ref()?;
+			let r = *video::VIDEO_RECT.lock().unwrap();
+			let (vx, vyb, vw, vh) = (r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32);
+			if vw < 1.0 || vh < 1.0 || !have_video {
+				return None;
+			}
+			// GL bottom-left rect → top-left pixel rect, then px → egui points (÷ ppp).
+			let vy_top = h as f32 - (vyb + vh);
+			let px = vx + nx * vw;
+			let py = vy_top + ny * vh;
+			let pos = egui::pos2((px - cursor_hot.0) / ppp, (py - cursor_hot.1) / ppp);
+			let size = egui::vec2(cursor_dims.0 / ppp, cursor_dims.1 / ppp);
+			Some((pos, tex.id(), size))
+		})();
+
+		// Draw the side-channel cursor with egui's painter (its own layer, on top of the video).
+		let paint_cursor = |ctx: &egui::Context| {
+			if let Some((pos, id, size)) = cursor_draw {
+				let painter = ctx.layer_painter(egui::LayerId::new(
+					egui::Order::Foreground,
+					egui::Id::new("pulsar-cursor-layer"),
+				));
+				painter.image(
+					id,
+					egui::Rect::from_min_size(pos, size),
+					egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+					egui::Color32::WHITE,
+				);
+			}
+		};
+
 		if open {
 			// Merge the webview-relayed keyboard (the Chat composer's only input
 			// channel — see the `kin` stdin arm) into this frame's events.
@@ -891,7 +1052,8 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			};
 			let mut cmds: Vec<OverlayCmd> = Vec::new();
 			let full = egui_ctx.run(raw_input, |ctx| {
-				cmds = overlay::draw(ctx, &state, &mut ov_ui)
+				cmds = overlay::draw(ctx, &state, &mut ov_ui);
+				paint_cursor(ctx);
 			});
 			for c in cmds {
 				emit_cmd(&mut state, c);
@@ -922,7 +1084,8 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 				out
 			};
 			let hint_text = hint;
-			if state.stats_hud || state.overlay_btn || hint_text.is_some() {
+			if state.stats_hud || state.overlay_btn || hint_text.is_some() || cursor_draw.is_some()
+			{
 				// Closed-state chrome: the mini stats HUD, the Parsec-style open button
 				// and/or the helper tooltip. Display-only on Linux (the container is input
 				// pass-through — the matching CLICK hotspot lives in the webview).
@@ -944,6 +1107,7 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 					if let Some((text, alpha)) = &hint_text {
 						overlay::draw_hint(ctx, text, *alpha);
 					}
+					paint_cursor(ctx);
 				});
 				gl.viewport(0, 0, w as i32, h as i32);
 				let prims = egui_ctx.tessellate(full.shapes, full.pixels_per_point);

@@ -58,6 +58,7 @@ pub(super) async fn hold_session(
 	req_h: u32,
 	req_fps: u32,
 	base_kbps: u32,
+	cursor_external: bool,
 ) {
 	let mut keep = tokio::time::interval(std::time::Duration::from_secs(2));
 	keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -71,6 +72,8 @@ pub(super) async fn hold_session(
 	};
 	let v_dest = std::net::SocketAddr::from(([127, 0, 0, 1], video_port));
 	let a_dest = std::net::SocketAddr::from(([127, 0, 0, 1], audio_port));
+	// One-shot diagnostic: did host media actually reach this client + get forwarded?
+	let mut first_video_logged = false;
 	// Video RTP gap tracking → NACK retransmit requests + the loss% the adaptive
 	// bitrate controller runs on. `missing` holds requested-but-not-yet-seen seqs.
 	let mut last_vseq: Option<u16> = None;
@@ -149,7 +152,14 @@ pub(super) async fn hold_session(
 					if let Some((tag, rtp)) = media::parse(&bytes) {
 						if let Some(s) = fwd_sock.as_ref() {
 							let dest = if tag == media::TAG_VIDEO { v_dest } else { a_dest };
+							if tag == media::TAG_VIDEO && !first_video_logged {
+								first_video_logged = true;
+								tracing::info!(%dest, "first video RTP datagram forwarded to renderer");
+							}
 							let _ = s.send_to(rtp, dest).await;
+						} else if !first_video_logged {
+							first_video_logged = true;
+							tracing::warn!("media arrived but fwd_sock is None — nothing forwarded");
 						}
 						// Video gap tracking: count loss for the adaptive controller and
 						// NACK freshly-missing seqs so the host retransmits them.
@@ -240,6 +250,34 @@ pub(super) async fn hold_session(
 								// The host's display name — the UI updates the session target
 								// chip and the recents cache.
 								let _ = app_ev.emit("peer-name", (id.to_string(), name));
+							}
+							DataMsg::CursorPos { x, y } => {
+								// Cursor side-channel: the host captured WITHOUT a hardware cursor
+								// in the frame (KMS zero-copy) and streams the pointer position
+								// out-of-band. Push it to the native renderer so it draws the cursor
+								// over the video (Moonlight model). Tiny payload, ~60 Hz.
+								use std::io::Write as _;
+								if let Some(si) = render_stdin.lock().unwrap().as_mut() {
+									let _ = writeln!(si, "cursor {x:.5} {y:.5}");
+								}
+							}
+							DataMsg::CursorShape { w, h, hot_x, hot_y, rgba_png } => {
+								// The host pointer's bitmap changed (caret/resize transitions).
+								// Base64 the PNG onto one stdin line so the renderer swaps the drawn
+								// cursor image + hotspot.
+								use base64::Engine as _;
+								use std::io::Write as _;
+								let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba_png);
+								if let Some(si) = render_stdin.lock().unwrap().as_mut() {
+									let _ = writeln!(si, "cursorimg {w} {h} {hot_x} {hot_y} {b64}");
+								}
+							}
+							DataMsg::CursorHidden => {
+								// The host pointer is hidden / left the screen — stop drawing it.
+								use std::io::Write as _;
+								if let Some(si) = render_stdin.lock().unwrap().as_mut() {
+									let _ = writeln!(si, "cursorhide");
+								}
 							}
 							DataMsg::FsEntries { path, entries } => {
 								// A host directory listing for the file panel's remote pane.
@@ -341,6 +379,7 @@ pub(super) async fn hold_session(
 							yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
 							decode_codecs: decode_codecs.clone(),
 							media_over_session: mos,
+							cursor_external,
 						};
 						if request_stream(&mut sess, &req).await.is_err() {
 							break;
@@ -387,6 +426,7 @@ pub(super) async fn hold_session(
 						yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
 						decode_codecs: decode_codecs.clone(),
 						media_over_session: mos,
+						cursor_external,
 					};
 					if request_stream(&mut sess, &req).await.is_err() {
 						break;

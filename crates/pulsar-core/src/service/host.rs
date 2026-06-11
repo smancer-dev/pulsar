@@ -171,6 +171,8 @@ pub async fn serve_with(
 				DataMsg::PeerName(name) => (data.on_peer_name)(name),
 				m @ (DataMsg::FsList { .. } | DataMsg::FsGet { .. }) => (data.on_fs)(m),
 				DataMsg::FsEntries { .. } => {} // host→client only; ignore if echoed back
+				// Cursor side-channel is host→client only; ignore if echoed back.
+				DataMsg::CursorPos { .. } | DataMsg::CursorShape { .. } | DataMsg::CursorHidden => {}
 			},
 			_ => {}
 		}

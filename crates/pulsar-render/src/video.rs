@@ -63,6 +63,13 @@ pub static FPS: Mutex<[f32; 3]> = Mutex::new([0.0; 3]); // fps, mbit, ms (filled
 /// overlay displays it read-only; selection is always automatic.
 pub static DEC_LABEL: Mutex<String> = Mutex::new(String::new());
 
+/// The video's on-screen letterbox rectangle in framebuffer PIXELS — `[x, y, w, h]`, updated
+/// every `draw()`. The cursor side-channel overlay (linux.rs) reads it to map a normalized host
+/// pointer position (0..1 in the streamed screen) to a screen point: the video may be
+/// letterboxed/cropped, so the cursor must follow the SAME rect the frame is drawn into. `w==0`
+/// means "no frame presented yet" (don't draw the cursor).
+pub static VIDEO_RECT: Mutex<[i32; 4]> = Mutex::new([0; 4]);
+
 /// View-fit mode for presenting the video in the window (AnyDesk-style): 0 = FIT
 /// (letterbox, keep aspect — default), 1 = STRETCH (fill the window, may distort),
 /// 2 = ORIGINAL (1:1 source pixels, centered; larger streams crop). Set by the
@@ -232,7 +239,7 @@ pub fn start_decode(sdp_path: &str) {
 			let st = *(*fmt).streams.add(vs as usize);
 			let codec_id = (*(*st).codecpar).codec_id;
 			let sel = match crate::decode::select(codec_id) {
-				Some(s) => s,
+				Some(s) => s.sel,
 				None => {
 					eprintln!("pulsar-render: no decoder validated for this codec");
 					break 'decode;
@@ -890,7 +897,12 @@ impl Presenter {
 				}
 			}
 		};
-		gl.viewport((w - rw) / 2, (h - rh) / 2, rw, rh);
+		let (vx, vy) = ((w - rw) / 2, (h - rh) / 2);
+		// Publish the letterbox rect so the cursor side-channel overlay maps the host pointer
+		// into the SAME rect the frame fills. Note the GL viewport origin is BOTTOM-left; the
+		// overlay (egui) is TOP-left, so it flips Y itself from `[x, y_bottom, w, h]`.
+		*VIDEO_RECT.lock().unwrap() = [vx, vy, rw, rh];
+		gl.viewport(vx, vy, rw, rh);
 		let quad: [f32; 24] = [
 			-1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0,
 			1.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 0.0,
