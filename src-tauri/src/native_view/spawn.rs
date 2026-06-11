@@ -174,6 +174,7 @@ pub fn spawn_render(
 	wid: Option<u64>,
 	game_mode: bool,
 	pace_on: bool,
+	lang: &str,
 ) -> Option<Child> {
 	// Single-surface renderer: rkmpp video + egui overlay in ONE child window of `wid` (the
 	// overlay moves/clips/stacks with the app). stdout carries `vidsink-fps …` (HUD) + `ov …`
@@ -186,6 +187,7 @@ pub fn spawn_render(
 	cmd.arg("--mode")
 		.arg(if game_mode { "game" } else { "remote" });
 	cmd.arg("--pace").arg(if pace_on { "on" } else { "off" });
+	cmd.arg("--lang").arg(lang);
 	// Pipe BOTH stdout (HUD `vidsink-fps` / `ov set` lines) AND stdin (live `pace 0|1` toggles
 	// from the frontend); without stdin piped, set_frame_pacing can't reach the renderer.
 	cmd.stdin(std::process::Stdio::piped());
@@ -210,6 +212,7 @@ pub fn spawn_render_win(
 	hwnd: u64,
 	game_mode: bool,
 	pace_on: bool,
+	lang: &str,
 ) -> Option<Child> {
 	let mut cmd = std::process::Command::new(bin);
 	cmd.arg(sdp);
@@ -217,6 +220,7 @@ pub fn spawn_render_win(
 	cmd.arg("--mode")
 		.arg(if game_mode { "game" } else { "remote" });
 	cmd.arg("--pace").arg(if pace_on { "on" } else { "off" });
+	cmd.arg("--lang").arg(lang);
 	cmd.stdin(std::process::Stdio::piped());
 	cmd.stdout(std::process::Stdio::piped());
 	crate::no_window(&mut cmd);
@@ -267,6 +271,33 @@ pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16) -> Option<Child> {
 	die_with_parent(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => Some(child),
+		// The bundled ffmpeg can be missing/unrunnable (e.g. a wrong-arch copy landed in
+		// resources/, or a build without libpulse) — that left remote audio silently dead.
+		// Fall back to a system `ffmpeg` on PATH, which on a Linux client is the distro build
+		// (carries libpulse + the Opus decoder). Better degraded-via-system than no audio.
+		Err(_) if ffmpeg != "ffmpeg" => {
+			let mut fallback = std::process::Command::new("ffmpeg");
+			fallback
+				.args([
+					"-hide_banner",
+					"-loglevel",
+					"error",
+					"-protocol_whitelist",
+					"file,udp,rtp",
+					"-fflags",
+					"nobuffer",
+					"-flags",
+					"low_delay",
+					"-i",
+				])
+				.arg(&path)
+				.args(["-f", "pulse", "default"]);
+			fallback.stdin(std::process::Stdio::null());
+			fallback.stdout(std::process::Stdio::null());
+			fallback.stderr(std::process::Stdio::null());
+			die_with_parent(&mut fallback);
+			fallback.spawn().ok()
+		}
 		Err(_) => None,
 	}
 }

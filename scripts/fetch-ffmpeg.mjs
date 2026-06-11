@@ -160,12 +160,65 @@ async function findFile(dir, re) {
   return null;
 }
 
+// On Linux arm64 (Orange Pi / RK3588 appliances) the BtbN static build is the
+// wrong choice for the CLIENT AUDIO path: those builds are fully static and link
+// NO libpulse, so `ffmpeg -f pulse default` (spawn_native_audio) fails and the
+// remote audio is dead. The distro ffmpeg (Ubuntu/Armbian) DOES carry libpulse +
+// the Opus decoder + rkmpp, and is the correct aarch64 arch. So when this script
+// runs NATIVELY on such a host, prefer copying that system ffmpeg if it actually
+// supports the pulse output muxer; only fall back to the BtbN download otherwise.
+// (On x64 / cross builds we keep the bundled static build — fetched below.)
+async function trySystemLinuxArm64() {
+  if (key !== "linux/arm64") return false;
+  // Only meaningful when we're really running on aarch64 Linux (native Pi build).
+  if (process.platform !== "linux" || process.arch !== "arm64") return false;
+  for (const cand of ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]) {
+    if (!existsSync(cand)) continue;
+    // Confirm the binary advertises the `pulse` output muxer + an Opus decoder;
+    // without both, spawn_native_audio can't play the host's Opus/RTP to PulseAudio.
+    const ok = await probeFfmpeg(cand);
+    if (!ok) continue;
+    if (existsSync(OUT_PATH)) await rm(OUT_PATH, { force: true });
+    const { copyFile } = await import("node:fs/promises");
+    await copyFile(cand, OUT_PATH);
+    await chmod(OUT_PATH, 0o755);
+    const s = await stat(OUT_PATH);
+    console.log(`Using system ffmpeg ${cand} (has pulse + opus) → ${OUT_PATH} (${(s.size / 1e6).toFixed(1)} MB)`);
+    return true;
+  }
+  return false;
+}
+
+// Run `ffmpeg -muxers` / `-decoders` and check for the pulse output muxer and an
+// Opus decoder. Returns false on any spawn error (e.g. wrong arch / broken binary).
+function probeFfmpeg(bin) {
+  return new Promise((resolve) => {
+    let muxers = "";
+    const p = spawn(bin, ["-hide_banner", "-muxers"], { env: cleanEnv() });
+    p.on("error", () => resolve(false));
+    p.stdout?.on("data", (d) => (muxers += d));
+    p.on("close", (code) => {
+      if (code !== 0 || !/\bpulse\b/.test(muxers)) return resolve(false);
+      let decoders = "";
+      const q = spawn(bin, ["-hide_banner", "-decoders"], { env: cleanEnv() });
+      q.on("error", () => resolve(false));
+      q.stdout?.on("data", (d) => (decoders += d));
+      q.on("close", (c) => resolve(c === 0 && /\bopus\b/.test(decoders)));
+    });
+  });
+}
+
 // --- main --------------------------------------------------------------------
 async function main() {
   console.log(`Fetching ffmpeg for ${key}`);
-  console.log(`  source: ${src.url}`);
 
   await mkdir(RESOURCES, { recursive: true });
+
+  // Linux/arm64 audio needs libpulse — try the distro ffmpeg first (see above).
+  if (await trySystemLinuxArm64()) return;
+
+  console.log(`  source: ${src.url}`);
+
   const work = await mkdtemp(join(tmpdir(), "pulsar-ffmpeg-"));
   const archive = join(work, src.kind === "zip" ? "ffmpeg.zip" : "ffmpeg.tar.xz");
 
