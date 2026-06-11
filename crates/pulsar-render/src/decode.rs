@@ -25,9 +25,31 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 // Canned single-keyframe bitstreams (320×180 testsrc2; regenerate with
 // `ffmpeg -f lavfi -i testsrc2=size=320x180:rate=30 -frames:v 1 -c:v <enc> -f <mux> …`).
+// These are the BASELINE, decoder-friendly fixtures (ffmpeg-muxed, conformant).
 const TEST_H264: &[u8] = include_bytes!("../testdata/test.h264");
 const TEST_H265: &[u8] = include_bytes!("../testdata/test.h265");
 const TEST_AV1: &[u8] = include_bytes!("../testdata/test.av1.ivf");
+
+// REAL native-NVENC bitstreams (cut from a `PULSAR_DUMP_BITSTREAM` capture — the same
+// path the host streams). A baseline fixture is not enough: the Pi's rkmpp decodes the
+// conformant ffmpeg sample fine yet chokes on our native NVENC HEVC ("Multi-layer HEVC
+// coding is not implemented", "Skipping NAL unit 30"). Probing the real encoder family's
+// output catches that BEFORE negotiation picks a dead codec. An EMPTY file means "no
+// NVENC fixture committed yet" and is skipped (so the probe degrades to baseline-only —
+// it never falsely flags). See testdata/README.md to regenerate.
+const TEST_NVENC_H264: &[u8] = include_bytes!("../testdata/test-nvenc.h264");
+const TEST_NVENC_H265: &[u8] = include_bytes!("../testdata/test-nvenc.h265");
+const TEST_NVENC_AV1: &[u8] = include_bytes!("../testdata/test-nvenc.av1.ivf");
+
+/// One probe sample: the encoder family it represents and the raw bitstream. `family`
+/// is empty for the baseline/conformant fixture (a generic correctness check) and an
+/// encoder wire-id (`nvenc`) for a family-specific real-world sample.
+struct Fixture {
+	family: &'static str,
+	bytes: &'static [u8],
+	/// File extension for the temp path avformat opens (probing wants a real path).
+	ext: &'static str,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
@@ -248,17 +270,30 @@ pub(crate) unsafe extern "C" fn get_format(
 	*fmts
 }
 
-/// Write the canned bitstream for `codec_id` to a temp file (avformat wants a path)
-/// and return it. None for codecs we have no fixture for.
-fn fixture_path(codec_id: ff::AVCodecID) -> Option<std::path::PathBuf> {
-	let (bytes, name) = match codec_id {
-		ff::AVCodecID::AV_CODEC_ID_H264 => (TEST_H264, "pulsar-test.h264"),
-		ff::AVCodecID::AV_CODEC_ID_HEVC => (TEST_H265, "pulsar-test.h265"),
-		ff::AVCodecID::AV_CODEC_ID_AV1 => (TEST_AV1, "pulsar-test.av1.ivf"),
-		_ => return None,
+/// All probe fixtures for `codec_id`: always the baseline (conformant) sample, plus any
+/// committed encoder-family real-world samples (skipped when their file is empty). Empty
+/// for codecs we have no fixture for at all.
+fn fixtures_for(codec_id: ff::AVCodecID) -> Vec<Fixture> {
+	let (baseline, ext, nvenc) = match codec_id {
+		ff::AVCodecID::AV_CODEC_ID_H264 => (TEST_H264, "h264", TEST_NVENC_H264),
+		ff::AVCodecID::AV_CODEC_ID_HEVC => (TEST_H265, "h265", TEST_NVENC_H265),
+		ff::AVCodecID::AV_CODEC_ID_AV1 => (TEST_AV1, "av1.ivf", TEST_NVENC_AV1),
+		_ => return Vec::new(),
 	};
-	let path = std::env::temp_dir().join(name);
-	std::fs::write(&path, bytes).ok()?;
+	let mut out = vec![Fixture { family: "", bytes: baseline, ext }];
+	// Family-specific samples (only when a non-empty fixture is committed).
+	if !nvenc.is_empty() {
+		out.push(Fixture { family: "nvenc", bytes: nvenc, ext });
+	}
+	out
+}
+
+/// Write a fixture's bitstream to a uniquely-named temp file (avformat wants a path) and
+/// return it. The name encodes codec+family so concurrent probes never collide.
+fn write_fixture(fix: &Fixture) -> Option<std::path::PathBuf> {
+	let tag = if fix.family.is_empty() { "base" } else { fix.family };
+	let path = std::env::temp_dir().join(format!("pulsar-probe-{tag}.{}", fix.ext));
+	std::fs::write(&path, fix.bytes).ok()?;
 	Some(path)
 }
 
@@ -355,26 +390,55 @@ unsafe fn validate(cand: &Candidate, fixture: &std::path::Path) -> bool {
 	ok
 }
 
-/// Pick the first candidate that REALLY decodes the canned keyframe. Tier order =
-/// zero-copy SoC → hwaccel (vaapi/cuda/vulkan/drm) → software.
-pub fn select(codec_id: ff::AVCodecID) -> Option<Selected> {
-	let fixture = fixture_path(codec_id)?;
+/// The outcome of selecting (and family-probing) a decoder for one codec.
+pub struct Probed {
+	pub sel: Selected,
+	/// Encoder families whose REAL bitstream this decoder could NOT decode, even though
+	/// the baseline fixture decoded fine (e.g. `["nvenc"]` on the Pi's rkmpp HEVC). The
+	/// negotiator uses this to avoid a host-encoder × client-decoder combo that is known
+	/// to produce a dead stream, falling back to h264 instead.
+	pub incompatible_with: Vec<String>,
+}
+
+/// Pick the first candidate that REALLY decodes the BASELINE keyframe (tier order =
+/// zero-copy SoC → hwaccel → software), then probe that SAME decoder against every
+/// committed encoder-family sample to learn which real-world bitstreams it rejects.
+pub fn select(codec_id: ff::AVCodecID) -> Option<Probed> {
+	let fixtures = fixtures_for(codec_id);
+	let baseline = fixtures.iter().find(|f| f.family.is_empty())?;
+	let baseline_path = write_fixture(baseline)?;
 	unsafe {
 		for cand in candidates(codec_id) {
-			if validate(&cand, &fixture) {
-				eprintln!(
-					"pulsar-render: selected decoder {} ({})",
-					cand.name,
-					cand.tier.as_str()
-				);
-				return Some(Selected {
+			if !validate(&cand, &baseline_path) {
+				eprintln!("pulsar-render: decoder {} failed validation", cand.name);
+				continue;
+			}
+			eprintln!(
+				"pulsar-render: selected decoder {} ({})",
+				cand.name,
+				cand.tier.as_str()
+			);
+			// The winner decodes conformant input — now check the real encoder families.
+			let mut incompatible_with = Vec::new();
+			for fix in fixtures.iter().filter(|f| !f.family.is_empty()) {
+				let Some(p) = write_fixture(fix) else { continue };
+				if !validate(&cand, &p) {
+					eprintln!(
+						"pulsar-render: decoder {} rejects {} bitstream",
+						cand.name, fix.family
+					);
+					incompatible_with.push(fix.family.to_string());
+				}
+			}
+			return Some(Probed {
+				sel: Selected {
 					name: cand.name,
 					tier: cand.tier,
 					hwdev: cand.hwdev,
 					hw_fmt: cand.hw_fmt,
-				});
-			}
-			eprintln!("pulsar-render: decoder {} failed validation", cand.name);
+				},
+				incompatible_with,
+			});
 		}
 	}
 	None
@@ -409,12 +473,23 @@ pub fn probe_json() -> String {
 		("av1", ff::AVCodecID::AV_CODEC_ID_AV1),
 	] {
 		match select(id) {
-			Some(sel) => entries.push(format!(
-				r#"{{"codec":"{label}","ok":true,"decoder":"{}","tier":"{}","hw":{}}}"#,
-				sel.name,
-				sel.tier.as_str(),
-				sel.tier != Tier::Software
-			)),
+			Some(p) => {
+				// Back-compat: `incompatible_with` is an additive array (older consumers
+				// ignore it; empty = no known-bad encoder family for this decoder).
+				let incompat = p
+					.incompatible_with
+					.iter()
+					.map(|f| format!(r#""{f}""#))
+					.collect::<Vec<_>>()
+					.join(",");
+				entries.push(format!(
+					r#"{{"codec":"{label}","ok":true,"decoder":"{}","tier":"{}","hw":{},"incompatible_with":[{}]}}"#,
+					p.sel.name,
+					p.sel.tier.as_str(),
+					p.sel.tier != Tier::Software,
+					incompat
+				));
+			}
 			None => entries.push(format!(r#"{{"codec":"{label}","ok":false}}"#)),
 		}
 	}

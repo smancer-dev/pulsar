@@ -32,6 +32,11 @@ pub(crate) struct DecoderCap {
 	pub name: String,
 	pub hw: bool,
 	pub tier: String,
+	/// Encoder families whose real bitstream this decoder can't decode even though the
+	/// codec validates against a conformant sample (e.g. `["nvenc"]` for rkmpp HEVC on
+	/// RK3588). The negotiator drops a host-encoder × this-decoder combo that lands here.
+	#[serde(default)]
+	pub incompatible_with: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -141,6 +146,7 @@ fn probe_decoders(app: &AppHandle, platform: &str) -> Vec<DecoderCap> {
 				name: "mpv".into(),
 				hw: false,
 				tier: "software".into(),
+				incompatible_with: Vec::new(),
 			})
 			.collect();
 	}
@@ -153,6 +159,7 @@ fn probe_decoders(app: &AppHandle, platform: &str) -> Vec<DecoderCap> {
 				name: "mediafoundation".into(),
 				hw: true,
 				tier: "hwaccel".into(),
+				incompatible_with: Vec::new(),
 			})
 			.collect();
 	}
@@ -193,6 +200,15 @@ fn probe_decoders(app: &AppHandle, platform: &str) -> Vec<DecoderCap> {
 								.and_then(|v| v.as_str())
 								.unwrap_or("")
 								.to_string(),
+							incompatible_with: e
+								.get("incompatible_with")
+								.and_then(|v| v.as_array())
+								.map(|a| {
+									a.iter()
+										.filter_map(|x| x.as_str().map(|s| s.to_string()))
+										.collect()
+								})
+								.unwrap_or_default(),
 						})
 					})
 					.collect()
