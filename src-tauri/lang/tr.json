@@ -14,5 +14,7 @@
 	"title.approve": "Pulsar — Bağlantı isteği",
 	"title.connections": "Pulsar — Bağlantılar",
 	"tray.show": "Pulsar'ı Göster",
-	"tray.quit": "Çıkış"
+	"tray.quit": "Çıkış",
+	"stream.mbitTarget": "Mbit hedef",
+	"stream.msEncode": "ms kodlama"
 }

@@ -440,11 +440,12 @@ pub(super) fn make_on_stream(
 				format!("{}fps", fps)
 			};
 			let _ = stats_out.try_send(DataMsg::Stats(format!(
-				"{} · {} · — · {} · {} Mbit hedef",
+				"{} · {} · — · {} · {} {}",
 				vcodec_label(gcodec),
 				genc.label(),
 				fps_part,
-				(bitrate as f32 / 1000.0).round() as u32
+				(bitrate as f32 / 1000.0).round() as u32,
+				crate::i18n::t("stream.mbitTarget")
 			)));
 			let token = restore_token.lock().unwrap().clone();
 			let restore_token = restore_token.clone();
@@ -732,13 +733,14 @@ pub(super) fn make_on_stream(
 							format!("{}p", eff_h)
 						};
 						let base_label = format!(
-							"{} · {}{} · {} · {} · {} Mbit hedef",
+							"{} · {}{} · {} · {} · {} {}",
 							vcodec_label(gcodec),
 							genc.label(),
 							if kms { " (KMS)" } else { "" },
 							res_part,
 							fps_part,
-							(eff_bitrate as f32 / 1000.0).round() as u32
+							(eff_bitrate as f32 / 1000.0).round() as u32,
+							crate::i18n::t("stream.mbitTarget")
 						);
 						let stats_enc = stats_out.clone();
 						let label_enc = base_label.clone();
@@ -749,7 +751,8 @@ pub(super) fn make_on_stream(
 						} else {
 							match spawn_gst_paced(&procs, &pipeline_str, move |ms| {
 								let _ = stats_enc.try_send(DataMsg::Stats(format!(
-									"{label_enc} · {ms:.1} ms kodlama"
+									"{label_enc} · {ms:.1} {}",
+									crate::i18n::t("stream.msEncode")
 								)));
 							}) {
 								Ok((pid, ticked)) => {
@@ -806,7 +809,7 @@ pub(super) fn make_on_stream(
 												&fb_pipeline,
 												move |ms| {
 													let _ = stats_fb.try_send(DataMsg::Stats(
-														format!("{label_fb} · {ms:.1} ms kodlama"),
+														format!("{label_fb} · {ms:.1} {}", crate::i18n::t("stream.msEncode")),
 													));
 												},
 											);
@@ -930,12 +933,13 @@ pub(super) fn make_on_stream(
 			format!("{}p", eff_h)
 		};
 		let base_label = format!(
-			"{} · {} · {} · {} · {} Mbit hedef",
+			"{} · {} · {} · {} · {} {}",
 			vcodec_label(codec),
 			encoder.label(),
 			res_part,
 			fps_part,
-			(eff_bitrate as f32 / 1000.0).round() as u32
+			(eff_bitrate as f32 / 1000.0).round() as u32,
+			crate::i18n::t("stream.mbitTarget")
 		);
 		// encode_command always yields ("ffmpeg", args); run the bundled
 		// ffmpeg binary directly rather than relying on a system ffmpeg.
@@ -949,7 +953,7 @@ pub(super) fn make_on_stream(
 			let label_enc = base_label.clone();
 			crate::process::spawn_tracked_enc_paced(&procs, &ffmpeg, &args, move |ms| {
 				let _ =
-					stats_enc.try_send(DataMsg::Stats(format!("{label_enc} · {ms:.1} ms kodlama")));
+					stats_enc.try_send(DataMsg::Stats(format!("{label_enc} · {ms:.1} {}", crate::i18n::t("stream.msEncode"))));
 			})
 			.is_ok()
 		};

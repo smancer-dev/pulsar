@@ -1111,7 +1111,7 @@ fn combo(
 		// What's REALLY in use right now (faint truth line; the combo is the request).
 		if !active.is_empty() {
 			ui.label(
-				egui::RichText::new(format!("Aktif: {active}"))
+				egui::RichText::new(format!("{} {active}", t("active")))
 					.size(10.0)
 					.color(egui::Color32::from_gray(110)),
 			);

@@ -14,5 +14,7 @@
 	"title.approve": "Pulsar — Connection request",
 	"title.connections": "Pulsar — Connections",
 	"tray.show": "Show Pulsar",
-	"tray.quit": "Quit"
+	"tray.quit": "Quit",
+	"stream.mbitTarget": "Mbit target",
+	"stream.msEncode": "ms encode"
 }
