@@ -95,6 +95,72 @@ static HOST_ENC: Mutex<String> = Mutex::new(String::new());
 #[allow(clippy::type_complexity)]
 static CAPS_SEED: Mutex<Option<(Vec<String>, Vec<String>, String, String, String)>> =
 	Mutex::new(None);
+// Cursor side-channel state (Moonlight model, mirrors linux.rs): the host captured
+// WITHOUT a hardware cursor (KMS zero-copy) and streams the pointer out-of-band; WE
+// draw it over the video. Fed over stdin: `cursor <x> <y>` (normalized 0..1),
+// `cursorimg w h hx hy <b64png>`, `cursorhide`.
+static CURSOR_POS: Mutex<Option<(f32, f32)>> = Mutex::new(None);
+static CURSOR_IMG: Mutex<Option<CursorImg>> = Mutex::new(None);
+static CURSOR_IMG_GEN: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+struct CursorImg {
+	w: usize,
+	h: usize,
+	hot_x: f32,
+	hot_y: f32,
+	rgba: Vec<u8>,
+}
+
+/// Decode the side-channel cursor PNG (RGBA, ≤256², dims must match) — same
+/// validation as linux.rs::decode_cursor_png.
+fn decode_cursor_png(b64: &str, w: usize, h: usize) -> Option<Vec<u8>> {
+	if w == 0 || h == 0 || w > 256 || h > 256 {
+		return None;
+	}
+	let bytes = base64_decode(b64)?;
+	let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+	let mut reader = decoder.read_info().ok()?;
+	let mut buf = vec![0u8; reader.output_buffer_size()];
+	let info = reader.next_frame(&mut buf).ok()?;
+	if info.color_type != png::ColorType::Rgba
+		|| info.width as usize != w
+		|| info.height as usize != h
+	{
+		return None;
+	}
+	buf.truncate(info.buffer_size());
+	Some(buf)
+}
+
+/// Minimal standard-base64 decoder (same as linux.rs — no base64 crate for one payload).
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+	fn val(c: u8) -> Option<u8> {
+		match c {
+			b'A'..=b'Z' => Some(c - b'A'),
+			b'a'..=b'z' => Some(c - b'a' + 26),
+			b'0'..=b'9' => Some(c - b'0' + 52),
+			b'+' => Some(62),
+			b'/' => Some(63),
+			_ => None,
+		}
+	}
+	let mut out = Vec::with_capacity(s.len() * 3 / 4);
+	let (mut acc, mut bits) = (0u32, 0u32);
+	for &c in s.as_bytes() {
+		if c == b'=' || c == b'\r' || c == b'\n' || c == b' ' {
+			continue;
+		}
+		acc = (acc << 6) | val(c)? as u32;
+		bits += 6;
+		if bits >= 8 {
+			bits -= 8;
+			out.push((acc >> bits) as u8);
+		}
+	}
+	Some(out)
+}
+
 /// Live overlay-button drag (closed state): (down.x, down.y, btn0.x, btn0.y, moved) in
 /// egui points. The webview drag hotspot is buried under this child on Windows, so the
 /// renderer owns the drag: ≤3 pt = click (toggle), more = move + persist via
@@ -147,6 +213,36 @@ fn stdin_control() {
 			}
 		} else if let Some(rest) = l.strip_prefix("pace ") {
 			PACE.store(rest.trim() != "0", Ordering::SeqCst);
+		} else if let Some(rest) = l.strip_prefix("cursor ") {
+			// Side-channel cursor position (normalized 0..1 over the host frame).
+			let v: Vec<f32> = rest
+				.split_whitespace()
+				.filter_map(|x| x.parse().ok())
+				.collect();
+			if v.len() >= 2 {
+				*CURSOR_POS.lock().unwrap() = Some((v[0].clamp(0.0, 1.0), v[1].clamp(0.0, 1.0)));
+			}
+		} else if let Some(rest) = l.strip_prefix("cursorimg ") {
+			let mut it = rest.split_whitespace();
+			let w = it.next().and_then(|v| v.parse::<usize>().ok());
+			let h = it.next().and_then(|v| v.parse::<usize>().ok());
+			let hx = it.next().and_then(|v| v.parse::<f32>().ok());
+			let hy = it.next().and_then(|v| v.parse::<f32>().ok());
+			let b64 = it.next().unwrap_or("");
+			if let (Some(w), Some(h), Some(hx), Some(hy)) = (w, h, hx, hy) {
+				if let Some(rgba) = decode_cursor_png(b64, w, h) {
+					*CURSOR_IMG.lock().unwrap() = Some(CursorImg {
+						w,
+						h,
+						hot_x: hx,
+						hot_y: hy,
+						rgba,
+					});
+					CURSOR_IMG_GEN.fetch_add(1, Ordering::SeqCst);
+				}
+			}
+		} else if l == "cursorhide" {
+			*CURSOR_POS.lock().unwrap() = None;
 		} else if let Some(rest) = l.strip_prefix("engaged ") {
 			// Live engage state (cursor visibility) — app-side edges, like linux.rs.
 			let v = rest.trim();
@@ -293,6 +389,23 @@ fn stdin_control() {
 		// `toast <text>` is tolerated but not drawn yet: this backend has no
 		// closed-state paint pass (paint_overlay no-ops while the overlay is
 		// closed) — wiring that is the documented follow-up.
+	}
+}
+
+/// Draw the side-channel cursor with egui's painter (own foreground layer, over the
+/// video and under nothing) — same shape as linux.rs's paint_cursor closure.
+fn paint_side_cursor(ctx: &egui::Context, draw: Option<(egui::Pos2, egui::TextureId, egui::Vec2)>) {
+	if let Some((pos, id, size)) = draw {
+		let painter = ctx.layer_painter(egui::LayerId::new(
+			egui::Order::Foreground,
+			egui::Id::new("pulsar-cursor-layer"),
+		));
+		painter.image(
+			id,
+			egui::Rect::from_min_size(pos, size),
+			egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+			egui::Color32::WHITE,
+		);
 	}
 }
 
@@ -451,6 +564,12 @@ struct Renderer {
 	bytes: u64,
 	dec_ms_acc: f32,
 	dec_n: u32,
+	// Side-channel cursor: uploaded egui texture + hotspot/dims (points come from the
+	// statics fed over stdin; re-uploaded when CURSOR_IMG_GEN moves).
+	cursor_tex: Option<egui::TextureHandle>,
+	cursor_gen: u64,
+	cursor_hot: (f32, f32),
+	cursor_dims: (f32, f32),
 	// egui overlay (same overlay.rs UI as Linux), painted on the swapchain after the video.
 	egui_ctx: egui::Context,
 	painter: Option<egui_paint::EguiPaint>,
@@ -540,6 +659,10 @@ impl Renderer {
 			bytes: 0,
 			dec_ms_acc: 0.0,
 			dec_n: 0,
+			cursor_tex: None,
+			cursor_gen: 0,
+			cursor_hot: (0.0, 0.0),
+			cursor_dims: (0.0, 0.0),
 			egui_ctx,
 			painter,
 			ostate,
@@ -573,6 +696,8 @@ impl Renderer {
 			return;
 		}
 		self.apply_caps_seed();
+		self.sync_cursor_tex();
+		let cursor_draw = self.cursor_draw();
 		let Some(painter) = self.painter.as_mut() else {
 			return;
 		};
@@ -628,6 +753,7 @@ impl Renderer {
 		let mut cmds = Vec::new();
 		let out = self.egui_ctx.run(raw, |ctx| {
 			cmds = crate::overlay::draw(ctx, ostate, ov_ui);
+			paint_side_cursor(ctx, cursor_draw);
 		});
 		// Apply + emit commands (mirrors desktop.rs / the Linux backend).
 		for c in cmds {
@@ -681,6 +807,53 @@ impl Renderer {
 		);
 	}
 
+	/// (Re)upload the side-channel cursor texture when a new `cursorimg` arrived.
+	fn sync_cursor_tex(&mut self) {
+		let gen = CURSOR_IMG_GEN.load(Ordering::SeqCst);
+		if gen == self.cursor_gen {
+			return;
+		}
+		self.cursor_gen = gen;
+		let img = CURSOR_IMG.lock().unwrap().clone();
+		if let Some(c) = img {
+			let color = egui::ColorImage::from_rgba_unmultiplied([c.w, c.h], &c.rgba);
+			self.cursor_tex = Some(self.egui_ctx.load_texture(
+				"pulsar-side-cursor",
+				color,
+				egui::TextureOptions::NEAREST,
+			));
+			self.cursor_hot = (c.hot_x, c.hot_y);
+			self.cursor_dims = (c.w as f32, c.h as f32);
+		}
+	}
+
+	/// Side-channel cursor draw data: position in egui POINTS over the video's
+	/// aspect-fit letterbox rect (same math as present.rs::dest_rect), or `None`
+	/// when there is no side cursor / no video yet.
+	fn cursor_draw(&self) -> Option<(egui::Pos2, egui::TextureId, egui::Vec2)> {
+		let (nx, ny) = (*CURSOR_POS.lock().unwrap())?;
+		let tex = self.cursor_tex.as_ref()?;
+		if self.src_w == 0 || self.src_h == 0 {
+			return None;
+		}
+		let (iw, ih) = (self.src_w as f32, self.src_h as f32);
+		let (ow, oh) = (self.width as f32, self.height as f32);
+		let scale = (ow / iw).min(oh / ih);
+		let (vw, vh) = (iw * scale, ih * scale);
+		let (vx, vy) = ((ow - vw) / 2.0, (oh - vh) / 2.0);
+		let px = vx + nx * vw;
+		let py = vy + ny * vh;
+		let pos = egui::pos2(
+			(px - self.cursor_hot.0) / OVERLAY_PPP,
+			(py - self.cursor_hot.1) / OVERLAY_PPP,
+		);
+		let size = egui::vec2(
+			self.cursor_dims.0 / OVERLAY_PPP,
+			self.cursor_dims.1 / OVERLAY_PPP,
+		);
+		Some((pos, tex.id(), size))
+	}
+
 	/// Apply a pending caps line (host codec/encoder lists + active request + conn
 	/// label) to the overlay state — one-shot per received line.
 	fn apply_caps_seed(&mut self) {
@@ -704,6 +877,8 @@ impl Renderer {
 	/// drawn over the live video while the overlay is CLOSED. Display chrome only — the
 	/// open-button CLICK is hit-tested in `wndproc` (this child owns the pointer here).
 	unsafe fn paint_closed(&mut self) {
+		self.sync_cursor_tex();
+		let cursor_draw = self.cursor_draw();
 		// Expire + fade the tooltip (alpha 1→0 over the last HINT_FADE seconds).
 		let hint_text: Option<(String, f32)> = {
 			let mut g = HINT.lock().unwrap();
@@ -721,7 +896,7 @@ impl Renderer {
 		};
 		let stats_hud = STATS_HUD.load(Ordering::SeqCst);
 		let ovbtn = OVERLAY_BTN.load(Ordering::SeqCst);
-		if !stats_hud && !ovbtn && hint_text.is_none() {
+		if !stats_hud && !ovbtn && hint_text.is_none() && cursor_draw.is_none() {
 			return;
 		}
 		// Sync the display state (same sources as the open path).
@@ -768,6 +943,7 @@ impl Renderer {
 			if let Some((text, alpha)) = &hint_text {
 				crate::overlay::draw_hint(ctx, text, *alpha);
 			}
+			paint_side_cursor(ctx, cursor_draw);
 		});
 		let _ = painter.update_textures(&self.device, &self.context, &out.textures_delta);
 		let prims = self
