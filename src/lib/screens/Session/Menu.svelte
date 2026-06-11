@@ -242,6 +242,8 @@
 						{hostEncoders}
 						decoderInfo={decoderCodec}
 						{activeInfo}
+						activeFps={hostFps}
+						activeRes={hostRes}
 						{streamRes}
 						{streamFps}
 						{streamBitrate}

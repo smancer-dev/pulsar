@@ -14,6 +14,9 @@ export type Session = {
 	tabId: number;
 	playId: number; // Rust play id (-1 until active / local host session)
 	phase: 'connecting' | 'active';
+	/** First decoded frames have landed (`play-ready`) — the native child window is now
+	 * actually painting over the webview. Drives the occlusion repaint-suspend. */
+	ready?: boolean;
 	target: Target;
 	mode: 'remote' | 'game';
 	conn: 'direct' | 'relay';
@@ -85,7 +88,7 @@ export class SessionManager {
 
 	#activateByPlayId(playId: number) {
 		this.sessions = this.sessions.map((s) =>
-			s.playId === playId && s.phase === 'connecting' ? { ...s, phase: 'active' } : s
+			s.playId === playId ? { ...s, phase: 'active', ready: true } : s
 		);
 	}
 

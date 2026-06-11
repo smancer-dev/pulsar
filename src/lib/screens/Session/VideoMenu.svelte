@@ -13,6 +13,8 @@
 		hostEncoders?: string[];
 		decoderInfo?: string;
 		activeInfo?: string;
+		activeFps?: string;
+		activeRes?: string;
 		streamRes: 'auto' | '1080p' | '1440p' | '4K';
 		streamFps: 'auto' | '30' | '60' | '120';
 		streamBitrate: number;
@@ -32,6 +34,8 @@
 		hostEncoders = [],
 		decoderInfo = '',
 		activeInfo = '',
+		activeFps = '',
+		activeRes = '',
 		streamRes,
 		streamFps,
 		streamBitrate,
@@ -56,6 +60,8 @@
 		{hostEncoders}
 		{decoderInfo}
 		{activeInfo}
+		{activeFps}
+		{activeRes}
 		{streamRes}
 		{streamFps}
 		{streamBitrate}

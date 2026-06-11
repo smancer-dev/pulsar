@@ -505,6 +505,16 @@
 				case 'pace': controls.setFramePacing(val === 'on' || val === '1' || val === 'true'); break;
 				case 'statshud': controls.setStatsHud(val === 'on' || val === '1' || val === 'true'); break;
 				case 'ovbtn': controls.setOverlayButton(val === 'on' || val === '1' || val === 'true'); break;
+				// Renderer-side button drag (Windows: the webview hotspot is buried under
+				// the video child): mirror + persist the new position, like the hotspot drag.
+				case 'btnpos': {
+					const [bx, by] = val.split(',').map(Number);
+					if (Number.isFinite(bx) && Number.isFinite(by)) {
+						ui.overlayBtnPos = { x: bx, y: by };
+						api.setOverlayButtonPos(playId, bx, by).catch(() => {});
+					}
+					break;
+				}
 				// View-fit is applied renderer-side instantly; mirror it for the webview
 				// canvas path so both presenters agree.
 				case 'fit': fitMode = (val as 'fit' | 'stretch' | 'original') ?? 'fit'; break;
@@ -696,6 +706,8 @@
 			{hostEncoders}
 			decoderInfo={media.decoderCodec}
 			{activeInfo}
+			activeFps={media.hostFps}
+			activeRes={media.hostRes}
 			streamRes={controls.streamRes}
 			streamFps={controls.streamFps}
 			streamBitrate={controls.streamBitrate}

@@ -19,6 +19,12 @@
 		decoderInfo?: string;
 		/** The host's ACTIVE codec+encoder (faint truth line under the selectors). */
 		activeInfo?: string;
+		/** The host's ACTUALLY-DELIVERED fps (faint truth line under the FPS select), e.g.
+		 *  "60fps (istenen 120)" when the host clamped the request to its panel. */
+		activeFps?: string;
+		/** The host's ACTUALLY-DELIVERED resolution (faint truth line under the res select),
+		 *  e.g. "1080p (istenen 1440p)" when the host clamped the request to its screen. */
+		activeRes?: string;
 		streamRes: 'auto' | '1080p' | '1440p' | '4K';
 		streamFps: 'auto' | '30' | '60' | '120';
 		streamBitrate: number;
@@ -36,6 +42,8 @@
 		hostEncoders = [],
 		decoderInfo = '',
 		activeInfo = '',
+		activeFps = '',
+		activeRes = '',
 		streamRes,
 		streamFps,
 		streamBitrate,
@@ -88,6 +96,9 @@
 		<option value="1440p">1440p</option>
 		<option value="4K">4K</option>
 	</select>
+	{#if activeRes}
+		<span class="m-active mono">{t('session.activeNow')}: {activeRes}</span>
+	{/if}
 </div>
 <div class="m-field">
 	<label class="m-flab" for="{idPrefix}-fps">FPS</label>
@@ -97,6 +108,9 @@
 		<option value="60">60</option>
 		<option value="120">120</option>
 	</select>
+	{#if activeFps}
+		<span class="m-active mono">{t('session.activeNow')}: {activeFps}</span>
+	{/if}
 </div>
 <div class="m-field">
 	<label class="m-flab" for="{idPrefix}-bitrate">{t('session.bitrate')}</label>

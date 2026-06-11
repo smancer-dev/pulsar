@@ -43,13 +43,9 @@
 		<div class="stallmsg">{t('session.streamStopped')}</div>
 	</div>
 {:else if native && !embedded}
-	<div class="ghost">
-		<Icon name="monitor" size={46} />
-		<div class="gname">{target.name}</div>
-		<div class="note">
-			{nativeEngaged ? t('session.nativeControlling') : t('session.nativeClickToControl')}
-		</div>
-	</div>
+	<!-- Native renderer plays in its own child window — show NOTHING behind it.
+	     The old "ghost" (icon + name + click-to-control note) must never appear
+	     (maintainer decision). -->
 {:else if !hasVideo && videoErr && !embedded}
 	<div class="ghost">
 		<Icon name={mode === 'game' ? 'gaming' : 'monitor'} size={46} />

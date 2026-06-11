@@ -493,6 +493,20 @@ h4 {
 		transform: rotate(360deg);
 	}
 }
+
+/* Native-video occlusion: while a native session's child window paints fullscreen over
+   the webview (`+page.svelte` sets `data-occluded` on play-ready of the active native
+   tab), nothing in the webview is visible — so freeze every running CSS animation and
+   transition to stop pointless repaints (≈0.5 software-rendered core on the Pi). This is
+   purely a paint suspend: JS, event handling, tab/home navigation, and the active-session
+   input rAF loop all keep running, so leaving the session (which clears the attribute)
+   instantly resumes the animations. `* , ::before , ::after` covers component-scoped
+   pulses (Connect rings, LAN radar, Session veils) without touching their definitions. */
+:root[data-occluded] *,
+:root[data-occluded] *::before,
+:root[data-occluded] *::after {
+	animation-play-state: paused !important;
+}
 /* range slider */
 .prange {
 	-webkit-appearance: none;

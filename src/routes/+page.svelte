@@ -337,6 +337,20 @@
 		document.documentElement.lang = i18n.lang;
 	});
 
+	// Native-video occlusion: when the active tab is a native session whose child window
+	// is actually painting over the webview (`play-ready` landed), the entire webview is
+	// hidden behind it — so every decorative CSS animation (Connect pulse rings, LAN radar,
+	// session veils, spinners) is just wasted repaint work (≈0.5 core of software rendering
+	// on the Pi). Flag the root with `data-occluded` so app.css pauses those animations.
+	// This ONLY suspends visual repaint: the process, all event handling, tab switching,
+	// and the active-session input rAF pump keep running. Cleared the instant the active
+	// tab leaves the native session (home/another tab) or the session ends.
+	$effect(() => {
+		const s = sm.sessions.find((x) => x.tabId === sm.activeTab);
+		const occluded = !!s && !!s.native && s.phase === 'active' && !!s.ready;
+		document.documentElement.toggleAttribute('data-occluded', occluded);
+	});
+
 	// Give the whole app a gaming look (cyan accent) while a game-stream session is
 	// the active tab; revert as soon as it's left.
 	$effect(() => {
