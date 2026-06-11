@@ -379,6 +379,13 @@ pub fn run() {
 						RTT_DMS.store((ms * 10.0) as u32, Ordering::Relaxed);
 					}
 				}
+				// Live codec switch: reopen the demuxer+decoder on a rewritten SDP IN PLACE —
+				// this process must survive (killing it corrupts WebKit's shared Mali GL).
+				Some("reopen") => {
+					if let Some(p) = it.next() {
+						video::request_reopen(p);
+					}
+				}
 				// View-fit mode (overlay Görüntü section / frontend persisted value).
 				Some("fit") => {
 					if let Some(v) = it.next() {

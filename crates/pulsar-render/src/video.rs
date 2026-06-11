@@ -40,6 +40,25 @@ static QCAP: AtomicUsize = AtomicUsize::new(3);
 
 static MBX: Mutex<VecDeque<FramePtr>> = Mutex::new(VecDeque::new());
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Live demuxer/decoder reopen (codec switch). On RK3588 the renderer PROCESS must survive a
+/// codec change (killing it corrupts WebKit's shared Mali GL state — the desktop/Windows
+/// backends respawn instead), so the app rewrites the SDP and sends `reopen <path>` over stdin:
+/// the decode loop tears the old demuxer+decoder down and reopens in place.
+static REOPEN: AtomicBool = AtomicBool::new(false);
+static REOPEN_SDP: Mutex<Option<String>> = Mutex::new(None);
+
+/// Queue a live reopen on `sdp_path` (called from the stdin reader on a `reopen` line).
+pub fn request_reopen(sdp_path: &str) {
+	*REOPEN_SDP.lock().unwrap() = Some(sdp_path.to_string());
+	REOPEN.store(true, Ordering::Relaxed);
+}
+
+/// libav interrupt callback: abort a blocked demuxer read on stop/reopen so the decode
+/// loop can't hang waiting for packets that will never come (e.g. the host already
+/// switched codecs and the old RTP flow went quiet).
+unsafe extern "C" fn intr_cb(_: *mut c_void) -> c_int {
+	(STOP.load(Ordering::Relaxed) || REOPEN.load(Ordering::Relaxed)) as c_int
+}
 /// Frame pacing toggle. false = newest-wins (drain all-but-newest each present); true =
 /// Moonlight per-vblank metering (present exactly ONE oldest frame per draw/vblank, hold the
 /// last frame on underflow, adaptive depth ≤ PACE_CEIL). The startup default is ON (set via
@@ -157,7 +176,42 @@ pub fn start_decode(sdp_path: &str) {
 		QCAP.store(n.max(2), Ordering::Relaxed);
 	}
 	let sdp = CString::new(sdp_path).unwrap();
-	std::thread::spawn(move || unsafe {
+	std::thread::spawn(move || {
+		let mut sdp = sdp;
+		loop {
+			unsafe { decode_once(&sdp) };
+			if STOP.load(Ordering::Relaxed) {
+				return;
+			}
+			// A pending reopen (live codec switch): drop the stale old-codec frames and
+			// run another decode pass on the rewritten SDP. No pending path → the demuxer
+			// hit EOF / a fatal open error: keep the old end-of-thread behavior.
+			let next = REOPEN_SDP.lock().unwrap().take();
+			REOPEN.store(false, Ordering::Relaxed);
+			match next {
+				Some(p) => {
+					let mut q = MBX.lock().unwrap();
+					while let Some(f) = q.pop_front() {
+						let mut o = f.0;
+						unsafe { ff::av_frame_free(&mut o) };
+					}
+					drop(q);
+					match CString::new(p) {
+						Ok(c) => sdp = c,
+						Err(_) => return,
+					}
+				}
+				None => return,
+			}
+		}
+	});
+}
+
+/// One demux+decode pass over `sdp` — runs until stop, reopen, EOF or a fatal error.
+/// (The body of the old inline decode thread, unchanged except the loop condition and
+/// the interrupt callback; extracted so a live reopen can run it again on a new SDP.)
+unsafe fn decode_once(sdp: &CString) {
+	{
 		let mut fmt: *mut ff::AVFormatContext = ptr::null_mut();
 		let mut opts: *mut ff::AVDictionary = ptr::null_mut();
 		let set = |o: &mut *mut ff::AVDictionary, k: &str, v: &str| {
@@ -205,6 +259,11 @@ pub fn start_decode(sdp_path: &str) {
 			.and_then(|v| v.parse::<u64>().ok())
 			.unwrap_or(40_000);
 		set(&mut opts, "max_delay", &maxdelay.to_string());
+		// Pre-allocate the context to install the interrupt callback (a blocked RTP read
+		// must abort on stop/reopen). avformat_open_input frees it on failure as usual.
+		fmt = ff::avformat_alloc_context();
+		(*fmt).interrupt_callback.callback = Some(intr_cb);
+		(*fmt).interrupt_callback.opaque = ptr::null_mut();
 		let opened =
 			ff::avformat_open_input(&mut fmt, sdp.as_ptr(), ptr::null_mut(), &mut opts) >= 0;
 		// Consumed entries were removed from the dict by the demuxer; free whatever remains.
@@ -306,7 +365,7 @@ pub fn start_decode(sdp_path: &str) {
 			let pkt = ff::av_packet_alloc();
 			let frame = ff::av_frame_alloc();
 			let mut last_pub_pace = std::time::Instant::now();
-			while !STOP.load(Ordering::Relaxed) {
+			while !STOP.load(Ordering::Relaxed) && !REOPEN.load(Ordering::Relaxed) {
 				let r = ff::av_read_frame(fmt, pkt);
 				if r == ff::AVERROR_EOF {
 					break;
@@ -438,7 +497,7 @@ pub fn start_decode(sdp_path: &str) {
 		// and the demuxer. Both calls are no-ops on still-null pointers.
 		ff::avcodec_free_context(&mut dc);
 		ff::avformat_close_input(&mut fmt);
-	});
+	}
 }
 
 /// Async-signal-safe stop request: ONLY stores the STOP atomic (no lock, no libav free), so it

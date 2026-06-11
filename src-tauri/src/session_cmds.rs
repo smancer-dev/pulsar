@@ -103,12 +103,61 @@ pub(crate) async fn set_play_codec(
 		windows
 	))]
 	respawn_render_for_codec(&app, &state, id, &codec).await;
+	// RK3588: the renderer process must survive (killing it corrupts WebKit's shared
+	// Mali GL state), but the demuxer/decoder were still fixed at spawn — without this
+	// the old hevc_rkmpp kept eating the new H.264 RTP ("Multi-layer HEVC" spam, frozen
+	// video). Rewrite the SDP and tell the LIVE renderer to reopen in place.
+	#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+	reopen_render_for_codec(&state, id, &codec);
 	#[cfg(not(any(
-		all(unix, not(target_os = "macos"), not(target_arch = "aarch64")),
+		all(unix, not(target_os = "macos")),
 		windows
 	)))]
 	let _ = &app;
+	#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+	let _ = &app;
 	Ok(())
+}
+
+/// Live in-place codec switch for the surviving RK3588 renderer: rewrite the SDP for
+/// `codec` (same video port — the host re-encodes to it) and send `reopen <path>` over
+/// stdin; video.rs tears the demuxer+decoder down and reselects (h264_rkmpp ↔ hevc_rkmpp).
+/// The overlay keeps all its state — no caps/seed replay needed (the process lives on).
+#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+fn reopen_render_for_codec(state: &State<'_, AppState>, id: u64, codec: &str) {
+	use std::io::Write as _;
+	let mut plays = state.plays.lock().unwrap();
+	let Some(p) = plays.get_mut(&id) else { return };
+	if p.render_child.is_none() {
+		return; // mpv/ffplay fallback paths keep their old behavior
+	}
+	let Ok(sdp) = crate::native_view::write_sdp(p.video_port, codec) else {
+		return;
+	};
+	let sent = if let Some(si) = p.render_stdin.lock().unwrap().as_mut() {
+		writeln!(si, "reopen {}", sdp.display()).and_then(|()| si.flush()).is_ok()
+	} else {
+		false
+	};
+	p.mpv_sdp = Some(sdp);
+	// Keep the stored caps line's codec field in sync for any later respawn/replay.
+	{
+		let mut line = p.caps_line.lock().unwrap();
+		if !line.is_empty() {
+			*line = line
+				.split_whitespace()
+				.map(|kv| {
+					if kv.starts_with("codec=") {
+						format!("codec={codec}")
+					} else {
+						kv.to_string()
+					}
+				})
+				.collect::<Vec<_>>()
+				.join(" ");
+		}
+	}
+	tracing::info!(id, codec, sent, "renderer demuxer reopened for codec switch");
 }
 
 /// Kill + respawn the native renderer with an SDP rewritten for `codec` (live codec
