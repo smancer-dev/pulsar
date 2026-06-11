@@ -189,7 +189,8 @@ mod win_loopback {
 			}
 			if !wrote_any {
 				// Host silent this tick → keep the timeline moving with one period of silence.
-				sink.write_all(silence).map_err(|e| format!("pipe write: {e}"))?;
+				sink.write_all(silence)
+					.map_err(|e| format!("pipe write: {e}"))?;
 			}
 			std::thread::sleep(std::time::Duration::from_millis(10));
 		}

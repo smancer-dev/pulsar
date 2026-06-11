@@ -1,7 +1,7 @@
 {
 	"identifier": "default",
-	"description": "Core capability for the main window and the approval popups.",
-	"windows": ["main", "approve-*"],
+	"description": "Core capability for the main window, the approval popups and the connections window.",
+	"windows": ["main", "approve-*", "connections"],
 	"permissions": [
 		"core:default",
 		"core:window:allow-start-dragging",

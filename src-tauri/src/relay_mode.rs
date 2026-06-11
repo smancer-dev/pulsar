@@ -16,25 +16,29 @@ pub fn run_relay(args: &[String]) {
 			.cloned()
 	};
 	let addr: SocketAddr = match flag("--bind") {
-		Some(b) => b.parse().expect("invalid --bind address (expected host:port)"),
+		Some(b) => b
+			.parse()
+			.expect("invalid --bind address (expected host:port)"),
 		None => {
 			let host = flag("--host").unwrap_or_else(|| "0.0.0.0".into());
-			let port =
-				flag("--port").unwrap_or_else(|| pulsar_core::proto::DEFAULT_RELAY_PORT.to_string());
-			format!("{host}:{port}").parse().expect("invalid --host/--port")
+			let port = flag("--port")
+				.unwrap_or_else(|| pulsar_core::proto::DEFAULT_RELAY_PORT.to_string());
+			format!("{host}:{port}")
+				.parse()
+				.expect("invalid --host/--port")
 		}
 	};
 	// Operator bandwidth limits (same flags + env as the standalone `pulsar-relay`).
 	// Default unlimited; e.g. `pulsar --relay --user-rate 10mbit --user-data 5gb`.
 	let rate = |name: &str, env: &str| {
-		flag(name)
-			.or_else(|| std::env::var(env).ok())
-			.map(|s| pulsar_relay::parse_rate(&s).unwrap_or_else(|| panic!("invalid {name}: {s:?}")))
+		flag(name).or_else(|| std::env::var(env).ok()).map(|s| {
+			pulsar_relay::parse_rate(&s).unwrap_or_else(|| panic!("invalid {name}: {s:?}"))
+		})
 	};
 	let size = |name: &str, env: &str| {
-		flag(name)
-			.or_else(|| std::env::var(env).ok())
-			.map(|s| pulsar_relay::parse_size(&s).unwrap_or_else(|| panic!("invalid {name}: {s:?}")))
+		flag(name).or_else(|| std::env::var(env).ok()).map(|s| {
+			pulsar_relay::parse_size(&s).unwrap_or_else(|| panic!("invalid {name}: {s:?}"))
+		})
 	};
 	let limits = pulsar_relay::Limits {
 		per_user_bps: rate("--user-rate", "PULSAR_RELAY_USER_RATE"),

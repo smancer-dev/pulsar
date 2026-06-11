@@ -28,11 +28,14 @@ describe('Home screen', () => {
 		expect(onConnect.mock.calls[0][0].id).toBe('719 204 663');
 	});
 
-	it('lists a real recorded connection and re-connects to it', async () => {
-		recordConnection('640 117 992', 'Oyun Rig’i');
+	it('lists a real recorded connection (id grouped in threes) and re-connects to it', async () => {
+		recordConnection('640117992', 'Oyun Rig’i'); // CLI-style raw id
 		const onConnect = vi.fn();
 		render(Home, { props: { selfId: '482 913 056', mode: 'game', hostSessions: [], activity: [], onMode: noop, onConnect } });
+		// Displayed grouped even though it was recorded raw.
+		expect(screen.getByText('640 117 992')).toBeTruthy();
 		await fireEvent.click(screen.getByText('Oyun Rig’i'));
-		expect(onConnect).toHaveBeenCalledWith({ name: 'Oyun Rig’i', id: '640 117 992' }, 'game');
+		// The stored id is canonical (despaced).
+		expect(onConnect).toHaveBeenCalledWith({ name: 'Oyun Rig’i', id: '640117992' }, 'game');
 	});
 });

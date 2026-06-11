@@ -11,6 +11,8 @@
 		embedded: boolean;
 		mode: 'remote' | 'game';
 		target: Target;
+		/** Native capture engaged (clicked in — input is being forwarded). */
+		nativeEngaged?: boolean;
 		hasVideo: boolean;
 		videoErr: string;
 		stalled: boolean;
@@ -23,6 +25,7 @@
 		embedded,
 		mode,
 		target,
+		nativeEngaged = false,
 		hasVideo,
 		videoErr,
 		stalled,
@@ -32,11 +35,20 @@
 	}: Props = $props();
 </script>
 
-{#if native && !embedded}
+{#if stalled && !embedded}
+	<!-- FIRST in the chain: the native ghost branch below would otherwise shadow it
+	     on every shipping path, leaving the "stream stopped" UI unreachable. -->
+	<div class="stall">
+		<Icon name="shield" size={34} />
+		<div class="stallmsg">{t('session.streamStopped')}</div>
+	</div>
+{:else if native && !embedded}
 	<div class="ghost">
 		<Icon name="monitor" size={46} />
 		<div class="gname">{target.name}</div>
-		<div class="note">{t('session.nativeActive')}</div>
+		<div class="note">
+			{nativeEngaged ? t('session.nativeControlling') : t('session.nativeClickToControl')}
+		</div>
 	</div>
 {:else if !hasVideo && videoErr && !embedded}
 	<div class="ghost">
@@ -53,11 +65,6 @@
 		<div class="gname">{target.name}</div>
 		<div class="lstat">{t('session.connecting')}</div>
 		<div class="lhint">{t('session.waiting')}</div>
-	</div>
-{:else if stalled && !embedded}
-	<div class="stall">
-		<Icon name="shield" size={34} />
-		<div class="stallmsg">{t('session.streamStopped')}</div>
 	</div>
 {:else if !controlling}
 	<button class="focushint" onpointerdown={onStartControl}>{t('session.clickToControl')}</button>

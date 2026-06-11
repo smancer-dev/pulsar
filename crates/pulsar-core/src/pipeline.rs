@@ -11,10 +11,11 @@
 //! so it's unit-tested; the actual process spawning lives in the Tauri layer.
 
 mod command;
+pub mod gst;
 mod types;
 
 pub use command::{decode_command, encode_command, probe_command};
-pub use types::{CaptureMethod, HwEncoder, StreamPlan, VCodec, detect, resolve, resolve_codec};
+pub use types::{detect, resolve, resolve_codec, CaptureMethod, HwEncoder, StreamPlan, VCodec};
 
 #[cfg(test)]
 mod tests;

@@ -10,9 +10,13 @@
 		/** True once the host has been reached and we're waiting on its approval /
 		 * the user's one-time password (a real milestone, driven by the parent). */
 		awaitingApproval?: boolean;
+		/** True once the host ACCEPTED (auth done, stream starting) — the screen stays
+		 * up until first frames (`play-ready`), but the status must say "preparing",
+		 * not "waiting for approval" (wrong for unattended hosts). */
+		preparing?: boolean;
 		onCancel: () => void;
 	};
-	let { target, mode, awaitingApproval = false, onCancel }: Props = $props();
+	let { target, mode, awaitingApproval = false, preparing = false, onCancel }: Props = $props();
 
 	// Real milestones only (no faked "peer found"): we show "reaching out", then the
 	// ACTUAL transport once the core establishes it (direct P2P vs relay), then
@@ -35,14 +39,24 @@
 		};
 	});
 	const status = $derived(
-		awaitingApproval
-			? t('connecting.awaiting')
-			: transport === 'direct'
-				? t('connecting.p2p')
-				: transport === 'relay'
-					? t('connecting.relay')
-					: t('connecting.reaching')
+		preparing
+			? t('connecting.preparing')
+			: awaitingApproval
+				? t('connecting.awaiting')
+				: transport === 'direct'
+					? t('connecting.p2p')
+					: transport === 'relay'
+						? t('connecting.relay')
+						: t('connecting.reaching')
 	);
+
+	// A connect stuck this long usually means an offline host or a blocking
+	// firewall — surface a hint instead of spinning silently forever.
+	let slow = $state(false);
+	$effect(() => {
+		const tmr = setTimeout(() => (slow = true), 12_000);
+		return () => clearTimeout(tmr);
+	});
 </script>
 
 <div class="overlay">
@@ -55,6 +69,9 @@
 	<h2>{target.name}</h2>
 	<div class="tid mono">{target.id} · {mode === 'game' ? t('connecting.modeGame') : t('connecting.modeRemote')}</div>
 	<div class="status"><span class="spin"></span>{status}</div>
+	{#if slow && !preparing}
+		<div class="slowhint">{t('connecting.slowHint')}</div>
+	{/if}
 	<button class="btn btn-ghost" onclick={onCancel}>{t('connecting.cancel')}</button>
 </div>
 
@@ -93,6 +110,13 @@
 		font-size: 13.5px;
 		color: var(--text-muted);
 		margin: 16px 0 8px;
+	}
+	.slowhint {
+		font-size: 12.5px;
+		color: var(--text-faint);
+		max-width: 44ch;
+		line-height: 1.5;
+		margin-bottom: 4px;
 	}
 	.spin {
 		width: 13px;

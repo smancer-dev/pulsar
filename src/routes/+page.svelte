@@ -7,10 +7,15 @@
 		onSessionEvent,
 		onAuthPrompt,
 		onReverseRequest,
-		onFullscreenToggle
+		onFullscreenToggle,
+		onLocalCaps,
+		onPeerAvatar,
+		onPeerName
 	} from '$lib/api';
+	import { setPeerIdentity } from '$lib/peers.svelte';
 	import { gameStore } from '$lib/games.svelte';
 	import { ui } from '$lib/settings.svelte';
+	import { initCaps } from '$lib/caps.svelte';
 	import { t, i18n } from '$lib/i18n.svelte';
 	import type { Config } from '$lib/types';
 	import Connecting from '$lib/screens/Connecting.svelte';
@@ -67,7 +72,7 @@
 	let connError = $state('');
 	// Multiple concurrent host connections (tabs), the active tab, fullscreen, and the
 	// connect/disconnect lifecycle live in the session manager.
-	const sm = new SessionManager({ getMode: () => mode, onAuthDone: () => closePw() });
+	const sm = new SessionManager({ getMode: () => mode, onAuthDone: (target) => closePwFor(target) });
 	// Client-side password prompts — driven by the host's `auth-prompt` event, so they
 	// appear at the same time as the host's Allow/Deny popup. Replying with the password
 	// OR the host clicking Allow (whichever first) completes the connect. Multiple tabs
@@ -96,6 +101,26 @@
 		pwError = '';
 		pwChecking = false;
 	}
+	// A finished connect dismisses only ITS OWN queued prompt: with concurrent tabs,
+	// dequeuing the head would remove the prompt the user is typing into whenever an
+	// UNRELATED connect settles first — that prompt's req would never be answered and
+	// its tab would hang on Connecting. Matched on the despaced id; the prompt's peer
+	// may carry a resolved `ip:port` while the target was typed as a bare ip.
+	function closePwFor(targetId: string) {
+		const want = targetId.replace(/\s/g, '');
+		const i = pwQueue.findIndex((q) => {
+			const p = q.peer.replace(/\s/g, '');
+			return p === want || p.startsWith(want + ':') || want.startsWith(p + ':');
+		});
+		if (i < 0) return;
+		pwQueue = pwQueue.filter((_, j) => j !== i);
+		// The visible head was removed → re-arm the inputs for the next prompt (if any).
+		if (i === 0) {
+			pwInput = '';
+			pwError = '';
+			pwChecking = false;
+		}
+	}
 	// Host-side activity: who's connected + a recent event log.
 	let hostSessions = $state<{ peer: string; since: number }[]>([]);
 	let activity = $state<string[]>([]);
@@ -114,11 +139,29 @@
 			online = false;
 			selfId = '—';
 			selfPw = '';
-			connError = e instanceof Error ? e.message : String(e);
+			const msg = e instanceof Error ? e.message : String(e);
+			// The sidebar shows this as the offline tooltip; the auto-retry effect below
+			// keeps trying, so say so instead of presenting a dead end.
+			connError = isTauri ? `${msg} — otomatik olarak yeniden denenecek` : msg;
 		} finally {
 			connecting = false;
 		}
 	}
+
+	// Unattended hosts must come online without a human: a machine that boots before
+	// its network is up (or loses the relay) would otherwise stay offline until someone
+	// clicks "Çevrimiçi ol". While offline and not mid-attempt, retry go_online on a
+	// capped backoff (3s → 12s); each attempt surfaces via the normal connecting state.
+	let retryDelay = 0;
+	$effect(() => {
+		if (isPopup || !isTauri || online || connecting) {
+			if (online) retryDelay = 0; // a real success re-arms the fresh backoff
+			return;
+		}
+		retryDelay = retryDelay > 0 ? Math.min(12_000, retryDelay * 2) : 3000;
+		const tmr = setTimeout(goOnline, retryDelay);
+		return () => clearTimeout(tmr);
+	});
 
 	// Roll a fresh one-time password (host side).
 	async function refreshPw() {
@@ -143,6 +186,18 @@
 	// connect finishing behind the splash and jumping straight to video.
 	let splashGone: () => void = () => {};
 	const splashDone = new Promise<void>((resolve) => (splashGone = resolve));
+	// Startup capability probe (encoders+decoders, re-run every launch): the splash
+	// holds until it lands so the UI never shows un-gated options. Safety-capped in
+	// boot() so a hung probe can't block startup.
+	const capsReady = new Promise<void>((resolve) => {
+		if (!isTauri) return resolve();
+		onLocalCaps(() => resolve());
+		api.localCaps()
+			.then((c) => {
+				if (c) resolve();
+			})
+			.catch(() => {});
+	});
 	// CLI --connect auto-connect: password to auto-submit if the host asks for one.
 	let autoPw = '';
 	const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -172,8 +227,9 @@
 			splashGone();
 			return;
 		}
-		// Window is up now → keep the splash visible a beat, then cross-fade to the UI.
-		await wait(1300);
+		// Window is up now → keep the splash visible a beat AND until the startup
+		// capability probe lands (≤5 s cap), then cross-fade to the UI.
+		await Promise.all([wait(1300), Promise.race([capsReady, wait(5000)])]);
 		booting = false; // start the opacity fade
 		await wait(500);
 		splashOn = false; // unmount once faded
@@ -181,6 +237,7 @@
 	}
 
 	onMount(async () => {
+		initCaps();
 		boot();
 		if (isPopup) return; // approval popup: nothing else to bootstrap
 		await goOnline();
@@ -202,6 +259,17 @@
 			} else if (e.kind === 'stream') {
 				activity = [t('activity.stream', { peer: e.peer, detail: e.detail }), ...activity].slice(0, 8);
 			}
+		});
+		// Host role: a connecting CLIENT pushed its identity (name/avatar, peer-keyed
+		// by its device id) — cache it so recents / LAN / devices show who it is.
+		// Client-side pushes use a play id ("3") as the peer key; only real device
+		// ids (9 digits / an address) belong in the cache.
+		const isDeviceId = (p: string) => /^\d{9}$/.test(p.replace(/\s/g, '')) || /[.:]/.test(p);
+		await onPeerAvatar((e) => {
+			if (isDeviceId(e.peer)) setPeerIdentity(e.peer, { avatar: e.dataUrl });
+		});
+		await onPeerName((e) => {
+			if (isDeviceId(e.peer)) setPeerIdentity(e.peer, { name: e.name });
 		});
 		// A controlled client asked to reverse direction — connect back to it so the
 		// roles swap (it must be online/serving for this to land).
@@ -370,6 +438,7 @@
 				onConnect={sm.startConnect}
 				onStream={sm.startHostSession}
 				onClearConnectErr={() => (sm.connectErr = '')}
+				onAuthDone={closePwFor}
 			/>
 		</div>
 
@@ -380,6 +449,7 @@
 						target={s.target}
 						mode={s.mode}
 						awaitingApproval={!!pwPrompt}
+						preparing={s.playId >= 0}
 						onCancel={() => sm.endSession(s.tabId)}
 					/>
 				{:else}
@@ -392,7 +462,10 @@
 						audioWsPort={s.audioWsPort ?? 0}
 						native={s.native ?? false}
 						embedded={s.embedded ?? false}
+						hostCodecs={s.hostCodecs ?? []}
+						hostEncoders={s.hostEncoders ?? []}
 						{selfId}
+						active={sm.activeTab === s.tabId}
 						fullscreen={sm.fullscreen}
 						onToggleFullscreen={sm.toggleFullscreen}
 						onEnd={() => sm.endSession(s.tabId)}

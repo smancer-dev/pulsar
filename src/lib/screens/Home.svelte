@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { historyPeers } from '$lib/peers.svelte';
-	import { api, type GameInfo } from '$lib/api';
+	import { historyPeers, removeFromHistory, fmtPeerId } from '$lib/peers.svelte';
+	import { api, onNodePort, type GameInfo } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 	import SelfCard from './Home/SelfCard.svelte';
 	import LanDevices from './Home/LanDevices.svelte';
@@ -21,6 +21,10 @@
 		onRefreshPw?: () => void;
 		onDisconnect?: (peer: string) => void;
 		onConnect: (t: Target, m?: 'remote' | 'game', gameId?: string) => void;
+		/** Called when a games fetch settles (success or fail) so the shell can dismiss
+		 * the password prompt it opened for this target (listRemoteGames authenticates
+		 * like a connect, but never goes through SessionManager.startConnect). */
+		onAuthDone?: (target: string) => void;
 	};
 	let {
 		selfId,
@@ -34,16 +38,34 @@
 		onMode,
 		onRefreshPw = () => {},
 		onDisconnect = () => {},
-		onConnect
+		onConnect,
+		onAuthDone = () => {}
 	}: Props = $props();
 
 	let showAllHistory = $state(false);
 	const allHistory = $derived(historyPeers());
 	const recents = $derived(showAllHistory ? allHistory : allHistory.slice(0, 3));
 
+	// Local IP + the node's ACTUAL bound port (direct-connect target "ip:port").
+	// Snapshot at mount for late opens; the node-port event keeps it live across
+	// go_online rebinds (e.g. after a Settings port change → reconnect).
 	let localIp = $state('');
+	let nodePort = $state(0);
 	onMount(() => {
 		api.localIp().then((ip) => (localIp = ip)).catch(() => {});
+		api.nodePort().then((p) => (nodePort = p)).catch(() => {});
+		let off: (() => void) | undefined;
+		let dead = false;
+		onNodePort((p) => (nodePort = p)).then((o) => {
+			// If Home unmounted before listen() resolved, unlisten right away —
+			// otherwise this late registration would leak past the cleanup below.
+			if (dead) o();
+			else off = o;
+		});
+		return () => {
+			dead = true;
+			off?.();
+		};
 	});
 
 	let target = $state('');
@@ -53,18 +75,31 @@
 	let loadingGames = $state(false);
 	let gamesErr = $state('');
 
+	// The fetched list is bound to the target it came from — editing the target
+	// invalidates it (a stale row would connect to B with A's game id).
+	function setTarget(v: string) {
+		const next = fmt(v);
+		if (next !== target) {
+			hostGames = null;
+			gamesErr = '';
+		}
+		target = next;
+	}
+
 	// Auth (password / host approval) is handled by the connect flow via events.
 	async function fetchGames() {
 		if (!canConnect) return;
+		const id = fmt(target);
 		loadingGames = true;
 		gamesErr = '';
 		hostGames = null;
 		try {
-			hostGames = await api.listRemoteGames(fmt(target));
+			hostGames = await api.listRemoteGames(id);
 		} catch (e) {
 			gamesErr = e instanceof Error ? e.message : String(e);
 		} finally {
 			loadingGames = false;
+			onAuthDone(id); // this fetch's password prompt (if any) is done
 		}
 	}
 	function playGame(g: GameInfo) {
@@ -120,6 +155,7 @@
 		{activity}
 		{debug}
 		{localIp}
+		{nodePort}
 		{onRefreshPw}
 		{onDisconnect}
 	/>
@@ -131,8 +167,8 @@
 			<Icon name="connect" size={17} />
 			<input
 				value={target}
-				oninput={(e) => (target = fmt(e.currentTarget.value))}
-				onkeydown={(e) => e.key === 'Enter' && go()}
+				oninput={(e) => setTarget(e.currentTarget.value)}
+				onkeydown={(e) => e.key === 'Enter' && (mode === 'game' ? fetchGames() : go())}
 				placeholder="000 000 000"
 				aria-label={t('home.targetAria')}
 				style="font-family:var(--font-mono);font-size:19px;letter-spacing:0.06em"
@@ -183,14 +219,24 @@
 				<div class="empty">{t('home.noRecents')}</div>
 			{:else}
 				{#each recents as r (r.id)}
-				<button class="recent-row" onclick={() => onConnect({ name: r.name, id: r.id }, mode)}>
-					<span class="ravatar">{initials(r.name)}</span>
-					<span class="rmeta">
-						<span class="rname">{r.name}</span>
-						<span class="rid mono">{r.id}</span>
-					</span>
-					<Icon name="arrowRight" size={15} class="push" />
-				</button>
+				<div class="rrow">
+					<button class="recent-row" onclick={() => onConnect({ name: r.name, id: r.id }, mode)}>
+						<span class="ravatar">
+							{#if r.avatar}<img class="rimg" src={r.avatar} alt="" />{:else}{initials(r.name)}{/if}
+						</span>
+						<span class="rmeta">
+							<span class="rname">{r.name}</span>
+							<span class="rid mono">{fmtPeerId(r.id)}</span>
+						</span>
+						<Icon name="arrowRight" size={15} class="push" />
+					</button>
+					<button
+						class="rdel"
+						title={t('home.removeRecent')}
+						aria-label={t('home.removeRecent')}
+						onclick={() => removeFromHistory(r.id)}>×</button
+					>
+				</div>
 				{/each}
 			{/if}
 		</div>
@@ -281,6 +327,43 @@
 	}
 	.recents .recent-row {
 		margin-bottom: 6px;
+	}
+	/* row wrapper: the connect button + the history-remove × side by side */
+	.rrow {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.rrow .recent-row {
+		flex: 1;
+		min-width: 0;
+	}
+	.rdel {
+		flex: none;
+		width: 26px;
+		height: 26px;
+		margin-bottom: 6px;
+		border: none;
+		border-radius: 7px;
+		background: transparent;
+		color: var(--text-faint);
+		font-size: 16px;
+		line-height: 1;
+		cursor: pointer;
+		display: grid;
+		place-items: center;
+	}
+	.rdel:hover {
+		background: var(--accent-soft);
+		color: var(--accent);
+	}
+	.ravatar {
+		overflow: hidden;
+	}
+	.rimg {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
 	}
 	.ravatar {
 		width: 30px;

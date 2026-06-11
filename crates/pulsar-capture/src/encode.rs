@@ -97,34 +97,34 @@ const VENDOR_NVIDIA: u32 = 0x10DE;
 
 /// Diagnostic log to a fixed file (the native encoder runs in the GUI host with no console).
 fn cap_dbg(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\Users\\Public\\pulsar-capture-dbg.txt")
-    {
-        let _ = writeln!(f, "{msg}");
-    }
+	use std::io::Write;
+	if let Ok(mut f) = std::fs::OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open("C:\\Users\\Public\\pulsar-capture-dbg.txt")
+	{
+		let _ = writeln!(f, "{msg}");
+	}
 }
 
 // ===========================================================================
 // Tunables the host derives 1:1 from `on_stream` (see `lib.rs` adapter).
 // ===========================================================================
 pub struct EncParams {
-    /// Encode (output) size — may be downscaled from native (auto caps at 1080p).
-    pub width: u32,
-    pub height: u32,
-    /// Native capture size (duplicated output / pool texture). When != encode size the
-    /// VideoProcessor Blt scales native→encode; the cross-adapter bridge is sized to THIS so
-    /// the AMD→NVIDIA `CopyResource` of the native `frame.texture` matches (hybrid bug fix).
-    pub capture_width: u32,
-    pub capture_height: u32,
-    pub fps: u32,
-    pub bitrate_kbps: u32,
-    pub dest: String, // "rtp://10.0.0.5:9000"
-    pub codec: Codec, // native NVENC: H264 + HEVC + AV1 (AV1 needs Ada/Ampere+; else Err → ffmpeg)
-    pub low_latency: bool,
-    /// Host display rotation (degrees CW: 0/90/180/270). The BGRA→NV12 Blt rotates the captured
-    /// frame by this so the STREAM is already upright for the viewer (no client-side rotation).
-    pub rotation: u32,
+	/// Encode (output) size — may be downscaled from native (auto caps at 1080p).
+	pub width: u32,
+	pub height: u32,
+	/// Native capture size (duplicated output / pool texture). When != encode size the
+	/// VideoProcessor Blt scales native→encode; the cross-adapter bridge is sized to THIS so
+	/// the AMD→NVIDIA `CopyResource` of the native `frame.texture` matches (hybrid bug fix).
+	pub capture_width: u32,
+	pub capture_height: u32,
+	pub fps: u32,
+	pub bitrate_kbps: u32,
+	pub dest: String, // "rtp://10.0.0.5:9000"
+	pub codec: Codec, // native NVENC: H264 + HEVC + AV1 (AV1 needs Ada/Ampere+; else Err → ffmpeg)
+	pub low_latency: bool,
+	/// Host display rotation (degrees CW: 0/90/180/270). The BGRA→NV12 Blt rotates the captured
+	/// frame by this so the STREAM is already upright for the viewer (no client-side rotation).
+	pub rotation: u32,
 }

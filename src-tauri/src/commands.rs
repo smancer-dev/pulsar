@@ -35,28 +35,28 @@ pub(crate) async fn set_config(
 /// Available hardware encoders detected via ffmpeg (kebab-case values).
 #[tauri::command]
 pub(crate) async fn available_encoders(app: AppHandle) -> Vec<String> {
-	detect_encoders(&ffmpeg_bin(&app))
+	let mut ids: Vec<String> = detect_encoders(&ffmpeg_bin(&app))
 		.into_iter()
-		.map(|e| {
-			match e {
-				HwEncoder::Nvenc => "nvenc",
-				HwEncoder::Amf => "amf",
-				HwEncoder::Vaapi => "vaapi",
-				HwEncoder::Qsv => "qsv",
-				HwEncoder::VideoToolbox => "videotoolbox",
-				HwEncoder::Vulkan => "vulkan",
-				HwEncoder::MediaFoundation => "mediafoundation",
-				HwEncoder::Software => "software",
-				HwEncoder::Auto => "auto",
-			}
-			.to_string()
-		})
-		.collect()
+		.map(|e| crate::process::encoder_wire_id(e).to_string())
+		.collect();
+	// Families served by the GStreamer backend (e.g. Rockchip MPP encode on RK3588,
+	// where ffmpeg has no rkmpp encoders) count as available too.
+	#[cfg(target_os = "linux")]
+	for (enc, _codecs) in crate::process::validated_gst_encoders() {
+		let id = enc.wire_id().to_string();
+		if !ids.contains(&id) {
+			ids.push(id);
+		}
+	}
+	ids
 }
 
 /// Set the host's stream settings (resolution/fps/bitrate/encoder/display).
 #[tauri::command]
-pub(crate) async fn set_stream_settings(state: State<'_, AppState>, cfg: StreamCfg) -> Result<(), String> {
+pub(crate) async fn set_stream_settings(
+	state: State<'_, AppState>,
+	cfg: StreamCfg,
+) -> Result<(), String> {
 	*state.stream_cfg.lock().unwrap() = cfg;
 	Ok(())
 }
@@ -78,7 +78,10 @@ pub(crate) async fn new_password(state: State<'_, AppState>) -> Result<String, S
 
 /// Publish the host's games so connecting clients can list/launch them.
 #[tauri::command]
-pub(crate) async fn publish_games(state: State<'_, AppState>, games: Vec<HostGame>) -> Result<(), String> {
+pub(crate) async fn publish_games(
+	state: State<'_, AppState>,
+	games: Vec<HostGame>,
+) -> Result<(), String> {
 	*state.games.lock().unwrap() = games;
 	Ok(())
 }
@@ -97,15 +100,10 @@ pub(crate) async fn list_remote_games(
 		.clone()
 		.ok_or("önce çevrimiçi ol")?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
-	let (mut sess, peer_label) = connect_target(&node, &target).await?;
-	if !crate::auth::client_authenticate(
-		&mut sess,
-		&app,
-		&pw_pending,
-		&next_auth,
-		&peer_label,
-	)
-	.await?
+	let disc = state.discovery.lock().unwrap().clone();
+	let (mut sess, peer_label) = connect_target(&node, disc, &target).await?;
+	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
+		.await?
 	{
 		return Err("Bağlantı reddedildi.".into());
 	}
@@ -127,15 +125,10 @@ pub(crate) async fn launch_remote_game(
 		.clone()
 		.ok_or("önce çevrimiçi ol")?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
-	let (mut sess, peer_label) = connect_target(&node, &target).await?;
-	if !crate::auth::client_authenticate(
-		&mut sess,
-		&app,
-		&pw_pending,
-		&next_auth,
-		&peer_label,
-	)
-	.await?
+	let disc = state.discovery.lock().unwrap().clone();
+	let (mut sess, peer_label) = connect_target(&node, disc, &target).await?;
+	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
+		.await?
 	{
 		return Err("Bağlantı reddedildi.".into());
 	}
@@ -145,14 +138,18 @@ pub(crate) async fn launch_remote_game(
 }
 
 #[tauri::command]
-pub(crate) async fn connect(state: State<'_, AppState>, target: String) -> Result<ConnInfo, String> {
+pub(crate) async fn connect(
+	state: State<'_, AppState>,
+	target: String,
+) -> Result<ConnInfo, String> {
 	let node = state
 		.node
 		.lock()
 		.unwrap()
 		.clone()
 		.ok_or("önce çevrimiçi ol")?;
-	let (sess, peer_label) = connect_target(&node, &target).await?;
+	let disc = state.discovery.lock().unwrap().clone();
+	let (sess, peer_label) = connect_target(&node, disc, &target).await?;
 	let transport = match sess.transport() {
 		Transport::Direct => "direct",
 		Transport::Relay => "relay",
@@ -225,6 +222,14 @@ pub(crate) async fn local_ip() -> Result<String, String> {
 		.unwrap_or_default())
 }
 
+/// The node's ACTUAL bound UDP port (0 = not online yet) — pairs with `local_ip` so
+/// the Home screen can show the full direct-connect target ("ip:port"). Kept current
+/// by `go_online` (which also emits the `node-port` event for live screens).
+#[tauri::command]
+pub(crate) fn node_port(state: State<'_, AppState>) -> u16 {
+	state.node_port.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Path to an installed Steam launcher, or empty if Steam isn't found — lets the UI
 /// offer a deletable "Steam" default only when it's actually installed.
 #[tauri::command]
@@ -237,7 +242,11 @@ pub(crate) async fn steam_path() -> Result<String, String> {
 	} else if cfg!(target_os = "macos") {
 		&["/Applications/Steam.app/Contents/MacOS/steam_osx"]
 	} else {
-		&["/usr/bin/steam", "/usr/games/steam", "/var/lib/flatpak/exports/bin/com.valvesoftware.Steam"]
+		&[
+			"/usr/bin/steam",
+			"/usr/games/steam",
+			"/var/lib/flatpak/exports/bin/com.valvesoftware.Steam",
+		]
 	};
 	for p in candidates {
 		if std::path::Path::new(p).exists() {
@@ -297,7 +306,15 @@ pub(crate) async fn run_command(command: String) -> Result<(), String> {
 	let spawn = std::process::Command::new("sh")
 		.args(["-c", &command])
 		.spawn();
-	spawn.map(|_| ()).map_err(|e| e.to_string())
+	spawn
+		.map(|mut c| {
+			// Reap off-thread: dropping the Child would leave one Unix zombie per
+			// hook invocation for the (tray-resident) app's lifetime.
+			std::thread::spawn(move || {
+				let _ = c.wait();
+			});
+		})
+		.map_err(|e| e.to_string())
 }
 
 /// The CLI `--connect` auto-connect target (id/ip + optional password), for the frontend

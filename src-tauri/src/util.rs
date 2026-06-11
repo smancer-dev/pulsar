@@ -74,8 +74,16 @@ pub(crate) fn parse_target_addr(s: &str) -> Option<SocketAddr> {
 /// label (grouped ID or the address). The ID path is unchanged; an IP routes to
 /// `connect_direct` (in-band key exchange), after which OTP auth / serve are
 /// byte-for-byte identical.
+///
+/// `discovery` enables the SAME-LAN FAST PATH for ID targets: when the LAN
+/// beacon already knows this device id, connect straight to its LAN endpoint.
+/// The relay rendezvous would hand two same-NAT peers their PUBLIC (hairpin)
+/// addresses, and consumer routers forward a 15 Mbit hairpin flow with heavy
+/// loss (measured 14.7% on this network) — the LAN path sidesteps the router's
+/// WAN side entirely. Falls back to the relay rendezvous within 1.5 s.
 pub(crate) async fn connect_target(
 	node: &Arc<Node>,
+	discovery: Option<Arc<pulsar_core::discovery::Discovery>>,
 	target: &str,
 ) -> Result<(pulsar_core::Session, String), String> {
 	let s = target.trim();
@@ -87,6 +95,30 @@ pub(crate) async fn connect_target(
 		return Ok((sess, addr.to_string()));
 	}
 	let id = DeviceId::parse(s).ok_or("geçersiz kimlik veya IP")?;
+	if let Some(disc) = discovery {
+		let lan = disc
+			.peers()
+			.await
+			.into_iter()
+			.find(|p| p.id == Some(id))
+			.map(|p| p.addr);
+		if let Some(addr) = lan {
+			match tokio::time::timeout(
+				std::time::Duration::from_millis(1500),
+				node.connect_direct(addr, None),
+			)
+			.await
+			{
+				Ok(Ok(sess)) => {
+					tracing::info!(%addr, id = %id.grouped(), "same-LAN fast path: connected directly (discovery match)");
+					return Ok((sess, id.grouped()));
+				}
+				_ => {
+					tracing::info!(%addr, "LAN fast path failed — falling back to the relay rendezvous");
+				}
+			}
+		}
+	}
 	let sess = node.connect(id).await.map_err(|e| e.to_string())?;
 	Ok((sess, id.grouped()))
 }
@@ -163,7 +195,9 @@ pub(crate) fn display_rotation() -> u32 {
 
 #[cfg(windows)]
 fn display_rotation_detect() -> u32 {
-	use windows_sys::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+	use windows_sys::Win32::Graphics::Gdi::{
+		EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+	};
 	unsafe {
 		let mut dm: DEVMODEW = std::mem::zeroed();
 		dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;

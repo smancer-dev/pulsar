@@ -74,8 +74,7 @@ impl VirtualGamepad for UinputGamepad {
 			let val = if state.is_pressed(bit) { 1 } else { 0 };
 			events.push(InputEvent::new(EventType::KEY, key.code(), val));
 		}
-		let abs =
-			|axis: AbsoluteAxisType, v: i32| InputEvent::new(EventType::ABSOLUTE, axis.0, v);
+		let abs = |axis: AbsoluteAxisType, v: i32| InputEvent::new(EventType::ABSOLUTE, axis.0, v);
 		events.push(abs(AbsoluteAxisType::ABS_X, state.left_x as i32));
 		// evdev Y points down; gamepad up is +, so invert.
 		events.push(abs(AbsoluteAxisType::ABS_Y, -(state.left_y as i32)));
@@ -151,10 +150,18 @@ impl DesktopInput {
 		let x = dx.round() as i32;
 		let y = dy.round() as i32;
 		if x != 0 {
-			ev.push(InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_X.0, x));
+			ev.push(InputEvent::new(
+				EventType::RELATIVE,
+				RelativeAxisType::REL_X.0,
+				x,
+			));
 		}
 		if y != 0 {
-			ev.push(InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_Y.0, y));
+			ev.push(InputEvent::new(
+				EventType::RELATIVE,
+				RelativeAxisType::REL_Y.0,
+				y,
+			));
 		}
 		if !ev.is_empty() {
 			let _ = self.pointer.emit(&ev);

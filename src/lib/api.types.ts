@@ -42,6 +42,12 @@ export interface PlayInfo {
 	/** True when the Linux single-surface renderer is active (video in a GLArea behind
 	 * this webview); the session screen must be transparent to show it through. */
 	embedded: boolean;
+	/** The HOST's validated stream caps: codecs + encoder backends it can really emit
+	 * (QueryStreamCaps). Empty = unknown (old host / timeout) — no menu gating then. */
+	host_codecs: string[];
+	host_encoders: string[];
+	/** This client's own decodable codecs (startup probe). */
+	client_codecs: string[];
 }
 
 /** A side-channel text message: `peer` is the host-side peer id, or (for client
@@ -51,12 +57,31 @@ export interface DataText {
 	text: string;
 }
 
-/** A finished (or failed) inbound file transfer, host side. */
+/** A finished (or failed) inbound file transfer, host side — and client side for
+ * file-manager downloads (`peer` = play id as string then). */
 export interface FileRecv {
 	peer: string;
 	name: string;
 	bytes: number;
 	ok: boolean;
+}
+
+/** One entry of a directory listing (file manager). Same JSON shape for the
+ * remote (`fs-entries` event) and local (`local_ls`) sides. */
+export interface FsEntry {
+	name: string;
+	dir: boolean;
+	/** Byte size for files; 0 for directories. */
+	size: number;
+}
+
+/** A host directory listing for the file panel (the `fs-entries` event):
+ * the play id it belongs to, the echoed HOME-relative path, and its entries
+ * (dirs first, alphabetical; empty = rejected/unreadable path). */
+export interface FsEntries {
+	id: number;
+	path: string;
+	entries: FsEntry[];
 }
 
 export interface SessionEvent {
@@ -70,4 +95,11 @@ export interface SessionEvent {
 export interface AuthPrompt {
 	req: number;
 	peer: string;
+}
+
+/** Startup-probed local capabilities (the `local-caps` event / `local_caps` command). */
+export interface LocalCaps {
+	platform: 'linux' | 'windows' | 'macos';
+	encoders: { id: string; backend: 'ffmpeg' | 'gst'; codecs: string[] }[];
+	decoders: { codec: string; ok: boolean; name: string; hw: boolean; tier: string }[];
 }

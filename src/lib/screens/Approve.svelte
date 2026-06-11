@@ -9,6 +9,18 @@
 
 	let busy = $state(false);
 
+	// Auto-deny countdown: an unanswered popup (unattended host, user away) must not
+	// pile up forever — after 30 s it denies itself, exactly like clicking Reddet.
+	let secsLeft = $state(30);
+	$effect(() => {
+		const tmr = setInterval(() => {
+			if (busy) return; // a decision is already in flight
+			secsLeft -= 1;
+			if (secsLeft <= 0) decide(false);
+		}, 1000);
+		return () => clearInterval(tmr);
+	});
+
 	// Only space-group a 9-digit relay id ("482913056" → "482 913 056"). A direct
 	// (relay-less) connect's peer is an address (e.g. "192.168.1.5:9000") — show it
 	// as-is instead of mangling its digit runs.
@@ -55,7 +67,7 @@
 	</div>
 
 	<div class="actions">
-		<button class="btn deny" disabled={busy} onclick={() => decide(false)}>{t('approve.deny')}</button>
+		<button class="btn deny" disabled={busy} onclick={() => decide(false)}>{t('approve.deny')} ({secsLeft})</button>
 		<button class="btn allow" disabled={busy} onclick={() => decide(true)}>{t('approve.allow')}</button>
 	</div>
 </div>

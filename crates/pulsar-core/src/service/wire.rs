@@ -53,6 +53,23 @@ pub enum QualityPref {
 	Quality,
 }
 
+/// What a host can actually stream — the `QueryStreamCaps` reply. Both lists are
+/// validated (one-frame probe) and preference-ordered; vocabularies match the UI/wire
+/// strings (`h265`/`h264`/`av1`; `nvenc`/`qsv`/`vaapi`/`videotoolbox`/`amf`/
+/// `mediafoundation`/`vulkan`/`software`). The client uses them to resolve its "auto"
+/// codec and to disable session-menu options the host can't honor.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StreamCaps {
+	pub codecs: Vec<String>,
+	pub encoders: Vec<String>,
+	/// Transport features this host supports (see [`crate::service::media`]):
+	/// `"mos"` = media-over-session (single-socket RTP), `"nack"` = it honors
+	/// `MediaNack` retransmit requests. `#[serde(default)]` — an old host omits
+	/// the field, so the client sees no features and uses the legacy direct flows.
+	#[serde(default)]
+	pub features: Vec<String>,
+}
+
 /// A client's request to start receiving a video stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StreamReq {
@@ -106,10 +123,31 @@ pub struct StreamReq {
 	/// Request **4:4:4** chroma (no subsampling; sharper text for remote desktop).
 	#[serde(default)]
 	pub yuv444: bool,
+	/// Codecs this CLIENT can decode (startup-probe result, best-first). The host
+	/// clamps its codec fallback to this set so it never streams something the client
+	/// can't show. `#[serde(default)]` (empty = unknown/old client → no clamping).
+	#[serde(default)]
+	pub decode_codecs: Vec<String>,
+	/// Carry the RTP media INSIDE this session (single external socket) instead of
+	/// separate plain-UDP flows to `port`/`audio_port` — see [`crate::service::media`].
+	/// Only set when the host advertised the `mos` feature; `#[serde(default)]`
+	/// (false) keeps the legacy direct flows for old peers.
+	#[serde(default)]
+	pub media_over_session: bool,
 }
 
 fn default_true() -> bool {
 	true
+}
+
+/// One entry of a host directory listing (the `FsEntries` reply): name only (no
+/// path components), whether it's a directory, and the byte size for files
+/// (0 for directories). Listings are sorted dirs-first, then alphabetically.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FsEntry {
+	pub name: String,
+	pub dir: bool,
+	pub size: u64,
 }
 
 /// A bidirectional data-channel message exchanged over a live session for the
@@ -150,6 +188,36 @@ pub enum DataMsg {
 	/// video by the inverse → it shows upright regardless of how the host screen is mounted
 	/// (e.g. a laptop configured upside-down sends 180). Sent once at stream start.
 	DisplayRotation(u32),
+	/// Client → host: RTP **video** sequence numbers the client detected as missing
+	/// (media-over-session only). The host re-sends them from its retransmit ring if
+	/// they're still buffered — cheap loss recovery on LAN/Wi-Fi without waiting for
+	/// the next keyframe. An old host fails to decode the unknown variant and ignores it.
+	MediaNack(Vec<u16>),
+	/// The sender's identity image (PNG bytes, **≤ 64 KB** — a small center-cropped
+	/// avatar), pushed once right after a session is up, in both directions: client →
+	/// host so the host's connections list can show *who* connected, host → client for
+	/// the session UI. Best-effort decoration: the session transport is one datagram
+	/// per message, so senders must keep it small; an old peer fails to decode the
+	/// unknown (appended) variant and ignores it.
+	Avatar(Vec<u8>),
+	/// Client → host: list a directory of the host's filesystem (the file-manager
+	/// panel). `path` is **relative to the host user's HOME** with `/` separators
+	/// ("" = HOME itself) — the host canonicalizes and refuses anything that
+	/// escapes HOME. Appended for additive wire compat (old hosts ignore it).
+	FsList { path: String },
+	/// Host → client: the `FsList` reply — the echoed request path + its entries
+	/// (dirs first, alphabetical). A rejected/unreadable path replies with an
+	/// empty `entries` so the client always gets an answer.
+	FsEntries { path: String, entries: Vec<FsEntry> },
+	/// Client → host: stream the file at this HOME-relative path back to the
+	/// client through the existing `FileBegin`/`FileChunk`/`FileEnd` flow (the
+	/// file-manager "indir" action). Same HOME jail as `FsList`.
+	FsGet { path: String },
+	/// The sender's display NAME (the device/OS-user name), pushed once right after
+	/// a session is up alongside [`DataMsg::Avatar`] — the receiving side shows it in
+	/// its connections list / session UI and caches it for recents. Appended for
+	/// additive wire compat (old peers ignore it).
+	PeerName(String),
 }
 
 #[cfg(test)]
@@ -178,6 +246,104 @@ mod tests {
 			QualityPref::Balanced,
 			"missing quality defaults to Balanced"
 		);
+		assert!(
+			req.decode_codecs.is_empty(),
+			"missing decode_codecs defaults to empty (= unknown → host doesn't clamp)"
+		);
+		assert!(
+			!req.media_over_session,
+			"missing media_over_session defaults to false (legacy direct flows)"
+		);
+	}
+
+	#[test]
+	fn stream_caps_roundtrip_and_features_default() {
+		let caps = StreamCaps {
+			codecs: vec!["av1".into(), "h265".into(), "h264".into()],
+			encoders: vec!["rkmpp".into(), "software".into()],
+			features: vec!["mos".into(), "nack".into()],
+		};
+		let json = serde_json::to_string(&caps).unwrap();
+		let back: StreamCaps = serde_json::from_str(&json).unwrap();
+		assert_eq!(caps, back);
+		// An OLD host's reply has no `features` — must deserialize to empty.
+		let old = r#"{"codecs":["h264"],"encoders":["software"]}"#;
+		let caps: StreamCaps = serde_json::from_str(old).unwrap();
+		assert!(caps.features.is_empty());
+	}
+
+	#[test]
+	fn media_nack_roundtrip() {
+		let m = DataMsg::MediaNack(vec![1, 65535, 42]);
+		let json = serde_json::to_string(&m).unwrap();
+		assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), m);
+	}
+
+	#[test]
+	fn avatar_roundtrip() {
+		// Locks the additive wire contract for the appended Avatar variant: raw PNG
+		// bytes (incl. the 0x89 signature byte) survive the JSON roundtrip intact.
+		let m = DataMsg::Avatar(vec![0x89, b'P', b'N', b'G', 0, 255, 13, 10]);
+		let json = serde_json::to_string(&m).unwrap();
+		assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), m);
+	}
+
+	#[test]
+	fn peer_name_roundtrip() {
+		// The pushed display name (Unicode-safe) survives the JSON roundtrip.
+		let m = DataMsg::PeerName("Ahmet Enes Dürüer".into());
+		let json = serde_json::to_string(&m).unwrap();
+		assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), m);
+	}
+
+	#[test]
+	fn fs_list_and_get_roundtrip() {
+		// Locks the additive wire contract for the file-manager request variants:
+		// HOME-relative paths (incl. "" = HOME and non-ASCII names) survive intact.
+		for m in [
+			DataMsg::FsList {
+				path: String::new(),
+			},
+			DataMsg::FsList {
+				path: "Belgeler/Çalışma".into(),
+			},
+			DataMsg::FsGet {
+				path: "Belgeler/rapor.pdf".into(),
+			},
+		] {
+			let json = serde_json::to_string(&m).unwrap();
+			assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), m);
+		}
+	}
+
+	#[test]
+	fn fs_entries_roundtrip() {
+		// The listing reply: echoed path + entries (dirs first, alphabetical — the
+		// producer sorts; the wire just carries the order through).
+		let m = DataMsg::FsEntries {
+			path: "Belgeler".into(),
+			entries: vec![
+				FsEntry {
+					name: "Projeler".into(),
+					dir: true,
+					size: 0,
+				},
+				FsEntry {
+					name: "not.txt".into(),
+					dir: false,
+					size: 1234,
+				},
+			],
+		};
+		let json = serde_json::to_string(&m).unwrap();
+		assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), m);
+		// A rejected path replies with empty entries — must roundtrip too.
+		let empty = DataMsg::FsEntries {
+			path: "../etc".into(),
+			entries: Vec::new(),
+		};
+		let json = serde_json::to_string(&empty).unwrap();
+		assert_eq!(serde_json::from_str::<DataMsg>(&json).unwrap(), empty);
 	}
 
 	#[test]

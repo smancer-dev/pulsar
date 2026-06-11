@@ -14,6 +14,8 @@ export type {
 	PlayInfo,
 	DataText,
 	FileRecv,
+	FsEntry,
+	FsEntries,
 	SessionEvent,
 	AuthPrompt
 } from './api.types';
@@ -23,26 +25,38 @@ export { isTauri } from './api.invoke';
 export { api } from './api.commands';
 
 export {
+	onLocalCaps,
 	onChatMsg,
 	onHostChat,
 	onClipboardIn,
 	onDataClip,
 	onFileRecv,
+	onFsEntries,
+	onPeerAvatar,
+	onPeerName,
 	onKbdLeave,
+	onKbdEngaged,
+	onKbdReleased,
 	onOverlayToggle,
 	onFullscreenToggle,
 	onOverlayCmd,
 	onOverlayEnd,
 	onOverlayClose,
+	onOverlayChat,
+	onOverlayFs,
 	onWindowBlur,
 	onPlayEnded,
+	onPlayReady,
 	onReverseRequest,
 	onConnPhase,
 	onPlayRtt,
 	onPlayStats,
 	onPlayVStats,
+	onPlayDecoder,
+	onPlayDims,
 	onSessionEvent,
-	onAuthPrompt
+	onAuthPrompt,
+	onNodePort
 } from './api.events';
 
 export { copyText, setFullscreen, readClipboard, windowControl } from './api.dom';

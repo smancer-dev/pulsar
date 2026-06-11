@@ -20,6 +20,8 @@
 		onFullscreen: () => void;
 		onSendClipboard: () => void;
 		onPickFile: () => void;
+		/** Open the two-pane file-manager panel (browse + download/upload). */
+		onOpenFiles: () => void;
 		onToggleMic: () => void;
 		onOpenChat: () => void;
 		onToggleFloating: () => void;
@@ -43,6 +45,7 @@
 		onFullscreen,
 		onSendClipboard,
 		onPickFile,
+		onOpenFiles,
 		onToggleMic,
 		onOpenChat,
 		onToggleFloating,
@@ -69,6 +72,10 @@
 			<button class="m-item" role="menuitem" onclick={onPickFile}>
 				<Icon name="file" size={18} />
 				<span>{t('session.files')}</span>
+			</button>
+			<button class="m-item" role="menuitem" onclick={onOpenFiles}>
+				<Icon name="folder" size={18} />
+				<span>{t('session.filesPanel')}</span>
 			</button>
 			<button class="m-item" class:active={micOn} role="menuitem" onclick={onToggleMic}>
 				<Icon name="mic" size={18} />

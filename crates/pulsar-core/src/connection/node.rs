@@ -16,6 +16,20 @@ pub struct Node {
 	pub(super) inner: Mutex<Inner>,
 	pub(super) incoming_tx: mpsc::UnboundedSender<Session>,
 	pub(super) incoming_rx: Mutex<mpsc::UnboundedReceiver<Session>>,
+	/// Signalled by `Drop` so `recv_loop` exits immediately (see below).
+	pub(super) shutdown: Arc<Notify>,
+}
+
+impl Drop for Node {
+	/// Wake `recv_loop` so it exits: it holds a strong `Arc<UdpSocket>`, so an
+	/// idle dropped node would otherwise keep its (well-known) port bound until
+	/// the next stray datagram — and `go_online`'s re-bind to port 21118 would
+	/// silently fall back to an ephemeral port.
+	fn drop(&mut self) {
+		// notify_one stores a permit, so the wakeup also lands if the loop is
+		// mid-dispatch rather than parked in its select! right now.
+		self.shutdown.notify_one();
+	}
 }
 
 impl Node {
@@ -48,7 +62,26 @@ impl Node {
 		name: String,
 		identity: Identity,
 	) -> std::io::Result<Arc<Self>> {
-		let sock = Arc::new(UdpSocket::bind(local).await?);
+		// Media-over-session rides THIS one socket: a 15 Mbit stream's IDR bursts
+		// overflow the kernel-default ~208 KiB rcvbuf (UdpRcvbufErrors → silent
+		// packet loss → broken reference chains / mosaic under motion). Ask for
+		// 4 MiB each way before binding; the kernel clamps to rmem_max/wmem_max,
+		// so this is best-effort (Pi has 16 MiB, stock desktops 4 MiB+).
+		let sock = {
+			use socket2::{Domain, Protocol, Socket, Type};
+			let domain = if local.is_ipv4() {
+				Domain::IPV4
+			} else {
+				Domain::IPV6
+			};
+			let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+			let _ = s.set_recv_buffer_size(4 << 20);
+			let _ = s.set_send_buffer_size(4 << 20);
+			s.set_nonblocking(true)?;
+			s.bind(&local.into())?;
+			UdpSocket::from_std(s.into())?
+		};
+		let sock = Arc::new(sock);
 		let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 		let node = Arc::new(Self {
 			sock,
@@ -60,6 +93,7 @@ impl Node {
 			inner: Mutex::new(Inner::default()),
 			incoming_tx,
 			incoming_rx: Mutex::new(incoming_rx),
+			shutdown: Arc::new(Notify::new()),
 		});
 		let weak = Arc::downgrade(&node);
 		tokio::spawn(recv_loop(weak));
@@ -68,6 +102,30 @@ impl Node {
 
 	pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
 		self.sock.local_addr()
+	}
+
+	/// Our best same-LAN punch candidate: the OS-routed outbound v4 + the node's
+	/// REAL bound port. Appended to the handshake blobs (`push_lan_candidate`) so
+	/// a same-NAT peer can punch our private address instead of the lossy router
+	/// hairpin. `None` when there's no usable v4 route (offline / v6-only).
+	pub(super) fn lan_candidate(&self) -> Option<SocketAddr> {
+		let port = self.sock.local_addr().ok()?.port();
+		// Routing probe only — UDP connect() sends no packets.
+		let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+		probe.connect("8.8.8.8:80").ok()?;
+		match probe.local_addr().ok()?.ip() {
+			std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(SocketAddr::new(v4.into(), port)),
+			_ => None,
+		}
+	}
+
+	/// Append our LAN candidate (`v4 ip(4) || port(2)`, big-endian) to a handshake
+	/// blob — the counterpart of `parse_lan_candidate`. No-op without a candidate.
+	pub(super) fn push_lan_candidate(&self, blob: &mut Vec<u8>) {
+		if let Some(SocketAddr::V4(a)) = self.lan_candidate() {
+			blob.extend_from_slice(&a.ip().octets());
+			blob.extend_from_slice(&a.port().to_be_bytes());
+		}
 	}
 
 	pub fn public_key(&self) -> [u8; 32] {
@@ -79,15 +137,24 @@ impl Node {
 		self.inner.lock().await.self_id
 	}
 
-	/// Register with the relay and obtain a [`DeviceId`]. Errors if the relay is
-	/// unreachable (e.g. taken down) — without it there is no ID.
-	pub async fn register(self: &Arc<Self>) -> Result<DeviceId, ConnError> {
-		let msg = ClientMsg::Register {
+	/// The relay registration message. One encoding for both the initial
+	/// `register()` and the `NotRegistered` re-register (relay restart / >TTL
+	/// outage): the relay maps pubkey → id, so re-sending this reissues the
+	/// SAME 9-digit ID.
+	pub(super) fn register_msg(&self) -> ClientMsg {
+		ClientMsg::Register {
 			version: PROTOCOL_VERSION,
 			pubkey: self.identity.public_bytes(),
 			name: Some(self.name.clone()),
-		};
-		self.sock.send_to(&encode(&msg), self.relay).await?;
+		}
+	}
+
+	/// Register with the relay and obtain a [`DeviceId`]. Errors if the relay is
+	/// unreachable (e.g. taken down) — without it there is no ID.
+	pub async fn register(self: &Arc<Self>) -> Result<DeviceId, ConnError> {
+		self.sock
+			.send_to(&encode(&self.register_msg()), self.relay)
+			.await?;
 		timeout(REGISTER_TIMEOUT, self.registered.notified())
 			.await
 			.map_err(|_| ConnError::RelayTimeout)?;
@@ -124,9 +191,12 @@ impl Node {
 			g.peer_found.insert(session, pf.clone());
 			g.pending_salt.insert(session, our_salt);
 		}
-		// Handshake blob: static pubkey(32) || fresh session salt(32).
+		// Handshake blob: static pubkey(32) || fresh session salt(32) || optional
+		// LAN candidate (same-NAT peers punch our PRIVATE addr too — see
+		// `parse_lan_candidate`).
 		let mut hello = self.identity.public_bytes().to_vec();
 		hello.extend_from_slice(&our_salt);
+		self.push_lan_candidate(&mut hello);
 		self.sock
 			.send_to(
 				&encode(&ClientMsg::Connect {
@@ -145,25 +215,48 @@ impl Node {
 		{
 			let mut g = self.inner.lock().await;
 			g.peer_found.remove(&session);
-			// On failure the key is never derived, so drop the stashed salt too.
+			// On failure the key is never derived, so drop the stashed salt too —
+			// and a PeerFound landing between the timeout and this cleanup may
+			// already have inserted the session; nothing will ever use it.
 			if rv.is_err() {
 				g.pending_salt.remove(&session);
+				g.sessions.remove(&session);
 			}
 		}
 		rv.map_err(|_| ConnError::TargetUnreachable(target))?;
 
-		// Decide the transport.
-		let transport = self.establish_transport(session).await?;
+		// Decide the transport. On failure (P2pOnly punch miss) no `Session` is
+		// ever built, so its Drop-based cleanup never runs — remove the state
+		// here or one SessionState leaks per failed connect.
+		let transport = match self.establish_transport(session).await {
+			Ok(t) => t,
+			Err(e) => {
+				self.inner.lock().await.sessions.remove(&session);
+				return Err(e);
+			}
+		};
 
 		// Wire up an inbound data channel for the caller.
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
-		{
+		let transport = {
 			let mut g = self.inner.lock().await;
-			if let Some(s) = g.sessions.get_mut(&session) {
-				s.transport = transport;
-				s.data_tx = Some(data_tx);
+			match g.sessions.get_mut(&session) {
+				Some(s) => {
+					// The punch handlers may have proven the direct path while
+					// our PunchAck waiter timed out — never downgrade such a
+					// session to the relay (data would ride the relay while
+					// `live_transport()` reports Direct).
+					s.transport = if s.direct_ok {
+						Transport::Direct
+					} else {
+						transport
+					};
+					s.data_tx = Some(data_tx);
+					s.transport
+				}
+				None => transport,
 			}
-		}
+		};
 		Ok(Session {
 			id: session,
 			peer: target,
@@ -205,17 +298,29 @@ impl Node {
 			g.hello_done.insert(session, hp.clone());
 			g.pending_salt.insert(session, our_salt);
 		}
+		// The caller may race this whole future against its own (shorter) timeout
+		// — the LAN fast path uses 1.5 s vs our 3 s — so if we're DROPPED at an
+		// await point below, this guard sweeps the entries just inserted (plus
+		// any half-built session) instead of leaking them per cancelled attempt.
+		let mut guard = DirectGuard {
+			node: self.clone(),
+			session,
+			armed: true,
+		};
 		for _ in 0..PUNCH_ATTEMPTS {
 			let _ = self.sock.send_to(&hello(), peer_addr).await;
 			tokio::time::sleep(Duration::from_millis(40)).await;
 		}
 		let hr = timeout(RENDEZVOUS_TIMEOUT, hp.notified()).await;
 		if hr.is_err() {
-			// Remove the waiter + stashed salt on the timeout path too so neither map
-			// leaks one stale entry per failed direct connect.
+			// Remove the waiter + stashed salt on the timeout path too so neither
+			// map leaks one stale entry per failed direct connect — and a session
+			// a late HelloAck may have inserted; nothing will ever use it.
 			let mut g = self.inner.lock().await;
 			g.hello_done.remove(&session);
 			g.pending_salt.remove(&session);
+			g.sessions.remove(&session);
+			guard.armed = false;
 			return Err(ConnError::P2pFailed);
 		}
 		{
@@ -223,12 +328,14 @@ impl Node {
 			g.hello_done.remove(&session);
 			match g.sessions.get_mut(&session) {
 				Some(s) => s.data_tx = Some(data_tx),
-				None => return Err(ConnError::P2pFailed),
+				None => return Err(ConnError::P2pFailed), // guard sweeps the salt
 			}
 		}
 
 		// Hole-punch the direct path; no relay fallback (there is no relay here).
 		self.establish_transport_direct(session, peer_addr).await;
+		// From here the returned `Session`'s Drop owns the state cleanup.
+		guard.armed = false;
 		Ok(Session {
 			id: session,
 			peer: DeviceId(0), // no relay id on a direct connect; UI shows the addr
@@ -244,14 +351,51 @@ impl Node {
 	}
 }
 
+/// Cancel-safety guard for [`Node::connect_direct`]: when the future is dropped
+/// mid-flight (caller-side timeout), remove the session's waiter/salt entries —
+/// and any half-built `SessionState` — that the in-line cleanup never reached.
+/// Disarmed on every path that already cleaned up (or handed ownership to the
+/// returned `Session`'s Drop).
+struct DirectGuard {
+	node: Arc<Node>,
+	session: SessionId,
+	armed: bool,
+}
+
+impl Drop for DirectGuard {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		let node = self.node.clone();
+		let session = self.session;
+		// Same pattern as Session::drop — Drop can't await the inner lock.
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			handle.spawn(async move {
+				let mut g = node.inner.lock().await;
+				g.hello_done.remove(&session);
+				g.pending_salt.remove(&session);
+				g.punched.remove(&session);
+				g.sessions.remove(&session);
+			});
+		}
+	}
+}
+
 pub(super) async fn recv_loop(weak: Weak<Node>) {
-	let sock = match weak.upgrade() {
-		Some(n) => n.sock.clone(),
+	let (sock, shutdown) = match weak.upgrade() {
+		Some(n) => (n.sock.clone(), n.shutdown.clone()),
 		None => return,
 	};
 	let mut buf = vec![0u8; 65_536];
 	loop {
-		let (n, from) = match sock.recv_from(&mut buf).await {
+		let recvd = tokio::select! {
+			r = sock.recv_from(&mut buf) => r,
+			// `Node::drop` signals here so this task releases its socket Arc
+			// (and the bound port) immediately, not at the next stray datagram.
+			_ = shutdown.notified() => return,
+		};
+		let (n, from) = match recvd {
 			Ok(x) => x,
 			// Windows: a prior send_to that drew an ICMP port-unreachable makes the
 			// next recv_from return WSAECONNRESET (10054). It is spurious for a

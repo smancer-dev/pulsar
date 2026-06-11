@@ -1,6 +1,10 @@
 {
 	"$schema": "https://schema.tauri.app/config/2",
 	"bundle": {
-		"resources": ["resources/ffmpeg"]
+		"resources": ["resources/ffmpeg", "resources/pulsar-render"],
+		"linux": {
+			"deb": { "depends": ["libmpv1 | libmpv2"] },
+			"rpm": { "depends": ["mpv-libs"] }
+		}
 	}
 }

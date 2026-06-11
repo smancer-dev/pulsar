@@ -14,7 +14,11 @@ use crate::util::{data_sender, forward};
 
 /// Client → host: push clipboard text (read from the webview) to the remote.
 #[tauri::command]
-pub(crate) async fn send_clipboard(state: State<'_, AppState>, id: u64, text: String) -> Result<(), String> {
+pub(crate) async fn send_clipboard(
+	state: State<'_, AppState>,
+	id: u64,
+	text: String,
+) -> Result<(), String> {
 	data_sender(&state, id)?
 		.send(DataMsg::Clipboard(text))
 		.await
@@ -23,7 +27,11 @@ pub(crate) async fn send_clipboard(state: State<'_, AppState>, id: u64, text: St
 
 /// Client → host: send a chat line.
 #[tauri::command]
-pub(crate) async fn send_chat(state: State<'_, AppState>, id: u64, text: String) -> Result<(), String> {
+pub(crate) async fn send_chat(
+	state: State<'_, AppState>,
+	id: u64,
+	text: String,
+) -> Result<(), String> {
 	data_sender(&state, id)?
 		.send(DataMsg::Chat(text))
 		.await
@@ -37,11 +45,29 @@ pub(crate) async fn host_send_chat(
 	peer: String,
 	text: String,
 ) -> Result<(), String> {
-	let tx = state.host_out.lock().unwrap().get(&peer).map(|(_, tx)| tx.clone());
-	tx.ok_or_else(|| "cihaz bağlı değil".to_string())?
-		.send(DataMsg::Chat(text))
+	let tx = state
+		.host_out
+		.lock()
+		.unwrap()
+		.get(&peer)
+		.map(|(_, tx)| tx.clone());
+	let tx = tx.ok_or_else(|| "cihaz bağlı değil".to_string())?;
+	tx.send(DataMsg::Chat(text.clone()))
 		.await
-		.map_err(|_| "mesaj gönderilemedi".to_string())
+		.map_err(|_| "mesaj gönderilemedi".to_string())?;
+	// Into the backlog too: sent lines have no broadcast event of their own, so a
+	// re-opened connections window rebuilds the full conversation from here.
+	state.chat_log.lock().unwrap().push((peer, text, true));
+	Ok(())
+}
+
+/// The host-side chat backlog (peer, text, me) — seeds the connections window's
+/// message modal with history from before that window existed.
+#[tauri::command]
+pub(crate) async fn chat_log(
+	state: State<'_, AppState>,
+) -> Result<Vec<(String, String, bool)>, String> {
+	Ok(state.chat_log.lock().unwrap().clone())
 }
 
 /// Client → host: send a file (chunked over the session, saved on the host).
@@ -52,7 +78,12 @@ pub(crate) async fn send_file(
 	name: String,
 	data: Vec<u8>,
 ) -> Result<(), String> {
-	const CHUNK: usize = 16 * 1024;
+	// MUST mirror fs_browse.rs's CHUNK: the session transport is one datagram per
+	// message, serde_json encodes Vec<u8> at ≈4 chars/byte worst case, and macOS
+	// only sends ~9216-byte UDP datagrams by default (net.inet.udp.maxdgram) —
+	// 2 KiB raw ≈ 8.3 KB JSON fits everywhere; bigger chunks fail EMSGSIZE and
+	// are silently dropped (serve_with/hold swallow send errors).
+	const CHUNK: usize = 2048;
 	let tx = data_sender(&state, id)?;
 	let chunks = data.len().div_ceil(CHUNK) as u32;
 	tx.send(DataMsg::FileBegin {
@@ -75,6 +106,22 @@ pub(crate) async fn send_file(
 		.map_err(|_| "dosya gönderilemedi".to_string())
 }
 
+/// Client → host: send a local file by its HOME-relative path (the file panel's
+/// "gönder" action). Unlike `send_file`, the webview never reads the bytes — Rust
+/// streams them straight from disk with the same chunker the host's FsGet reply
+/// uses, jailed to HOME exactly like the `local_ls` listing the path came from.
+#[tauri::command]
+pub(crate) async fn send_file_path(
+	state: State<'_, AppState>,
+	id: u64,
+	path: String,
+) -> Result<(), String> {
+	let tx = data_sender(&state, id)?;
+	crate::fs_browse::send_file_at(&tx, &path)
+		.await
+		.ok_or_else(|| "dosya gönderilemedi".to_string())
+}
+
 /// Client: start streaming the microphone to the host (raw PCM over the session).
 #[tauri::command]
 pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(), String> {
@@ -83,13 +130,20 @@ pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(),
 		let p = plays.get(&id).ok_or("oturum bulunamadı")?;
 		(p.data_tx.clone(), p.mic.clone())
 	};
-	if mic_slot.lock().unwrap().is_some() {
+	// Hold the slot lock across check→spawn→insert (spawn_mic_recorder is
+	// synchronous, no await): two concurrent invocations could otherwise both
+	// pass the is_some() check, and the loser's parecord would be dropped
+	// without kill() — recording and sending duplicate Audio frames for the
+	// session's lifetime.
+	let mut slot = mic_slot.lock().unwrap();
+	if slot.is_some() {
 		return Ok(()); // already on
 	}
 	let mut child =
 		spawn_mic_recorder().ok_or("mikrofon kaydedici bulunamadı (parecord/pw-record/arecord)")?;
 	let stdout = child.stdout.take().ok_or("mikrofon çıkışı alınamadı")?;
-	*mic_slot.lock().unwrap() = Some(child);
+	*slot = Some(child);
+	drop(slot);
 	// Blocking read loop on a dedicated thread; killing the child ends it.
 	std::thread::spawn(move || {
 		let mut rdr = stdout;
@@ -127,7 +181,12 @@ pub(crate) async fn mic_stop(state: State<'_, AppState>, id: u64) -> Result<(), 
 
 /// Client: forward absolute pointer motion (normalized 0..1) to the host.
 #[tauri::command]
-pub(crate) async fn input_pointer(state: State<'_, AppState>, id: u64, x: f64, y: f64) -> Result<(), String> {
+pub(crate) async fn input_pointer(
+	state: State<'_, AppState>,
+	id: u64,
+	x: f64,
+	y: f64,
+) -> Result<(), String> {
 	forward(&state, id, InputEvent::PointerMotion { x, y });
 	Ok(())
 }
@@ -146,7 +205,12 @@ pub(crate) async fn input_button(
 
 /// Client: forward a scroll delta.
 #[tauri::command]
-pub(crate) async fn input_scroll(state: State<'_, AppState>, id: u64, dx: f64, dy: f64) -> Result<(), String> {
+pub(crate) async fn input_scroll(
+	state: State<'_, AppState>,
+	id: u64,
+	dx: f64,
+	dy: f64,
+) -> Result<(), String> {
 	forward(&state, id, InputEvent::Scroll { dx, dy });
 	Ok(())
 }
@@ -198,6 +262,34 @@ pub(crate) async fn kbd_capture_stop() -> Result<(), String> {
 	Ok(())
 }
 
+/// Client (native renderer): explicit click-to-engage. The in-app video container is
+/// input pass-through, so a click on the video lands on the webview underneath — the
+/// session screen forwards it here and the armed evdev capture takes the devices.
+#[tauri::command]
+pub(crate) fn kbd_engage(app: AppHandle) -> Result<(), String> {
+	kbdhook::engage(&app);
+	Ok(())
+}
+
+/// Client (Linux native): position the in-app native-video container over the session
+/// tab's content area (viewport CSS px == GDK logical px). Zero area hides it (the
+/// tab went inactive / the session screen unmounted). No-op elsewhere.
+#[tauri::command]
+pub(crate) fn native_view_rect(
+	app: AppHandle,
+	id: u64,
+	x: i32,
+	y: i32,
+	w: i32,
+	h: i32,
+) -> Result<(), String> {
+	#[cfg(all(unix, not(target_os = "macos")))]
+	crate::render::native_container_rect(&app, id, x, y, w, h);
+	#[cfg(not(all(unix, not(target_os = "macos"))))]
+	let _ = (app, id, x, y, w, h);
+	Ok(())
+}
+
 /// True, taskbar-covering fullscreen. A transparent Tauri window isn't treated as
 /// a real fullscreen app on Windows (the shell keeps the taskbar on top), so we
 /// cover the current monitor manually and stay above the taskbar — the same
@@ -210,7 +302,14 @@ pub(crate) fn set_window_fullscreen(
 ) -> Result<(), String> {
 	if on {
 		if let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) {
-			*state.fs_geom.lock().unwrap() = Some((pos, size));
+			// Save only when ENTERING from windowed state: an on=true while already
+			// fullscreen (the F12 combo and the UI toggle racing out of sync) would
+			// otherwise capture the fullscreen rect, and exiting would "restore" a
+			// fullscreen-sized borderless window instead of the windowed geometry.
+			let mut g = state.fs_geom.lock().unwrap();
+			if g.is_none() {
+				*g = Some((pos, size));
+			}
 		}
 	}
 	let saved = if on {
@@ -230,14 +329,21 @@ pub(crate) fn set_window_fullscreen(
 	#[cfg(not(windows))]
 	{
 		let _ = saved; // geometry restore is a Windows-only concern here
-		// GTK window ops must run on the main (GTK) thread; a Tauri command runs off it, so
-		// dispatch there — calling set_fullscreen directly off-thread can silently no-op.
+				 // GTK window ops must run on the main (GTK) thread; a Tauri command runs off it, so
+				 // dispatch there — calling set_fullscreen directly off-thread can silently no-op.
 		let w = window.clone();
 		let _ = window.run_on_main_thread(move || {
+			// Leaving fullscreen must also drop topmost: the Focused handler in lib.rs only
+			// manages always-on-top while fs_geom is Some, and fs_geom was just cleared above —
+			// without this the window stays above every other app forever (the Windows branch
+			// already does the equivalent via HWND_NOTOPMOST).
+			if !on {
+				let _ = w.set_always_on_top(false);
+			}
 			let _ = w.set_fullscreen(on); // X11/Wayland/macOS hide the panel/dock correctly
-			// Keep input focus on the GTK toplevel after the toggle — otherwise X moves focus
-			// to the embedded native-renderer child window, which flips kbdhook's FOCUSED to
-			// false and silently kills the evdev combos (F12/M/Q) until the user clicks back in.
+								 // Keep input focus on the GTK toplevel after the toggle — otherwise X moves focus
+								 // to the embedded native-renderer child window, which flips kbdhook's FOCUSED to
+								 // false and silently kills the evdev combos (F12/M/Q) until the user clicks back in.
 			let _ = w.set_focus();
 		});
 	}

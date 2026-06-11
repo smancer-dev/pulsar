@@ -77,10 +77,10 @@ pub fn write_sdp(port: u16, codec: &str) -> std::io::Result<PathBuf> {
 	Ok(path)
 }
 
-/// Spawn ffplay to render the SDP stream: hardware decode, low-latency, borderless
-/// fullscreen, always-on-top, no audio (audio still plays via the webview path). The
-/// returned `Child` is kept so the caller can kill it on session end. No console
-/// window pops up. Returns None if ffplay can't be spawned.
+/// Spawn ffplay to render the SDP stream: hardware decode, low-latency, a normal
+/// WINDOWED window (the user fullscreens it themself), no audio (audio still plays via
+/// the webview path). The returned `Child` is kept so the caller can kill it on session
+/// end. No console window pops up. Returns None if ffplay can't be spawned.
 pub fn spawn_ffplay(ffplay: &str, sdp: &PathBuf) -> Option<Child> {
 	let mut cmd = std::process::Command::new(ffplay);
 	cmd.args([
@@ -107,9 +107,12 @@ pub fn spawn_ffplay(ffplay: &str, sdp: &PathBuf) -> Option<Child> {
 		"-hwaccel",
 		"auto",
 		"-an", // audio comes through the webview WebAudio path, not ffplay
-		"-noborder",
-		"-fs",
-		"-alwaysontop",
+		// Windowed by default (no -fs/-noborder/-alwaysontop): a session must not take
+		// over the screen on connect; the user fullscreens it themself.
+		"-x",
+		"1280",
+		"-y",
+		"720",
 		"-autoexit",
 		"-window_title",
 		"Pulsar",
@@ -165,7 +168,13 @@ pub fn spawn_vidsink(bin: &str, sdp: &Path, wid: Option<u64>, rotate: u32) -> Op
 /// carries `ov set <field> <val>` / `ov end` / `ov close` (user interaction). Returns None if
 /// the binary is missing (the overlay is then simply unavailable; video is unaffected).
 #[cfg(all(unix, not(target_os = "macos")))]
-pub fn spawn_render(bin: &str, sdp: &Path, wid: Option<u64>, game_mode: bool, pace_on: bool) -> Option<Child> {
+pub fn spawn_render(
+	bin: &str,
+	sdp: &Path,
+	wid: Option<u64>,
+	game_mode: bool,
+	pace_on: bool,
+) -> Option<Child> {
 	// Single-surface renderer: rkmpp video + egui overlay in ONE child window of `wid` (the
 	// overlay moves/clips/stacks with the app). stdout carries `vidsink-fps …` (HUD) + `ov …`
 	// (overlay interaction). SIGUSR1/2 toggle the overlay; video runs throughout.
@@ -174,7 +183,8 @@ pub fn spawn_render(bin: &str, sdp: &Path, wid: Option<u64>, game_mode: bool, pa
 	if let Some(xid) = wid {
 		cmd.arg("--wid").arg(format!("0x{xid:x}"));
 	}
-	cmd.arg("--mode").arg(if game_mode { "game" } else { "remote" });
+	cmd.arg("--mode")
+		.arg(if game_mode { "game" } else { "remote" });
 	cmd.arg("--pace").arg(if pace_on { "on" } else { "off" });
 	// Pipe BOTH stdout (HUD `vidsink-fps` / `ov set` lines) AND stdin (live `pace 0|1` toggles
 	// from the frontend); without stdin piped, set_frame_pacing can't reach the renderer.
@@ -194,11 +204,18 @@ pub fn spawn_render(bin: &str, sdp: &Path, wid: Option<u64>, game_mode: bool, pa
 /// path). stdin carries `stat …` / `open|close` / `pace 0|1`; stdout carries `vidsink-fps …`
 /// / `ov …`. Tied to the Job Object so it dies with Pulsar (job.rs). None on spawn failure.
 #[cfg(windows)]
-pub fn spawn_render_win(bin: &str, sdp: &PathBuf, hwnd: u64, game_mode: bool, pace_on: bool) -> Option<Child> {
+pub fn spawn_render_win(
+	bin: &str,
+	sdp: &PathBuf,
+	hwnd: u64,
+	game_mode: bool,
+	pace_on: bool,
+) -> Option<Child> {
 	let mut cmd = std::process::Command::new(bin);
 	cmd.arg(sdp);
 	cmd.arg("--wid").arg(format!("0x{hwnd:x}"));
-	cmd.arg("--mode").arg(if game_mode { "game" } else { "remote" });
+	cmd.arg("--mode")
+		.arg(if game_mode { "game" } else { "remote" });
 	cmd.arg("--pace").arg(if pace_on { "on" } else { "off" });
 	cmd.stdin(std::process::Stdio::piped());
 	cmd.stdout(std::process::Stdio::piped());
@@ -231,9 +248,15 @@ pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16) -> Option<Child> {
 	}
 	let mut cmd = std::process::Command::new(ffmpeg);
 	cmd.args([
-		"-hide_banner", "-loglevel", "error",
-		"-protocol_whitelist", "file,udp,rtp",
-		"-fflags", "nobuffer", "-flags", "low_delay",
+		"-hide_banner",
+		"-loglevel",
+		"error",
+		"-protocol_whitelist",
+		"file,udp,rtp",
+		"-fflags",
+		"nobuffer",
+		"-flags",
+		"low_delay",
 		"-i",
 	])
 	.arg(&path)
@@ -258,8 +281,8 @@ pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16) -> Option<Child> {
 /// When `wid` is `Some(xid)` mpv is **embedded INSIDE the given X11 window** (the Pulsar
 /// app window) via `--wid`, so the video renders *in-app* (like the WebCodecs canvas on
 /// Windows) instead of a separate top-level window — the goal on Linux/X11 where the
-/// webview can't hardware-decode. When `None` it falls back to a borderless fullscreen
-/// window (legacy / non-X11).
+/// webview can't hardware-decode. When `None` it falls back to its own normal windowed
+/// toplevel (legacy / non-X11).
 ///
 /// The demuxer opts give it a large UDP receive buffer and make it **survive overruns and
 /// drop corrupt access units** (self-healing on the next keyframe) instead of freezing on
@@ -345,7 +368,9 @@ pub fn spawn_mpv(sdp: &PathBuf, wid: Option<u64>, ipc: &Path) -> Option<Child> {
 			cmd.arg("--gpu-context=x11egl");
 		}
 		None => {
-			cmd.args(["--fullscreen", "--no-border", "--title=Pulsar"]);
+			// No embed target → mpv's own toplevel. WINDOWED by default (sessions must not
+			// take over the screen on connect); the user maximizes/fullscreens it themself.
+			cmd.args(["--geometry=1280x720", "--title=Pulsar"]);
 		}
 	}
 	cmd.arg(sdp);

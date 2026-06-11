@@ -52,6 +52,29 @@ pub fn mpv_ipc_get_f64(sock: &Path, prop: &str) -> Option<f64> {
 	parse_ipc_data_f64(&line)
 }
 
+/// Read a boolean mpv property over JSON IPC (same one-shot connection as
+/// `mpv_ipc_get_f64`). Used to poll `focused` for the standalone (no `--wid`) mpv
+/// fallback window: its focus is invisible to Tauri, but the evdev capture's
+/// focus/engage gates need it. None on any error or non-boolean `data`.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn mpv_ipc_get_bool(sock: &Path, prop: &str) -> Option<bool> {
+	use std::io::{BufRead, BufReader, Write};
+	use std::os::unix::net::UnixStream;
+	let mut stream = UnixStream::connect(sock).ok()?;
+	let cmd = format!("{{\"command\":[\"get_property\",\"{prop}\"]}}\n");
+	stream.write_all(cmd.as_bytes()).ok()?;
+	let mut reader = BufReader::new(&stream);
+	let mut line = String::new();
+	reader.read_line(&mut line).ok()?;
+	let after = line.split_once("\"data\":")?.1;
+	let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
+	match after[..end].trim() {
+		"true" => Some(true),
+		"false" => Some(false),
+		_ => None,
+	}
+}
+
 /// Pull the numeric `"data"` field out of an mpv IPC reply line without a JSON dep:
 /// finds `"data":`, then parses the following number up to the next `,`/`}`. Returns None if
 /// the field is absent or its value isn't a finite number (e.g. `"data":null` when the
@@ -59,9 +82,7 @@ pub fn mpv_ipc_get_f64(sock: &Path, prop: &str) -> Option<f64> {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn parse_ipc_data_f64(line: &str) -> Option<f64> {
 	let after = line.split_once("\"data\":")?.1;
-	let end = after
-		.find(|c| c == ',' || c == '}')
-		.unwrap_or(after.len());
+	let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
 	let v: f64 = after[..end].trim().parse().ok()?;
 	v.is_finite().then_some(v)
 }

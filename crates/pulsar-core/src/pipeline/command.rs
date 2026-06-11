@@ -19,7 +19,12 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	// Vulkan encode needs a vulkan hwdevice declared up front (frames are uploaded to it
 	// below). `vk` is the device alias used by `hwupload`.
 	if plan.encoder == HwEncoder::Vulkan {
-		a.extend([s("-init_hw_device"), s("vulkan=vk"), s("-filter_hw_device"), s("vk")]);
+		a.extend([
+			s("-init_hw_device"),
+			s("vulkan=vk"),
+			s("-filter_hw_device"),
+			s("vk"),
+		]);
 	}
 
 	// QSV on Windows/ddagrab: ddagrab creates and uses its OWN internal D3D11 device,
@@ -114,9 +119,14 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		(HwEncoder::Amf, false) => a.extend([s("-usage"), s("transcoding")]),
 		// VA-API (Intel/AMD on Linux): CBR + low-delay-B disabled for games (no B-frames →
 		// no reorder latency); desktop leans on the default rate control for a sharper frame.
-		(HwEncoder::Vaapi, true) => {
-			a.extend([s("-rc_mode"), s("CBR"), s("-bf"), s("0"), s("-async_depth"), s("1")])
-		}
+		(HwEncoder::Vaapi, true) => a.extend([
+			s("-rc_mode"),
+			s("CBR"),
+			s("-bf"),
+			s("0"),
+			s("-async_depth"),
+			s("1"),
+		]),
 		(HwEncoder::Vaapi, false) => a.extend([s("-rc_mode"), s("VBR"), s("-bf"), s("0")]),
 		// Apple VideoToolbox: realtime + no frame reordering for low latency; desktop allows
 		// the encoder its default quality path. `-realtime 1` is the VT low-latency switch.
@@ -142,7 +152,7 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	if plan.hdr || plan.yuv444 {
 		// Profile bumps required for 10-bit / 4:4:4. AV1 `main` already spans 8/10-bit 4:2:0.
 		let profile = match (plan.codec, plan.hdr, plan.yuv444) {
-			(VCodec::H265, _, true) => Some("rext"),  // HEVC Range Extensions = 4:4:4
+			(VCodec::H265, _, true) => Some("rext"), // HEVC Range Extensions = 4:4:4
 			(VCodec::H265, true, false) => Some("main10"),
 			(VCodec::H264, _, true) => Some("high444p"),
 			(VCodec::H264, true, false) => Some("high10"),
@@ -170,6 +180,13 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 				s("bt2020nc"),
 			]);
 		}
+	} else if matches!(plan.encoder, HwEncoder::Software) {
+		// SDR software encode: PIN 4:2:0. Without it ffmpeg matches the capture's BGR frames
+		// to the encoder's "closest" format — libx264 then silently produces High 4:4:4
+		// (yuv444p), which hardware decoders (rkmpp) and 4:2:0-only client paths can't play
+		// (the "stream runs, screen stays black" failure). HW encoders keep their native
+		// formats (nv12/hwframes) via their own format= chains.
+		a.extend([s("-pix_fmt"), s("yuv420p")]);
 	}
 
 	// RTP/H.264 so the client can depacketize and feed WebCodecs in the webview.
@@ -209,15 +226,30 @@ pub fn probe_command(
 	// upload+encode path, not a CPU shortcut that would falsely pass.
 	match encoder {
 		HwEncoder::Vaapi => a.extend([s("-vaapi_device"), s(vaapi_device)]),
-		HwEncoder::Vulkan => {
-			a.extend([s("-init_hw_device"), s("vulkan=vk"), s("-filter_hw_device"), s("vk")])
-		}
-		HwEncoder::Qsv => a.extend([s("-init_hw_device"), s("qsv=qs"), s("-filter_hw_device"), s("qs")]),
+		HwEncoder::Vulkan => a.extend([
+			s("-init_hw_device"),
+			s("vulkan=vk"),
+			s("-filter_hw_device"),
+			s("vk"),
+		]),
+		HwEncoder::Qsv => a.extend([
+			s("-init_hw_device"),
+			s("qsv=qs"),
+			s("-filter_hw_device"),
+			s("qs"),
+		]),
 		_ => {}
 	}
 
 	// One synthetic 320x240 frame.
-	a.extend([s("-f"), s("lavfi"), s("-i"), s("testsrc=size=320x240:rate=30"), s("-frames:v"), s("1")]);
+	a.extend([
+		s("-f"),
+		s("lavfi"),
+		s("-i"),
+		s("testsrc=size=320x240:rate=30"),
+		s("-frames:v"),
+		s("1"),
+	]);
 
 	// Upload to the GPU where the encoder needs a hwframe.
 	match encoder {
@@ -226,7 +258,26 @@ pub fn probe_command(
 		_ => {}
 	}
 
-	a.extend([s("-c:v"), s(name), s("-f"), s("null"), s("-")]);
+	a.extend([s("-c:v"), s(name)]);
+
+	// AV1: probe through the REAL RTP muxer, not just `-f null`. Current ffmpeg gates AV1
+	// packetization behind `-strict experimental` (header write fails outright), and the
+	// Software arms emit x264-style presets libsvtav1 rejects — so a null-mux probe passes
+	// for a stream `encode_command` then can't start ("ffmpeg başlamadı", dead video). With
+	// the muxer in the probe, validation fails on such builds and `resolve_codec_validated`
+	// degrades AV1 to HEVC/H.264 instead; a future build where AV1-over-RTP works passes the
+	// probe and re-enables it with no code change. One frame to the loopback discard port.
+	if codec == VCodec::Av1 {
+		a.extend([
+			s("-f"),
+			s("rtp"),
+			s("rtp://127.0.0.1:9"),
+			s("-frames:v"),
+			s("1"),
+		]);
+	}
+
+	a.extend([s("-f"), s("null"), s("-")]);
 	Some(("ffmpeg".to_string(), a))
 }
 

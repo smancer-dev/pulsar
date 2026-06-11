@@ -46,9 +46,7 @@ pub fn audio_command(input: &AudioInput, dest: &str) -> (String, Vec<String>) {
 
 	// Capture (platform-specific input).
 	match input {
-		AudioInput::Dshow(dev) => {
-			a.extend([s("-f"), s("dshow"), s("-i"), format!("audio={dev}")])
-		}
+		AudioInput::Dshow(dev) => a.extend([s("-f"), s("dshow"), s("-i"), format!("audio={dev}")]),
 		AudioInput::Pulse(src) => a.extend([s("-f"), s("pulse"), s("-i"), src.clone()]),
 		AudioInput::AvFoundation(idx) => {
 			a.extend([s("-f"), s("avfoundation"), s("-i"), format!(":{idx}")])
@@ -66,7 +64,10 @@ mod tests {
 
 	#[test]
 	fn audio_command_encodes_opus_rtp() {
-		let (prog, args) = audio_command(&AudioInput::Pulse("x.monitor".into()), "rtp://10.0.0.5:9100");
+		let (prog, args) = audio_command(
+			&AudioInput::Pulse("x.monitor".into()),
+			"rtp://10.0.0.5:9100",
+		);
 		assert_eq!(prog, "ffmpeg");
 		assert!(args.iter().any(|a| a == "pulse"));
 		assert!(args.iter().any(|a| a == "x.monitor"));

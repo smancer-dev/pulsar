@@ -12,8 +12,8 @@
 // Media Foundation+D3D11 on Windows; mpv/VideoToolbox on macOS) — the webview WebCodecs
 // video path was removed (too slow). Only audio still decodes in the webview (WebAudio).
 import { startOpusAudio } from '$lib/opus-audio';
-import { onPlayRtt, onPlayStats, onPlayVStats } from '$lib/api';
-import { type Encoder } from '$lib/settings.svelte';
+import { onPlayDecoder, onPlayRtt, onPlayStats, onPlayVStats } from '$lib/api';
+import { listenScope } from '$lib/api.events';
 
 type Inputs = {
 	playId: () => number;
@@ -33,6 +33,11 @@ export class SessionMedia {
 	// host revoked/closed the screen share — so we surface an error to the user.
 	stalled = $state(false);
 	#staleSecs = 0;
+	// Stall detection runs on the RAW renderer-reported fps + vstats arrival time:
+	// the DISPLAYED `fps` substitutes the host's target rate when the renderer
+	// reports 0, which would otherwise mask a frozen stream as healthy forever.
+	#rawFps = 0;
+	#lastVStatsAt = 0;
 	// Rolling fps samples (one per second) for the perf hover graph.
 	fpsHistory = $state<number[]>([]);
 	// Live performance metrics shown in the in-session stats panel. Client-side video numbers
@@ -59,7 +64,9 @@ export class SessionMedia {
 	// latency" number — like Moonlight's network latency readout.
 	latencyMs = $derived(this.rttMs > 0 ? Math.round(this.rttMs / 2) : 0);
 
-	netClass = $derived(!this.hasVideo ? 'bad' : this.fps >= 24 ? 'ok' : this.fps >= 12 ? 'mid' : 'bad');
+	netClass = $derived(
+		!this.hasVideo || this.stalled ? 'bad' : this.fps >= 24 ? 'ok' : this.fps >= 12 ? 'mid' : 'bad'
+	);
 	// Polyline points for the fps sparkline in the perf tooltip.
 	spark = $derived.by(() => {
 		const h = this.fpsHistory;
@@ -83,18 +90,30 @@ export class SessionMedia {
 		$effect(() => {
 			if (!(inputs.native() || inputs.embedded()) || inputs.playId() < 0) return;
 			const playId = inputs.playId();
-			let un: () => void = () => {};
-			onPlayVStats((e) => {
-				if (e.id !== playId) return;
-				this.fps = e.fps > 0 ? Math.round(e.fps) : parseInt(this.hostFps, 10) || 0;
-				this.mbps = Math.round(e.mbps * 10) / 10;
-				// decodeMs is mpv's real pipeline-buffer latency on --wid (demuxer-cache-duration) — never
-				// faked; 0 when mpv can't report it. Feeds the Decode-time row + the overlay HUD.
-				this.decodeMs = Math.round(e.decodeMs * 10) / 10;
-				this.decoderCodec = 'rkmpp (HW)';
-				if (e.mbps > 0 || e.fps > 0) this.hasVideo = true; // video is flowing
-			}).then((u) => (un = u));
-			return () => un();
+			const scope = listenScope();
+			// The renderer reports which decoder it REALLY opened (read-only display —
+			// there is no decoder picker; selection is automatic per platform/stream).
+			scope.add(
+				onPlayDecoder((e) => {
+					if (e.id !== playId) return;
+					const suffix = e.hw === 'hw' ? ' (HW)' : e.hw === 'sw' ? ' (SW)' : '';
+					this.decoderCodec = `${e.name}${suffix}`;
+				}),
+				onPlayVStats((e) => {
+					if (e.id !== playId) return;
+					this.#rawFps = e.fps;
+					this.#lastVStatsAt = Date.now();
+					// Display only: substitute the host's target rate for a momentary 0 —
+					// the stall detector below runs on #rawFps, never on this.
+					this.fps = e.fps > 0 ? Math.round(e.fps) : parseInt(this.hostFps, 10) || 0;
+					this.mbps = Math.round(e.mbps * 10) / 10;
+					// decodeMs is mpv's real pipeline-buffer latency on --wid (demuxer-cache-duration) — never
+					// faked; 0 when mpv can't report it. Feeds the Decode-time row + the overlay HUD.
+					this.decodeMs = Math.round(e.decodeMs * 10) / 10;
+					if (e.mbps > 0 || e.fps > 0) this.hasVideo = true; // video is flowing
+				})
+			);
+			return scope.dispose;
 		});
 
 		// Audio: a second loopback WebSocket carries the host's Opus stream; decode +
@@ -122,27 +141,29 @@ export class SessionMedia {
 		// session; keep only this tab's (by playId).
 		$effect(() => {
 			const playId = inputs.playId();
-			let unRtt: () => void = () => {};
-			let unStats: () => void = () => {};
-			onPlayRtt((e) => {
-				if (e.id === playId) this.rttMs = Math.round(e.rtt);
-			}).then((u) => (unRtt = u));
-			onPlayStats((e) => {
-				if (e.id === playId) this.hostStats = e.label;
-			}).then((u) => (unStats = u));
-			return () => {
-				unRtt();
-				unStats();
-			};
+			const scope = listenScope();
+			scope.add(
+				onPlayRtt((e) => {
+					if (e.id === playId) this.rttMs = Math.round(e.rtt);
+				}),
+				onPlayStats((e) => {
+					if (e.id === playId) this.hostStats = e.label;
+				})
+			);
+			return scope.dispose;
 		});
 
 		// Sample the (native-reported) fps into the rolling history once a second for the perf
-		// sparkline, and flag a stall if frames stop after video had started.
+		// sparkline, and flag a stall if frames stop after video had started. The detector runs
+		// on the RAW fps (the displayed one substitutes the host target for 0) and also trips
+		// when vstats themselves go silent (renderer/IPC died → fps would freeze at its last value).
 		$effect(() => {
 			const timer = setInterval(() => {
 				this.fpsHistory = [...this.fpsHistory, this.fps].slice(-48);
 				if (this.hasVideo) {
-					if (this.fps === 0) {
+					const statsSilent =
+						this.#lastVStatsAt > 0 && Date.now() - this.#lastVStatsAt > 3000;
+					if (this.#rawFps <= 0 || statsSilent) {
 						this.#staleSecs++;
 						if (this.#staleSecs >= 3) this.stalled = true;
 					} else {
@@ -155,7 +176,4 @@ export class SessionMedia {
 		});
 	}
 
-	// Decoder switching is handled host-side via the in-session overlay/menu now (the native
-	// renderer picks the HW decoder from the stream codec); no client-side WebCodecs hint.
-	reconfigure(_v: Encoder) {}
 }

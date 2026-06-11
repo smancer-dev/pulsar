@@ -11,8 +11,8 @@ impl Node {
 		if self.mode == NetworkMode::RelayOnly {
 			return Ok(Transport::Relay);
 		}
-		let peer_addr = match self.inner.lock().await.sessions.get(&session) {
-			Some(s) => s.peer_addr,
+		let (peer_addr, peer_lan) = match self.inner.lock().await.sessions.get(&session) {
+			Some(s) => (s.peer_addr, s.peer_lan),
 			None => return Err(ConnError::P2pFailed),
 		};
 
@@ -23,6 +23,15 @@ impl Node {
 				.sock
 				.send_to(&encode(&PeerMsg::Punch { session, seq }), peer_addr)
 				.await;
+			// Same-NAT peer: also punch its PRIVATE candidate — the public addr
+			// above is a router hairpin there (lossy); whichever path answers
+			// first wins `peer_addr` (LAN preferred, see the Punch handler).
+			if let Some(lan) = peer_lan {
+				let _ = self
+					.sock
+					.send_to(&encode(&PeerMsg::Punch { session, seq }), lan)
+					.await;
+			}
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
 		let res = timeout(PUNCH_TIMEOUT, pk.notified()).await;
@@ -39,7 +48,11 @@ impl Node {
 	/// Punch a direct path to a known addr. Never relay-falls-back (direct-IP has no
 	/// relay). Best-effort: on a LAN the punch ack arrives; if not, data still flows
 	/// to the user-provided (reachable) address.
-	pub(super) async fn establish_transport_direct(&self, session: SessionId, peer_addr: SocketAddr) {
+	pub(super) async fn establish_transport_direct(
+		&self,
+		session: SessionId,
+		peer_addr: SocketAddr,
+	) {
 		let pk = Arc::new(Notify::new());
 		self.inner.lock().await.punched.insert(session, pk.clone());
 		for seq in 0..PUNCH_ATTEMPTS as u32 {
@@ -88,25 +101,27 @@ impl Node {
 				session,
 				answer,
 			} => {
-				// answer = peer pubkey(32) || peer salt(32). Reject a malformed blob
-				// rather than index-slicing past the end.
+				// answer = peer pubkey(32) || peer salt(32) || optional LAN candidate.
+				// Reject a malformed blob rather than index-slicing past the end.
 				let Some((key, peer_salt)) = split_handshake(&answer) else {
 					tracing::warn!(session, "PeerFound answer blob too short");
 					return;
 				};
+				let peer_lan = parse_lan_candidate(&answer);
 				let mut g = self.inner.lock().await;
 				// Pair the peer's salt with the one we minted in `connect`.
 				let Some(our_salt) = g.pending_salt.remove(&session) else {
 					tracing::warn!(session, "PeerFound for an unknown/expired connect");
 					return;
 				};
-				let crypto = self
-					.identity
-					.session(key, Role::Initiator, session, our_salt, peer_salt);
+				let crypto =
+					self.identity
+						.session(key, Role::Initiator, session, our_salt, peer_salt);
 				g.sessions.insert(
 					session,
 					SessionState {
 						peer_addr: target_addr,
+						peer_lan,
 						crypto,
 						transport: Transport::Relay,
 						send_seq: 0,
@@ -127,6 +142,18 @@ impl Node {
 			}
 			RelayMsg::Error { code, message } => {
 				tracing::warn!(?code, message, "relay error");
+				// The relay evicted us (>TTL outage / relay restart): our id+token
+				// are stale, every heartbeat keeps bouncing, and this device is
+				// unreachable by ID until re-registered. Re-send Register — the
+				// relay maps pubkey → id so the same 9-digit ID is reissued, and
+				// the `Registered` arm above refreshes self_id/token in place.
+				// Bounded by the heartbeat cadence: at most one retry per bounce.
+				if code == ErrCode::NotRegistered {
+					let _ = self
+						.sock
+						.send_to(&encode(&self.register_msg()), self.relay)
+						.await;
+				}
 			}
 		}
 	}
@@ -138,11 +165,13 @@ impl Node {
 		session: SessionId,
 		hello: Vec<u8>,
 	) {
-		// hello = requester pubkey(32) || requester salt(32). Reject a malformed blob.
+		// hello = requester pubkey(32) || requester salt(32) || optional LAN
+		// candidate. Reject a malformed blob.
 		let Some((key, peer_salt)) = split_handshake(&hello) else {
 			tracing::warn!(session, "incoming hello blob too short");
 			return;
 		};
+		let peer_lan = parse_lan_candidate(&hello);
 		// Retransmit guard: a duplicated requester Connect (UDP can duplicate) makes the
 		// relay emit a 2nd Incoming. If this session already exists, re-send Accept with
 		// the SAME salt we already committed — minting a fresh salt would derive a
@@ -157,6 +186,7 @@ impl Node {
 				if let (Some(id), Some(token)) = (id, token) {
 					let mut answer = self.identity.public_bytes().to_vec();
 					answer.extend_from_slice(&our_salt);
+					self.push_lan_candidate(&mut answer);
 					let _ = self
 						.sock
 						.send_to(
@@ -186,6 +216,7 @@ impl Node {
 				session,
 				SessionState {
 					peer_addr: from_addr,
+					peer_lan,
 					crypto,
 					transport: Transport::Relay,
 					send_seq: 0,
@@ -200,9 +231,11 @@ impl Node {
 			return;
 		};
 
-		// Accept: send back our pubkey(32) || our salt(32) as the answer, then punch.
+		// Accept: send back our pubkey(32) || our salt(32) || optional LAN candidate
+		// as the answer, then punch.
 		let mut answer = self.identity.public_bytes().to_vec();
 		answer.extend_from_slice(&our_salt);
+		self.push_lan_candidate(&mut answer);
 		let _ = self
 			.sock
 			.send_to(
@@ -216,14 +249,28 @@ impl Node {
 			)
 			.await;
 		// RelayOnly "skips punching entirely" (don't reveal our addr); the relay
-		// carries the traffic. Other modes probe to upgrade to a direct path.
+		// carries the traffic. Other modes probe to upgrade to a direct path —
+		// including the peer's PRIVATE candidate (same-NAT: the public addr is a
+		// lossy router hairpin; the LAN path wins via the Punch-handler preference).
+		// Paced like establish_transport's burst, in its own task: the first probes
+		// beat the requester's PeerFound by one relay RTT and are dropped (no
+		// session there yet) — the paced retransmits land after it exists, and
+		// recv_loop keeps draining meanwhile.
 		if self.mode != NetworkMode::RelayOnly {
-			for seq in 0..PUNCH_ATTEMPTS as u32 {
-				let _ = self
-					.sock
-					.send_to(&encode(&PeerMsg::Punch { session, seq }), from_addr)
-					.await;
-			}
+			let sock = self.sock.clone();
+			tokio::spawn(async move {
+				for seq in 0..PUNCH_ATTEMPTS as u32 {
+					let _ = sock
+						.send_to(&encode(&PeerMsg::Punch { session, seq }), from_addr)
+						.await;
+					if let Some(lan) = peer_lan {
+						let _ = sock
+							.send_to(&encode(&PeerMsg::Punch { session, seq }), lan)
+							.await;
+					}
+					tokio::time::sleep(Duration::from_millis(20)).await;
+				}
+			});
 		}
 
 		let _ = self.incoming_tx.send(Session {
@@ -248,17 +295,47 @@ impl Node {
 				if self.mode != NetworkMode::RelayOnly {
 					let mut g = self.inner.lock().await;
 					if let Some(s) = g.sessions.get_mut(&session) {
+						// PREFER THE PRIVATE PATH: with both the LAN route and the
+						// router-hairpin route alive, punch retransmits would otherwise
+						// flap `peer_addr` between them — and the hairpin route is the
+						// lossy one. Once a private source is locked in, a public
+						// arrival no longer overwrites it.
+						if !(s.direct_ok && is_private_v4(s.peer_addr)) || is_private_v4(from) {
+							s.peer_addr = from;
+						}
 						s.direct_ok = true;
 						s.transport = Transport::Direct;
-						s.peer_addr = from;
 					}
 				}
 			}
 			PeerMsg::PunchAck { session, .. } => {
-				let mut g = self.inner.lock().await;
-				if let Some(s) = g.sessions.get_mut(&session) {
-					s.direct_ok = true;
+				// Mirror of the Punch arm's mode guard: a RelayOnly node never
+				// punches, so any ack is gratuitous — and must not flip Direct.
+				if self.mode == NetworkMode::RelayOnly {
+					return;
 				}
+				let mut g = self.inner.lock().await;
+				let Some(s) = g.sessions.get_mut(&session) else {
+					return;
+				};
+				// Only honor acks from one of THIS session's punch candidates:
+				// every Pulsar binds the same well-known port and acks probes for
+				// unknown sessions, so a stale private candidate can resolve to a
+				// DIFFERENT device on our LAN — its ack would lock Direct while
+				// `peer_addr` still points at an unpunchable public addr,
+				// suppressing the relay fallback.
+				if from != s.peer_addr && Some(from) != s.peer_lan {
+					return;
+				}
+				// The ack's source IS a verified working path — adopt it, with the
+				// same prefer-the-private-path rule as the Punch arm (otherwise the
+				// initiator keeps the relay-observed public addr and its data
+				// blackholes on non-hairpin NATs / rides the lossy hairpin).
+				if !(s.direct_ok && is_private_v4(s.peer_addr)) || is_private_v4(from) {
+					s.peer_addr = from;
+				}
+				s.direct_ok = true;
+				s.transport = Transport::Direct;
 				if let Some(n) = g.punched.get(&session).cloned() {
 					n.notify_one();
 				}
@@ -305,6 +382,7 @@ impl Node {
 					session,
 					SessionState {
 						peer_addr: from,
+						peer_lan: None, // direct-IP: the typed address IS the path
 						crypto,
 						transport: Transport::Direct,
 						send_seq: 0,
@@ -362,6 +440,7 @@ impl Node {
 						session,
 						SessionState {
 							peer_addr: from,
+							peer_lan: None, // direct-IP: the typed address IS the path
 							crypto,
 							transport: Transport::Direct,
 							send_seq: 0,
@@ -393,5 +472,194 @@ impl Node {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const SESSION: SessionId = 42;
+
+	fn addr(s: &str) -> SocketAddr {
+		s.parse().unwrap()
+	}
+
+	/// A node whose handlers we drive directly — the relay addr is a black hole
+	/// (no relay involved) and outbound acks/punches go nowhere; only the state
+	/// transitions matter here.
+	async fn test_node() -> Arc<Node> {
+		Node::bind(
+			addr("127.0.0.1:0"),
+			addr("198.51.100.1:21116"),
+			NetworkMode::Auto,
+		)
+		.await
+		.expect("bind test node")
+	}
+
+	/// `PeerFound` answer blob: peer pubkey(32) || peer salt(32) || LAN tail.
+	fn answer_with_lan(lan: SocketAddr) -> Vec<u8> {
+		let mut blob = vec![7u8; 32];
+		blob.extend_from_slice(&[9u8; 32]);
+		if let SocketAddr::V4(a) = lan {
+			blob.extend_from_slice(&a.ip().octets());
+			blob.extend_from_slice(&a.port().to_be_bytes());
+		}
+		blob
+	}
+
+	/// Stand in for `connect()`'s preamble (salt minted before the rendezvous),
+	/// then deliver the relay's `PeerFound` so the session exists.
+	async fn rendezvous(node: &Arc<Node>, public: SocketAddr, lan: SocketAddr) {
+		node.inner
+			.lock()
+			.await
+			.pending_salt
+			.insert(SESSION, random_salt());
+		node.handle_relay(RelayMsg::PeerFound {
+			target: DeviceId(1),
+			target_addr: public,
+			session: SESSION,
+			answer: answer_with_lan(lan),
+		})
+		.await;
+	}
+
+	/// The initiator's punch state machine: an early responder punch (it beats
+	/// `PeerFound` by one relay RTT) must not create state; a `PunchAck` is only
+	/// honored from this session's punch candidates and ADOPTS the validated
+	/// source as the data path, preferring the private (LAN) one over the
+	/// public router hairpin.
+	#[tokio::test]
+	async fn punch_state_machine_adopts_validated_private_path() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118"); // relay-observed peer addr
+		let lan = addr("192.168.77.5:21118"); // peer's LAN candidate
+		let foreign = addr("192.168.77.99:21118"); // another Pulsar on our LAN
+
+		// Responder punch arriving BEFORE PeerFound: acked, but no session yet.
+		node.handle_peer(
+			PeerMsg::Punch {
+				session: SESSION,
+				seq: 0,
+			},
+			lan,
+		)
+		.await;
+		assert!(!node.inner.lock().await.sessions.contains_key(&SESSION));
+
+		// PeerFound: the session starts on the relay-observed public addr.
+		rendezvous(&node, public, lan).await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).expect("session after PeerFound");
+			assert_eq!(s.peer_addr, public);
+			assert_eq!(s.peer_lan, Some(lan));
+			assert!(!s.direct_ok);
+		}
+
+		// An ack from a FOREIGN device (a stale candidate resolved to another
+		// Pulsar on the well-known port) must not lock Direct.
+		node.handle_peer(
+			PeerMsg::PunchAck {
+				session: SESSION,
+				seq: 0,
+			},
+			foreign,
+		)
+		.await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).unwrap();
+			assert!(!s.direct_ok, "foreign ack must not prove the direct path");
+			assert_eq!(s.peer_addr, public);
+		}
+
+		// Ack from the public (hairpin) path: verified — adopted as the data path.
+		node.handle_peer(
+			PeerMsg::PunchAck {
+				session: SESSION,
+				seq: 0,
+			},
+			public,
+		)
+		.await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).unwrap();
+			assert!(s.direct_ok);
+			assert_eq!(s.transport, Transport::Direct);
+			assert_eq!(s.peer_addr, public, "the ack source becomes the data path");
+		}
+
+		// Ack from the LAN candidate: the private path wins over the hairpin.
+		node.handle_peer(
+			PeerMsg::PunchAck {
+				session: SESSION,
+				seq: 1,
+			},
+			lan,
+		)
+		.await;
+		assert_eq!(node.inner.lock().await.sessions[&SESSION].peer_addr, lan);
+
+		// A late punch retransmit via the public path must NOT flap the locked
+		// private path back to the hairpin.
+		node.handle_peer(
+			PeerMsg::Punch {
+				session: SESSION,
+				seq: 3,
+			},
+			public,
+		)
+		.await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).unwrap();
+			assert_eq!(s.peer_addr, lan);
+			assert!(s.direct_ok);
+		}
+	}
+
+	/// Only a candidate-validated ack wakes the `punched` waiter that gates
+	/// `establish_transport` — a foreign ack must leave it parked (so Auto can
+	/// still fall back to the relay).
+	#[tokio::test]
+	async fn punch_ack_notifies_only_from_session_candidates() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118");
+		let lan = addr("192.168.77.5:21118");
+		rendezvous(&node, public, lan).await;
+
+		let pk = Arc::new(Notify::new());
+		node.inner.lock().await.punched.insert(SESSION, pk.clone());
+
+		node.handle_peer(
+			PeerMsg::PunchAck {
+				session: SESSION,
+				seq: 0,
+			},
+			addr("10.0.0.9:21118"),
+		)
+		.await;
+		assert!(
+			timeout(Duration::from_millis(50), pk.notified())
+				.await
+				.is_err(),
+			"foreign ack must not unblock the punch waiter"
+		);
+
+		node.handle_peer(
+			PeerMsg::PunchAck {
+				session: SESSION,
+				seq: 0,
+			},
+			public,
+		)
+		.await;
+		assert!(timeout(Duration::from_millis(50), pk.notified())
+			.await
+			.is_ok());
 	}
 }

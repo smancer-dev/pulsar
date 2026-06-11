@@ -19,7 +19,10 @@
 		mbps: number;
 		codec: VideoCodec;
 		encoder: Encoder;
-		decoder: Encoder;
+		hostCodecs?: string[];
+		hostEncoders?: string[];
+		decoderInfo?: string;
+		activeInfo?: string;
 		streamRes: 'auto' | '1080p' | '1440p' | '4K';
 		streamFps: 'auto' | '30' | '60' | '120';
 		streamBitrate: number;
@@ -27,7 +30,6 @@
 		framePacing: boolean;
 		onCodec: (v: VideoCodec) => void;
 		onEncoder: (v: Encoder) => void;
-		onDecoder: (v: Encoder) => void;
 		onRes: (v: 'auto' | '1080p' | '1440p' | '4K') => void;
 		onFps: (v: 'auto' | '30' | '60' | '120') => void;
 		onBitrate: (v: number) => void;
@@ -46,7 +48,10 @@
 		mbps,
 		codec,
 		encoder,
-		decoder,
+		hostCodecs = [],
+		hostEncoders = [],
+		decoderInfo = '',
+		activeInfo = '',
 		streamRes,
 		streamFps,
 		streamBitrate,
@@ -54,7 +59,6 @@
 		framePacing,
 		onCodec,
 		onEncoder,
-		onDecoder,
 		onRes,
 		onFps,
 		onBitrate,
@@ -91,13 +95,15 @@
 			idPrefix="ov"
 			{codec}
 			{encoder}
-			{decoder}
+			{hostCodecs}
+			{hostEncoders}
+			{decoderInfo}
+			{activeInfo}
 			{streamRes}
 			{streamFps}
 			{streamBitrate}
 			{onCodec}
 			{onEncoder}
-			{onDecoder}
 			{onRes}
 			{onFps}
 			{onBitrate}

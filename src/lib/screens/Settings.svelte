@@ -15,6 +15,7 @@
 	let tab = $state<'display' | 'network' | 'security' | 'general'>('display');
 	let config = $state<Config | null>(null);
 	let saved = $state(false);
+	let saveErr = $state('');
 	let detected = $state<string[]>([]);
 
 	const tabs = [
@@ -24,8 +25,14 @@
 		{ id: 'general', icon: 'settings' }
 	] as const;
 
+	// Only these fields affect the relay registration — anything else (audio,
+	// unattended, avatar…) saves without tearing the node down and re-registering.
+	const reconnectKey = (c: Config) => `${c.relay}|${c.network_mode}|${c.node_port}|${c.device_name}`;
+	let lastReconnectKey = '';
+
 	onMount(async () => {
 		config = await api.getConfig();
+		lastReconnectKey = reconnectKey(config);
 		detected = await api.availableEncoders().catch(() => []);
 	});
 
@@ -33,10 +40,24 @@
 	// re-register so the change takes effect.
 	async function saveConfig() {
 		if (!config) return;
-		await api.setConfig($state.snapshot(config));
+		// A cleared number input binds null (and >65535 overflows the core's u16) —
+		// clamp before the snapshot crosses to Rust, or set_config rejects EVERY
+		// subsequent save (they all send the whole snapshot).
+		config.node_port = Math.min(65535, Math.max(0, Math.round(Number(config.node_port)) || 0));
+		saveErr = '';
+		try {
+			await api.setConfig($state.snapshot(config));
+		} catch (e) {
+			saveErr = e instanceof Error ? e.message : String(e);
+			return;
+		}
 		saved = true;
 		setTimeout(() => (saved = false), 1200);
-		onReconnect?.();
+		const key = reconnectKey(config);
+		if (key !== lastReconnectKey) {
+			lastReconnectKey = key;
+			onReconnect?.();
+		}
 	}
 	function setMode(m: NetworkMode) {
 		if (config) {
@@ -108,6 +129,9 @@
 		{:else}
 			<GeneralTab bind:config {saveConfig} {setAvatar} />
 		{/if}
+		{#if saveErr}
+			<div class="saveerr" role="alert">{t('settings.saveFailed')} · {saveErr}</div>
+		{/if}
 	</div>
 </div>
 
@@ -154,5 +178,11 @@
 		font-weight: 600;
 		color: var(--accent-press);
 		background: var(--accent-soft);
+	}
+	.saveerr {
+		font-size: 12.5px;
+		color: var(--danger);
+		padding-top: 12px;
+		word-break: break-word;
 	}
 </style>

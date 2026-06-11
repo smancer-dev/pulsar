@@ -11,10 +11,25 @@
 		online: boolean;
 		connecting: boolean;
 		connError: string;
+		/** Active inbound (host) connections — shown as a badge on "Bağlantılar". */
+		hostCount?: number;
 		onView: (v: View) => void;
 		onGoOnline: () => void;
 	};
-	let { nav, view, online, connecting, connError, onView, onGoOnline }: Props = $props();
+	let { nav, view, online, connecting, connError, hostCount = 0, onView, onGoOnline }: Props = $props();
+
+	// The identity chip: the OS account image (or wallpaper, per avatar_mode) and
+	// the OS user's display name replace the static "Sen" / "Bu cihaz" labels.
+	// Loaded once — both only change outside the app. Failures (browser mock,
+	// anonymous mode, no image) keep the textual fallbacks.
+	let avatarUrl = $state('');
+	let userName = $state('');
+	api.selfAvatar()
+		.then((u) => (avatarUrl = u ?? ''))
+		.catch(() => {});
+	api.deviceUserName()
+		.then((n) => (userName = n ?? ''))
+		.catch(() => {});
 </script>
 
 <aside class="sidebar">
@@ -39,14 +54,19 @@
 			<button class="navlink" onclick={() => api.showConnections().catch(() => {})}>
 				<Icon name="devices" size={19} />
 				{t('host.connectionsBtn')}
+				{#if hostCount > 0}
+					<span class="navbadge">{hostCount}</span>
+				{/if}
 			</button>
 		{/if}
 	</nav>
 	<div class="sidefoot">
 		<div class="me">
-			<div class="meavatar">{t('sidebar.me')}</div>
+			<div class="meavatar">
+				{#if avatarUrl}<img src={avatarUrl} alt={t('sidebar.me')} />{:else}{t('sidebar.me')}{/if}
+			</div>
 			<div>
-				<div class="mename">{t('sidebar.thisDevice')}</div>
+				<div class="mename">{userName || t('sidebar.thisDevice')}</div>
 				<div class="mestatus" class:off={!online}>
 					<span class="dot"></span>
 					{#if connecting}{t('status.connecting')}{:else if online}{t('status.online')}{:else}{t('status.offline')}{/if}
@@ -111,6 +131,20 @@
 		color: var(--accent-press);
 		background: var(--accent-soft);
 	}
+	/* live-connection count pill on "Bağlantılar" (only rendered when ≥1) */
+	.navbadge {
+		margin-left: auto;
+		min-width: 18px;
+		height: 18px;
+		padding: 0 5px;
+		border-radius: var(--r-pill, 999px);
+		background: var(--accent);
+		color: var(--text-on-accent);
+		font-size: 11px;
+		font-weight: 700;
+		display: grid;
+		place-items: center;
+	}
 	.sidefoot {
 		margin-top: auto;
 		display: flex;
@@ -134,6 +168,15 @@
 		font-weight: 700;
 		font-size: 11px;
 		font-family: var(--font-display);
+		/* the account-image variant must stay inside the rounded chip */
+		overflow: hidden;
+		flex: none;
+	}
+	.meavatar img {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+		display: block;
 	}
 	.mename {
 		font-size: 13px;

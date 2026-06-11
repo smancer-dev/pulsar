@@ -21,6 +21,9 @@ path = "src/main.rs"
 
 [dependencies]
 egui = "0.29"
+# The app relays the host's FsEntries as one-line JSON over stdin (`fsjson …`)
+# for the native Files view — tiny parse, no derives needed.
+serde_json = "1"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 egui_glow = { version = "0.29", default-features = false }
@@ -28,9 +31,17 @@ glow = "0.14"
 khronos-egl = { version = "6", features = ["static"] }
 x11 = { version = "2.21", features = ["xlib"] }
 libc = "0.2"
-# Video decode (rkmpp → DRM_PRIME) for the single-surface renderer: video + egui overlay in ONE
-# GL context/window so the overlay is a child of the app window (moves/clips/stacks with it).
-ffmpeg-sys-next = "4.4"
+
+# Video decode for the single-surface renderer: video + egui overlay in ONE GL context/window
+# so the overlay is a child of the app window (moves/clips/stacks with it). Two presents:
+# DRM_PRIME zero-copy (rkmpp) and a software planar-YUV upload (desktop, AV1 fallback).
+#
+# One version for every install (Cargo's `links = "ffmpeg"` forbids two, even split by
+# target): the crate bindgens against the INSTALLED headers, so the same dep builds on the
+# rkmpp boards' patched FFmpeg 4.4 (Orange Pi 5 / Ubuntu 22.04) AND desktop FFmpeg ≥7
+# (where 4.4's bindgen broke on the removed avfft.h). The decode code sticks to the stable
+# send/receive API, which exists in both.
+ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec", "avformat"] }
 
 # Windows: native zero-copy renderer, Moonlight-style. Media Foundation HW decoder (DXVA →
 # ID3D11Texture2D, no ffmpeg/libclang needed) → ID3D11VideoProcessor NV12→RGB → DXGI swapchain

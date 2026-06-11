@@ -34,4 +34,22 @@ pub use imp::{disable, enable, overlay_suspend, set_focused};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{disable, enable, overlay_suspend, set_focused};
+pub use linux::{
+	arm_kiosk_engage, disable, enable, engage, engage_render, overlay_suspend, release,
+	set_focused, set_render_focused,
+};
+
+// The click-to-engage + standalone-render-window focus channels are Linux-only (the evdev
+// capture); elsewhere these are no-ops so callers stay portable.
+#[cfg(not(target_os = "linux"))]
+pub fn set_render_focused(_focused: bool) {}
+#[cfg(not(target_os = "linux"))]
+pub fn engage(_app: &AppHandle) {}
+#[cfg(not(target_os = "linux"))]
+pub fn engage_render(_app: &AppHandle) {}
+#[cfg(not(target_os = "linux"))]
+pub fn release(_app: &AppHandle) {}
+// Kiosk auto-engage (CLI --connect starts controlling immediately) only exists for
+// the Linux evdev capture; elsewhere arming it is a no-op.
+#[cfg(not(target_os = "linux"))]
+pub fn arm_kiosk_engage() {}

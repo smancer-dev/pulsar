@@ -1,0 +1,57 @@
+diff --git a/gst/kmssrc/gstkmssrc.c b/gst/kmssrc/gstkmssrc.c
+index 44b2157..e43765d 100644
+--- a/gst/kmssrc/gstkmssrc.c
++++ b/gst/kmssrc/gstkmssrc.c
+@@ -677,8 +677,20 @@ gst_kms_src_import_drm_fb (GstKmsSrc * self, guint fb_id)
+       }
+     }
+ 
+-    mem = gst_fd_allocator_alloc (self->allocator, dmafd[i], st[i].st_size,
+-              GST_FD_MEMORY_FLAG_NONE);
++    {
++      /* Some kernels report st_size == 0 for imported dmabufs; fall back to
++       * the FB geometry so the downstream size checks see the real size. */
++      gsize fdsize = st[i].st_size;
++
++      GST_DEBUG_OBJECT (self, "dmabuf fd %d st_size %" G_GSIZE_FORMAT,
++          dmafd[i], fdsize);
++
++      if (fdsize < fb.offsets[i] + (gsize) size[i])
++        fdsize = fb.offsets[i] + size[i];
++
++      mem = gst_fd_allocator_alloc (self->allocator, dmafd[i], fdsize,
++                GST_FD_MEMORY_FLAG_NONE);
++    }
+     if (!mem) {
+       close (dmafd[i]);
+       goto err;
+diff --git a/gst/rockchipmpp/gstmpph264enc.c b/gst/rockchipmpp/gstmpph264enc.c
+index 07b19d3..309ba00 100644
+--- a/gst/rockchipmpp/gstmpph264enc.c
++++ b/gst/rockchipmpp/gstmpph264enc.c
+@@ -105,6 +105,9 @@ GST_STATIC_PAD_TEMPLATE ("sink",
+     GST_PAD_SINK,
+     GST_PAD_ALWAYS,
+     GST_STATIC_CAPS ("video/x-raw,"
++        "format = (string) { " MPP_H264_ENC_FORMATS " }, "
++        GST_MPP_H264_ENC_SIZE_CAPS ";"
++        "video/x-raw(memory:DMABuf),"
+         "format = (string) { " MPP_H264_ENC_FORMATS " }, "
+         GST_MPP_H264_ENC_SIZE_CAPS));
+ 
+diff --git a/gst/rockchipmpp/gstmpph265enc.c b/gst/rockchipmpp/gstmpph265enc.c
+index 7e59eba..bf3eb57 100644
+--- a/gst/rockchipmpp/gstmpph265enc.c
++++ b/gst/rockchipmpp/gstmpph265enc.c
+@@ -89,7 +89,10 @@ static GstStaticPadTemplate gst_mpp_h265_enc_sink_template =
+     GST_PAD_ALWAYS,
+     GST_STATIC_CAPS ("video/x-raw,"
+         "format = (string) { " MPP_H265_ENC_FORMATS " }, "
+-        GST_MPP_H265_ENC_SIZE_CAPS ";"));
++        GST_MPP_H265_ENC_SIZE_CAPS ";"
++        "video/x-raw(memory:DMABuf),"
++        "format = (string) { " MPP_H265_ENC_FORMATS " }, "
++        GST_MPP_H265_ENC_SIZE_CAPS));
+ 
+ static void
+ gst_mpp_h265_enc_set_property (GObject * object,

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { addPeer } from '$lib/peers.svelte';
+	import { addPeer, avatarFor } from '$lib/peers.svelte';
 	import { api, type LanDevice } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
@@ -45,7 +45,15 @@
 		<div class="langrid">
 			{#each lan as d (d.addr + '|' + d.id)}
 				<div class="device-tile">
-					<span class="ravatar lavatar">{initials(d.name)}</span>
+					<span class="ravatar lavatar">
+						{#if d.id && avatarFor(d.id)}
+							<!-- last-seen identity image from the peers cache (the beacon itself
+							     can't carry an image — it must fit one small multicast packet) -->
+							<img class="limg" src={avatarFor(d.id)} alt="" />
+						{:else}
+							{initials(d.name)}
+						{/if}
+					</span>
 					<div class="lmeta">
 						<div class="lname">{d.name}</div>
 						<div class="lsub mono">{d.id || d.addr}</div>
@@ -127,6 +135,12 @@
 	}
 	.lavatar {
 		flex: none;
+		overflow: hidden;
+	}
+	.limg {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
 	}
 	.lmeta {
 		flex: 1;

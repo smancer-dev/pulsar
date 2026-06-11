@@ -58,7 +58,10 @@ pub fn spawn_audio_player() -> Option<(Child, std::process::ChildStdin)> {
 /// stdout. `None` if no recorder is available.
 pub fn spawn_mic_recorder() -> Option<Child> {
 	let candidates: [(&str, Vec<String>); 3] = [
-		("parecord", AUDIO_ARGS.iter().map(|s| s.to_string()).collect()),
+		(
+			"parecord",
+			AUDIO_ARGS.iter().map(|s| s.to_string()).collect(),
+		),
 		(
 			"pw-record",
 			["--rate", "48000", "--channels", "1", "--format", "s16", "-"]

@@ -52,14 +52,36 @@ pub(crate) struct DataPayload {
 	pub(crate) text: String,
 }
 
+/// A peer's identity image, emitted as `peer-avatar`. Mirrors [`DataPayload`]'s
+/// addressing: `peer` is the connection's peer id on the host side, or the play id
+/// (as a string) on the client side. `data_url` is a ready-to-render
+/// `data:image/png;base64,…` URL (built in Rust so the webview never touches raw bytes).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AvatarPayload {
+	pub(crate) peer: String,
+	pub(crate) data_url: String,
+}
+
 /// Emitted to the host UI (`file-recv`) when a file transfer from a client
-/// finishes (or fails the gap check).
+/// finishes (or fails the gap check). Also emitted to the CLIENT UI when a
+/// file-manager download lands (with `peer` holding the play id, like
+/// [`DataPayload`]'s client-side addressing).
 #[derive(Clone, Serialize)]
 pub(crate) struct FilePayload {
 	pub(crate) peer: String,
 	pub(crate) name: String,
 	pub(crate) bytes: u64,
 	pub(crate) ok: bool,
+}
+
+/// A host directory listing (the file panel's right pane), emitted to the client
+/// UI as `fs-entries` — addressed by play id like the other client-side payloads.
+#[derive(Clone, Serialize)]
+pub(crate) struct FsEntriesPayload {
+	pub(crate) id: u64,
+	pub(crate) path: String,
+	pub(crate) entries: Vec<pulsar_core::service::FsEntry>,
 }
 
 /// Emitted to the CLIENT UI (`auth-prompt`) when a host asks for a password — the
@@ -89,6 +111,13 @@ pub(crate) struct PlayInfo {
 	/// True when the Linux single-surface renderer is active: video is in a GtkGLArea
 	/// *behind* this same webview, so the session screen must be transparent to show it.
 	pub(crate) embedded: bool,
+	/// The HOST's validated stream caps (QueryStreamCaps): codecs + encoder backends it
+	/// can really emit. The session menu disables/hides options outside these lists.
+	/// Empty = unknown (old host / timeout) — the UI then only trusts "auto".
+	pub(crate) host_codecs: Vec<String>,
+	pub(crate) host_encoders: Vec<String>,
+	/// This client's own decodable codecs (probe), for completeness/diagnostics.
+	pub(crate) client_codecs: Vec<String>,
 }
 
 /// A real connection milestone for the Connecting screen, emitted as `conn-phase`

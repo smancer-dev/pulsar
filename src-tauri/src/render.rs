@@ -57,6 +57,126 @@ thread_local! {
 	> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// In-app native-video containers, keyed by play id: a child `GdkWindow` of the main
+/// window that the native renderer (`pulsar-render` / mpv `--wid`) embeds into. The
+/// frontend positions it over the session tab's CONTENT area (`native_view_rect`), so the
+/// video renders inside the app — chrome/tabs stay visible and clickable — instead of
+/// covering the whole window or opening its own toplevel. It is input PASS-THROUGH
+/// (empty input shape): clicks on the video fall through to the webview underneath,
+/// which drives click-to-engage and the rest of the session UI. `GdkWindow` is `!Send`,
+/// so the map lives on the GTK main thread (same model as `GL_RENDERERS`).
+thread_local! {
+	static NATIVE_CONTAINERS: std::cell::RefCell<std::collections::HashMap<u64, gdk::Window>> =
+		std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Create the in-app container window for play `id` and return its X11 XID for the
+/// renderer's `--wid`. Starts hidden 1×1 — the frontend's first `native_view_rect`
+/// sizes and maps it. None off X11 or if the main window isn't available.
+pub(crate) async fn create_native_container(app: &AppHandle, id: u64) -> Option<u64> {
+	let (tx, rx) = tokio::sync::oneshot::channel::<Option<u64>>();
+	let app2 = app.clone();
+	let posted = app.run_on_main_thread(move || {
+		let xid = (|| -> Option<u64> {
+			use gtk::glib::Cast;
+			use gtk::prelude::WidgetExt;
+			let w = app2.get_webview_window("main")?;
+			let gw = w.gtk_window().ok()?;
+			if !gw.is_realized() {
+				gw.realize();
+			}
+			let parent = gw.window()?;
+			let attrs = gdk::WindowAttr {
+				window_type: gdk::WindowType::Child,
+				wclass: gdk::WindowWindowClass::InputOutput,
+				x: Some(0),
+				y: Some(0),
+				width: 1,
+				height: 1,
+				..Default::default()
+			};
+			let child = gdk::Window::new(Some(&parent), &attrs);
+			// Input pass-through (X11: empty input shape): pointer events skip this window
+			// AND the renderer's child inside it, landing on the webview below — the webview
+			// keeps owning clicks (click-to-engage, menu) while the video draws on top.
+			child.set_pass_through(true);
+			let xid = child
+				.clone()
+				.downcast::<gdkx11::X11Window>()
+				.ok()
+				.map(|x| x.xid() as u64)?;
+			NATIVE_CONTAINERS.with(|m| m.borrow_mut().insert(id, child));
+			Some(xid)
+		})();
+		let _ = tx.send(xid);
+	});
+	if posted.is_err() {
+		return None;
+	}
+	rx.await.ok().flatten()
+}
+
+/// Position/show the container over the session tab's content area (GDK logical px,
+/// same units as the webview's CSS px). A zero-area rect hides it (inactive tab).
+pub(crate) fn native_container_rect(app: &AppHandle, id: u64, x: i32, y: i32, w: i32, h: i32) {
+	let _ = app.run_on_main_thread(move || {
+		NATIVE_CONTAINERS.with(|m| {
+			if let Some(win) = m.borrow().get(&id) {
+				if w > 0 && h > 0 {
+					win.move_resize(x, y, w, h);
+					if !win.is_visible() {
+						win.show();
+					}
+					win.raise(); // stay above the webview's GdkWindow
+				} else {
+					win.hide();
+				}
+			}
+		});
+	});
+}
+
+/// Show/hide the container without touching its geometry (overlay open/close on the
+/// mpv fallback, which kills/respawns mpv — the empty container must not cover the
+/// webview menu in between).
+pub(crate) fn set_container_visible(app: &AppHandle, id: u64, visible: bool) {
+	let _ = app.run_on_main_thread(move || {
+		NATIVE_CONTAINERS.with(|m| {
+			if let Some(win) = m.borrow().get(&id) {
+				if visible {
+					win.show();
+					win.raise();
+				} else {
+					win.hide();
+				}
+			}
+		});
+	});
+}
+
+/// Toggle input pass-through: the gaming overlay (`pulsar-render` egui) needs real
+/// clicks while OPEN, so pass-through goes off then and back on when it closes.
+pub(crate) fn set_container_pass_through(app: &AppHandle, id: u64, pass: bool) {
+	let _ = app.run_on_main_thread(move || {
+		NATIVE_CONTAINERS.with(|m| {
+			if let Some(win) = m.borrow().get(&id) {
+				win.set_pass_through(pass);
+			}
+		});
+	});
+}
+
+/// Drop play `id`'s container (session teardown; the renderer child is already dead).
+pub(crate) fn destroy_native_container(app: &AppHandle, id: u64) {
+	let _ = app.run_on_main_thread(move || {
+		NATIVE_CONTAINERS.with(|m| {
+			if let Some(win) = m.borrow_mut().remove(&id) {
+				win.hide();
+			}
+		});
+	});
+}
+
 /// Build the moonlight-style single surface (Linux/X11): reparent the WebKitGTK webview on
 /// top of a `GtkGLArea` via a `GtkOverlay`, drive the GLArea with libmpv's render API
 /// (rkmpp), and make the webview transparent so the video shows through. MUST run on the
@@ -142,11 +262,8 @@ pub(crate) fn install_single_surface(
 		.and_then(|d| d.downcast::<gdkx11::X11Display>().ok())
 		.map(|d| {
 			// Keep the GObject alive across the ffi call; pick the *mut GdkX11Display impl.
-			let stash =
-				ToGlibPtr::<*mut gdkx11::ffi::GdkX11Display>::to_glib_none(&d);
-			unsafe {
-				gdkx11::ffi::gdk_x11_display_get_xdisplay(stash.0) as *mut std::ffi::c_void
-			}
+			let stash = ToGlibPtr::<*mut gdkx11::ffi::GdkX11Display>::to_glib_none(&d);
+			unsafe { gdkx11::ffi::gdk_x11_display_get_xdisplay(stash.0) as *mut std::ffi::c_void }
 		})
 		.unwrap_or(std::ptr::null_mut());
 	let x11_usize = x11_display as usize; // carry into the 'static realize closure
@@ -163,7 +280,11 @@ pub(crate) fn install_single_surface(
 			if a.error().is_some() {
 				return;
 			}
-			match MpvGl::attach(handle_usize as *mut _, a, x11_usize as *mut std::ffi::c_void) {
+			match MpvGl::attach(
+				handle_usize as *mut _,
+				a,
+				x11_usize as *mut std::ffi::c_void,
+			) {
 				Ok(r) => {
 					r.load_sdp(&sdp);
 					*shared.borrow_mut() = Some(r);
@@ -198,14 +319,14 @@ pub(crate) fn install_single_surface(
 	// frame-clock timer; on_render then presents the latest decoded frame. Stops with the area.
 	{
 		let gl_weak = gl.downgrade();
-		gtk::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-			match gl_weak.upgrade() {
-				Some(a) => {
-					a.queue_render();
-					gtk::glib::ControlFlow::Continue
-				}
-				None => gtk::glib::ControlFlow::Break,
+		gtk::glib::timeout_add_local(std::time::Duration::from_millis(16), move || match gl_weak
+			.upgrade()
+		{
+			Some(a) => {
+				a.queue_render();
+				gtk::glib::ControlFlow::Continue
 			}
+			None => gtk::glib::ControlFlow::Break,
 		});
 	}
 
@@ -219,6 +340,8 @@ pub(crate) fn install_single_surface(
 fn start_mpv_stats(app: &AppHandle, id: u64) {
 	use tauri::Emitter;
 	let app = app.clone();
+	// One-shot stream-ready signal (first live fps/bitrate sample).
+	let mut ready_sent = false;
 	gtk::glib::timeout_add_seconds_local(1, move || {
 		let alive = GL_RENDERERS.with(|m| {
 			let map = m.borrow();
@@ -247,6 +370,10 @@ fn start_mpv_stats(app: &AppHandle, id: u64) {
 					decode_ms,
 				},
 			);
+			if !ready_sent && (fps > 0.0 || mbps > 0.0) {
+				ready_sent = true;
+				let _ = app.emit("play-ready", id);
+			}
 			true
 		});
 		if alive {
@@ -264,12 +391,35 @@ fn start_mpv_stats(app: &AppHandle, id: u64) {
 /// appears once mpv has started, so connect-refused on the first polls is tolerated
 /// (mpv_ipc_get_f64 returns None). Stops when the play session for `id` is gone or no
 /// longer running.
-pub(crate) fn start_mpv_ipc_stats(app: &AppHandle, id: u64, sock: std::path::PathBuf) {
+pub(crate) fn start_mpv_ipc_stats(
+	app: &AppHandle,
+	id: u64,
+	sock: std::path::PathBuf,
+	standalone: bool,
+) {
 	use tauri::Emitter;
 	let app = app.clone();
 	tokio::spawn(async move {
 		let state = app.state::<AppState>();
 		let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+		// One-shot stream-ready signal (first live fps/bitrate sample).
+		let mut ready_sent = false;
+		// Standalone mpv window focus tracking (see below). None = no sample yet: the FIRST
+		// reading must never engage — the WM usually auto-focuses the freshly spawned mpv
+		// window, and engaging on that would re-create the "grabbed at session start" bug.
+		let mut was_focused: Option<bool> = None;
+		// Consecutive failed `focused` reads: ONE transient IPC hiccup used to map to
+		// "unfocused" → ENGAGED latch cleared mid-drag with zero user input. Require
+		// two misses (~2 s at this poll rate) before treating mpv as gone.
+		let mut focus_read_misses = 0u32;
+		// `state.plays.insert` happens only AFTER start_remote_play's network awaits
+		// (request_launch/request_stream), so the id is normally ABSENT on the first
+		// ticks — breaking on that killed the poller instantly (no vstats, no
+		// play-ready, and the standalone `focused` poll never ran → capture could
+		// never engage). Distinguish "not yet inserted" (bounded grace) from
+		// "removed after being seen" (stop).
+		let mut seen = false;
+		let mut grace_ticks = 15u32;
 		loop {
 			tick.tick().await;
 			// Stop once this session is gone (or has been marked not-running).
@@ -278,10 +428,47 @@ pub(crate) fn start_mpv_ipc_stats(app: &AppHandle, id: u64, sock: std::path::Pat
 				.lock()
 				.unwrap()
 				.get(&id)
-				.map(|p| p.running.load(Ordering::SeqCst))
-				.unwrap_or(false);
-			if !alive {
-				break;
+				.map(|p| p.running.load(Ordering::SeqCst));
+			match alive {
+				Some(true) => seen = true,
+				Some(false) => break,
+				None => {
+					if seen {
+						break; // existed, then removed → session ended
+					}
+					grace_ticks = grace_ticks.saturating_sub(1);
+					if grace_ticks == 0 {
+						break; // never registered (failed connect; mpv already torn down)
+					}
+					continue; // not inserted yet — keep waiting, don't poll mpv
+				}
+			}
+			// STANDALONE mpv (no --wid embed, e.g. a Wayland client): its window focus is
+			// invisible to Tauri, but the evdev capture gates on it. Poll mpv's `focused`
+			// property and feed it through; a false→true edge (the user clicked/focused the
+			// video window) also ENGAGES capture — mpv has no click channel, so focusing the
+			// window IS the explicit opt-in here.
+			if standalone {
+				match native_view::mpv_ipc_get_bool(&sock, "focused") {
+					Some(f) => {
+						focus_read_misses = 0;
+						crate::kbdhook::set_render_focused(f);
+						if f && was_focused == Some(false) {
+							crate::kbdhook::engage_render(&app);
+						}
+						was_focused = Some(f);
+					}
+					// Unreadable (mpv gone / socket hiccup): only a SUSTAINED failure
+					// (2 consecutive polls) flips unfocused — one hiccup must not clear
+					// the ENGAGED latch mid-drag. `was_focused` keeps the last REAL
+					// reading, so recovery alone doesn't auto-engage.
+					None => {
+						focus_read_misses += 1;
+						if focus_read_misses >= 2 {
+							crate::kbdhook::set_render_focused(false);
+						}
+					}
+				}
 			}
 			// Read from mpv; None (socket not ready / property missing) → 0, never faked.
 			let get = |prop: &str| native_view::mpv_ipc_get_f64(&sock, prop);
@@ -294,7 +481,9 @@ pub(crate) fn start_mpv_ipc_stats(app: &AppHandle, id: u64, sock: std::path::Pat
 			// Real pipeline-buffer latency (demuxer-cache-duration, seconds → ms): how much
 			// video is buffered ahead (~one frame with cache=no). `vo-delay` doesn't exist in
 			// mpv 0.34, so this is the honest local-latency number; 0 if unavailable. (D1)
-			let decode_ms = get("demuxer-cache-duration").map(|s| s * 1000.0).unwrap_or(0.0);
+			let decode_ms = get("demuxer-cache-duration")
+				.map(|s| s * 1000.0)
+				.unwrap_or(0.0);
 			let _ = app.emit(
 				"play-vstats",
 				PlayVStats {
@@ -305,6 +494,10 @@ pub(crate) fn start_mpv_ipc_stats(app: &AppHandle, id: u64, sock: std::path::Pat
 					decode_ms,
 				},
 			);
+			if !ready_sent && (fps > 0.0 || mbps > 0.0) {
+				ready_sent = true;
+				let _ = app.emit("play-ready", id);
+			}
 		}
 	});
 }
@@ -357,7 +550,9 @@ pub(crate) fn apply_vidsink_rotation(app: &AppHandle, id: u64, host_deg: u32) {
 			None => return,
 		}
 	};
-	let (Some(sdp), Some(bin)) = (sdp, bin) else { return };
+	let (Some(sdp), Some(bin)) = (sdp, bin) else {
+		return;
+	};
 	if target == cur {
 		return; // already applied
 	}

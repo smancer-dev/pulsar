@@ -21,6 +21,10 @@ pub enum HwEncoder {
 	Vulkan,
 	/// Windows Media Foundation (Qualcomm/ARM Windows; the only HW encoder on Snapdragon).
 	MediaFoundation,
+	/// Rockchip MPP (RK3588-class SBCs). Reachable two ways: ffmpeg `h264/hevc_rkmpp`
+	/// encoders when an ffmpeg-rockchip build is installed, or the GStreamer
+	/// `mpph264enc/mpph265enc` elements (see `pipeline::gst`) — both share this id.
+	Rkmpp,
 	/// libx264/libx265/libsvtav1 on the CPU.
 	Software,
 }
@@ -181,10 +185,14 @@ impl HwEncoder {
 			(Self::MediaFoundation, VCodec::H264) => "h264_mf",
 			(Self::MediaFoundation, VCodec::H265) => "hevc_mf",
 			(Self::MediaFoundation, VCodec::Av1) => "av1_mf",
+			(Self::Rkmpp, VCodec::H264) => "h264_rkmpp",
+			(Self::Rkmpp, VCodec::H265) => "hevc_rkmpp",
 			(Self::Software, VCodec::H264) => "libx264",
 			(Self::Software, VCodec::H265) => "libx265",
 			(Self::Software, VCodec::Av1) => "libsvtav1",
-			(Self::VideoToolbox, VCodec::Av1) | (Self::Auto, _) => return None,
+			(Self::VideoToolbox, VCodec::Av1) | (Self::Rkmpp, VCodec::Av1) | (Self::Auto, _) => {
+				return None
+			}
 		})
 	}
 
@@ -194,6 +202,8 @@ impl HwEncoder {
 		match self {
 			// VideoToolbox has no AV1 ENCODE on Apple silicon (decode only).
 			Self::VideoToolbox => &[VCodec::H264, VCodec::H265],
+			// RK3588 VEPU does H.264 + HEVC (no AV1 encode).
+			Self::Rkmpp => &[VCodec::H264, VCodec::H265],
 			Self::Auto => &[],
 			// Every other backend (NVENC/AMF/QSV/VAAPI/Software) covers all three.
 			_ => &[VCodec::H264, VCodec::H265, VCodec::Av1],
@@ -225,6 +235,7 @@ impl HwEncoder {
 			Self::VideoToolbox => "Apple VideoToolbox",
 			Self::Vulkan => "Vulkan",
 			Self::MediaFoundation => "Media Foundation",
+			Self::Rkmpp => "Rockchip MPP",
 			Self::Software => "Yazılım (CPU)",
 		}
 	}
@@ -243,6 +254,7 @@ pub fn detect(ffmpeg_encoders_output: &str) -> Vec<HwEncoder> {
 		HwEncoder::Vulkan,
 		HwEncoder::VideoToolbox,
 		HwEncoder::MediaFoundation,
+		HwEncoder::Rkmpp,
 		HwEncoder::Software,
 	]
 	.into_iter()
@@ -264,6 +276,7 @@ pub fn resolve(choice: HwEncoder, available: &[HwEncoder]) -> HwEncoder {
 		HwEncoder::Vulkan,
 		HwEncoder::VideoToolbox,
 		HwEncoder::MediaFoundation,
+		HwEncoder::Rkmpp,
 		HwEncoder::Software,
 	] {
 		if available.contains(&c) {

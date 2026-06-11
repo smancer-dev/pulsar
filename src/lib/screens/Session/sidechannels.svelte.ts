@@ -8,9 +8,10 @@
 // the API calls track them as they did inline).
 
 import { api, copyText, readClipboard, onChatMsg, onDataClip } from '$lib/api';
+import { listenScope } from '$lib/api.events';
 import { t } from '$lib/i18n.svelte';
 
-type Panel = 'menu' | 'chat';
+type Panel = 'menu' | 'chat' | 'files';
 type ChatMsg = { me: boolean; text: string };
 
 type Inputs = {
@@ -38,23 +39,21 @@ export class SessionSideChannels {
 		// Inbound side-channel data for THIS play (events carry the play id as `peer`).
 		$effect(() => {
 			const idStr = String(inputs.playId());
-			let offChat: (() => void) | undefined;
-			let offClip: (() => void) | undefined;
-			onChatMsg((e) => {
-				if (e.peer !== idStr) return;
-				this.messages = [...this.messages, { me: false, text: e.text }];
-				if (this.panel !== 'chat' || !inputs.menuOpen()) this.unread++;
-				queueMicrotask(() => this.chatBox?.scrollTo({ top: this.chatBox.scrollHeight }));
-			}).then((off) => (offChat = off));
-			onDataClip((e) => {
-				if (e.peer !== idStr) return;
-				copyText(e.text).catch(() => {});
-				this.flash(t('session.clipboardRecv'));
-			}).then((off) => (offClip = off));
-			return () => {
-				offChat?.();
-				offClip?.();
-			};
+			const scope = listenScope();
+			scope.add(
+				onChatMsg((e) => {
+					if (e.peer !== idStr) return;
+					this.messages = [...this.messages, { me: false, text: e.text }];
+					if (this.panel !== 'chat' || !inputs.menuOpen()) this.unread++;
+					queueMicrotask(() => this.chatBox?.scrollTo({ top: this.chatBox.scrollHeight }));
+				}),
+				onDataClip((e) => {
+					if (e.peer !== idStr) return;
+					copyText(e.text).catch(() => {});
+					this.flash(t('session.clipboardRecv'));
+				})
+			);
+			return scope.dispose;
 		});
 	}
 

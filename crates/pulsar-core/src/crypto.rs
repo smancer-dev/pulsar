@@ -303,8 +303,20 @@ mod tests {
 		let session_id = 0x1234_5678_9abc_def0;
 		let salt_a = random_salt();
 		let salt_b = random_salt();
-		let a_sess = a.session(b.public_bytes(), Role::Initiator, session_id, salt_a, salt_b);
-		let b_sess = b.session(a.public_bytes(), Role::Responder, session_id, salt_b, salt_a);
+		let a_sess = a.session(
+			b.public_bytes(),
+			Role::Initiator,
+			session_id,
+			salt_a,
+			salt_b,
+		);
+		let b_sess = b.session(
+			a.public_bytes(),
+			Role::Responder,
+			session_id,
+			salt_b,
+			salt_a,
+		);
 		(a_sess, b_sess)
 	}
 
@@ -345,8 +357,20 @@ mod tests {
 		let session_id = 99;
 		let salt_a = random_salt();
 		let salt_eve = random_salt();
-		let a_to_b = a.session(b.public_bytes(), Role::Initiator, session_id, salt_a, salt_eve);
-		let mut eve_as_b = eve.session(a.public_bytes(), Role::Responder, session_id, salt_eve, salt_a);
+		let a_to_b = a.session(
+			b.public_bytes(),
+			Role::Initiator,
+			session_id,
+			salt_a,
+			salt_eve,
+		);
+		let mut eve_as_b = eve.session(
+			a.public_bytes(),
+			Role::Responder,
+			session_id,
+			salt_eve,
+			salt_a,
+		);
 		let ct = a_to_b.seal(0, b"top secret");
 		assert!(eve_as_b.open(0, &ct).is_err());
 	}

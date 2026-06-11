@@ -27,10 +27,12 @@ pub fn encoder_from_str(s: &str) -> HwEncoder {
 		"nvenc" => HwEncoder::Nvenc,
 		"amf" => HwEncoder::Amf,
 		"vaapi" => HwEncoder::Vaapi,
-		"qsv" => HwEncoder::Qsv,
+		// "quicksync" was the UI's old value for QSV — keep accepting persisted configs.
+		"qsv" | "quicksync" => HwEncoder::Qsv,
 		"videotoolbox" => HwEncoder::VideoToolbox,
 		"vulkan" => HwEncoder::Vulkan,
 		"mediafoundation" | "mf" => HwEncoder::MediaFoundation,
+		"rkmpp" => HwEncoder::Rkmpp,
 		"software" => HwEncoder::Software,
 		_ => HwEncoder::Auto,
 	}
@@ -85,12 +87,204 @@ pub fn detect_encoders(ffmpeg: &str) -> Vec<HwEncoder> {
 	pipeline::detect(&encoders_text(ffmpeg))
 }
 
+/// UI/wire id for an encoder backend (the `StreamCaps.encoders` / settings vocabulary).
+pub fn encoder_wire_id(e: HwEncoder) -> &'static str {
+	match e {
+		HwEncoder::Auto => "auto",
+		HwEncoder::Nvenc => "nvenc",
+		HwEncoder::Amf => "amf",
+		HwEncoder::Vaapi => "vaapi",
+		HwEncoder::Qsv => "qsv",
+		HwEncoder::VideoToolbox => "videotoolbox",
+		HwEncoder::Vulkan => "vulkan",
+		HwEncoder::MediaFoundation => "mediafoundation",
+		HwEncoder::Rkmpp => "rkmpp",
+		HwEncoder::Software => "software",
+	}
+}
+
+/// Encoder backends that ACTUALLY work on this machine, preference-ordered, always
+/// ending with Software (which needs no probe). Off-Windows each candidate must pass
+/// the cached one-frame probe (a generic ffmpeg build LISTS h264_nvenc on a GPU-less
+/// SBC); on Windows ffmpeg probes are unreliable on hybrid boxes and the native NVENC
+/// SDK path exists, so the name-detected list is trusted as-is.
+pub fn validated_encoders(ffmpeg: &str, vaapi_device: &str) -> Vec<HwEncoder> {
+	let mut out: Vec<HwEncoder> = detect_encoders(ffmpeg)
+		.into_iter()
+		.filter(|&e| e != HwEncoder::Software)
+		.filter(|&e| {
+			#[cfg(windows)]
+			{
+				let _ = (&e, vaapi_device);
+				true
+			}
+			#[cfg(not(windows))]
+			{
+				!validated_codecs(ffmpeg, e, vaapi_device).is_empty()
+			}
+		})
+		.collect();
+	out.push(HwEncoder::Software);
+	out
+}
+
+/// GStreamer encode support (Linux): which gst encoder families ACTUALLY work here,
+/// each validated by launching a one-frame `videotestsrc → fragment → fakesink`
+/// pipeline (the gst analog of `probe_encoder_codec`). Hardware families only get in
+/// when both the element exists (`gst-inspect-1.0 --exists`) and the probe exits 0;
+/// X264 is included whenever gst itself is present. Cached per (family, codec) for
+/// the process lifetime. Empty when gst-launch isn't installed.
+#[cfg(target_os = "linux")]
+pub fn validated_gst_encoders() -> Vec<(pipeline::gst::GstEncoder, Vec<VCodec>)> {
+	use pipeline::gst::{self, GstEncoder};
+	use std::collections::HashMap;
+	use std::sync::{Mutex, OnceLock};
+	static CACHE: OnceLock<Mutex<HashMap<(GstEncoder, VCodec), bool>>> = OnceLock::new();
+	if !gst_available() {
+		return Vec::new();
+	}
+	let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+	let mut out = Vec::new();
+	for enc in GstEncoder::PRIORITY {
+		let mut codecs = Vec::new();
+		for &codec in enc.codecs() {
+			if let Some(&hit) = cache.lock().unwrap().get(&(enc, codec)) {
+				if hit {
+					codecs.push(codec);
+				}
+				continue;
+			}
+			let ok = enc.element(codec).is_some_and(|el| {
+				gst_element_exists(el)
+					&& gst::encoder_fragment(enc, codec, 4000, 30)
+						.is_some_and(|frag| probe_gst_pipeline(&gst::probe_pipeline(&frag)))
+			});
+			cache.lock().unwrap().insert((enc, codec), ok);
+			if ok {
+				codecs.push(codec);
+			}
+		}
+		if !codecs.is_empty() {
+			out.push((enc, codecs));
+		}
+	}
+	out
+}
+
+/// Pick a (family, codec) from the validated gst set: an explicit wire-id request
+/// ("rkmpp"/"vaapi"/"nvenc"/"software") binds the family; "auto"/unknown takes the
+/// first validated (PRIORITY order = hardware first). Codec preference degrades
+/// requested → H.264 → first available, mirroring `resolve_codec`.
+#[cfg(target_os = "linux")]
+pub fn pick_gst(
+	validated: &[(pipeline::gst::GstEncoder, Vec<VCodec>)],
+	enc_pref: &str,
+	codec_pref: &str,
+) -> Option<(pipeline::gst::GstEncoder, VCodec)> {
+	let want = codec_from_str(codec_pref);
+	let pick_codec = |codecs: &[VCodec]| -> Option<VCodec> {
+		if codecs.contains(&want) {
+			Some(want)
+		} else if codecs.contains(&VCodec::H264) {
+			Some(VCodec::H264)
+		} else {
+			codecs.first().copied()
+		}
+	};
+	if let Some(explicit) = pipeline::gst::from_wire_id(enc_pref) {
+		if let Some((enc, codecs)) = validated.iter().find(|(e, _)| *e == explicit) {
+			return pick_codec(codecs).map(|c| (*enc, c));
+		}
+	}
+	validated
+		.first()
+		.and_then(|(enc, codecs)| pick_codec(codecs).map(|c| (*enc, c)))
+}
+
+/// The gst-launch binary all gst pipelines (probe AND runtime) spawn through.
+/// `~/pulsar-gst-launch` — a user-made copy of gst-launch-1.0 carrying
+/// `CAP_SYS_ADMIN` (file capability, granted once via `sudo setcap`) — is
+/// preferred when present: DRM `GETFB2` only hands FB handles to privileged
+/// callers, so the zero-copy `kmssrc` path needs it (ffmpeg's `kmsgrab` has the
+/// same requirement). Plain `gst-launch-1.0` otherwise; every non-KMS pipeline
+/// behaves identically under both.
+#[cfg(target_os = "linux")]
+pub fn gst_launch_bin() -> std::path::PathBuf {
+	if let Some(home) = std::env::var_os("HOME") {
+		let cap = std::path::Path::new(&home).join("pulsar-gst-launch");
+		if cap.is_file() {
+			return cap;
+		}
+	}
+	std::path::PathBuf::from("gst-launch-1.0")
+}
+
+/// Whether the zero-copy KMS capture→encode path works for this (family, codec):
+/// runs `kms_probe_pipeline` (2 real scanout frames through the encoder) via
+/// `gst_launch_bin`. Cached per pair — the stack (plugins, capability, DRM)
+/// doesn't change within a process lifetime.
+#[cfg(target_os = "linux")]
+pub fn kms_encode_ok(enc: pipeline::gst::GstEncoder, codec: VCodec) -> bool {
+	use std::collections::HashMap;
+	use std::sync::{Mutex, OnceLock};
+	static CACHE: OnceLock<Mutex<HashMap<(pipeline::gst::GstEncoder, VCodec), bool>>> =
+		OnceLock::new();
+	let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+	if let Some(&hit) = cache.lock().unwrap().get(&(enc, codec)) {
+		return hit;
+	}
+	let ok = pipeline::gst::encoder_fragment(enc, codec, 4000, 30)
+		.is_some_and(|frag| probe_gst_pipeline(&pipeline::gst::kms_probe_pipeline(&frag)));
+	tracing::info!(?enc, ?codec, ok, "kms zero-copy probe");
+	cache.lock().unwrap().insert((enc, codec), ok);
+	ok
+}
+
+#[cfg(target_os = "linux")]
+fn gst_available() -> bool {
+	std::process::Command::new("gst-launch-1.0")
+		.arg("--version")
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.status()
+		.map(|st| st.success())
+		.unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn gst_element_exists(element: &str) -> bool {
+	// Plain inspect, NOT `--exists`: on Ubuntu 22.04's gst 1.20 `--exists` exits 1
+	// even for elements that ARE present (verified live on the Orange Pi — mpph264enc
+	// and x264enc both "missing" per --exists, both exit 0 via plain inspect).
+	std::process::Command::new("gst-inspect-1.0")
+		.arg(element)
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.status()
+		.map(|st| st.success())
+		.unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_gst_pipeline(pipeline: &str) -> bool {
+	let mut cmd = std::process::Command::new(gst_launch_bin());
+	cmd.arg("-q").args(pipeline.split_whitespace());
+	cmd.stdout(std::process::Stdio::null());
+	cmd.stderr(std::process::Stdio::null());
+	cmd.status().map(|st| st.success()).unwrap_or(false)
+}
+
 /// Sunshine-style runtime VALIDATION of one encoder+codec: actually encode a single
 /// synthetic frame and check ffmpeg exits 0. Catches the cases name-presence detection
 /// misses — encoder listed but the GPU/driver can't init it (e.g. `av1_nvenc` on an Ampere
 /// card, `h264_qsv` with no Intel GPU). Results are cached per (encoder, codec) for the
 /// process lifetime so we probe at most once each.
-fn probe_encoder_codec(ffmpeg: &str, encoder: HwEncoder, codec: VCodec, vaapi_device: &str) -> bool {
+fn probe_encoder_codec(
+	ffmpeg: &str,
+	encoder: HwEncoder,
+	codec: VCodec,
+	vaapi_device: &str,
+) -> bool {
 	use std::collections::HashMap;
 	use std::sync::{Mutex, OnceLock};
 	static CACHE: OnceLock<Mutex<HashMap<(HwEncoder, VCodec), bool>>> = OnceLock::new();
@@ -202,6 +396,32 @@ pub fn no_window(cmd: &mut std::process::Command) {
 #[cfg(not(windows))]
 pub fn no_window(_cmd: &mut std::process::Command) {}
 
+/// Linux: tie a child to Pulsar's lifetime via `PR_SET_PDEATHSIG` (mirrors the gst
+/// spawns in host/handlers.rs) — a Pulsar crash/SIGKILL must never leave an ffmpeg
+/// capturing and streaming the host's screen/audio to the last client. Windows gets
+/// the equivalent through job.rs; macOS has no prctl (accepted gap).
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut std::process::Command) {
+	use std::os::unix::process::CommandExt;
+	unsafe {
+		cmd.pre_exec(|| {
+			// SAFETY: async-signal-safe libc calls only.
+			libc::prctl(
+				libc::PR_SET_PDEATHSIG,
+				libc::SIGKILL as libc::c_ulong,
+				0,
+				0,
+				0,
+			);
+			// Parent died before the prctl took effect — don't outlive it.
+			if libc::getppid() == 1 {
+				libc::_exit(0);
+			}
+			Ok(())
+		});
+	}
+}
+
 /// Spawn a process and remember it (in `procs`) so it can be stopped later.
 pub fn spawn_tracked(
 	procs: &Arc<Mutex<Vec<Child>>>,
@@ -211,12 +431,70 @@ pub fn spawn_tracked(
 	let mut cmd = std::process::Command::new(program);
 	cmd.args(args);
 	no_window(&mut cmd); // never pop up a console window for ffmpeg
+	#[cfg(target_os = "linux")]
+	die_with_parent(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => {
 			// Tie it to Pulsar's lifetime so a crash/taskkill/tray-quit can't leave the
 			// encoder running and pegging NVENC (see job.rs).
 			#[cfg(windows)]
 			crate::job::assign(&child);
+			procs.lock().unwrap().push(child);
+			Ok(())
+		}
+		Err(e) => Err(format!("{program} başlatılamadı: {e}")),
+	}
+}
+
+/// Spawn the stream-encode ffmpeg like `spawn_tracked`, but with `-nostats -progress
+/// pipe:2` injected and stderr piped to a parser thread that measures the ENCODE PACE:
+/// per-frame wall time between progress ticks (Δt/Δframes, ms). Realtime capture pins
+/// this near the frame budget while the encoder keeps up; it RISES when encoding falls
+/// behind — the host-side number the client's "Kodlama ms" tile shows. The thread calls
+/// `on_ms` (~2 Hz) and exits when ffmpeg does.
+pub fn spawn_tracked_enc_paced(
+	procs: &Arc<Mutex<Vec<Child>>>,
+	program: &str,
+	args: &[String],
+	on_ms: impl Fn(f32) + Send + 'static,
+) -> Result<(), String> {
+	let mut cmd = std::process::Command::new(program);
+	// Global options — must precede everything else on the command line.
+	cmd.args(["-nostats", "-progress", "pipe:2"]);
+	cmd.args(args);
+	cmd.stderr(std::process::Stdio::piped());
+	no_window(&mut cmd);
+	#[cfg(target_os = "linux")]
+	die_with_parent(&mut cmd);
+	match cmd.spawn() {
+		Ok(mut child) => {
+			#[cfg(windows)]
+			crate::job::assign(&child);
+			if let Some(stderr) = child.stderr.take() {
+				std::thread::spawn(move || {
+					use std::io::BufRead;
+					let reader = std::io::BufReader::new(stderr);
+					let mut last: Option<(u64, std::time::Instant)> = None;
+					for line in reader.lines() {
+						let Ok(line) = line else { break };
+						let Some(v) = line.strip_prefix("frame=") else {
+							continue;
+						};
+						let Ok(frame) = v.trim().parse::<u64>() else {
+							continue;
+						};
+						let now = std::time::Instant::now();
+						if let Some((f0, t0)) = last {
+							let df = frame.saturating_sub(f0);
+							if df > 0 {
+								let ms = now.duration_since(t0).as_secs_f32() * 1000.0 / df as f32;
+								on_ms(ms);
+							}
+						}
+						last = Some((frame, now));
+					}
+				});
+			}
 			procs.lock().unwrap().push(child);
 			Ok(())
 		}

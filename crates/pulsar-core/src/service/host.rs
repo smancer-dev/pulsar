@@ -15,6 +15,22 @@ pub struct DataHandlers {
 	pub on_audio: Box<dyn FnMut(DataMsg) + Send>,
 	/// Client asked to reverse direction; arg is the requester's connect id.
 	pub on_reverse: Box<dyn FnMut(String) + Send>,
+	/// What this host can actually stream (validated codec + encoder caps, best-first)
+	/// — the `QueryStreamCaps` reply. Default claims only H.264 / software.
+	pub stream_caps: Box<dyn Fn() -> StreamCaps + Send>,
+	/// Client reported missing RTP video seqs (media-over-session): re-send them from
+	/// the retransmit ring. Default no-op (host without a media forwarder).
+	pub on_nack: Box<dyn FnMut(Vec<u16>) + Send>,
+	/// The client pushed its identity image (PNG bytes, see [`DataMsg::Avatar`]) so
+	/// the host UI can show *who* connected. Default no-op.
+	pub on_avatar: Box<dyn FnMut(Vec<u8>) + Send>,
+	/// The client pushed its display name (see [`DataMsg::PeerName`]). Default no-op.
+	pub on_peer_name: Box<dyn FnMut(String) + Send>,
+	/// File-manager requests from the client (`FsList` / `FsGet`). The handler
+	/// replies through `outbound` (`FsEntries`, or the file as
+	/// `FileBegin`/`FileChunk`/`FileEnd`). Default no-op — a host without the
+	/// file manager just never answers.
+	pub on_fs: Box<dyn FnMut(DataMsg) + Send>,
 }
 
 impl Default for DataHandlers {
@@ -26,6 +42,15 @@ impl Default for DataHandlers {
 			on_file: Box::new(|_| {}),
 			on_audio: Box::new(|_| {}),
 			on_reverse: Box::new(|_| {}),
+			stream_caps: Box::new(|| StreamCaps {
+				codecs: vec!["h264".to_string()],
+				encoders: vec!["software".to_string()],
+				features: Vec::new(),
+			}),
+			on_nack: Box::new(|_| {}),
+			on_avatar: Box::new(|_| {}),
+			on_peer_name: Box::new(|_| {}),
+			on_fs: Box::new(|_| {}),
 		}
 	}
 }
@@ -70,18 +95,30 @@ pub async fn serve_with(
 		In(Result<Option<Vec<u8>>, tokio::time::error::Elapsed>),
 		Out(Option<DataMsg>),
 	}
+	let mut last_inbound = tokio::time::Instant::now();
 	loop {
 		// A dead client over UDP never closes the channel, so bound the wait: no
 		// message (not even a keepalive) within `PEER_TIMEOUT` means it's gone.
+		// The budget is anchored to the last INBOUND frame — the outbound branch
+		// also completes iterations, and a long outbound stream (e.g. an FsGet
+		// download) must not keep a silently-dead client "alive" while the host
+		// streams into the void.
+		let budget = PEER_TIMEOUT.saturating_sub(last_inbound.elapsed());
+		if budget.is_zero() {
+			break; // peer silent too long while we were busy sending
+		}
 		let ev = match data.outbound.as_mut() {
 			Some(rx) => tokio::select! {
-				r = timeout(PEER_TIMEOUT, session.recv()) => Ev::In(r),
+				r = timeout(budget, session.recv()) => Ev::In(r),
 				o = rx.recv() => Ev::Out(o),
 			},
-			None => Ev::In(timeout(PEER_TIMEOUT, session.recv()).await),
+			None => Ev::In(timeout(budget, session.recv()).await),
 		};
 		let bytes = match ev {
-			Ev::In(Ok(Some(b))) => b,
+			Ev::In(Ok(Some(b))) => {
+				last_inbound = tokio::time::Instant::now();
+				b
+			}
 			Ev::In(Ok(None)) | Ev::In(Err(_)) => break, // closed or peer silent too long
 			Ev::Out(Some(msg)) => {
 				let _ = session.send(&enc(&Msg::Data(msg))).await;
@@ -101,6 +138,11 @@ pub async fn serve_with(
 			Some(Msg::Bye) => break, // client said goodbye — tear down immediately
 			Some(Msg::ListGames) => {
 				let _ = session.send(&enc(&Msg::Games(games()))).await;
+			}
+			Some(Msg::QueryStreamCaps) => {
+				let _ = session
+					.send(&enc(&Msg::StreamCaps((data.stream_caps)())))
+					.await;
 			}
 			Some(Msg::Launch(id)) => {
 				on_launch(id);
@@ -124,6 +166,11 @@ pub async fn serve_with(
 				DataMsg::Stats(_) => {} // host→client only; ignore if echoed back
 				DataMsg::DisplayRotation(_) => {} // host→client only; ignore if echoed back
 				DataMsg::ReverseRequest(id) => (data.on_reverse)(id),
+				DataMsg::MediaNack(seqs) => (data.on_nack)(seqs),
+				DataMsg::Avatar(png) => (data.on_avatar)(png),
+				DataMsg::PeerName(name) => (data.on_peer_name)(name),
+				m @ (DataMsg::FsList { .. } | DataMsg::FsGet { .. }) => (data.on_fs)(m),
+				DataMsg::FsEntries { .. } => {} // host→client only; ignore if echoed back
 			},
 			_ => {}
 		}

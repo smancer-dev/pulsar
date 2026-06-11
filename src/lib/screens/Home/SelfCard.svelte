@@ -12,6 +12,8 @@
 		activity: string[];
 		debug?: boolean;
 		localIp: string;
+		/** The node's actual bound UDP port (0 = offline) — shown as "ip:port". */
+		nodePort?: number;
 		onRefreshPw?: () => void;
 		onDisconnect?: (peer: string) => void;
 	};
@@ -24,6 +26,7 @@
 		activity,
 		debug = false,
 		localIp,
+		nodePort = 0,
 		onRefreshPw = () => {},
 		onDisconnect = () => {}
 	}: Props = $props();
@@ -44,6 +47,13 @@
 			setTimeout(() => (pwCopied = false), 1400);
 		}
 	}
+	let addrCopied = $state(false);
+	async function copyAddr() {
+		if (await copyText(`${localIp}${nodePort > 0 ? `:${nodePort}` : ''}`)) {
+			addrCopied = true;
+			setTimeout(() => (addrCopied = false), 1400);
+		}
+	}
 </script>
 
 <div class="card">
@@ -62,12 +72,18 @@
 		</button>
 	</div>
 	{#if localIp}
-		<div
-			style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12.5px;color:var(--text-muted)"
-			title={t('home.localIp')}
+		<!-- The whole row copies the direct-connect address (same check-flash as the id). -->
+		<button
+			class="addr"
+			onclick={copyAddr}
+			title={t('home.localIp') + ' · ' + t('home.copy')}
+			aria-label={t('home.copyAddr')}
 		>
-			<Icon name="globe" size={13} /><span class="mono">{localIp}</span>
-		</div>
+			<Icon name="globe" size={13} /><span class="mono"
+				>{localIp}{nodePort > 0 ? `:${nodePort}` : ''}</span
+			>
+			<Icon name={addrCopied ? 'check' : 'copy'} size={12} />
+		</button>
 	{/if}
 	<div class="sep"></div>
 	<div class="lab">{t('home.otp')}</div>
@@ -129,6 +145,22 @@
 	.icon-btn:disabled {
 		opacity: 0.4;
 		cursor: not-allowed;
+	}
+	.addr {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 8px;
+		padding: 0;
+		border: none;
+		background: transparent;
+		font: inherit;
+		font-size: 12.5px;
+		color: var(--text-muted);
+		cursor: pointer;
+	}
+	.addr:hover {
+		color: var(--accent-press);
 	}
 	.eyebrow {
 		font-size: 11px;

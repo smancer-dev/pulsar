@@ -183,3 +183,70 @@ async fn direct_ip_connect_without_a_relay() {
 		.unwrap();
 	assert_eq!(got, b"ping");
 }
+
+/// Media-over-session: tagged RTP frames ride the SAME encrypted session as the
+/// JSON control messages — through the RELAY (the single-socket promise must hold
+/// on the worst-case transport), sent from a concurrent `SessionSender` while the
+/// owner keeps using `send`/`recv`. The receiver must demux media vs control.
+#[tokio::test]
+async fn media_frames_ride_the_session_alongside_control() {
+	use pulsar_core::service::media;
+
+	let (relay, _h) = start_relay().await;
+	let host = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::RelayOnly)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::RelayOnly)
+		.await
+		.unwrap();
+	host.register().await.unwrap();
+	client.register().await.unwrap();
+	let host_id = host.self_id().await.unwrap();
+
+	let mut client_sess = client.connect(host_id).await.unwrap();
+	let host_sess = timeout(Duration::from_secs(2), host.next_incoming())
+		.await
+		.unwrap()
+		.unwrap();
+
+	// The host's media forwarder uses a cloned send-only handle, concurrently
+	// with the serve loop owning the session itself.
+	let media_tx = host_sess.sender();
+	let mut rtp = vec![0x80u8, 96, 0x00, 0x2A, 0, 0, 0, 1]; // seq 42
+	rtp.extend_from_slice(&[0xAB; 1200]); // MTU-sized video payload
+	media_tx
+		.send(&media::frame(media::TAG_VIDEO, &rtp))
+		.await
+		.unwrap();
+	host_sess.send(b"{\"control\":true}").await.unwrap();
+	media_tx
+		.send(&media::frame(
+			media::TAG_AUDIO,
+			&[0x80, 97, 0, 1, 0, 0, 0, 2],
+		))
+		.await
+		.unwrap();
+
+	// Client demuxes: one video frame (seq intact), one control payload, one audio.
+	let (mut vids, mut auds, mut ctrls) = (0, 0, 0);
+	for _ in 0..3 {
+		let bytes = timeout(Duration::from_secs(2), client_sess.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		match media::parse(&bytes) {
+			Some((media::TAG_VIDEO, body)) => {
+				assert_eq!(media::rtp_seq(body), Some(42));
+				assert_eq!(body.len(), rtp.len(), "video datagram intact");
+				vids += 1;
+			}
+			Some((media::TAG_AUDIO, _)) => auds += 1,
+			Some(_) => unreachable!("parse only yields known tags"),
+			None => {
+				assert_eq!(bytes, b"{\"control\":true}");
+				ctrls += 1;
+			}
+		}
+	}
+	assert_eq!((vids, auds, ctrls), (1, 1, 1));
+}

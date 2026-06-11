@@ -31,6 +31,9 @@ pub(crate) struct AppState {
 	pub(crate) stream_cfg: Arc<Mutex<StreamCfg>>,
 	/// Saved windowed geometry while fullscreen, restored on exit.
 	pub(crate) fs_geom: Mutex<Option<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>)>>,
+	/// Startup-probed local capabilities (encoders + decoders); None until the
+	/// background probe finishes. Re-probed on every launch (Moonlight model).
+	pub(crate) local_caps: Mutex<Option<crate::caps::LocalCaps>>,
 	/// One-time password a client must present to connect (shown in the host UI).
 	/// Generated on `go_online`; empty means "not online yet".
 	pub(crate) password: Arc<Mutex<String>>,
@@ -72,6 +75,18 @@ pub(crate) struct AppState {
 	/// fullscreen game / leak into its stream). `sid` is the session id, used so a stale
 	/// session's teardown doesn't evict a same-peer reconnection's newer entry.
 	pub(crate) active: Arc<Mutex<HashMap<String, ConnInfo>>>,
+	/// Peer identity decorations pushed over sessions (`DataMsg::PeerName`/`Avatar`),
+	/// keyed by peer id: (display name, avatar data-URL). The connections window's
+	/// snapshot reads this so rows opened AFTER the push still show who connected.
+	pub(crate) peer_meta: Arc<Mutex<HashMap<String, (Option<String>, Option<String>)>>>,
+	/// Host-side chat log (peer id, text, me?) for the connections window's message
+	/// modal: events broadcast only to LIVE windows, so a message arriving while the
+	/// window is closed would otherwise vanish — the modal seeds from this backlog.
+	pub(crate) chat_log: Arc<Mutex<Vec<(String, String, bool)>>>,
+	/// The node's ACTUAL bound UDP port (0 = not online yet). Set on `go_online`
+	/// (also emitted as the `node-port` event); the Home screen shows it next to the
+	/// local IP so a copy-able direct `ip:port` target is always visible.
+	pub(crate) node_port: std::sync::atomic::AtomicU16,
 }
 
 /// Whether an inbound connection is a remote-desktop or a game-streaming session.
@@ -90,6 +105,9 @@ pub(crate) struct ConnInfo {
 	/// Connection start, epoch milliseconds (host clock == the window's `Date.now()`).
 	pub(crate) since_ms: u64,
 	pub(crate) mode: ConnMode,
+	/// "Sadece izleme": the host user revoked this client's CONTROL — its input is
+	/// dropped before injection while the stream keeps running (AnyDesk-style).
+	pub(crate) view_only: bool,
 }
 
 /// A live stream-reconfiguration command from the session menu. Each one merges into
@@ -109,6 +127,29 @@ pub(crate) enum Restream {
 	Quality(QualityPref),
 	/// Audio toggles: (transmit_audio, mute_host).
 	Audio(bool, bool),
+}
+
+/// Stdin-only renderer state re-pushed after a codec-switch renderer respawn: a
+/// fresh `pulsar-render` process starts from its built-in defaults, so everything
+/// previously configured over stdin must be replayed (the `caps …` line is kept
+/// separately in [`PlaySession::caps_line`]). `None` = never set → nothing to replay.
+#[derive(Clone, Default)]
+pub(crate) struct RenderSeed {
+	/// Parsec-style overlay-open button visibility ("ovbtn 0|1").
+	pub(crate) ovbtn: Option<bool>,
+	/// …and its dragged position in egui points ("ovbtnpos <x> <y>").
+	pub(crate) ovbtn_pos: Option<(f32, f32)>,
+	/// Always-on mini stats HUD ("statshud 0|1").
+	pub(crate) statshud: Option<bool>,
+	/// Frame pacing ("pace 0|1") — `--pace` only covers the spawn-time default; a
+	/// live toggle after spawn is recorded here.
+	pub(crate) pace: Option<bool>,
+	/// View-fit mode ("fit <fit|stretch|original>"). The renderer owns fit changes
+	/// (`ov set fit` flows outward only), so this has no app-side writer yet; the
+	/// respawn re-push is wired for when one mirrors it back.
+	pub(crate) fit: Option<String>,
+	/// Audio truth: (transmit, mute_host, mic_on) → "audio tx=… mute=… mic=…".
+	pub(crate) audio: Option<(bool, bool, bool)>,
 }
 
 /// One active outbound remote-play session (one connected-host tab): the local
@@ -161,6 +202,17 @@ pub(crate) struct PlaySession {
 	/// `stat <fps> <lat> <dec> <mbps>` lines for the overlay HUD. `None` → no overlay process.
 	#[allow(dead_code)]
 	pub(crate) render_stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+	/// The renderer's RTP video port (its SDP points here) — needed to rewrite the
+	/// SDP + respawn the renderer on a live codec switch.
+	pub(crate) video_port: u16,
+	/// Whether this play session runs in game mode (renderer --mode on respawn).
+	pub(crate) game_mode: bool,
+	/// The last `caps …` stdin line sent to the renderer (re-sent after a respawn so
+	/// the egui overlay keeps its filtered lists + seeded selections).
+	pub(crate) caps_line: Arc<Mutex<String>>,
+	/// Stdin-only renderer state (see [`RenderSeed`]) — re-sent after a codec-switch
+	/// respawn, which otherwise resets the fresh renderer to its defaults.
+	pub(crate) render_seed: Arc<Mutex<RenderSeed>>,
 }
 
 /// Host-side stream settings pushed from the UI.

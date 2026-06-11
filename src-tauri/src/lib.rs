@@ -16,10 +16,13 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 mod audio_io;
 mod auth;
+mod avatar;
+mod caps;
 mod commands;
 mod connections;
 mod events;
 mod files;
+mod fs_browse;
 mod host;
 mod io_cmds;
 #[cfg(windows)]
@@ -46,27 +49,48 @@ pub(crate) use process::no_window;
 // Re-export every `#[tauri::command]` so `tauri::generate_handler!` below resolves
 // them by bare name (they're defined across the submodules above).
 use auth::{disconnect_peer, respond_request, submit_password};
-use connections::{list_connections, show_connections};
+use avatar::{device_user_name, self_avatar};
 use commands::{
 	auto_connect_target, available_encoders, connect, controllers, get_config, lan_devices,
-	launch_remote_game, list_remote_games, local_ip, new_password, publish_games, relaunch_to_home,
-	run_command, scan_folder, session_password, set_config, set_stream_settings, steam_path,
+	launch_remote_game, list_remote_games, local_ip, new_password, node_port, publish_games,
+	relaunch_to_home, run_command, scan_folder, session_password, set_config, set_stream_settings,
+	steam_path,
 };
+use connections::{list_connections, set_view_only, show_connections};
+use fs_browse::local_ls;
 use host::go_online;
 use io_cmds::{
-	host_send_chat, input_button, input_key, input_pointer, input_scroll, kbd_capture_start,
-	kbd_capture_stop, mic_start, mic_stop, send_chat, send_clipboard, send_file,
-	set_window_fullscreen,
+	chat_log, host_send_chat, input_button, input_key, input_pointer, input_scroll,
+	kbd_capture_start, kbd_capture_stop, kbd_engage, mic_start, mic_stop, native_view_rect,
+	send_chat, send_clipboard, send_file, send_file_path, set_window_fullscreen,
 };
 use play::{start_remote_play, stop_stream};
 use session_cmds::{
-	reverse_play, set_frame_pacing, set_overlay, set_play_audio, set_play_bitrate, set_play_codec,
-	set_play_encoder, set_play_fps, set_play_quality, set_play_resolution,
+	fs_get, fs_list, render_chat, render_fs, render_hint, render_kin, render_toast, reverse_play,
+	set_frame_pacing, set_overlay, set_overlay_button, set_overlay_button_pos, set_play_audio,
+	set_play_bitrate, set_play_codec, set_play_encoder, set_play_fps, set_play_quality,
+	set_play_resolution, set_stats_hud,
 };
 
 // Headless `pulsar --relay` mode lives in its own module to keep this file focused.
 mod relay_mode;
 pub use relay_mode::run_relay;
+
+/// Per-window focus map driving the global input-capture gate (`kbdhook::set_focused`),
+/// OR-ed across ALL Pulsar windows so an app-internal focus handoff (main → approval
+/// popup / connections window) isn't treated as "unfocused" (that cleared the ENGAGED
+/// latch mid-session). Module-scoped because BOTH the `Focused` and `Destroyed` arms
+/// below must maintain it: tao's GTK backend doesn't guarantee a final Focused(false)
+/// for a window destroyed while focused (the approve popup is closed programmatically
+/// right after its Allow click), and a stale `true` would pin the evdev grab/combos on
+/// after Pulsar loses focus — while unique approve-N labels grew the map forever.
+static WIN_FOCUS: std::sync::Mutex<Option<std::collections::HashMap<String, bool>>> =
+	std::sync::Mutex::new(None);
+
+/// Recompute the OR of all per-window focus states and push it to the capture gate.
+fn refresh_focus_gate(map: &std::collections::HashMap<String, bool>) {
+	kbdhook::set_focused(map.values().any(|f| *f));
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// Acquire a per-user/per-session single-instance lock. Returns false if another
@@ -217,6 +241,25 @@ pub fn run() {
 			#[cfg(windows)]
 			spawn_show_watcher(app.handle().clone());
 
+			// Startup capability probe (encode + decode), Moonlight-style: every launch,
+			// in the background; the frontend splash waits for the `local-caps` event.
+			crate::caps::spawn_startup_probe(app.handle().clone());
+
+			// Kiosk auto-engage is ONE-SHOT: arm it only when THIS launch will actually
+			// auto-connect. AUTO_CONNECT alone is the wrong key — app.restart() preserves
+			// argv, so it stays Some for every later manual session of a `--connect`
+			// process — and the `.skip-autoconnect` marker (relaunch_to_home; consumed
+			// later by auto_connect_target) means the frontend will NOT auto-connect.
+			{
+				let auto = util::AUTO_CONNECT.get().map_or(false, |t| t.is_some());
+				let skip = util::config_path(app.handle())
+					.with_file_name(".skip-autoconnect")
+					.exists();
+				if auto && !skip {
+					kbdhook::arm_kiosk_engage();
+				}
+			}
+
 			// Load persisted config (relay endpoint, network mode, etc.).
 			let cfg = pulsar_core::config::Config::load(util::config_path(app.handle()));
 			tracing::info!(relay = %cfg.relay, "config loaded");
@@ -273,29 +316,49 @@ pub fn run() {
 			// Closing the window hides Pulsar to the tray rather than quitting, so a
 			// single launch stays resident until the tray's "Çıkış" is chosen.
 			WindowEvent::CloseRequested { api, .. } => {
-					// Only the MAIN window hides-to-tray; secondary windows (approval popup,
-					// connections manager) close NORMALLY so a host-side win.close() works
-					// (prevent_close + hide would otherwise leave them stuck hidden).
-					if window.label() == "main" {
-						api.prevent_close();
-						let _ = window.hide();
-					}
+				// Only the MAIN window hides-to-tray; secondary windows (approval popup,
+				// connections manager) close NORMALLY so a host-side win.close() works
+				// (prevent_close + hide would otherwise leave them stuck hidden).
+				if window.label() == "main" {
+					api.prevent_close();
+					let _ = window.hide();
 				}
+			}
 			// While fullscreen, stay above the taskbar/other apps ONLY when focused;
 			// drop topmost when alt-tabbed away so other apps come forward normally.
 			WindowEvent::Focused(focused) => {
-				if window.state::<AppState>().fs_geom.lock().unwrap().is_some() {
-					let _ = window.set_always_on_top(*focused);
+				// Main window only — the approval popup (auth.rs) is always-on-top by design
+				// and must not have its flag cleared here. Outside fullscreen this actively
+				// clears topmost, self-healing any path that left the flag set.
+				if window.label() == "main" {
+					let fs = window.state::<AppState>().fs_geom.lock().unwrap().is_some();
+					let _ = window.set_always_on_top(*focused && fs);
 				}
-				// Capture/forward keyboard+mouse + the overlay/leave combos ONLY while the
-				// Pulsar window is focused (Linux evdev grab is otherwise global → the combo
-				// fired even when another app had focus). Releases the grab when we lose focus.
-				kbdhook::set_focused(*focused);
+				// Capture/forward keyboard+mouse + the overlay/leave combos ONLY while
+				// SOME Pulsar window is focused (Linux evdev grab is otherwise global).
+				// See WIN_FOCUS for why the map is OR-ed across all windows.
+				{
+					let mut g = WIN_FOCUS.lock().unwrap();
+					let map = g.get_or_insert_with(Default::default);
+					map.insert(window.label().to_string(), *focused);
+					refresh_focus_gate(map);
+				}
 				// Losing focus while the overlay is open would otherwise STRAND it: the combo is
 				// now focus-gated off, so it couldn't be closed. Auto-close it on blur so the
 				// state resets — refocusing then re-enables the combo cleanly.
 				if !*focused {
 					let _ = window.emit("window-blur", ());
+				}
+			}
+			// A destroyed window must leave the focus map (no Focused(false) is
+			// guaranteed first — see WIN_FOCUS): drop its entry and recompute the
+			// gate so a popup that died focused can't hold the global grab on.
+			WindowEvent::Destroyed => {
+				let mut g = WIN_FOCUS.lock().unwrap();
+				if let Some(map) = g.as_mut() {
+					if map.remove(window.label()).is_some() {
+						refresh_focus_gate(map);
+					}
 				}
 			}
 			_ => {}
@@ -308,6 +371,7 @@ pub fn run() {
 			lan_devices,
 			controllers,
 			local_ip,
+			node_port,
 			auto_connect_target,
 			relaunch_to_home,
 			steam_path,
@@ -327,10 +391,23 @@ pub fn run() {
 			set_play_bitrate,
 			set_play_quality,
 			set_frame_pacing,
+			set_stats_hud,
+			set_overlay_button,
+			set_overlay_button_pos,
+			render_hint,
+			render_toast,
+			render_chat,
+			render_fs,
+			render_kin,
 			set_overlay,
 			set_play_audio,
 			reverse_play,
 			set_window_fullscreen,
+			kbd_engage,
+			native_view_rect,
+			crate::caps::local_caps,
+			self_avatar,
+			device_user_name,
 			session_password,
 			new_password,
 			respond_request,
@@ -338,6 +415,7 @@ pub fn run() {
 			disconnect_peer,
 			list_connections,
 			show_connections,
+			set_view_only,
 			input_pointer,
 			input_button,
 			input_scroll,
@@ -347,7 +425,12 @@ pub fn run() {
 			send_clipboard,
 			send_chat,
 			host_send_chat,
+			chat_log,
 			send_file,
+			send_file_path,
+			fs_list,
+			fs_get,
+			local_ls,
 			mic_start,
 			mic_stop
 		])

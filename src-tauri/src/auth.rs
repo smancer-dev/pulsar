@@ -91,19 +91,29 @@ pub(crate) async fn race_host_auth(
 	);
 	open_approval_window(app, id, peer, "wait");
 
+	// Inactivity deadline: UDP gives no close, so a client that dies silently
+	// mid-prompt would otherwise leave the Allow/Deny popup open forever. Any
+	// client message (keepalive, password retry) re-arms it; expiry denies.
+	const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+	let deadline = tokio::time::sleep(IDLE);
+	tokio::pin!(deadline);
 	let result = loop {
 		tokio::select! {
 			biased;
 			d = &mut rx => break matches!(d, Ok(true)),
-			msg = recv_client_auth(session) => match msg {
-				ClientAuth::Password(pw) => {
-					if !host_pw.is_empty() && pw == host_pw {
-						break true; // correct password → accept
+			_ = &mut deadline => break false, // client silent too long → deny
+			msg = recv_client_auth(session) => {
+				deadline.as_mut().reset(tokio::time::Instant::now() + IDLE);
+				match msg {
+					ClientAuth::Password(pw) => {
+						if !host_pw.is_empty() && pw == host_pw {
+							break true; // correct password → accept
+						}
+						let _ = need_password(session).await; // wrong → ask client to retry
 					}
-					let _ = need_password(session).await; // wrong → ask client to retry
+					ClientAuth::Keepalive => {}
+					ClientAuth::Gone => break false,
 				}
-				ClientAuth::Keepalive => {}
-				ClientAuth::Gone => break false,
 			}
 		}
 	};
@@ -206,7 +216,10 @@ pub(crate) async fn submit_password(
 
 /// Host: forcibly disconnect a connected client by its peer id.
 #[tauri::command]
-pub(crate) async fn disconnect_peer(state: State<'_, AppState>, peer: String) -> Result<(), String> {
+pub(crate) async fn disconnect_peer(
+	state: State<'_, AppState>,
+	peer: String,
+) -> Result<(), String> {
 	if let Some((_, tx)) = state.incoming.lock().unwrap().remove(&peer) {
 		let _ = tx.send(());
 	}

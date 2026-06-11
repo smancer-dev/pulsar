@@ -3,18 +3,38 @@
 //! On Linux the embedded native renderer (mpv inside the app window) covers the webview,
 //! so the webview's JS input handlers never see the keyboard/mouse. Instead we grab the
 //! local input devices via evdev (EVIOCGRAB — like the Windows Interception path) and
-//! forward every event to the host as an `InputEvent`. Ctrl+Shift+F12 emits `kbd-leave`
-//! (the UI then ends the session, which calls `disable()` → the grab is released).
+//! forward every event to the host as an `InputEvent`. Capture is CLICK-TO-ENGAGE: the
+//! thread arms disengaged (no grab) and only takes the devices after the user clicks the
+//! session video (BTN_LEFT while focused, or the standalone render window's `ov engage`).
+//! Ctrl+Shift+Q emits `kbd-leave` (the UI ENDS the session); 3×RightCtrl emits
+//! `kbd-released` and only DISENGAGES (grab released, thread stays alive, the next video
+//! click re-engages). Full teardown is `disable()` (session end).
 
 use super::*;
 use evdev::{InputEventKind, Key, RelativeAxisType};
-use xkbcommon::xkb;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::Emitter;
 use tokio::sync::mpsc::Sender;
+use xkbcommon::xkb;
 
+/// Capture-thread generation. `enable()` bumps this and hands the new value to the
+/// thread it spawns; the thread loops only while it is still the NEWEST generation,
+/// and `disable()` bumps again. A plain running-bool can't do this: a disable()→
+/// enable() inside one ~200 ms poll interval (exactly what tab-switching between two
+/// native sessions does) revived the flag before the old thread observed false,
+/// leaving TWO threads sharing the ENGAGED/SUSPENDED statics and racing EVIOCGRAB —
+/// with events draining into the dead (or the WRONG host's) tx. With a generation,
+/// every superseded thread exits deterministically; only the newest tx survives.
+static GEN: AtomicU64 = AtomicU64::new(0);
+/// True while a capture thread is armed (session live) — gates `engage()`.
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// One-shot kiosk auto-engage: armed by `lib.rs` only for a launch that will actually
+/// auto-connect (CLI `--connect` present and no `.skip-autoconnect` relaunch marker),
+/// consumed by the first `enable()`. Keying engage off `AUTO_CONNECT` directly was
+/// wrong — `app.restart()` preserves argv, so it stays `Some` for every later MANUAL
+/// session in the process, which then started with the keyboard/mouse grabbed.
+static KIOSK_ENGAGE: AtomicBool = AtomicBool::new(false);
 /// True while the Pulsar window is focused. Capture (grab + forward + the overlay/leave
 /// combos) is active ONLY when focused — the evdev grab is global, so an unfocused window
 /// must not steal input or fire combos. Driven by `set_focused()` (Tauri focus event).
@@ -24,6 +44,24 @@ static FOCUSED: AtomicBool = AtomicBool::new(true);
 /// re-grab instantly on close. Driven by `overlay_suspend()` (called from the
 /// `set_overlay` command), NOT by the leave combo — the session stays alive.
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// Click-to-engage gate: the grab is held ONLY while engaged. Sessions start
+/// DISENGAGED (except CLI `--connect` kiosk starts) so the user keeps their own
+/// keyboard/mouse until they explicitly click the session video. Set by a
+/// BTN_LEFT press while focused (embedded video = the whole app window) or by
+/// the standalone render window's `ov engage` stdout line (`engage()`); cleared
+/// by the leave combos and whenever focus is lost.
+static ENGAGED: AtomicBool = AtomicBool::new(false);
+/// True while the STANDALONE native render window (pulsar-render with no `--wid`,
+/// e.g. a Wayland client where the X11 embed fails) has input focus. That window
+/// is a separate X(Wayland) toplevel, so focusing it UNfocuses the Tauri window —
+/// capture must treat "render window focused" as focused too. Driven by the
+/// renderer's `ov focus 0|1` stdout lines via `set_render_focused()`.
+static RENDER_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+/// Effective focus: the Tauri window OR the standalone render window has focus.
+fn is_focused() -> bool {
+	FOCUSED.load(Ordering::SeqCst) || RENDER_FOCUSED.load(Ordering::SeqCst)
+}
 
 /// Build an xkb keyboard state from the X session's ACTIVE layout (e.g. Turkish-Q), so a grabbed
 /// evdev keycode can be resolved to the Unicode char that layout produces — enabling
@@ -75,6 +113,8 @@ const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_F12: u16 = 88;
 const KEY_Q: u16 = 16; // reliable leave key (media-mode keyboards don't emit KEY_F12)
 const KEY_M: u16 = 50; // overlay-toggle combo Ctrl+Shift+M (distinct from leave Q/F12)
+const KEY_LEFTALT: u16 = 56; // chord modifier for the release combo (AltGr=100 excluded)
+const KEY_Z: u16 = 44; // release combo Ctrl+Alt+Z (Parsec's detach shortcut)
 
 /// Keep a device if it's a keyboard (has letter/escape keys) or, when `mouse`, a mouse
 /// (relative axes + a left button). Gamepads (read separately via gilrs) are skipped so
@@ -85,7 +125,9 @@ fn wanted(dev: &evdev::Device, mouse: bool) -> bool {
 	if keys.map_or(false, |k| k.contains(Key::BTN_SOUTH)) {
 		return false;
 	}
-	let is_kbd = keys.map_or(false, |k| k.contains(Key::KEY_A) || k.contains(Key::KEY_ESC));
+	let is_kbd = keys.map_or(false, |k| {
+		k.contains(Key::KEY_A) || k.contains(Key::KEY_ESC)
+	});
 	let is_mouse = mouse
 		&& dev
 			.supported_relative_axes()
@@ -104,24 +146,39 @@ fn wanted(dev: &evdev::Device, mouse: bool) -> bool {
 /// Querying the kernel at the trigger moment is immune to all of it. OR across devices so
 /// any Ctrl + any Shift on any keyboard counts (Parsec/Moonlight semantics); works on
 /// ungrabbed-but-open fds too, so the close combo is detected while the overlay suspends.
-fn chord_mods(devs: &[evdev::Device]) -> (bool, bool) {
-	let (mut ctrl, mut shift) = (false, false);
+fn chord_mods(devs: &[evdev::Device]) -> (bool, bool, bool) {
+	let (mut ctrl, mut shift, mut alt) = (false, false, false);
 	for d in devs {
 		if let Ok(st) = d.get_key_state() {
 			ctrl |= st.contains(Key::KEY_LEFTCTRL) || st.contains(Key::KEY_RIGHTCTRL);
 			shift |= st.contains(Key::KEY_LEFTSHIFT) || st.contains(Key::KEY_RIGHTSHIFT);
+			// LeftAlt only — RightAlt is AltGr (a char-composition modifier, not a chord key).
+			alt |= st.contains(Key::KEY_LEFTALT);
 		}
 	}
-	(ctrl, shift)
+	(ctrl, shift, alt)
 }
 
 pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
-	if RUNNING.swap(true, Ordering::SeqCst) {
-		return; // already armed
-	}
+	// Supersede any prior capture thread (a tab switch is stop+start back-to-back;
+	// the bumped generation makes the old thread exit on its next loop pass).
+	let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
+	RUNNING.store(true, Ordering::SeqCst);
 	// A fresh session never starts suspended (a prior overlay close may have
 	// raced teardown). The capture thread re-grabs from a clean state below.
 	SUSPENDED.store(false, Ordering::SeqCst);
+	RENDER_FOCUSED.store(false, Ordering::SeqCst);
+	// Click-to-engage: a manual session starts DISENGAGED — the user keeps local
+	// input until they click the session video. A CLI `--connect` (kiosk/appliance,
+	// e.g. the Orange Pi player) starts ENGAGED: there is no local desktop to
+	// protect and the remote should be controllable immediately. One-shot — only
+	// the session the auto-connect actually starts may take it (see KIOSK_ENGAGE).
+	let kiosk = KIOSK_ENGAGE.swap(false, Ordering::SeqCst);
+	ENGAGED.store(kiosk, Ordering::SeqCst);
+	if kiosk {
+		// Keep the frontend's engage hint in sync with the auto-engage.
+		let _ = app.emit("kbd-engaged", ());
+	}
 	std::thread::spawn(move || {
 		let mut grabbed: Vec<evdev::Device> = Vec::new();
 		let mut grabbed_paths: std::collections::HashSet<std::path::PathBuf> =
@@ -152,12 +209,14 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 		// the loop, making forwarded mouse/keys arrive in stuttering bursts (the "input lag /
 		// jerky" symptom). Time-based → at most one ~once-a-second blip.
 		let mut last_rescan: Option<std::time::Instant> = None;
+		// When the app FIRST went unfocused (None = focused) — the disengage debounce.
+		let mut unfocused_since: Option<std::time::Instant> = None;
 		// Every /dev/input/event* node we've already evaluated. The rescan below first does a
 		// CHEAP read_dir against this set and only runs the EXPENSIVE evdev::enumerate() when a
 		// genuinely new node appears (real hotplug) — see the comment at the gate.
 		let mut seen_nodes: std::collections::HashSet<std::path::PathBuf> =
 			std::collections::HashSet::new();
-		while RUNNING.load(Ordering::SeqCst) {
+		while GEN.load(Ordering::SeqCst) == gen {
 			if last_rescan.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 				last_rescan = Some(std::time::Instant::now());
 				let before = grabbed.len();
@@ -204,6 +263,12 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 						}
 						grabbed_paths.insert(path);
 						grabbed.push(d);
+					} else {
+						// Grab refused (EBUSY — e.g. a just-superseded capture thread
+						// hasn't dropped its EVIOCGRAB yet): forget the node so the next
+						// 1 s rescan re-enumerates and retries instead of writing the
+						// device off for the session's lifetime.
+						seen_nodes.remove(&path);
 					}
 				}
 				if grabbed.len() != before {
@@ -227,8 +292,23 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 			// Release the grab (and stop forwarding) when the overlay is open OR the Pulsar
 			// window is NOT focused — the evdev grab is global, so without the focus gate
 			// the user couldn't use other apps and the combos fired regardless of focus.
-			let want_suspend =
-				SUSPENDED.load(Ordering::SeqCst) || !FOCUSED.load(Ordering::SeqCst);
+			// Losing all focus also DISENGAGES: refocusing alone must not resume the grab,
+			// the user has to click back into the video (click-to-engage). DEBOUNCED:
+			// app-internal focus handoffs (main → approval popup) deliver blur→focus as
+			// two events with a gap; this loop samples per event batch, so an instant
+			// latch turned that gap into a permanent mid-drag disengage. Only a SUSTAINED
+			// unfocused state (200 ms) clears the latch.
+			if is_focused() {
+				unfocused_since = None;
+			} else {
+				let t = *unfocused_since.get_or_insert_with(std::time::Instant::now);
+				if t.elapsed() >= std::time::Duration::from_millis(200) {
+					ENGAGED.store(false, Ordering::SeqCst);
+				}
+			}
+			let want_suspend = SUSPENDED.load(Ordering::SeqCst)
+				|| !is_focused()
+				|| !ENGAGED.load(Ordering::SeqCst);
 			if want_suspend != applied_suspend {
 				if want_suspend {
 					// Release any keys the host is still holding for this combo.
@@ -237,10 +317,21 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 						KEY_RIGHTCTRL,
 						KEY_LEFTSHIFT,
 						KEY_RIGHTSHIFT,
+						KEY_LEFTALT,
 						KEY_M,
+						KEY_Z,
 					] {
 						let _ = tx.try_send(InputEvent::Key {
 							code: code as u32,
+							down: false,
+						});
+					}
+					// And any held MOUSE buttons: a disengage mid-drag (focus loss,
+					// release combo, overlay open) otherwise left the host's uinput
+					// holding BTN_LEFT — a stuck drag until the next engaged click.
+					for button in 0..3u8 {
+						let _ = tx.try_send(InputEvent::PointerButton {
+							button,
 							down: false,
 						});
 					}
@@ -287,25 +378,32 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 							let code = key.code();
 							let down = ev.value() != 0; // 1 down / 2 repeat → down
 							match code {
-									KEY_LEFTCTRL | KEY_RIGHTCTRL => ctrl = down,
-									KEY_LEFTSHIFT | KEY_RIGHTSHIFT => shift = down,
-									56 => lalt = down, // KEY_LEFTALT (RightAlt=100 = AltGr, a char modifier, not a shortcut)
-									125 | 126 => win = down, // KEY_LEFTMETA / KEY_RIGHTMETA
-									_ => {}
-								}
+								KEY_LEFTCTRL | KEY_RIGHTCTRL => ctrl = down,
+								KEY_LEFTSHIFT | KEY_RIGHTSHIFT => shift = down,
+								56 => lalt = down, // KEY_LEFTALT (RightAlt=100 = AltGr, a char modifier, not a shortcut)
+								125 | 126 => win = down, // KEY_LEFTMETA / KEY_RIGHTMETA
+								_ => {}
+							}
+							// NOTE: there is deliberately NO raw-BTN_LEFT engage here. evdev can't
+							// tell a click on the video from a click on the app's own chrome (tab
+							// bar, close button) or on another window — engaging on any click made
+							// the local UI unclickable (the grab ate the very next click). Engage
+							// comes from explicit channels instead: the webview's click on the
+							// pass-through video area (`kbd_engage` command), the standalone render
+							// window's `ov engage`, or the standalone mpv focus edge.
 							// Robust escape: 3 quick Right-Ctrl taps within 1s (no chord needed).
-							if code == KEY_RIGHTCTRL
-								&& ev.value() == 1
-								&& FOCUSED.load(Ordering::SeqCst)
-							{
+							if code == KEY_RIGHTCTRL && ev.value() == 1 && is_focused() {
 								let now = std::time::Instant::now();
 								rctrl_taps.retain(|t| {
 									now.duration_since(*t) < std::time::Duration::from_millis(1000)
 								});
 								rctrl_taps.push(now);
 								if rctrl_taps.len() >= 3 {
-									let _ = app.emit("kbd-leave", ());
-									RUNNING.store(false, Ordering::SeqCst);
+									// RELEASE control (grab off, session + thread stay alive) —
+									// the next video click re-engages. Ending is Ctrl+Shift+Q.
+									let _ = app.emit("kbd-released", ());
+									ENGAGED.store(false, Ordering::SeqCst);
+									rctrl_taps.clear();
 									continue;
 								}
 							}
@@ -318,12 +416,22 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 							// `want_suspend` gate so the overlay can also be CLOSED (and the
 							// session left) by combo while the grab is suspended.
 							if ev.value() == 1
-								&& matches!(code, KEY_M | KEY_F12 | KEY_Q)
-								&& FOCUSED.load(Ordering::SeqCst)
+								&& matches!(code, KEY_M | KEY_F12 | KEY_Q | KEY_Z)
+								&& is_focused()
 							{
-								let (lc, ls) = chord_mods(&grabbed);
-								let (cmod, smod) = (ctrl || lc, shift || ls);
-								if cmod && smod {
+								let (lc, ls, la) = chord_mods(&grabbed);
+								let (cmod, smod, amod) = (ctrl || lc, shift || ls, lalt || la);
+								// Ctrl+Alt+Z (Parsec's detach shortcut): RELEASE the mouse+keyboard
+								// without ending the session — same effect as 3×RightCtrl. The user
+								// can then click the overlay button / app chrome; clicking the video
+								// re-engages.
+								if code == KEY_Z {
+									if cmod && amod {
+										let _ = app.emit("kbd-released", ());
+										ENGAGED.store(false, Ordering::SeqCst);
+										continue;
+									}
+								} else if cmod && smod {
 									if code == KEY_M {
 										// Overlay toggle — does NOT end the session (RUNNING
 										// stays true); the ungrab/regrab is driven by
@@ -338,9 +446,11 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 									} else {
 										// Leave (Ctrl+Shift+Q). Q is the reliable leave key --
 										// media-mode keyboards (e.g. Logitech MX Keys) do not
-										// emit KEY_F12, and F12 is fullscreen now.
+										// emit KEY_F12, and F12 is fullscreen now. The UI ENDS
+										// the session on kbd-leave; drop the grab right away so
+										// the user's input is free during the teardown.
 										let _ = app.emit("kbd-leave", ());
-										RUNNING.store(false, Ordering::SeqCst);
+										ENGAGED.store(false, Ordering::SeqCst);
 									}
 									continue;
 								}
@@ -354,51 +464,80 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 							// Mouse buttons also arrive as EV_KEY (BTN_LEFT/RIGHT/MIDDLE
 							// = 272/273/274 → 0/1/2).
 							// Keep the xkb state synced with every forwarded key so Shift/AltGr affect the char a
-								// printable key resolves to (no-op when xkb is absent).
-								if let Some(st) = xkb_state.as_mut() {
-									st.update_key(
-										xkb::Keycode::new((code as u32) + 8),
-										if down { xkb::KeyDirection::Down } else { xkb::KeyDirection::Up },
-									);
-								}
-								match code {
-									272 | 273 | 274 => {
+							// printable key resolves to (no-op when xkb is absent).
+							if let Some(st) = xkb_state.as_mut() {
+								st.update_key(
+									xkb::Keycode::new((code as u32) + 8),
+									if down {
+										xkb::KeyDirection::Down
+									} else {
+										xkb::KeyDirection::Up
+									},
+								);
+							}
+							match code {
+								272 | 273 | 274 => {
+									// EV_KEY values: 0=up, 1=down, 2=KERNEL AUTOREPEAT. EV_REP
+									// devices soft-repeat BTN_* too (Logitech Unifying combo
+									// nodes do — the MX Master 3 here), so a held button emits
+									// value=2 at ~30 Hz after ~250 ms. Mapping that to `down:
+									// ev.value() == 1` sent a RELEASE mid-hold → every drag
+									// self-released after ~0.28 s. A repeat is neither a press
+									// nor a release — skip it.
+									if ev.value() != 2 {
 										let _ = tx.try_send(InputEvent::PointerButton {
 											button: (code - 272) as u8,
 											down: ev.value() == 1,
 										});
 									}
-									_ if !down => {
-										// key UP: a Char key had a one-shot Unicode insert (no VK to release) -> suppress
-										// its up; otherwise release the VK as before.
-										if !char_keys.remove(&code) {
-											fwd(&tx, InputEvent::Key { code: code as u32, down: false });
-										}
-									}
-									_ => {
-										// key DOWN/REPEAT - WYSIWYG: a printable key with NO shortcut modifier (Ctrl/
-										// LeftAlt/Win) is resolved via the client's OWN layout to a Unicode char and sent
-										// as Char (host types it regardless of ITS layout). A key already in char-mode
-										// keeps re-sending Char on autorepeat. Shortcuts, non-text keys (xkb yields no
-										// printable) and the no-xkb fallback take the raw-keycode VK path.
-										let shortcut = ctrl || lalt || win;
-										let ch = if char_keys.contains(&code) || !shortcut {
-											xkb_state
-												.as_ref()
-												.map(|st| st.key_get_utf8(xkb::Keycode::new((code as u32) + 8)))
-												.and_then(|s| s.chars().next())
-												.filter(|c| !c.is_control())
-										} else {
-											None
-										};
-										if let Some(c) = ch {
-											char_keys.insert(code);
-											fwd(&tx, InputEvent::Char(c));
-										} else if !char_keys.contains(&code) {
-											fwd(&tx, InputEvent::Key { code: code as u32, down: true });
-										}
+								}
+								_ if !down => {
+									// key UP: a Char key had a one-shot Unicode insert (no VK to release) -> suppress
+									// its up; otherwise release the VK as before.
+									if !char_keys.remove(&code) {
+										fwd(
+											&tx,
+											InputEvent::Key {
+												code: code as u32,
+												down: false,
+											},
+										);
 									}
 								}
+								_ => {
+									// key DOWN/REPEAT - WYSIWYG: a printable key with NO shortcut modifier (Ctrl/
+									// LeftAlt/Win) is resolved via the client's OWN layout to a Unicode char and sent
+									// as Char (host types it regardless of ITS layout). A key already in char-mode
+									// keeps re-sending Char on autorepeat. Shortcuts, non-text keys (xkb yields no
+									// printable) and the no-xkb fallback take the raw-keycode VK path.
+									let shortcut = ctrl || lalt || win;
+									let ch = if char_keys.contains(&code) || !shortcut {
+										xkb_state
+											.as_ref()
+											.map(|st| {
+												st.key_get_utf8(xkb::Keycode::new(
+													(code as u32) + 8,
+												))
+											})
+											.and_then(|s| s.chars().next())
+											.filter(|c| !c.is_control())
+									} else {
+										None
+									};
+									if let Some(c) = ch {
+										char_keys.insert(code);
+										fwd(&tx, InputEvent::Char(c));
+									} else if !char_keys.contains(&code) {
+										fwd(
+											&tx,
+											InputEvent::Key {
+												code: code as u32,
+												down: true,
+											},
+										);
+									}
+								}
+							}
 						}
 						// While suspended, drop pointer motion + scroll too (the local OS
 						// drives the cursor over the overlay).
@@ -434,10 +573,21 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 }
 
 pub fn disable() {
+	// Bump past every live thread's generation → each exits on its next loop pass
+	// (and a quick re-enable can't revive them — it bumps again to a NEWER value).
+	GEN.fetch_add(1, Ordering::SeqCst);
 	RUNNING.store(false, Ordering::SeqCst);
 	// Clear the overlay gate so a teardown mid-overlay leaves clean state and the
 	// next session never starts suspended.
 	SUSPENDED.store(false, Ordering::SeqCst);
+	ENGAGED.store(false, Ordering::SeqCst);
+	RENDER_FOCUSED.store(false, Ordering::SeqCst);
+}
+
+/// Arm the one-shot kiosk auto-engage (see [`KIOSK_ENGAGE`]). Called from `lib.rs`
+/// setup only when this launch will actually auto-connect.
+pub fn arm_kiosk_engage() {
+	KIOSK_ENGAGE.store(true, Ordering::SeqCst);
 }
 
 /// Open/close the gaming overlay: release (suspend) or restore (resume) the
@@ -455,4 +605,38 @@ pub fn overlay_suspend(suspend: bool) {
 /// when focused it re-grabs and resumes. Same observe-the-atomic model as `overlay_suspend`.
 pub fn set_focused(focused: bool) {
 	FOCUSED.store(focused, Ordering::SeqCst);
+}
+
+/// The STANDALONE native render window's focus changed (`ov focus 0|1` on the renderer's
+/// stdout). That window is a separate toplevel — focusing it unfocuses the Tauri window,
+/// so capture treats "either focused" as focused (see `is_focused`).
+pub fn set_render_focused(focused: bool) {
+	RENDER_FOCUSED.store(focused, Ordering::SeqCst);
+}
+
+/// Engage capture: the user explicitly clicked the session video (the webview saw the
+/// click through the pass-through container and invoked `kbd_engage`). The Tauri window
+/// is focused (it just received the click), so no focus bookkeeping is needed.
+pub fn engage(app: &AppHandle) {
+	if RUNNING.load(Ordering::SeqCst) && !ENGAGED.swap(true, Ordering::SeqCst) {
+		let _ = app.emit("kbd-engaged", ());
+	}
+}
+
+/// Release (disengage) capture programmatically — the overlay opening must drop the user
+/// out of control mode (closing then leaves them disengaged: click-to-engage again).
+/// Emits `kbd-released` so the frontend hint state stays in sync.
+pub fn release(app: &AppHandle) {
+	if ENGAGED.swap(false, Ordering::SeqCst) {
+		let _ = app.emit("kbd-released", ());
+	}
+}
+
+/// Engage capture from the STANDALONE render window (`ov engage` stdout line / the mpv
+/// focus edge — the user clicked/focused the video toplevel). The click also focused
+/// that window, so mark it focused; its FocusIn report may still be in flight and the
+/// grab must not instantly re-suspend.
+pub fn engage_render(app: &AppHandle) {
+	RENDER_FOCUSED.store(true, Ordering::SeqCst);
+	engage(app);
 }

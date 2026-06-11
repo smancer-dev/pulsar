@@ -1,12 +1,11 @@
 // Host-stream control state + live setters for a session, lifted out of Session.svelte.
 // Owns the resolution/fps/bitrate/quality/frame-pacing/audio selections shown in the menu +
-// overlay and the codec/encoder/decoder switches; each setter mutates the local state and
-// pokes the host over `api` exactly as the inline code did. Persisted prefs still go through
-// the shared `ui` store. Behaviour is identical to the original inline script.
+// overlay and the codec/encoder switches; each setter mutates the local state and pokes the
+// host over `api`. Persisted prefs still go through the shared `ui` store. (There is no
+// decoder setter: the client decoder is auto-selected and shown read-only.)
 //
 // Instantiated at component init so the persisted frame-pacing one-shot $effect scopes to the
-// component. `playId`/`native` are read through getters; `reconfigure` re-hints the WebCodecs
-// decoder (the media engine owns the sink).
+// component. `playId`/`native` are read through getters.
 
 import { api } from '$lib/api';
 import { ui, saveUi, type Encoder, type VideoCodec } from '$lib/settings.svelte';
@@ -15,11 +14,20 @@ type Inputs = {
 	playId: () => number;
 	native: () => boolean;
 	mode: () => 'remote' | 'game';
-	reconfigure: (v: Encoder) => void;
 };
 
 export class SessionControls {
 	#in: Inputs;
+	/// True for a short window after a codec/encoder switch — the session screen
+	/// shows a "restarting the stream" veil (the native container is hidden by the
+	/// Rust side for the same window, so the veil is actually visible).
+	switching = $state(false);
+	#switchTimer: ReturnType<typeof setTimeout> | undefined;
+	#beginSwitch(ms: number) {
+		this.switching = true;
+		clearTimeout(this.#switchTimer);
+		this.#switchTimer = setTimeout(() => (this.switching = false), ms);
+	}
 
 	// Stream resolution requested from the host, changed live from the menu.
 	// 'auto' = let the host use its own configured size.
@@ -51,6 +59,27 @@ export class SessionControls {
 			if (inputs.native() && inputs.playId() >= 0 && !pacingApplied) {
 				pacingApplied = true;
 				api.setFramePacing(inputs.playId(), ui.framePacing).catch(() => {});
+				// Same one-shot for the persisted always-on stats HUD + overlay button.
+				if (ui.statsHud) api.setStatsHud(inputs.playId(), true).catch(() => {});
+				if (!ui.overlayButton) api.setOverlayButton(inputs.playId(), false).catch(() => {});
+				// Persisted dragged button position (skip when still at the default —
+				// the renderer already starts there).
+				const p = ui.overlayBtnPos;
+				if (p && (p.x !== 90 || p.y !== 70))
+					api.setOverlayButtonPos(inputs.playId(), p.x, p.y).catch(() => {});
+			}
+		});
+
+		// The persisted bitrate renders as the ACTIVE menu/overlay selection, so push it to
+		// the host once the play is live — start_remote_play carries no bitrate, so without
+		// this the host streams its default while the UI claims e.g. "20 Mbit". One-shot,
+		// NOT native-gated (the webview menu shows it too); 0 = auto → nothing to send.
+		let bitrateApplied = false;
+		$effect(() => {
+			if (inputs.playId() >= 0 && !bitrateApplied) {
+				bitrateApplied = true;
+				if (ui.bitrate > 0)
+					api.setPlayBitrate(inputs.playId(), ui.bitrate * 1000).catch(() => {});
 			}
 		});
 	}
@@ -102,6 +131,21 @@ export class SessionControls {
 		this.muteHost = !this.muteHost;
 		this.#applyAudio();
 	};
+	// Always-on mini stats HUD (persisted; the renderer draws it while the overlay
+	// is closed).
+	setStatsHud = (on: boolean) => {
+		ui.statsHud = on;
+		saveUi();
+		const playId = this.#in.playId();
+		if (playId >= 0) api.setStatsHud(playId, on).catch(() => {});
+	};
+	// Parsec-style always-visible overlay-open button (persisted).
+	setOverlayButton = (on: boolean) => {
+		ui.overlayButton = on;
+		saveUi();
+		const playId = this.#in.playId();
+		if (playId >= 0) api.setOverlayButton(playId, on).catch(() => {});
+	};
 	// Keep the control handle/menu always visible (even fullscreen / while controlling).
 	toggleKeepVisible = () => {
 		ui.keepVisible = !ui.keepVisible;
@@ -112,14 +156,10 @@ export class SessionControls {
 		ui.encoder = v;
 		saveUi();
 		const playId = this.#in.playId();
-		if (playId >= 0) api.setPlayEncoder(playId, v).catch(() => {});
-	};
-	// Live decoder switch (client-side WebCodecs hint: hardware vs software). Applied at
-	// the next keyframe; no host round-trip. The actual codec is dictated by the stream.
-	setDecoder = (v: Encoder) => {
-		ui.decoder = v;
-		saveUi();
-		this.#in.reconfigure(v);
+		if (playId >= 0) {
+			this.#beginSwitch(1600);
+			api.setPlayEncoder(playId, v).catch(() => {});
+		}
 	};
 	// Live codec switch (H.264/H.265/AV1) — the host restarts ffmpeg with it; the client
 	// decoder re-derives its codec string from the new stream automatically.
@@ -127,6 +167,9 @@ export class SessionControls {
 		ui.codec = v;
 		saveUi();
 		const playId = this.#in.playId();
-		if (playId >= 0) api.setPlayCodec(playId, v).catch(() => {});
+		if (playId >= 0) {
+			this.#beginSwitch(2800);
+			api.setPlayCodec(playId, v).catch(() => {});
+		}
 	};
 }

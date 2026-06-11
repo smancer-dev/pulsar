@@ -61,6 +61,13 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 			return Promise.resolve([] as unknown as T);
 		case 'local_ip':
 			return Promise.resolve('192.168.1.42' as unknown as T);
+		case 'node_port':
+			return Promise.resolve(21118 as unknown as T);
+		case 'self_avatar':
+			// No OS account image in the browser mock — the UI keeps its textual chip.
+			return Promise.resolve(null as unknown as T);
+		case 'device_user_name':
+			return Promise.resolve('Deniz Yılmaz' as unknown as T);
 		case 'steam_path':
 			return Promise.resolve('' as unknown as T);
 		case 'scan_folder':
@@ -78,7 +85,20 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'available_encoders':
 			return Promise.resolve(['software'] as unknown as T);
 		case 'start_remote_play':
-			return Promise.resolve({ id: 0, transport: 'direct', ws_port: 0, audio_ws_port: 0, local: false, native: false, embedded: false } as unknown as T);
+			return Promise.resolve({ id: 0, transport: 'direct', ws_port: 0, audio_ws_port: 0, local: false, native: false, embedded: false, host_codecs: ['h264'], host_encoders: ['software'], client_codecs: ['h264', 'h265'] } as unknown as T);
+		case 'local_caps':
+			return Promise.resolve({
+				platform: 'linux',
+				encoders: [
+					{ id: 'vaapi', backend: 'ffmpeg', codecs: ['h264', 'h265'] },
+					{ id: 'software', backend: 'ffmpeg', codecs: ['h264', 'h265', 'av1'] }
+				],
+				decoders: [
+					{ codec: 'h264', ok: true, name: 'h264', hw: false, tier: 'software' },
+					{ codec: 'h265', ok: true, name: 'hevc', hw: false, tier: 'software' },
+					{ codec: 'av1', ok: true, name: 'libdav1d', hw: false, tier: 'software' }
+				]
+			} as unknown as T);
 		case 'auto_connect_target':
 			// No CLI auto-connect target in the browser mock (silences the reject log).
 			return Promise.resolve(null as unknown as T);
@@ -97,6 +117,9 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'set_play_bitrate':
 		case 'set_play_quality':
 		case 'set_frame_pacing':
+		case 'set_stats_hud':
+		case 'set_overlay_button':
+		case 'set_overlay_button_pos':
 		case 'reverse_play':
 		case 'set_window_fullscreen':
 		case 'input_pointer':
@@ -105,13 +128,30 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'input_key':
 		case 'kbd_capture_start':
 		case 'kbd_capture_stop':
+		case 'kbd_engage':
+		case 'native_view_rect':
 		case 'send_clipboard':
 		case 'send_chat':
 		case 'host_send_chat':
 		case 'send_file':
+		case 'send_file_path':
+		case 'fs_list':
+		case 'fs_get':
 		case 'mic_start':
 		case 'mic_stop':
 			return Promise.resolve(undefined as unknown as T);
+		case 'local_ls':
+			// Deterministic sample listing so the file panel is browsable in the
+			// browser preview (dirs first, alphabetical — like the real command).
+			return Promise.resolve(
+				(args?.path
+					? []
+					: [
+							{ name: 'Belgeler', dir: true, size: 0 },
+							{ name: 'İndirilenler', dir: true, size: 0 },
+							{ name: 'notlar.txt', dir: false, size: 2048 }
+						]) as unknown as T
+			);
 		default:
 			return Promise.reject(new Error(`unknown command: ${cmd}`));
 	}

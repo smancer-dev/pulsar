@@ -26,10 +26,18 @@ fn build_vidsink() {
 	// (process::vidsink_bin → bundled_bin → next-to-exe) finds it. OUT_DIR is
 	// target/<profile>/build/pulsar-tauri-<hash>/out, so the profile dir is 3 levels up.
 	let out_dir = std::env::var("OUT_DIR").unwrap();
-	let Some(profile_dir) = Path::new(&out_dir).ancestors().nth(3) else { return };
+	let Some(profile_dir) = Path::new(&out_dir).ancestors().nth(3) else {
+		return;
+	};
 	let out_bin = profile_dir.join("pulsar-vidsink");
 	let pc = match Command::new("pkg-config")
-		.args(["--cflags", "--libs", "libavformat", "libavcodec", "libavutil"])
+		.args([
+			"--cflags",
+			"--libs",
+			"libavformat",
+			"libavcodec",
+			"libavutil",
+		])
 		.output()
 	{
 		Ok(o) if o.status.success() => o.stdout,

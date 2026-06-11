@@ -8,7 +8,6 @@
 	import {
 		gameStore,
 		removeGame,
-		saveGames,
 		isBuiltin,
 		ensureSteamDefault,
 		type Game,
@@ -47,28 +46,9 @@
 	<button class="btn btn-primary" onclick={() => openForm()}><Icon name="plus" size={17} />{t('games.add')}</button>
 </div>
 
-<!-- General host streaming settings (not per-game) -->
-<div class="card host">
-	<div class="hlab mono">{t('games.hostSettings')}</div>
-	<div class="hrow">
-		<span class="cfg-lab">{t('games.resolution')}</span>
-		<div class="seg">
-			{#each ['1080p', '1440p', '4K'] as v (v)}
-				<button class:active={gameStore.host.resolution === v} onclick={() => { gameStore.host.resolution = v; saveGames(); }}>{v}</button>
-			{/each}
-		</div>
-	</div>
-	<div class="hrow">
-		<span class="cfg-lab">{t('games.fps', { fps: gameStore.host.fps })}</span>
-		<input class="prange" type="range" min="30" max="240" step="10" bind:value={gameStore.host.fps} onchange={saveGames} aria-label={t('games.fpsAria')} />
-	</div>
-	<div class="hrow">
-		<span class="cfg-lab">{t('games.bitrate', { n: gameStore.host.bitrate })}</span>
-		<input class="prange" type="range" min="5" max="100" step="5" bind:value={gameStore.host.bitrate} onchange={saveGames} aria-label={t('games.bitrateAria')} />
-	</div>
-</div>
-
 <!-- Detected controllers (forwarded to the host while streaming) -->
+<!-- The host stream defaults (resolution/fps/bitrate) live in Settings → Görüntü
+     ("Yayın varsayılanları"), not here — this screen is purely the game library. -->
 <div style="margin-bottom:22px"><Controllers /></div>
 
 <!-- Games -->
@@ -122,26 +102,6 @@
 		color: var(--text-muted);
 		font-size: 14.5px;
 		margin: 7px 0 0;
-	}
-	.host {
-		margin-bottom: 18px;
-	}
-	.hlab {
-		font-size: 10.5px;
-		letter-spacing: 0.1em;
-		text-transform: uppercase;
-		color: var(--text-faint);
-		margin-bottom: 14px;
-	}
-	.hrow {
-		padding: 8px 0;
-	}
-	.cfg-lab {
-		font-size: 12.5px;
-		font-weight: 600;
-		color: var(--text-muted);
-		margin-bottom: 8px;
-		display: block;
 	}
 	.grid {
 		display: grid;

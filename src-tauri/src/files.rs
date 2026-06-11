@@ -1,19 +1,28 @@
 //! Received-file helpers for the session file-transfer side channel. Extracted from
 //! `lib.rs` (see PENDING-WORK #9).
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Strip path separators so a peer can't write outside the received-files dir.
 pub fn sanitize_filename(name: &str) -> String {
 	let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+	// ':' is rejected too: on Windows a separator-less name like "C:evil.exe" is a
+	// drive-relative path — PathBuf::push with it REPLACES the received-files dir
+	// (drive-CWD-relative write outside the jail); it also covers NTFS ADS names.
 	let cleaned: String = base
 		.chars()
-		.filter(|c| !matches!(c, '\0'..='\u{1f}'))
+		.filter(|c| !matches!(c, '\0'..='\u{1f}' | ':'))
 		.collect();
-	if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-		"dosya".into()
-	} else {
+	// Structural guard: the result must parse as exactly ONE normal path component
+	// on THIS platform — anything else (empty, ".", "..", a surviving prefix/root)
+	// falls back to a harmless fixed name.
+	let mut comps = Path::new(&cleaned).components();
+	let single_normal =
+		matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none();
+	if single_normal {
 		cleaned
+	} else {
+		"dosya".into()
 	}
 }
 

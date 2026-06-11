@@ -39,44 +39,16 @@ impl Session {
 
 	/// Encrypt and send a payload over whichever transport this session uses.
 	pub async fn send(&self, payload: &[u8]) -> Result<(), ConnError> {
-		let (frame, dest_relay, peer_addr, transport) = {
-			let mut g = self.node.inner.lock().await;
-			let s = g.sessions.get_mut(&self.id).ok_or(ConnError::P2pFailed)?;
-			let seq = s.send_seq;
-			s.send_seq += 1;
-			let ct = s.crypto.seal(seq, payload);
-			let inner = PeerMsg::Data {
-				session: self.id,
-				seq,
-				payload: ct,
-			};
-			let transport = s.transport;
-			let peer_addr = s.peer_addr;
-			match transport {
-				Transport::Direct => (encode(&inner), None, peer_addr, transport),
-				Transport::Relay => {
-					let id = g.self_id.ok_or(ConnError::NotRegistered)?;
-					let token = g.token.ok_or(ConnError::NotRegistered)?;
-					(
-						encode(&ClientMsg::RelayData {
-							id,
-							token,
-							session: self.id,
-							payload: encode(&inner),
-						}),
-						Some(self.node.relay),
-						peer_addr,
-						transport,
-					)
-				}
-			}
-		};
-		let dest = match transport {
-			Transport::Direct => peer_addr,
-			Transport::Relay => dest_relay.unwrap(),
-		};
-		self.node.sock.send_to(&frame, dest).await?;
-		Ok(())
+		send_payload(&self.node, self.id, payload).await
+	}
+
+	/// A cloneable send-only handle to this session, so other tasks (the media
+	/// forwarder) can transmit concurrently while the owner keeps `recv()`.
+	pub fn sender(&self) -> SessionSender {
+		SessionSender {
+			node: self.node.clone(),
+			id: self.id,
+		}
 	}
 
 	/// Receive the next decrypted inbound payload.
@@ -113,4 +85,61 @@ impl Session {
 			.get(&self.id)
 			.map(|s| s.peer_addr)
 	}
+}
+
+/// A cloneable, send-only handle to an established session (see [`Session::sender`]).
+/// Sends the same sealed frames over the same transport; safe to use concurrently
+/// with the owning `Session` (the per-session crypto seq is serialized internally).
+#[derive(Clone)]
+pub struct SessionSender {
+	node: Arc<Node>,
+	id: SessionId,
+}
+
+impl SessionSender {
+	pub async fn send(&self, payload: &[u8]) -> Result<(), ConnError> {
+		send_payload(&self.node, self.id, payload).await
+	}
+}
+
+/// Shared seal+route body for [`Session::send`] / [`SessionSender::send`].
+async fn send_payload(node: &Arc<Node>, id: SessionId, payload: &[u8]) -> Result<(), ConnError> {
+	let (frame, dest_relay, peer_addr, transport) = {
+		let mut g = node.inner.lock().await;
+		let s = g.sessions.get_mut(&id).ok_or(ConnError::P2pFailed)?;
+		let seq = s.send_seq;
+		s.send_seq += 1;
+		let ct = s.crypto.seal(seq, payload);
+		let inner = PeerMsg::Data {
+			session: id,
+			seq,
+			payload: ct,
+		};
+		let transport = s.transport;
+		let peer_addr = s.peer_addr;
+		match transport {
+			Transport::Direct => (encode(&inner), None, peer_addr, transport),
+			Transport::Relay => {
+				let self_id = g.self_id.ok_or(ConnError::NotRegistered)?;
+				let token = g.token.ok_or(ConnError::NotRegistered)?;
+				(
+					encode(&ClientMsg::RelayData {
+						id: self_id,
+						token,
+						session: id,
+						payload: encode(&inner),
+					}),
+					Some(node.relay),
+					peer_addr,
+					transport,
+				)
+			}
+		}
+	};
+	let dest = match transport {
+		Transport::Direct => peer_addr,
+		Transport::Relay => dest_relay.unwrap(),
+	};
+	node.sock.send_to(&frame, dest).await?;
+	Ok(())
 }

@@ -186,9 +186,8 @@ impl MpvGl {
 			},
 		];
 		let mut render_ctx: *mut mpv::mpv_render_context = ptr::null_mut();
-		let rc = unsafe {
-			mpv::mpv_render_context_create(&mut render_ctx, handle, params.as_mut_ptr())
-		};
+		let rc =
+			unsafe { mpv::mpv_render_context_create(&mut render_ctx, handle, params.as_mut_ptr()) };
 		if rc < 0 {
 			return Err(format!("render_context_create failed: {rc}"));
 		}
@@ -295,7 +294,11 @@ impl MpvGl {
 		}
 		let dt = t0.elapsed().as_secs_f64() * 1000.0;
 		let prev = self.render_ms.get();
-		let ema = if prev > 0.0 { prev * 0.8 + dt * 0.2 } else { dt };
+		let ema = if prev > 0.0 {
+			prev * 0.8 + dt * 0.2
+		} else {
+			dt
+		};
 		self.render_ms.set(ema);
 	}
 

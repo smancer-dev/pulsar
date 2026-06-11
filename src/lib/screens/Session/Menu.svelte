@@ -2,6 +2,7 @@
 	import Icon from '$lib/Icon.svelte';
 	import StatsPanel from './StatsPanel.svelte';
 	import Chat from './Chat.svelte';
+	import Files from './Files.svelte';
 	import VideoMenu from './VideoMenu.svelte';
 	import SessionActions from './SessionActions.svelte';
 	import { t } from '$lib/i18n.svelte';
@@ -12,8 +13,10 @@
 	// the callbacks. Two-way state (statsHover/chatInput/panel/fitMode/chatBox) is $bindable.
 	type Target = { name: string; id: string };
 	type ChatMsg = { me: boolean; text: string };
-	type Panel = 'menu' | 'chat';
+	type Panel = 'menu' | 'chat' | 'files';
 	type Props = {
+		/** Play/tab id of this session — the file panel addresses its api calls with it. */
+		playId: number;
 		menuOpen: boolean;
 		controlling: boolean;
 		floating: boolean;
@@ -36,6 +39,9 @@
 		lossPct: number;
 		mbps: number;
 		target: Target;
+		/** The HOST's identity image (its account photo / wallpaper, pushed over the
+		 * session as `peer-avatar`) — shown next to the target name when known. */
+		peerAvatar?: string;
 		mode: 'remote' | 'game';
 		fullscreen: boolean;
 		panel: Panel;
@@ -51,7 +57,9 @@
 		fitMode: 'fit' | 'stretch' | 'original';
 		codec: VideoCodec;
 		encoder: Encoder;
-		decoder: Encoder;
+		hostCodecs?: string[];
+		hostEncoders?: string[];
+		activeInfo?: string;
 		streamRes: 'auto' | '1080p' | '1440p' | '4K';
 		streamFps: 'auto' | '30' | '60' | '120';
 		streamBitrate: number;
@@ -61,9 +69,9 @@
 		onHandleDown: (e: PointerEvent) => void;
 		onHandleMove: (e: PointerEvent) => void;
 		onHandleUp: (e: PointerEvent) => void;
+		onHandleCancel: (e: PointerEvent) => void;
 		onCodec: (v: VideoCodec) => void;
 		onEncoder: (v: Encoder) => void;
-		onDecoder: (v: Encoder) => void;
 		onRes: (v: 'auto' | '1080p' | '1440p' | '4K') => void;
 		onFps: (v: 'auto' | '30' | '60' | '120') => void;
 		onBitrate: (v: number) => void;
@@ -83,6 +91,7 @@
 		onEnd: () => void;
 	};
 	let {
+		playId,
 		menuOpen,
 		controlling,
 		floating,
@@ -105,6 +114,7 @@
 		lossPct,
 		mbps,
 		target,
+		peerAvatar = '',
 		mode,
 		fullscreen,
 		panel = $bindable(),
@@ -120,7 +130,9 @@
 		fitMode = $bindable(),
 		codec,
 		encoder,
-		decoder,
+		hostCodecs = [],
+		hostEncoders = [],
+		activeInfo = '',
 		streamRes,
 		streamFps,
 		streamBitrate,
@@ -130,9 +142,9 @@
 		onHandleDown,
 		onHandleMove,
 		onHandleUp,
+		onHandleCancel,
 		onCodec,
 		onEncoder,
-		onDecoder,
 		onRes,
 		onFps,
 		onBitrate,
@@ -171,6 +183,7 @@
 		onpointerdown={onHandleDown}
 		onpointermove={onHandleMove}
 		onpointerup={onHandleUp}
+		onpointercancel={onHandleCancel}
 		onpointerenter={() => (statsHover = true)}
 		onpointerleave={() => (statsHover = false)}
 		title={t('session.menu')}
@@ -203,22 +216,32 @@
 	{/if}
 
 	{#if menuOpen}
-		<div class="menu" role="menu">
+		<div class="menu" class:wide={panel === 'files'} role="menu">
 			<div class="m-head">
-				<div class="m-name">{target.name}</div>
-				<div class="m-sub mono">
-					<span class="net-dot {netClass}"></span>{target.id} · {connLabel} · {fps} fps
+				{#if peerAvatar}
+					<img class="m-avatar" src={peerAvatar} alt="" />
+				{/if}
+				<div>
+					<div class="m-name">{target.name}</div>
+					<div class="m-sub mono">
+						<span class="net-dot {netClass}"></span>{target.id} · {connLabel} · {fps} fps
+					</div>
 				</div>
 			</div>
 
 			{#if panel === 'chat'}
 				<Chat {messages} bind:chatInput bind:chatBox onSend={onSendChat} onBack={() => (panel = 'menu')} />
+			{:else if panel === 'files'}
+				<Files {playId} onBack={() => (panel = 'menu')} />
 			{:else}
 				<div class="m-cols">
 					<VideoMenu
 						{codec}
 						{encoder}
-						{decoder}
+						{hostCodecs}
+						{hostEncoders}
+						decoderInfo={decoderCodec}
+						{activeInfo}
 						{streamRes}
 						{streamFps}
 						{streamBitrate}
@@ -226,7 +249,6 @@
 						bind:fitMode
 						{onCodec}
 						{onEncoder}
-						{onDecoder}
 						{onRes}
 						{onFps}
 						{onBitrate}
@@ -246,6 +268,7 @@
 						{onFullscreen}
 						{onSendClipboard}
 						{onPickFile}
+						onOpenFiles={() => (panel = 'files')}
 						{onToggleMic}
 						{onOpenChat}
 						{onToggleFloating}
@@ -339,6 +362,10 @@
 	.hfps {
 		font-size: 11px;
 	}
+	/* the two-pane file panel needs more room than the single-column bodies */
+	.menu.wide {
+		width: 560px;
+	}
 	.menu {
 		margin-top: 6px;
 		width: 360px;
@@ -359,6 +386,16 @@
 		padding: 2px 4px 12px;
 		border-bottom: 1px solid oklch(0.32 0.016 265 / 0.6);
 		margin-bottom: 10px;
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.m-avatar {
+		width: 34px;
+		height: 34px;
+		border-radius: 9px;
+		object-fit: cover;
+		flex: none;
 	}
 	.m-name {
 		font-family: var(--font-display);

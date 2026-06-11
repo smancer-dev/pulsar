@@ -22,7 +22,7 @@ pub mod pipeline;
 pub mod service;
 
 pub use config::{Config, Language, NetworkMode};
-pub use connection::{ConnError, Node, Session, Transport};
+pub use connection::{ConnError, Node, Session, SessionSender, Transport};
 pub use crypto::{Identity, Role};
 pub use discovery::{DiscoveredPeer, Discovery};
 pub use input::{GamepadKind, GamepadState, VirtualGamepad};

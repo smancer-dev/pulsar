@@ -4,6 +4,11 @@ use super::*;
 
 pub(super) struct SessionState {
 	pub(super) peer_addr: SocketAddr,
+	/// The peer's same-LAN candidate from its handshake blob tail (see
+	/// `parse_lan_candidate`): punched ALONGSIDE the relay-observed public addr,
+	/// so same-NAT peers converge on the true LAN path instead of the lossy
+	/// router hairpin. `None` for old peers / cross-network connects.
+	pub(super) peer_lan: Option<SocketAddr>,
 	pub(super) crypto: Crypto,
 	pub(super) transport: Transport,
 	pub(super) send_seq: u64,

@@ -12,6 +12,8 @@
 mod overlay;
 
 #[cfg(all(unix, not(target_os = "macos")))]
+mod decode;
+#[cfg(all(unix, not(target_os = "macos")))]
 mod linux;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod video;
@@ -32,21 +34,31 @@ mod desktop;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn main() {
-    linux::run();
+	// `--probe`: headless capability probe (per-codec decoder selection with REAL
+	// canned-frame decodes) printing JSON for the app's startup detection.
+	if std::env::args().any(|a| a == "--probe") {
+		println!("{}", decode::probe_json());
+		return;
+	}
+	linux::run();
 }
 
 #[cfg(target_os = "windows")]
 fn main() {
-    win::run();
+	win::run();
 }
 
 #[cfg(target_os = "macos")]
 fn main() {
-    desktop::run();
+	desktop::run();
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos", all(unix, not(target_os = "macos")))))]
+#[cfg(not(any(
+	target_os = "windows",
+	target_os = "macos",
+	all(unix, not(target_os = "macos"))
+)))]
 fn main() {
-    eprintln!("pulsar-render: native backend for this platform not built yet");
-    std::process::exit(1);
+	eprintln!("pulsar-render: native backend for this platform not built yet");
+	std::process::exit(1);
 }

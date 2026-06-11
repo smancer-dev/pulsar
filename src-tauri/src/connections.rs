@@ -81,20 +81,45 @@ pub(crate) struct ConnRow {
 	pub(crate) peer: String,
 	pub(crate) since_ms: u64,
 	pub(crate) mode: ConnMode,
+	pub(crate) view_only: bool,
+	/// Pushed identity decorations (`DataMsg::PeerName`/`Avatar`), when the client
+	/// sent them — so a window opened AFTER the push still shows who connected.
+	pub(crate) name: Option<String>,
+	pub(crate) avatar: Option<String>,
 }
 
 /// The connections window's initial snapshot (it then stays live via `session` events).
 #[tauri::command]
 pub(crate) async fn list_connections(state: State<'_, AppState>) -> Result<Vec<ConnRow>, String> {
+	let meta = state.peer_meta.lock().unwrap().clone();
 	let g = state.active.lock().unwrap();
-	Ok(g
-		.iter()
-		.map(|(peer, ci)| ConnRow {
-			peer: peer.clone(),
-			since_ms: ci.since_ms,
-			mode: ci.mode,
+	Ok(g.iter()
+		.map(|(peer, ci)| {
+			let (name, avatar) = meta.get(peer).cloned().unwrap_or((None, None));
+			ConnRow {
+				peer: peer.clone(),
+				since_ms: ci.since_ms,
+				mode: ci.mode,
+				view_only: ci.view_only,
+				name,
+				avatar,
+			}
 		})
 		.collect())
+}
+
+/// "Sadece izleme" toggle: revoke/restore a connected client's CONTROL — the serve
+/// loop's input handler drops its events while set; the stream keeps running.
+#[tauri::command]
+pub(crate) async fn set_view_only(
+	state: State<'_, AppState>,
+	peer: String,
+	on: bool,
+) -> Result<(), String> {
+	if let Some(ci) = state.active.lock().unwrap().get_mut(&peer) {
+		ci.view_only = on;
+	}
+	Ok(())
 }
 
 /// Sidebar "Bağlantılar" button → reveal/focus the (possibly hidden) window.

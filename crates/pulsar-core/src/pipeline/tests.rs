@@ -80,9 +80,18 @@ fn detect_registers_vendor_on_any_codec_not_just_h264() {
 	// An HEVC/AV1-only build (no h264_amf) must still register AMF.
 	let out = " V..... hevc_amf\n V..... av1_qsv\n V..... libx265\n";
 	let got = detect(out);
-	assert!(got.contains(&HwEncoder::Amf), "hevc_amf alone must register AMF");
-	assert!(got.contains(&HwEncoder::Qsv), "av1_qsv alone must register QSV");
-	assert!(got.contains(&HwEncoder::Software), "libx265 alone must register Software");
+	assert!(
+		got.contains(&HwEncoder::Amf),
+		"hevc_amf alone must register AMF"
+	);
+	assert!(
+		got.contains(&HwEncoder::Qsv),
+		"av1_qsv alone must register QSV"
+	);
+	assert!(
+		got.contains(&HwEncoder::Software),
+		"libx265 alone must register Software"
+	);
 }
 
 #[test]
@@ -90,7 +99,10 @@ fn available_codecs_intersects_with_ffmpeg() {
 	let out = " V..... h264_nvenc\n V..... av1_nvenc\n"; // no hevc_nvenc
 	let c = HwEncoder::Nvenc.available_codecs(out);
 	assert!(c.contains(&VCodec::H264) && c.contains(&VCodec::Av1));
-	assert!(!c.contains(&VCodec::H265), "missing hevc_nvenc must not be advertised");
+	assert!(
+		!c.contains(&VCodec::H265),
+		"missing hevc_nvenc must not be advertised"
+	);
 	// VideoToolbox never advertises AV1 even if the name somehow appears.
 	assert!(!HwEncoder::VideoToolbox.all_codecs().contains(&VCodec::Av1));
 }
@@ -99,13 +111,22 @@ fn available_codecs_intersects_with_ffmpeg() {
 fn resolve_codec_honors_then_falls_back() {
 	let full = " h264_nvenc hevc_nvenc av1_nvenc ";
 	// requested available → honored
-	assert_eq!(resolve_codec(HwEncoder::Nvenc, VCodec::Av1, full), VCodec::Av1);
+	assert_eq!(
+		resolve_codec(HwEncoder::Nvenc, VCodec::Av1, full),
+		VCodec::Av1
+	);
 	// requested missing → prefer H.264 (webview-decodable)
 	let only_h264 = " h264_nvenc ";
-	assert_eq!(resolve_codec(HwEncoder::Nvenc, VCodec::H265, only_h264), VCodec::H264);
+	assert_eq!(
+		resolve_codec(HwEncoder::Nvenc, VCodec::H265, only_h264),
+		VCodec::H264
+	);
 	// no H.264 but HEVC present → first available
 	let only_hevc = " hevc_nvenc ";
-	assert_eq!(resolve_codec(HwEncoder::Nvenc, VCodec::Av1, only_hevc), VCodec::H265);
+	assert_eq!(
+		resolve_codec(HwEncoder::Nvenc, VCodec::Av1, only_hevc),
+		VCodec::H265
+	);
 }
 
 #[test]
@@ -151,8 +172,14 @@ fn probe_command_is_one_frame_to_null() {
 
 #[test]
 fn new_backends_have_names_and_labels() {
-	assert_eq!(HwEncoder::Vulkan.ffmpeg_name(VCodec::Av1), Some("av1_vulkan"));
-	assert_eq!(HwEncoder::MediaFoundation.ffmpeg_name(VCodec::H265), Some("hevc_mf"));
+	assert_eq!(
+		HwEncoder::Vulkan.ffmpeg_name(VCodec::Av1),
+		Some("av1_vulkan")
+	);
+	assert_eq!(
+		HwEncoder::MediaFoundation.ffmpeg_name(VCodec::H265),
+		Some("hevc_mf")
+	);
 	assert_eq!(HwEncoder::Vulkan.label(), "Vulkan");
 	// Vulkan declares all three codecs.
 	assert_eq!(HwEncoder::Vulkan.all_codecs().len(), 3);
@@ -245,15 +272,24 @@ fn ddagrab_is_fully_gpu_per_encoder() {
 	let f = encode_command(&p).1.join(" ");
 	assert!(f.contains("hwmap=derive_device=cuda"));
 	assert!(f.contains("scale_cuda"));
-	assert!(!f.contains("hwdownload"), "zero-copy must not round-trip to CPU");
+	assert!(
+		!f.contains("hwdownload"),
+		"zero-copy must not round-trip to CPU"
+	);
 
 	// NVENC hybrid (display on iGPU, CUDA map unavailable): feed ddagrab's D3D11 frame
 	// STRAIGHT into NVENC — no CPU round-trip at all (the hwdownload/hwupload path capped
 	// ~51 fps on a 3080 laptop). NVENC does the cross-GPU copy itself.
 	p.gpu_zerocopy = false;
 	let f = encode_command(&p).1.join(" ");
-	assert!(!f.contains("hwdownload"), "hybrid NVENC must not round-trip to CPU");
-	assert!(!f.contains("scale_cuda"), "no on-GPU scaler without the CUDA map; native res");
+	assert!(
+		!f.contains("hwdownload"),
+		"hybrid NVENC must not round-trip to CPU"
+	);
+	assert!(
+		!f.contains("scale_cuda"),
+		"no on-GPU scaler without the CUDA map; native res"
+	);
 
 	// AMD AMF: NV12, no yuv420p swscale.
 	let mut a = plan(HwEncoder::Amf);
@@ -273,6 +309,9 @@ fn software_command_is_zerolatency() {
 	assert_eq!(program, "ffmpeg");
 	assert!(args.iter().any(|a| a == "libx264"));
 	assert!(args.iter().any(|a| a == "zerolatency"));
+	// SDR software encode pins 4:2:0 — without it libx264 matched the BGR capture to
+	// High 4:4:4, which the client's HW/4:2:0 decode paths can't play (black screen).
+	assert!(args.join(" ").contains("-pix_fmt yuv420p"));
 }
 
 #[test]
@@ -282,4 +321,86 @@ fn decode_command_is_low_latency_ffplay() {
 	assert!(args.iter().any(|a| a == "nobuffer"));
 	assert!(args.iter().any(|a| a == "low_delay"));
 	assert_eq!(args.last().unwrap(), "udp://@:9000");
+}
+
+#[test]
+fn gst_fragment_mpp_h265_matches_verified_pi_pipeline() {
+	// Property names verified live on an Orange Pi 5 (gst 1.20 rockchipmpp plugin).
+	let f = gst::encoder_fragment(gst::GstEncoder::Mpp, VCodec::H265, 8000, 60).unwrap();
+	assert!(f.contains("mpph265enc bps=8000000 gop=60 header-mode=each-idr"));
+	assert!(f.contains("h265parse"));
+	assert!(f.contains("rtph265pay config-interval=1 pt=96 mtu=1200"));
+}
+
+#[test]
+fn gst_fragment_rejects_impossible_pairs() {
+	// Software HEVC stays off (same policy as the ffmpeg path); no AV1 elements modeled.
+	assert!(gst::encoder_fragment(gst::GstEncoder::X264, VCodec::H265, 8000, 60).is_none());
+	assert!(gst::encoder_fragment(gst::GstEncoder::Mpp, VCodec::Av1, 8000, 60).is_none());
+}
+
+#[test]
+fn gst_pipelines_embed_fragment_and_low_latency_queue() {
+	let f = gst::encoder_fragment(gst::GstEncoder::X264, VCodec::H264, 6000, 30).unwrap();
+	let w = gst::wayland_pipeline(7, 42, &f, "10.0.0.2", 9000);
+	assert!(w.contains("pipewiresrc fd=7 path=42"));
+	assert!(w.contains("queue leaky=downstream"));
+	assert!(w.contains("x264enc tune=zerolatency"));
+	assert!(w.contains("udpsink host=10.0.0.2 port=9000 sync=false"));
+	let x = gst::x11_pipeline(":0", 60, &f, "10.0.0.2", 9000, false);
+	assert!(x.contains("ximagesrc display-name=:0 use-damage=0"));
+	assert!(x.contains("framerate=60/1"));
+	assert!(x.contains("videoconvert"), "non-MPP keeps the CPU convert");
+	assert!(x.contains(&f));
+	// MPP path: capture's BGRx goes STRAIGHT to the encoder (RGA converts inside) —
+	// the CPU videoconvert that capped the Pi at ~49 fps must be gone.
+	let xd = gst::x11_pipeline(":0", 120, &f, "10.0.0.2", 9000, true);
+	assert!(xd.contains("format=BGRx,framerate=120/1"));
+	assert!(!xd.contains("videoconvert"));
+	assert!(xd.contains("queue leaky=downstream"));
+	// Probe wraps the SAME fragment between a testsrc and a fakesink.
+	let p = gst::probe_pipeline(&f);
+	assert!(p.starts_with("videotestsrc num-buffers=2"));
+	assert!(p.contains(&f) && p.ends_with("fakesink sync=false"));
+}
+
+#[test]
+fn gst_kms_pipeline_is_zero_copy_and_vblank_paced() {
+	let f = gst::encoder_fragment(gst::GstEncoder::Mpp, VCodec::H265, 12000, 120).unwrap();
+	let k = gst::kms_pipeline(120, &f, "10.0.0.2", 9000);
+	// The scanout DMABuf rides untouched into MPP: DMABuf caps feature, no X
+	// capture, no CPU convert anywhere.
+	assert!(k.starts_with("kmssrc driver-name=rockchip dma-feature=true sync-fb=false"));
+	assert!(k.contains("video/x-raw(memory:DMABuf),format=BGRx,framerate=120/1"));
+	assert!(!k.contains("videoconvert") && !k.contains("ximagesrc"));
+	// sync-fb=false is load-bearing: the default waits for NEW pageflips and an
+	// idle desktop then throttles to ~58 fps instead of the 120 Hz vblank.
+	assert!(k.contains("sync-fb=false"));
+	assert!(k.contains("queue leaky=downstream"));
+	assert!(k.contains(&f));
+	assert!(k.ends_with("udpsink host=10.0.0.2 port=9000 sync=false"));
+	// fps=0 guards the division the same way the other builders do.
+	assert!(gst::kms_pipeline(0, &f, "1.2.3.4", 1).contains("framerate=1/1"));
+	// The KMS probe validates the REAL capture path (2 scanout frames), not a
+	// videotestsrc stand-in — it must fail where GETFB2 privileges are missing.
+	let p = gst::kms_probe_pipeline(&f);
+	assert!(
+		p.starts_with("kmssrc driver-name=rockchip dma-feature=true sync-fb=false num-buffers=2")
+	);
+	assert!(p.contains("(memory:DMABuf)"));
+	assert!(p.contains(&f) && p.ends_with("fakesink sync=false"));
+}
+
+#[test]
+fn rkmpp_encoder_is_detected_and_resolves_before_software() {
+	// An ffmpeg-rockchip build lists the rkmpp encoders → the vendor registers and
+	// auto-resolution prefers it over software on a GPU-less SBC.
+	let out = " V..... h264_rkmpp\n V..... hevc_rkmpp\n V..... libx264\n";
+	let avail = detect(out);
+	assert!(avail.contains(&HwEncoder::Rkmpp));
+	assert_eq!(resolve(HwEncoder::Auto, &avail), HwEncoder::Rkmpp);
+	assert_eq!(
+		HwEncoder::Rkmpp.available_codecs(out),
+		vec![VCodec::H264, VCodec::H265]
+	);
 }

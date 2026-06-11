@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pulsar_proto::{
-	decode, encode, ClientMsg, DeviceId, PeerMsg, PublicKey, RelayMsg, SessionId, Token,
+	decode, encode, ClientMsg, DeviceId, ErrCode, PeerMsg, PublicKey, RelayMsg, SessionId, Token,
 	PROTOCOL_VERSION,
 };
 use tokio::net::UdpSocket;
@@ -34,7 +34,7 @@ mod session;
 mod types;
 
 pub use node::Node;
-pub use session::Session;
+pub use session::{Session, SessionSender};
 
 use types::{Inner, SessionState};
 
@@ -72,9 +72,11 @@ pub enum Transport {
 /// Parse a relay-path handshake blob `pubkey(32) || salt(32)` into its two halves.
 ///
 /// Returns `None` (so the caller fails the connection gracefully) if the blob is
-/// the wrong length — never index-slices an untrusted, attacker-influenced buffer.
+/// too short — never index-slices an untrusted, attacker-influenced buffer.
+/// `< 64` (not `!= 64`): the blob may carry the optional LAN-candidate tail
+/// (see [`parse_lan_candidate`]) — anything after the fixed part is tolerated.
 fn split_handshake(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
-	if blob.len() != 64 {
+	if blob.len() < 64 {
 		return None;
 	}
 	let mut pubkey = [0u8; 32];
@@ -82,4 +84,25 @@ fn split_handshake(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
 	pubkey.copy_from_slice(&blob[..32]);
 	salt.copy_from_slice(&blob[32..64]);
 	Some((pubkey, salt))
+}
+
+/// Optional same-LAN punch candidate appended to the 64-byte handshake blobs:
+/// `v4 ip(4) || port(2)`, big-endian. Two peers behind the SAME NAT only ever
+/// learn each other's PUBLIC address from the relay, so their "direct" path is a
+/// router hairpin — which measurably drops a double-digit share of a 15 Mbit
+/// stream on consumer gear. Punching the private candidate too lets same-LAN
+/// peers go truly direct. Absent tail (old peer) → `None`, unchanged fallback.
+fn parse_lan_candidate(blob: &[u8]) -> Option<SocketAddr> {
+	let t = blob.get(64..70)?;
+	let ip = std::net::Ipv4Addr::new(t[0], t[1], t[2], t[3]);
+	let port = u16::from_be_bytes([t[4], t[5]]);
+	(!ip.is_unspecified() && port != 0).then(|| SocketAddr::new(ip.into(), port))
+}
+
+/// RFC1918/link-local/loopback v4 — the "prefer the LAN path" test for punches.
+fn is_private_v4(addr: SocketAddr) -> bool {
+	match addr.ip() {
+		std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+		_ => false,
+	}
 }

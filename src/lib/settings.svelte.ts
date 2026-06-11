@@ -6,10 +6,11 @@ export type VideoCodec = 'auto' | 'h264' | 'h265' | 'av1';
 export type Encoder =
 	| 'auto'
 	| 'nvenc'
-	| 'quicksync'
+	| 'qsv'
 	| 'amf'
 	| 'videotoolbox'
 	| 'vaapi'
+	| 'rkmpp'
 	| 'software';
 
 export interface UiSettings {
@@ -21,8 +22,6 @@ export interface UiSettings {
 	codec: VideoCodec;
 	/** Host-side hardware encoder. */
 	encoder: Encoder;
-	/** Client-side hardware decoder (same families as encoders). */
-	decoder: Encoder;
 	hdr: boolean;
 	bwlimit: boolean;
 	unattended: boolean;
@@ -39,6 +38,14 @@ export interface UiSettings {
 	 * present at a steady cadence to smooth network/decode jitter (slightly higher latency).
 	 * Off = present newest immediately (lowest latency). */
 	framePacing: boolean;
+	/** Always-on mini stats HUD over the video while the overlay is closed. */
+	statsHud: boolean;
+	/** Parsec-style always-visible overlay-open button (Pulsar mark) over the video. */
+	overlayButton: boolean;
+	/** Overlay-open button position — egui POINTS from the video's top-left (the
+	 * renderer draws there; the webview hotspot mirrors it as CSS px ×1.25).
+	 * Drag-movable in-session; default mirrors overlay.rs BTN_POS_DEFAULT. */
+	overlayBtnPos: { x: number; y: number };
 }
 
 export const CODECS: { value: VideoCodec; label: string }[] = [
@@ -51,15 +58,28 @@ export const CODECS: { value: VideoCodec; label: string }[] = [
 export const ENCODERS: { value: Encoder; label: string }[] = [
 	{ value: 'auto', label: 'Otomatik (en iyi donanım)' },
 	{ value: 'nvenc', label: 'NVIDIA NVENC' },
-	{ value: 'quicksync', label: 'Intel QuickSync' },
+	{ value: 'qsv', label: 'Intel QuickSync' },
 	{ value: 'amf', label: 'AMD AMF' },
 	{ value: 'videotoolbox', label: 'Apple VideoToolbox' },
 	{ value: 'vaapi', label: 'VA-API (Linux)' },
+	{ value: 'rkmpp', label: 'Rockchip MPP' },
 	{ value: 'software', label: 'Yazılım (CPU)' }
 ];
 
-// Decode uses the same hardware families.
-export const DECODERS: { value: Encoder; label: string }[] = ENCODERS;
+/** Per-platform encoder families: a platform shows ONLY its own backends (foreign
+ * entries never render); availability within the family is a separate, probe-driven
+ * disabled state (see `caps.svelte.ts`). `auto` + `software` exist everywhere —
+ * software is the universal terminal fallback. */
+const PLATFORM_ENCODERS: Record<string, Encoder[]> = {
+	linux: ['auto', 'nvenc', 'vaapi', 'qsv', 'rkmpp', 'software'],
+	windows: ['auto', 'nvenc', 'amf', 'qsv', 'software'],
+	macos: ['auto', 'videotoolbox', 'software']
+};
+
+export function encodersForPlatform(platform: string): { value: Encoder; label: string }[] {
+	const family = PLATFORM_ENCODERS[platform] ?? PLATFORM_ENCODERS.linux;
+	return ENCODERS.filter((e) => family.includes(e.value));
+}
 
 const DEFAULTS: UiSettings = {
 	quality: 'auto',
@@ -68,7 +88,6 @@ const DEFAULTS: UiSettings = {
 	bitrate: 0,
 	codec: 'auto',
 	encoder: 'auto',
-	decoder: 'auto',
 	hdr: false,
 	bwlimit: false,
 	unattended: true,
@@ -78,7 +97,10 @@ const DEFAULTS: UiSettings = {
 	tray: true,
 	debug: false,
 	keepVisible: true,
-	framePacing: true
+	framePacing: true,
+	statsHud: false,
+	overlayButton: true,
+	overlayBtnPos: { x: 90, y: 70 }
 };
 
 const KEY = 'pulsar.ui.v1';
@@ -88,7 +110,12 @@ function load(): UiSettings {
 	if (!hasLS) return { ...DEFAULTS };
 	try {
 		const raw = localStorage.getItem(KEY);
-		return raw ? { ...DEFAULTS, ...(JSON.parse(raw) as Partial<UiSettings>) } : { ...DEFAULTS };
+		if (!raw) return { ...DEFAULTS };
+		const saved = JSON.parse(raw) as Partial<UiSettings> & { decoder?: string };
+		delete saved.decoder; // removed: the decoder is auto-selected and shown read-only
+		// 'quicksync' was the old UI value; the wire/host vocabulary is 'qsv'.
+		if ((saved.encoder as string) === 'quicksync') saved.encoder = 'qsv';
+		return { ...DEFAULTS, ...saved };
 	} catch {
 		return { ...DEFAULTS };
 	}

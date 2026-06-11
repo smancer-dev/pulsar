@@ -67,10 +67,14 @@ impl Viewer {
 /// Start the relays: one UDP→WS pair for video and one for audio. The webview
 /// connects to each WebSocket, depacketizes the RTP in JS, and decodes (WebCodecs
 /// for video, WebAudio for the Opus audio).
-pub async fn start() -> std::io::Result<Viewer> {
+///
+/// `loopback_only`: media-over-session is negotiated, so the RTP arrives via the
+/// session demuxer ON THIS MACHINE — bind the intake sockets to 127.0.0.1 (nothing
+/// external may feed them; zero externally-reachable media ports).
+pub async fn start(loopback_only: bool) -> std::io::Result<Viewer> {
 	let mut tasks = Vec::new();
-	let (media_port, ws_port, _video_tx) = relay(&mut tasks).await?;
-	let (audio_port, audio_ws_port, audio_tx) = relay(&mut tasks).await?;
+	let (media_port, ws_port, _video_tx) = relay(&mut tasks, loopback_only).await?;
+	let (audio_port, audio_ws_port, audio_tx) = relay(&mut tasks, loopback_only).await?;
 	Ok(Viewer {
 		media_port,
 		ws_port,
@@ -84,8 +88,12 @@ pub async fn start() -> std::io::Result<Viewer> {
 /// Bind one UDP→WebSocket relay (an ephemeral UDP port for the host's RTP + a
 /// loopback WebSocket the webview reads), spawn its two pump tasks onto `tasks`,
 /// and return `(udp_port, ws_port)`. Used once for video and once for audio.
-async fn relay(tasks: &mut Vec<JoinHandle<()>>) -> std::io::Result<(u16, u16, broadcast::Sender<Vec<u8>>)> {
-	// `0.0.0.0` so the host can reach us over LAN too, not just loopback. Bind via
+async fn relay(
+	tasks: &mut Vec<JoinHandle<()>>,
+	loopback_only: bool,
+) -> std::io::Result<(u16, u16, broadcast::Sender<Vec<u8>>)> {
+	// Legacy direct flows need `0.0.0.0` so the host can reach us over LAN; under
+	// media-over-session the feeder is the local demuxer → loopback-only. Bind via
 	// socket2 to raise SO_RCVBUF: a 40 Mbps stream bursts hundreds of ~1400 B
 	// datagrams per keyframe in a few ms, overflowing the default kernel recv buffer
 	// and silently dropping packets — and dropped RTP corrupts H.264 until the next
@@ -97,7 +105,12 @@ async fn relay(tasks: &mut Vec<JoinHandle<()>>) -> std::io::Result<(u16, u16, br
 	)?;
 	sock.set_recv_buffer_size(8 * 1024 * 1024)?;
 	sock.set_nonblocking(true)?; // required by UdpSocket::from_std
-	sock.bind(&"0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap().into())?;
+	let bind_ip = if loopback_only {
+		"127.0.0.1:0"
+	} else {
+		"0.0.0.0:0"
+	};
+	sock.bind(&bind_ip.parse::<std::net::SocketAddr>().unwrap().into())?;
 	let udp = Arc::new(UdpSocket::from_std(sock.into())?);
 	let media_port = udp.local_addr()?.port();
 	let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -165,7 +178,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn forwards_udp_datagrams_to_the_websocket() {
-		let v = start().await.unwrap();
+		let v = start(false).await.unwrap();
 		let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", v.ws_port))
 			.await
 			.unwrap();

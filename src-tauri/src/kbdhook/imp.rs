@@ -14,8 +14,8 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
 	CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-	TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP,
-	MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+	TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP, MSG,
+	WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
 };
 
 mod keymap;
@@ -122,7 +122,16 @@ fn init_interception() -> Option<Interception> {
 		if ctx.is_null() {
 			return None;
 		}
-		Some(Interception { _lib: lib, set_filter, wait, receive, send, is_kbd, is_mouse, ctx })
+		Some(Interception {
+			_lib: lib,
+			set_filter,
+			wait,
+			receive,
+			send,
+			is_kbd,
+			is_mouse,
+			ctx,
+		})
 	}
 }
 
@@ -349,11 +358,7 @@ fn hook_thread() {
 }
 
 /// The LL keyboard callback. Runs on the hook thread for every key system-wide.
-unsafe extern "system" fn ll_keyboard_proc(
-	ncode: i32,
-	wparam: WPARAM,
-	lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn ll_keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 	// Per docs: if ncode < 0 we must pass through untouched.
 	if ncode < 0 || !ENABLED.load(Ordering::SeqCst) {
 		return CallNextHookEx(std::ptr::null_mut(), ncode, wparam, lparam);

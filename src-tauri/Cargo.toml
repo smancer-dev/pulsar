@@ -7,6 +7,15 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Pulsar desktop app — Tauri shell bridging the SvelteKit UI to pulsar-core."
 
+# The user-facing binary is `pulsar` (not the package name): on Linux GTK derives
+# WM_CLASS from argv[0], so taskbars/Alt-Tab would otherwise label the app
+# "pulsar-tauri" wherever no .desktop entry matches (dev runs, bare AppImage, Pi
+# kiosk). Also makes /usr/bin/pulsar + the .desktop Exec/StartupWMClass + the
+# documented CLI (`pulsar --connect`, `pulsar --relay`) all consistent.
+[[bin]]
+name = "pulsar"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -28,6 +37,9 @@ libloading = "0.8"
 # Local UDP(RTP) → WebSocket relay that feeds the webview's WebCodecs decoder.
 tokio-tungstenite = "0.21"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Peer avatars arrive as raw PNG bytes over the session side channel; the webview
+# renders them from a `data:image/png;base64,…` URL (avatar.rs::data_url).
+base64 = "0.22"
 
 # Raw Win32 for true taskbar-covering fullscreen (borderless-fullscreen via SetWindowPos).
 [target.'cfg(windows)'.dependencies]
@@ -58,6 +70,11 @@ gdkx11 = "0.18"
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.12"
 libc = "0.2"
+# Self-avatar resolution (avatar.rs): decode the account photo / wallpaper, center-crop
+# + downscale to a 96×96 PNG. Decode-only features kept minimal (png/jpeg/webp/bmp cover
+# AccountsService icons, ~/.face and GNOME wallpapers); Linux-only until the Windows/macOS
+# account-image lookups are implemented.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 # Layout-aware keyboard forwarding (WYSIWYG): resolve a grabbed evdev keycode → the Unicode
 # char the user's OWN active layout (e.g. Turkish-Q) produces, via libxkbcommon, so the host
 # types the exact char regardless of ITS layout. Links the system libxkbcommon (libxkbcommon-dev).

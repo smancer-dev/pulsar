@@ -20,6 +20,25 @@ pub async fn request_games(session: &mut Session) -> Result<Vec<GameInfo>, ConnE
 	Ok(Vec::new())
 }
 
+/// Client: ask the host what it can actually stream (validated codec + encoder caps,
+/// best-first). Empty on timeout/old host — the caller falls back to H.264. Used to
+/// resolve the client's "auto" codec BEFORE writing its decoder SDP (so the SDP and
+/// the stream can never disagree) and to gate the session-menu options.
+pub async fn query_stream_caps(session: &mut Session) -> Result<StreamCaps, ConnError> {
+	session.send(&enc(&Msg::QueryStreamCaps)).await?;
+	for _ in 0..MAX_WAIT_MSGS {
+		match session.recv().await {
+			Some(bytes) => {
+				if let Some(Msg::StreamCaps(caps)) = dec(&bytes) {
+					return Ok(caps);
+				}
+			}
+			None => break,
+		}
+	}
+	Ok(StreamCaps::default())
+}
+
 /// Client: ask the peer to launch a game by id.
 pub async fn request_launch(session: &mut Session, id: &str) -> Result<(), ConnError> {
 	session.send(&enc(&Msg::Launch(id.to_string()))).await

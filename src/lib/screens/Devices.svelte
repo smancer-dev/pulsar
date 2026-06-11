@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Icon from '$lib/Icon.svelte';
 	import Modal from '$lib/Modal.svelte';
-	import { savedPeers, addPeer, removePeer, toggleFav, type PeerCategory } from '$lib/peers.svelte';
+	import { savedPeers, addPeer, removePeer, toggleFav, fmtPeerId, type PeerCategory } from '$lib/peers.svelte';
 	import { t } from '$lib/i18n.svelte';
 
 	type Target = { name: string; id: string };
@@ -29,13 +29,17 @@
 	const FILTERS = ['all', 'pc', 'server', 'console'] as const;
 
 	const peers = $derived(savedPeers());
-	const filtered = $derived(
-		peers.filter(
+	// Ids are stored canonical (despaced) — despace the query too so typing the
+	// grouped form ("641 724…") still matches.
+	const filtered = $derived.by(() => {
+		const ql = q.trim().toLowerCase();
+		const qd = ql.replace(/\s/g, '');
+		return peers.filter(
 			(d) =>
 				(filter === 'all' || d.cat === filter) &&
-				(d.name.toLowerCase().includes(q.toLowerCase()) || d.id.includes(q))
-		)
-	);
+				(!ql || d.name.toLowerCase().includes(ql) || (!!qd && d.id.includes(qd)))
+		);
+	});
 
 	const fmtId = (v: string) =>
 		v
@@ -137,7 +141,7 @@
 						>
 						<span class="dname">{d.name}</span>
 					</div>
-					<div class="did mono">{d.id}</div>
+					<div class="did mono">{fmtPeerId(d.id)}</div>
 					<div class="dstatus">{relTime(d.lastConnected) + ' · ' + catFull(d.cat)}</div>
 				</div>
 				<div class="actions">

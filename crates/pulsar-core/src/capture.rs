@@ -63,92 +63,100 @@ fn clear_cloexec(fd: i32) -> std::io::Result<()> {
 	Ok(())
 }
 
-/// Start a portal screencast and pipe the screen to `udp://ip:port` as RTP/H.264.
-/// Shows the compositor's share dialog the first time; pass a stored
+/// Start a portal screencast and pipe the screen to `udp://ip:port` as RTP.
+/// `encoder_fragment` is a prebuilt gst encode→parse→rtp-payload fragment from
+/// [`crate::pipeline::gst::encoder_fragment`] — the codec/encoder choice (and thus
+/// what the client's SDP must declare) is the CALLER's, made against its validated
+/// gst caps. Shows the compositor's share dialog the first time; pass a stored
 /// `restore_token` to skip it on later calls. Returns the running capture and a
 /// (possibly new) restore token to persist.
 pub async fn start(
 	ip: &str,
 	port: u16,
-	_codec: &str,
-	bitrate_kbps: u32,
-	fps: u32,
+	encoder_fragment: &str,
 	restore_token: Option<String>,
 ) -> anyhow::Result<(WaylandCapture, Option<String>)> {
 	let proxy: Screencast<'static> = Screencast::new().await?;
 	let session: Session<'static, Screencast<'static>> = proxy.create_session().await?;
-	proxy
-		.select_sources(
-			&session,
-			CursorMode::Embedded,
-			SourceType::Monitor | SourceType::Window,
-			false,
-			restore_token.as_deref(),
-			PersistMode::Application,
-		)
-		.await?;
-	let response = proxy
-		.start(&session, &WindowIdentifier::default())
-		.await?
-		.response()?;
-	let stream = response
-		.streams()
-		.first()
-		.ok_or_else(|| anyhow::anyhow!("portal returned no screencast stream"))?;
-	let node_id = stream.pipe_wire_node_id();
-	let token = response.restore_token().map(|s| s.to_string());
+	// Everything past `create_session` can fail with the portal cast already live
+	// (the realistic case: gstreamer not installed). ashpd does NOT close the
+	// session on drop (see the struct docs above), so a bare `?` here would leave
+	// the compositor showing "your screen is being shared" forever with no stream
+	// behind it — run the fallible tail in a block and close the session on error.
+	let res = async {
+		proxy
+			.select_sources(
+				&session,
+				CursorMode::Embedded,
+				SourceType::Monitor | SourceType::Window,
+				false,
+				restore_token.as_deref(),
+				PersistMode::Application,
+			)
+			.await?;
+		let response = proxy
+			.start(&session, &WindowIdentifier::default())
+			.await?
+			.response()?;
+		let stream = response
+			.streams()
+			.first()
+			.ok_or_else(|| anyhow::anyhow!("portal returned no screencast stream"))?;
+		let node_id = stream.pipe_wire_node_id();
+		let token = response.restore_token().map(|s| s.to_string());
 
-	let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(&session).await?;
-	clear_cloexec(pw_fd.as_raw_fd())?;
+		let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(&session).await?;
+		clear_cloexec(pw_fd.as_raw_fd())?;
 
-	// H.264 over RTP so the client can depacketize it and feed WebCodecs.
-	// `config-interval=1` re-sends SPS/PPS so a mid-stream join gets a keyframe.
-	//
-	// Latency: a `leaky=downstream` queue drops stale frames if software x264 can't
-	// keep up with the monitor's refresh, so end-to-end lag stays bounded (effective
-	// fps drops instead of latency growing). `tune=zerolatency` + `bframes=0` emit
-	// each frame immediately; a 1-second GOP keeps recovery quick after a drop.
-	let key_int = fps.max(1);
-	let pipeline = format!(
-		"pipewiresrc fd={fd} path={node} do-timestamp=true keepalive-time=1000 \
-		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-		 ! videoconvert ! video/x-raw,format=I420 \
-		 ! x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={key_int} bframes=0 \
-		 ! rtph264pay config-interval=1 pt=96 mtu=1200 \
-		 ! udpsink host={ip} port={port} sync=false",
-		fd = pw_fd.as_raw_fd(),
-		node = node_id,
-	);
-	let mut cmd = std::process::Command::new("gst-launch-1.0");
-	cmd.arg("-q").args(pipeline.split_whitespace());
-	// Die if our process dies, so an orphaned gst-launch never keeps the screen
-	// "being shared" (KDE tray) after the app/session goes away.
-	unsafe {
-		cmd.pre_exec(|| {
-			// SAFETY: async-signal-safe libc calls only.
-			libc::prctl(
-				libc::PR_SET_PDEATHSIG,
-				libc::SIGKILL as libc::c_ulong,
-				0,
-				0,
-				0,
-			);
-			if libc::getppid() == 1 {
-				libc::_exit(0); // parent already gone between fork and here
-			}
-			Ok(())
-		});
+		// Latency: the builder's `leaky=downstream` queue drops stale frames if the
+		// encoder can't keep up with the monitor's refresh, so end-to-end lag stays
+		// bounded (effective fps drops instead of latency growing).
+		let pipeline = crate::pipeline::gst::wayland_pipeline(
+			pw_fd.as_raw_fd(),
+			node_id,
+			encoder_fragment,
+			ip,
+			port,
+		);
+		let mut cmd = std::process::Command::new("gst-launch-1.0");
+		cmd.arg("-q").args(pipeline.split_whitespace());
+		// Die if our process dies, so an orphaned gst-launch never keeps the screen
+		// "being shared" (KDE tray) after the app/session goes away.
+		unsafe {
+			cmd.pre_exec(|| {
+				// SAFETY: async-signal-safe libc calls only.
+				libc::prctl(
+					libc::PR_SET_PDEATHSIG,
+					libc::SIGKILL as libc::c_ulong,
+					0,
+					0,
+					0,
+				);
+				if libc::getppid() == 1 {
+					libc::_exit(0); // parent already gone between fork and here
+				}
+				Ok(())
+			});
+		}
+		let child = cmd.spawn().map_err(|e| {
+			anyhow::anyhow!("gst-launch-1.0 başlatılamadı (gstreamer kurulu mu?): {e}")
+		})?;
+		Ok::<_, anyhow::Error>((child, pw_fd, token))
 	}
-	let child = cmd
-		.spawn()
-		.map_err(|e| anyhow::anyhow!("gst-launch-1.0 başlatılamadı (gstreamer kurulu mu?): {e}"))?;
+	.await;
 
-	Ok((
-		WaylandCapture {
-			child,
-			session,
-			_pw_fd: pw_fd,
-		},
-		token,
-	))
+	match res {
+		Ok((child, pw_fd, token)) => Ok((
+			WaylandCapture {
+				child,
+				session,
+				_pw_fd: pw_fd,
+			},
+			token,
+		)),
+		Err(e) => {
+			let _ = session.close().await;
+			Err(e)
+		}
+	}
 }

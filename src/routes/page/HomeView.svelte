@@ -31,6 +31,8 @@
 		onConnect: (target: Target, m?: 'remote' | 'game', gameId?: string) => void;
 		onStream: (game: Game) => void;
 		onClearConnectErr: () => void;
+		/** Settle the password prompt queued for `target` (game-list fetch auth). */
+		onAuthDone?: (target: string) => void;
 	};
 	let {
 		nav,
@@ -51,12 +53,13 @@
 		onDisconnect,
 		onConnect,
 		onStream,
-		onClearConnectErr
+		onClearConnectErr,
+		onAuthDone = () => {}
 	}: Props = $props();
 </script>
 
 <div class="body">
-	<Sidebar {nav} {view} {online} {connecting} {connError} {onView} {onGoOnline} />
+	<Sidebar {nav} {view} {online} {connecting} {connError} hostCount={hostSessions.length} {onView} {onGoOnline} />
 
 	<!-- content -->
 	<main class="content">
@@ -83,6 +86,7 @@
 				{onRefreshPw}
 				{onDisconnect}
 				{onConnect}
+				{onAuthDone}
 			/>
 		{:else if view === 'devices'}
 			<Devices {onConnect} />

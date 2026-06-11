@@ -18,7 +18,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::events::{ConnPhase, PlayInfo};
 use crate::native_view;
 use crate::process;
-use crate::state::{AppState, PlaySession, Restream};
+use crate::state::{AppState, PlaySession, RenderSeed, Restream};
 use crate::util::{client_auto_fps, connect_target};
 use crate::viewer;
 
@@ -29,12 +29,31 @@ mod hold;
 /// returns so a connect that fails after auth (but before `state.plays` insert)
 /// doesn't orphan the viewer's UDP/WS tasks or the native renderer process — the
 /// same orphaned-renderer class that causes the Pi input-stutter (see MEMORY).
-fn teardown_partial(view: viewer::Viewer, children: Vec<Option<Child>>) {
+/// Children go through `stop_render_child` (SIGTERM + grace), never a bare kill:
+/// SIGKILLing a renderer mid-EGL-bind wedges WebKitGTK's shared Mali GL input on
+/// RK3588 (see `stop_render_child`). Also drops the per-id GTK state created
+/// earlier (in-app container / single-surface GL renderer) — ids are never
+/// reused, so skipping that leaks a hidden child window per failed connect.
+async fn teardown_partial(
+	app: &AppHandle,
+	id: u64,
+	single_surface: bool,
+	view: viewer::Viewer,
+	children: Vec<Option<Child>>,
+) {
 	view.stop();
 	for mut c in children.into_iter().flatten() {
-		let _ = c.kill();
-		let _ = c.wait();
+		stop_render_child(&mut c);
 	}
+	#[cfg(all(unix, not(target_os = "macos")))]
+	{
+		if single_surface {
+			crate::render::teardown_single_surface(app, id).await;
+		}
+		crate::render::destroy_native_container(app, id);
+	}
+	#[cfg(not(all(unix, not(target_os = "macos"))))]
+	let _ = (app, id, single_surface);
 }
 
 /// Client: connect to a host, start receiving its video (embedded WebCodecs
@@ -65,7 +84,8 @@ pub(crate) async fn start_remote_play(
 	// the session-menu UI (the host still validates + degrades if it can't encode it).
 	let codec = std::env::var("PULSAR_FORCE_CODEC").unwrap_or(codec);
 
-	let (mut sess, peer_label) = connect_target(&node, &target).await?;
+	let disc = state.discovery.lock().unwrap().clone();
+	let (mut sess, peer_label) = connect_target(&node, disc, &target).await?;
 	// Real connection phase: the transport is now actually established (direct P2P or
 	// relay). Tell the Connecting screen so it reflects the truth instead of guessing.
 	let transport = match sess.transport() {
@@ -80,17 +100,69 @@ pub(crate) async fn start_remote_play(
 			transport: transport.clone(),
 		},
 	);
-	if !crate::auth::client_authenticate(
-		&mut sess,
-		&app,
-		&pw_pending,
-		&next_auth,
-		&peer_label,
-	)
-	.await?
+	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
+		.await?
 	{
 		return Err("Bağlantı reddedildi.".into());
 	}
+	// Default codec ("auto"): prefer H.265, but only when the HOST can actually encode
+	// it — asked over the session (validated, hardware-only caps) BEFORE this client
+	// writes its decoder SDP, so the SDP and the stream the host starts can never
+	// disagree. Timeout/old host/empty caps → H.264 (universally encodable).
+	let host_caps = tokio::time::timeout(
+		std::time::Duration::from_secs(2),
+		pulsar_core::service::query_stream_caps(&mut sess),
+	)
+	.await
+	.ok()
+	.and_then(|r| r.ok())
+	.unwrap_or_default();
+	tracing::info!(codecs = ?host_caps.codecs, encoders = ?host_caps.encoders, features = ?host_caps.features, "host caps received");
+	// Media-over-session: carry the RTP inside the encrypted session (ONE external
+	// socket — the same hole the control channel punched; symmetric NAT then works
+	// via the relay). Only when the host advertises it; old hosts stream direct.
+	let mos = host_caps
+		.features
+		.iter()
+		.any(|f| f == pulsar_core::service::media::FEAT_MOS);
+	let host_nack = host_caps
+		.features
+		.iter()
+		.any(|f| f == pulsar_core::service::media::FEAT_NACK);
+	// This client's DECODE caps (startup probe). Unknown (probe still running /
+	// macOS stub failure) → assume the universal software pair.
+	let client_codecs: Vec<String> = {
+		let probed = state.local_caps.lock().unwrap().clone();
+		match probed {
+			Some(lc) if !lc.decoders.is_empty() => lc
+				.decoders
+				.iter()
+				.filter(|d| d.ok)
+				.map(|d| d.codec.clone())
+				.collect(),
+			_ => vec!["h264".to_string(), "h265".to_string()],
+		}
+	};
+	// Negotiated set = host-encodable ∩ client-decodable; "auto" picks by quality
+	// (av1 > h265 > h264). The SDP is written from this AFTER the pick, so the codec
+	// on the wire and the client's decoder can never disagree.
+	let allowed: Vec<String> = host_caps
+		.codecs
+		.iter()
+		.filter(|c| client_codecs.iter().any(|d| d == *c))
+		.cloned()
+		.collect();
+	let codec = if codec.is_empty() || codec == "auto" {
+		["av1", "h265", "h264"]
+			.iter()
+			.find(|c| allowed.iter().any(|a| a == **c))
+			.map(|c| c.to_string())
+			.unwrap_or_else(|| "h264".to_string())
+	} else {
+		codec
+	};
+	tracing::info!(%codec, ?allowed, "stream codec resolved");
+
 	// Same machine? (loopback P2P) → control would feed back, so flag it.
 	let local = matches!(sess.transport(), Transport::Direct)
 		&& sess
@@ -103,7 +175,7 @@ pub(crate) async fn start_remote_play(
 	// rejected connection). The host streams to the viewer's ephemeral UDP port.
 	// `mut` is used on Linux (forward_audio_to_loopback for the native audio player).
 	#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-	let mut view = viewer::start()
+	let mut view = viewer::start(mos)
 		.await
 		.map_err(|e| format!("video alıcı başlatılamadı: {e}"))?;
 	let ws_port = view.ws_port;
@@ -148,6 +220,9 @@ pub(crate) async fn start_remote_play(
 	#[allow(unused_mut, unused_assignments)]
 	let mut render_child: Option<Child> = None;
 	let overlay_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> = Arc::new(Mutex::new(None));
+	let caps_line: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+	// Stdin-only renderer state remembered for a codec-switch respawn re-push.
+	let render_seed: Arc<Mutex<RenderSeed>> = Arc::new(Mutex::new(RenderSeed::default()));
 	// Linux/X11: the embedded webview (WebKitGTK WebCodecs) can't hardware-decode here — it
 	// would software-decode + glitch AND add a webview hop to the video path. So the native
 	// mpv renderer (rkmpp) is the DEFAULT. We first try the moonlight-style SINGLE SURFACE
@@ -216,7 +291,9 @@ pub(crate) async fn start_remote_play(
 							let app2 = app.clone();
 							let posted = app
 								.run_on_main_thread(move || {
-									let _ = tx.send(crate::render::install_single_surface(&app2, id, sdp_s));
+									let _ = tx.send(crate::render::install_single_surface(
+										&app2, id, sdp_s,
+									));
 								})
 								.is_ok();
 							match (posted, rx.await) {
@@ -231,7 +308,18 @@ pub(crate) async fn start_remote_play(
 							single_surface = true;
 							video_port = vport;
 						} else {
-							let wid = crate::render::window_xid(&app).await;
+							let toplevel = crate::render::window_xid(&app).await;
+							// In-app container: a pass-through child GdkWindow the renderer embeds
+							// into. The frontend positions it over the session tab's content area
+							// (`native_view_rect`), so the video renders INSIDE the app — tabs and
+							// chrome stay visible/clickable — instead of covering the whole window.
+							// Falls back to the toplevel XID (old full-window embed) and then to a
+							// standalone renderer window if there's no XID at all.
+							let container = match toplevel {
+								Some(_) => crate::render::create_native_container(&app, id).await,
+								None => None,
+							};
+							let wid = container.or(toplevel);
 							// DEFAULT Linux renderer: `pulsar-render` — a SINGLE-SURFACE native
 							// renderer doing rkmpp video + the egui overlay in ONE child window of the
 							// app (`--wid`). The overlay is a child of the app window, so it moves/
@@ -265,16 +353,50 @@ pub(crate) async fn start_remote_play(
 								video_port = vport;
 								mpv_sdp = Some(sdp.clone());
 								mpv_wid = wid;
+								// Seed the egui overlay: host caps (filters its codec/encoder
+								// rows) + the active request (so it doesn't show "Otomatik"
+								// while an explicit codec/encoder is live).
+								{
+									use std::io::Write as _;
+									let enc = if encoder.is_empty() { "auto" } else { &encoder };
+									let line = format!(
+										"caps codecs={} encoders={} codec={} encoder={} conn={}",
+										allowed.join(","),
+										host_caps.encoders.join(","),
+										codec,
+										enc,
+										if transport == "relay" { "Relay" } else { "P2P" }
+									);
+									if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
+										let _ = writeln!(si, "{line}");
+										// Seed the overlay's Ses section with the session's
+										// starting audio policy (game mode mutes the host).
+										let _ = writeln!(
+											si,
+											"audio tx=1 mute={} mic=0",
+											if game_mode { 1 } else { 0 }
+										);
+									}
+									*caps_line.lock().unwrap() = line;
+									render_seed.lock().unwrap().audio =
+										Some((true, game_mode, false));
+								}
 							} else {
 								// mpv fallback (no overlay). Deterministic per-id IPC socket.
-								let ipc = std::env::temp_dir().join(format!("pulsar-mpv-{id}.sock"));
+								let ipc =
+									std::env::temp_dir().join(format!("pulsar-mpv-{id}.sock"));
 								if let Some(c) = native_view::spawn_mpv(&sdp, wid, &ipc) {
 									native_child = Some(c);
 									video_port = vport;
 									mpv_ipc_sock = Some(ipc.clone());
 									mpv_sdp = Some(sdp.clone());
 									mpv_wid = wid;
-									crate::render::start_mpv_ipc_stats(&app, id, ipc);
+									crate::render::start_mpv_ipc_stats(
+										&app,
+										id,
+										ipc,
+										wid.is_none(),
+									);
 								}
 							}
 						}
@@ -298,7 +420,14 @@ pub(crate) async fn start_remote_play(
 	if !game_id.is_empty() {
 		if let Err(e) = request_launch(&mut sess, &game_id).await {
 			// Clean up the viewer + native renderer we already brought up before bailing.
-			teardown_partial(view, vec![native_child, render_child]);
+			teardown_partial(
+				&app,
+				id,
+				single_surface,
+				view,
+				vec![native_child, render_child],
+			)
+			.await;
 			return Err(e.to_string());
 		}
 	}
@@ -322,19 +451,39 @@ pub(crate) async fn start_remote_play(
 	// "Auto" fps targets the client's display refresh (nearest of 30/60/120).
 	let auto_fps = client_auto_fps(&app).await;
 	let (req_w, req_h, req_fps, req_kbps) = if native && cfg!(target_os = "linux") {
-		let g = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+		let g = |k: &str, d: u32| {
+			std::env::var(k)
+				.ok()
+				.and_then(|v| v.parse().ok())
+				.unwrap_or(d)
+		};
 		if render_child.is_some() {
 			// Native zero-copy single-surface renderer (rkmpp→DRM_PRIME→EGL): sustains a full
 			// stream easily. Default 1080p; fps follows the client's display refresh (auto).
-			(g("PULSAR_W", 1920), g("PULSAR_H", 1080), g("PULSAR_FPS", auto_fps), g("PULSAR_KBPS", 15_000))
+			(
+				g("PULSAR_W", 1920),
+				g("PULSAR_H", 1080),
+				g("PULSAR_FPS", auto_fps),
+				g("PULSAR_KBPS", 15_000),
+			)
 		} else if vidsink_bin_path.is_some() {
 			// Native zero-copy vidsink (rkmpp→DRM_PRIME→EGL): proven 468 fps @1080p / 264 @1440p
 			// on this Pi, so it easily sustains a full stream. Default 1080p; auto fps.
-			(g("PULSAR_W", 1920), g("PULSAR_H", 1080), g("PULSAR_FPS", auto_fps), g("PULSAR_KBPS", 15_000))
+			(
+				g("PULSAR_W", 1920),
+				g("PULSAR_H", 1080),
+				g("PULSAR_FPS", auto_fps),
+				g("PULSAR_KBPS", 15_000),
+			)
 		} else {
 			// mpv fallback (no DRM_PRIME→EGL interop → HW-downloads every frame): keep the light
 			// 540p30 cap so it can keep up / not overflow the socket.
-			(g("PULSAR_W", 960), g("PULSAR_H", 540), g("PULSAR_FPS", 30), g("PULSAR_KBPS", 6_000))
+			(
+				g("PULSAR_W", 960),
+				g("PULSAR_H", 540),
+				g("PULSAR_FPS", 30),
+				g("PULSAR_KBPS", 6_000),
+			)
 		}
 	} else {
 		(0, 0, 0, 0) // defer to the host config
@@ -365,10 +514,19 @@ pub(crate) async fn start_remote_play(
 		// degrades if the chosen encoder+codec can't actually do them.
 		hdr: std::env::var_os("PULSAR_HDR").is_some(),
 		yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
+		decode_codecs: client_codecs.clone(),
+		media_over_session: mos,
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
 		// Clean up the viewer + native renderer we already brought up before bailing.
-		teardown_partial(view, vec![native_child, render_child]);
+		teardown_partial(
+			&app,
+			id,
+			single_surface,
+			view,
+			vec![native_child, render_child],
+		)
+		.await;
 		return Err(e.to_string());
 	}
 
@@ -377,7 +535,9 @@ pub(crate) async fn start_remote_play(
 	// The viewer forwards the received audio datagrams to a loopback port ffmpeg listens on.
 	#[cfg(target_os = "linux")]
 	let audio_native: Option<Child> = if native && req.transmit_audio && audio_port > 0 {
-		match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| s.local_addr().map(|a| a.port())) {
+		match std::net::UdpSocket::bind("127.0.0.1:0")
+			.and_then(|s| s.local_addr().map(|a| a.port()))
+		{
 			Ok(lp) => {
 				let ff = process::ffmpeg_bin(&app);
 				match native_view::spawn_native_audio(&ff, lp) {
@@ -419,6 +579,33 @@ pub(crate) async fn start_remote_play(
 
 	// Side-channel queue (clipboard / chat / file / mic audio → host).
 	let (data_tx, data_rx) = tokio::sync::mpsc::channel::<DataMsg>(512);
+	// Push our identity image to the host (client → host direction; the host's
+	// connections list shows it next to our id). Queued here and drained by
+	// hold_session's data_rx → send_data like any side-channel message, so it goes
+	// out right after the session is up. On a blocking thread — resolving the
+	// avatar may decode a full-size wallpaper, too slow for this async fn. Honors
+	// the avatar_mode setting (anonymous = nothing sent); best-effort, no error path.
+	{
+		let tx = data_tx.clone();
+		let app_av = app.clone();
+		let (mode, name) = {
+			let cfg = state.config.lock().unwrap();
+			let n = cfg.device_name.trim();
+			let name = if n.is_empty() || n == "Pulsar Cihazı" {
+				pulsar_core::discovery::os_display_name()
+			} else {
+				n.to_string()
+			};
+			(cfg.avatar_mode.clone(), name)
+		};
+		// Name first (tiny, instant); the avatar may take a blocking decode.
+		let _ = tx.try_send(DataMsg::PeerName(name));
+		tokio::task::spawn_blocking(move || {
+			if let Some(png) = crate::avatar::avatar_png(&app_av, &mode) {
+				let _ = tx.try_send(DataMsg::Avatar(png));
+			}
+		});
+	}
 	// Live stream changes from the session menu (resolution / encoder) → re-request.
 	let (restream_tx, restream_rx) = tokio::sync::mpsc::channel::<Restream>(8);
 	let mic = Arc::new(Mutex::new(None));
@@ -440,6 +627,14 @@ pub(crate) async fn start_remote_play(
 		encoder_h,
 		codec_h,
 		game_mode,
+		client_codecs.clone(),
+		overlay_stdin.clone(),
+		mos,
+		host_nack,
+		req_w,
+		req_h,
+		req_fps,
+		req_kbps,
 	));
 
 	state.plays.lock().unwrap().insert(
@@ -460,6 +655,10 @@ pub(crate) async fn start_remote_play(
 			vidsink_rotate: vidsink_rotate_init,
 			render_child,
 			render_stdin: overlay_stdin,
+			video_port,
+			game_mode,
+			caps_line,
+			render_seed,
 		},
 	);
 	Ok(PlayInfo {
@@ -470,6 +669,10 @@ pub(crate) async fn start_remote_play(
 		local,
 		native,
 		embedded: single_surface,
+		// The UI gates codec options on the NEGOTIATED set (host ∩ client).
+		host_codecs: allowed,
+		host_encoders: host_caps.encoders,
+		client_codecs,
 	})
 }
 
@@ -482,7 +685,7 @@ pub(crate) async fn start_remote_play(
 /// if it doesn't exit promptly. No-op-different on non-unix (plain kill — Windows has no shared-GL
 /// wedge and the renderer there is a separate top-level).
 #[cfg(unix)]
-fn stop_render_child(child: &mut std::process::Child) {
+pub(crate) fn stop_render_child(child: &mut std::process::Child) {
 	unsafe {
 		libc::kill(child.id() as i32, libc::SIGTERM);
 	}
@@ -498,7 +701,7 @@ fn stop_render_child(child: &mut std::process::Child) {
 	let _ = child.wait();
 }
 #[cfg(not(unix))]
-fn stop_render_child(child: &mut std::process::Child) {
+pub(crate) fn stop_render_child(child: &mut std::process::Child) {
 	let _ = child.kill();
 	let _ = child.wait();
 }
@@ -520,6 +723,7 @@ pub(crate) async fn stop_stream(
 		play.viewer.stop();
 		if let Some(mut mic) = play.mic.lock().unwrap().take() {
 			let _ = mic.kill();
+			let _ = mic.wait(); // reap — kill alone leaves a unix zombie until app exit
 		}
 		// Close the native renderer's fullscreen/embedded `--wid` window, if any. GRACEFUL
 		// (SIGTERM-first, see stop_render_child) so the GL/EGL teardown runs and WebKit's input
@@ -571,6 +775,9 @@ pub(crate) async fn stop_stream(
 	// Tear down the Linux single-surface renderer (libmpv→GLArea), if this session used it.
 	#[cfg(all(unix, not(target_os = "macos")))]
 	crate::render::teardown_single_surface(&app, id).await;
+	// Drop the in-app video container (the renderer child inside it is already dead).
+	#[cfg(all(unix, not(target_os = "macos")))]
+	crate::render::destroy_native_container(&app, id);
 	let _ = &app; // used by teardown on Linux; silence unused elsewhere
 	Ok(())
 }

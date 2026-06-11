@@ -3,6 +3,8 @@
 	import type { Config } from '$lib/types';
 	import { ui, saveUi } from '$lib/settings.svelte';
 	import { t } from '$lib/i18n.svelte';
+	import { isTauri } from '$lib/api';
+	import pkg from '../../../../package.json';
 
 	let {
 		config = $bindable(),
@@ -13,6 +15,16 @@
 		saveConfig: () => void;
 		setAvatar: (mode: string) => void;
 	} = $props();
+
+	// The shipped version comes from the Tauri shell (tauri.conf / Cargo.toml);
+	// the browser mock falls back to package.json's.
+	let version = $state(pkg.version);
+	if (isTauri) {
+		import('@tauri-apps/api/app')
+			.then((m) => m.getVersion())
+			.then((v) => (version = v))
+			.catch(() => {});
+	}
 </script>
 
 <div class="srow">
@@ -46,7 +58,7 @@
 </div>
 <div class="srow">
 	<div class="st"><b>{t('settings.version')}</b><span>{t('settings.versionDesc')}</span></div>
-	<span class="mono ver">Pulsar v1.0.0</span>
+	<span class="mono ver">Pulsar v{version}</span>
 </div>
 
 <style>

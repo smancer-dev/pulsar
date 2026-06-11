@@ -3,7 +3,7 @@
 // the connect/disconnect lifecycle. Kept out of the route component so the shell
 // markup stays small; behavior is identical to the inline version it replaced.
 
-import { api, setFullscreen } from '$lib/api';
+import { api, isTauri, onPlayEnded, onPlayReady, setFullscreen } from '$lib/api';
 import { recordConnection } from '$lib/peers.svelte';
 import { ui } from '$lib/settings.svelte';
 import { t } from '$lib/i18n.svelte';
@@ -21,6 +21,9 @@ export type Session = {
 	audioWsPort?: number;
 	native?: boolean;
 	embedded?: boolean;
+	/** Host's validated stream caps (empty = unknown) — gates the session-menu options. */
+	hostCodecs?: string[];
+	hostEncoders?: string[];
 	// For a local host-game tab: the game's stop command, run when this tab closes.
 	// Per-session (not a shared global) so closing one tab never stops another game.
 	stopCmd?: string;
@@ -28,12 +31,30 @@ export type Session = {
 
 const STREAM_PORT = 9000;
 
+// Known core connect errors arrive as raw English Rust strings (ConnError) — map them
+// to friendly Turkish copy for the connect flash (substring match so wrapped/formatted
+// variants still hit). Unknown/already-Turkish messages fall through verbatim.
+function friendlyConnectError(raw: string): string {
+	const m = raw.toLowerCase();
+	if (m.includes('relay did not respond'))
+		return 'Aktarıcı sunucuya ulaşılamadı — internet bağlantınızı ve aktarıcı ayarını kontrol edin.';
+	if (m.includes('could not be reached via the relay'))
+		return 'Cihaza ulaşılamadı — çevrimdışı olabilir ya da kimlik hatalı.';
+	if (m.includes('not registered with a relay yet'))
+		return 'Henüz çevrimiçi değilsiniz — önce çevrimiçi olun.';
+	if (m.includes('p2p connection failed'))
+		return 'Doğrudan bağlantı kurulamadı ve aktarıcı kullanımı kapalı (Ağ ayarlarına bakın).';
+	if (m.includes('network is unreachable') || m.includes('connection refused') || m.includes('timed out'))
+		return 'Hedefe bağlanılamadı — adresi ve ağ bağlantınızı kontrol edin.';
+	return raw;
+}
+
 type Deps = {
 	/** Current default connect mode (from the shell's mode toggle). */
 	getMode: () => 'remote' | 'game';
 	/** Called when a connection attempt finishes (success or fail) so the shell can
-	 * dismiss its password prompt. */
-	onAuthDone: () => void;
+	 * dismiss THAT target's password prompt (others may still be pending). */
+	onAuthDone: (targetId: string) => void;
 };
 
 export class SessionManager {
@@ -49,6 +70,23 @@ export class SessionManager {
 
 	constructor(deps: Deps) {
 		this.#deps = deps;
+		// The Connecting screen holds until the stream is REALLY up (first decoded
+		// frames — `play-ready`), so the user never lands on a black session.
+		onPlayReady((playId) => this.#activateByPlayId(playId));
+		// A session can die during the connecting-hold window (after start_remote_play
+		// resolves but before play-ready) — Session.svelte isn't mounted yet to see
+		// `play-ended` then, so close the tab here regardless of phase. (Local host-game
+		// tabs carry playId -1 and can never match.)
+		onPlayEnded((playId) => {
+			const s = this.sessions.find((x) => x.playId === playId);
+			if (s) this.endSession(s.tabId);
+		});
+	}
+
+	#activateByPlayId(playId: number) {
+		this.sessions = this.sessions.map((s) =>
+			s.playId === playId && s.phase === 'connecting' ? { ...s, phase: 'active' } : s
+		);
 	}
 
 	#patch(tabId: number, patch: Partial<Session>) {
@@ -97,21 +135,32 @@ export class SessionManager {
 				api.stopStream(info.id).catch(() => {});
 				return;
 			}
+			// Connected, but HOLD the Connecting screen until first frames arrive
+			// (`play-ready`, video+audio pipelines start together host-side). A
+			// fallback timer activates anyway so a stats-less edge case can't hang.
+			// Browser dev (mock api): Tauri events never fire (no play-ready, no
+			// play-ended) and the mock always returns id 0 — substitute the tab id so
+			// concurrent mock tabs don't share a play id, and activate immediately
+			// instead of sitting on Connecting for the full fallback window.
+			const pid = isTauri ? info.id : tabId;
 			this.#patch(tabId, {
-				playId: info.id,
-				phase: 'active',
+				playId: pid,
+				phase: isTauri ? 'connecting' : 'active',
 				conn: info.transport === 'relay' ? 'relay' : 'direct',
 				wsPort: info.ws_port,
 				audioWsPort: info.audio_ws_port,
 				native: info.native,
-				embedded: info.embedded
+				embedded: info.embedded,
+				hostCodecs: info.host_codecs ?? [],
+				hostEncoders: info.host_encoders ?? []
 			});
+			setTimeout(() => this.#activateByPlayId(pid), 10_000);
 			recordConnection(target.id, target.name, useMode === 'game' ? 'console' : 'pc');
 		} catch (e) {
-			this.connectErr = e instanceof Error ? e.message : String(e);
+			this.connectErr = friendlyConnectError(e instanceof Error ? e.message : String(e));
 			this.removeTab(tabId);
 		} finally {
-			this.#deps.onAuthDone(); // this connection's prompt (if any) is done
+			this.#deps.onAuthDone(target.id); // this connection's prompt (if any) is done
 		}
 	};
 

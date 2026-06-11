@@ -17,6 +17,7 @@ use crate::connection::{ConnError, Session};
 mod auth;
 mod client;
 mod host;
+pub mod media;
 mod wire;
 
 pub use auth::{
@@ -24,11 +25,11 @@ pub use auth::{
 	send_auth, AuthOutcome, ClientAuth, HostAuth,
 };
 pub use client::{
-	decode_data, is_pong, request_games, request_launch, request_stream, send_bye, send_data,
-	send_input, send_keepalive,
+	decode_data, is_pong, query_stream_caps, request_games, request_launch, request_stream,
+	send_bye, send_data, send_input, send_keepalive,
 };
 pub use host::{serve, serve_with, DataHandlers};
-pub use wire::{DataMsg, GameInfo, InputEvent, QualityPref, StreamReq};
+pub use wire::{DataMsg, FsEntry, GameInfo, InputEvent, QualityPref, StreamCaps, StreamReq};
 
 /// If a connected peer sends nothing (not even a keepalive) for this long, treat
 /// it as gone and tear the session down. Clients send a keepalive every ~2s.
@@ -60,6 +61,15 @@ enum Msg {
 	/// (kill ffmpeg, release held input) instead of waiting out the keepalive timeout.
 	Bye,
 	Ok,
+	/// Client → host: which codecs can this host actually stream (validated encode
+	/// caps, best-first)? Lets the client resolve its "auto" codec to what the host
+	/// will really send — the client writes its decoder SDP BEFORE the stream starts,
+	/// so the two must never disagree.
+	QueryStreamCaps,
+	/// Host → client reply to `QueryStreamCaps`: validated codec + encoder ids,
+	/// preference-ordered. An old host never replies (unknown message) — the client
+	/// times out and falls back to H.264.
+	StreamCaps(wire::StreamCaps),
 }
 
 /// A short, human-typable one-time password like `7yf2-qk` (no ambiguous chars).
