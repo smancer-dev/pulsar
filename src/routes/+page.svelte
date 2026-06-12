@@ -23,6 +23,7 @@
 	import SessionView from '$lib/screens/Session.svelte';
 	import Approve from '$lib/screens/Approve.svelte';
 	import Connections from '$lib/screens/Connections.svelte';
+	import FilesWindow from '$lib/screens/FilesWindow.svelte';
 	import HostChat from '$lib/screens/HostChat.svelte';
 	import Chrome from './page/Chrome.svelte';
 	import Tabs from './page/Tabs.svelte';
@@ -50,8 +51,16 @@
 		typeof window !== 'undefined' &&
 		!!(window as unknown as { __CONNECTIONS__?: boolean }).__CONNECTIONS__;
 
-	// Either popup window short-circuits the main-app bootstrap (no relay re-register).
-	const isPopup = !!approveReq || connReq;
+	// When opened as a per-session file-manager window (one per remote-play session,
+	// label `files-<id>`), render only the standalone Files screen.
+	const filesReq = (() => {
+		if (typeof window === 'undefined') return null;
+		const inj = (window as unknown as { __FILES__?: { id: number; peer: string } }).__FILES__;
+		return inj ? { id: Number(inj.id), peer: String(inj.peer ?? '') } : null;
+	})();
+
+	// Any popup window short-circuits the main-app bootstrap (no relay re-register).
+	const isPopup = !!approveReq || connReq || !!filesReq;
 
 	type View = 'home' | 'devices' | 'gaming' | 'settings';
 
@@ -420,6 +429,8 @@
 	<Approve id={approveReq.id} peer={approveReq.peer} pw={approveReq.pw} />
 {:else if connReq}
 	<Connections />
+{:else if filesReq}
+	<FilesWindow playId={filesReq.id} peer={filesReq.peer} />
 {:else}
 	<HostChat />
 	<div class="desktop">

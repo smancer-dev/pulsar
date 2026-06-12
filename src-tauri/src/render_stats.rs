@@ -142,6 +142,11 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 							let _ = app.emit("overlay-chat", (id, text.to_string()));
 						}
 					}
+					// The overlay's Files box: open the per-session file-manager window
+					// (the frontend supplies the peer label and invokes the command).
+					(Some("ov"), Some("files")) => {
+						let _ = app.emit("overlay-files", id);
+					}
 					// Native Files (remote pane): list / download / upload requests.
 					(Some("ov"), Some(op @ ("fsls" | "fsget" | "fssend"))) => {
 						let path = line.splitn(3, ' ').nth(2).unwrap_or("").trim();

@@ -9,7 +9,9 @@
 	// asynchronously as the `fs-entries` event). Both sides speak HOME-relative
 	// paths with `/` separators ("" = home) and are jailed to HOME in Rust, so the
 	// breadcrumb math here never has to care about OS path syntax.
-	type Props = { playId: number; onBack: () => void };
+	// `onBack` absent = standalone mode (the dedicated per-session files WINDOW):
+	// no back button and the panes fill the window instead of the menu's 320px.
+	type Props = { playId: number; onBack?: () => void };
 	let { playId, onBack }: Props = $props();
 
 	let localPath = $state('');
@@ -165,10 +167,12 @@
 	</div>
 {/snippet}
 
-<div class="files">
-	<button class="files-back" onclick={onBack}>
-		<Icon name="arrowRight" size={14} class="flip" />{t('session.back')}
-	</button>
+<div class="files" class:standalone={!onBack}>
+	{#if onBack}
+		<button class="files-back" onclick={onBack}>
+			<Icon name="arrowRight" size={14} class="flip" />{t('session.back')}
+		</button>
+	{/if}
 	<div class="panes">
 		<section class="pane" aria-label={t('files.local')}>
 			<div class="pane-head"><Icon name="monitor" size={13} />{t('files.local')}</div>
@@ -205,6 +209,11 @@
 		display: flex;
 		flex-direction: column;
 		height: 320px;
+	}
+	.files.standalone {
+		height: 100%;
+		min-height: 0;
+		flex: 1;
 	}
 	.files-back {
 		align-self: flex-start;

@@ -66,6 +66,8 @@ static MIC_ON: AtomicBool = AtomicBool::new(false);
 /// Native Chat view state: the conversation (me, text) fed over stdin
 /// (`chat in|out <text>` — the app echoes BOTH directions, single source of truth).
 static CHAT_LOG: std::sync::Mutex<Vec<(bool, String)>> = std::sync::Mutex::new(Vec::new());
+/// Host messages not yet seen in the overlay Chat view — badge on the open button.
+static CHAT_UNREAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Native Files view, REMOTE pane: (HOME-relative path, rows) from `fsjson …`.
 static FS_REMOTE: std::sync::Mutex<(String, Vec<crate::overlay::FsRow>)> =
 	std::sync::Mutex::new((String::new(), Vec::new()));
@@ -265,6 +267,9 @@ pub fn run() {
 						log.push((dir == "out", text));
 						if log.len() > 200 {
 							log.remove(0);
+						}
+						if dir != "out" {
+							CHAT_UNREAD.fetch_add(1, Ordering::SeqCst);
 						}
 					}
 				}
@@ -774,6 +779,12 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		state.audio_mute = AUDIO_MUTE.load(Ordering::SeqCst);
 		state.mic_on = MIC_ON.load(Ordering::SeqCst);
 		state.chat = CHAT_LOG.lock().unwrap().clone();
+		// Reading the chat clears the unread badge; new arrivals while the Chat view
+		// is on screen count as read immediately.
+		if open && ov_ui.view == overlay::View::Chat {
+			CHAT_UNREAD.store(0, Ordering::SeqCst);
+		}
+		state.chat_unread = CHAT_UNREAD.load(Ordering::SeqCst);
 		{
 			let (p, rows) = &*FS_REMOTE.lock().unwrap();
 			state.fs_remote_path = p.clone();
@@ -1209,6 +1220,7 @@ fn emit_cmd(state: &mut OverlayState, c: OverlayCmd) {
 		OverlayCmd::FsLs(p) => println!("ov fsls {p}"),
 		OverlayCmd::FsGet(p) => println!("ov fsget {p}"),
 		OverlayCmd::FsSend(p) => println!("ov fssend {p}"),
+		OverlayCmd::OpenFiles => println!("ov files"),
 	}
 	let _ = std::io::stdout().flush();
 }

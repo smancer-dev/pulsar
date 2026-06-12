@@ -13,6 +13,7 @@
 	"stream.fpsRequested": "requested",
 	"title.approve": "Pulsar — Connection request",
 	"title.connections": "Pulsar — Connections",
+	"title.files": "Pulsar — Files",
 	"tray.show": "Show Pulsar",
 	"tray.quit": "Quit",
 	"stream.mbitTarget": "Mbit target",

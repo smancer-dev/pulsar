@@ -55,6 +55,9 @@ pub struct OverlayState {
 	pub mic_on: bool,
 	/// Chat log (me, text) — fed by the app over stdin (`chat in|out …`).
 	pub chat: Vec<(bool, String)>,
+	/// Host messages received while the Chat view wasn't open — drawn as a count
+	/// badge on the overlay-open button; the backend zeroes it on Chat entry.
+	pub chat_unread: usize,
 	/// Whether the relayed Enter key fired this frame (sends the chat composer).
 	pub chat_enter: bool,
 	/// Remote file pane: current HOME-relative path + its entries (`fsjson` stdin).
@@ -137,6 +140,7 @@ impl Default for OverlayState {
 			audio_mute: false,
 			mic_on: false,
 			chat: Vec::new(),
+			chat_unread: 0,
 			chat_enter: false,
 			fs_remote_path: String::new(),
 			fs_remote: Vec::new(),
@@ -156,6 +160,9 @@ pub enum OverlayCmd {
 	FsLs(String),
 	FsGet(String),
 	FsSend(String),
+	/// Open the app-side per-session file-manager WINDOW (`ov files`) — the overlay's
+	/// Files box routes here instead of the cramped in-overlay two-pane view.
+	OpenFiles,
 }
 
 fn codecs_opts() -> [(&'static str, &'static str); 4] {
@@ -393,7 +400,13 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 		.show(ui, |ui| {
 			for (i, (icon, label, v)) in boxes.iter().enumerate() {
 				if cat_box(ui, icon, label) {
-					*view = *v;
+					// Files opens the app's dedicated per-session window — the in-overlay
+					// two-pane view was too cramped (kept as code for a potential fallback).
+					if *v == View::Files {
+						cmds.push(OverlayCmd::OpenFiles);
+					} else {
+						*view = *v;
+					}
 				}
 				if i % 2 == 1 {
 					ui.end_row();
@@ -1045,6 +1058,24 @@ pub fn draw_open_button(ctx: &egui::Context, st: &OverlayState) -> bool {
 			p.circle_stroke(c, 12.0, egui::Stroke::new(1.6, ring.gamma_multiply(0.55)));
 			p.circle_stroke(c, 7.5, egui::Stroke::new(1.8, ring.gamma_multiply(0.8)));
 			p.circle_filled(c, 3.2, ring);
+			// Unread host-chat badge (top-right): a red disc with the count, like an
+			// app-icon notification. Cleared by the backend when the Chat view opens.
+			if st.chat_unread > 0 {
+				let n = if st.chat_unread > 9 {
+					"9+".to_string()
+				} else {
+					st.chat_unread.to_string()
+				};
+				let bc = egui::pos2(rect.right() - 5.0, rect.top() + 5.0);
+				p.circle_filled(bc, 7.5, egui::Color32::from_rgb(225, 60, 70));
+				p.text(
+					bc,
+					egui::Align2::CENTER_CENTER,
+					n,
+					egui::FontId::proportional(9.5),
+					egui::Color32::WHITE,
+				);
+			}
 			clicked = resp.clicked();
 		});
 	clicked

@@ -2,10 +2,10 @@
 	import Icon from '$lib/Icon.svelte';
 	import StatsPanel from './StatsPanel.svelte';
 	import Chat from './Chat.svelte';
-	import Files from './Files.svelte';
 	import VideoMenu from './VideoMenu.svelte';
 	import SessionActions from './SessionActions.svelte';
 	import { t } from '$lib/i18n.svelte';
+	import { api } from '$lib/api';
 	import { type Encoder, type VideoCodec } from '$lib/settings.svelte';
 
 	// Parsec-style floating control handle + expandable menu (remote-desktop full menu). The
@@ -231,8 +231,6 @@
 
 			{#if panel === 'chat'}
 				<Chat {messages} bind:chatInput bind:chatBox onSend={onSendChat} onBack={() => (panel = 'menu')} />
-			{:else if panel === 'files'}
-				<Files {playId} onBack={() => (panel = 'menu')} />
 			{:else}
 				<div class="m-cols">
 					<VideoMenu
@@ -270,7 +268,7 @@
 						{onFullscreen}
 						{onSendClipboard}
 						{onPickFile}
-						onOpenFiles={() => (panel = 'files')}
+						onOpenFiles={() => api.openFilesWindow(playId, target.name).catch(() => {})}
 						{onToggleMic}
 						{onOpenChat}
 						{onToggleFloating}

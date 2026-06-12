@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import Modal from '$lib/Modal.svelte';
-	import { savedPeers, addPeer, removePeer, toggleFav, fmtPeerId, normalizeId } from '$lib/peers.svelte';
+	import { savedPeers, addPeer, updatePeer, removePeer, toggleFav, fmtPeerId, normalizeId } from '$lib/peers.svelte';
 	import { api, type LanDevice } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
@@ -12,12 +12,30 @@
 
 	let q = $state('');
 
-	// add-device form: name + id-or-IP + an image (a built-in icon or an upload).
+	// add/edit-device form: name + id-or-IP + an image (a built-in icon or an
+	// upload). `editing` holds the ORIGINAL id of the device being edited
+	// (null = adding a new one); the same modal serves both.
 	let adding = $state(false);
+	let editing = $state<string | null>(null);
 	let newName = $state('');
 	let newId = $state('');
 	let newImage = $state('icon:monitor');
 	let fileInput = $state<HTMLInputElement | null>(null);
+
+	function openEdit(d: { id: string; name: string; image?: string }) {
+		editing = d.id;
+		newName = d.name;
+		newId = fmtPeerId(d.id);
+		newImage = d.image ?? 'icon:monitor';
+		adding = true;
+	}
+	function closeForm() {
+		adding = false;
+		editing = null;
+		newName = '';
+		newId = '';
+		newImage = 'icon:monitor';
+	}
 
 	const ICONS = ['monitor', 'devices', 'gaming', 'keyboard'] as const;
 
@@ -88,11 +106,12 @@
 	function submitAdd() {
 		const id = normalizeId(newId);
 		if (!id) return;
-		addPeer(newName.trim() || t('devices.defaultName'), id, 'pc', newImage);
-		newName = '';
-		newId = '';
-		newImage = 'icon:monitor';
-		adding = false;
+		if (editing) {
+			updatePeer(editing, { name: newName, newId: id, image: newImage });
+		} else {
+			addPeer(newName.trim() || t('devices.defaultName'), id, 'pc', newImage);
+		}
+		closeForm();
 	}
 
 	function relTime(ms: number | null): string {
@@ -123,7 +142,7 @@
 </div>
 
 {#if adding}
-	<Modal title={t('devices.add')} onClose={() => (adding = false)}>
+	<Modal title={editing ? t('devices.editTitle') : t('devices.add')} onClose={closeForm}>
 		<div class="addform">
 			<span class="fl">{t('devices.name')}</span>
 			<div class="field"><input bind:value={newName} placeholder={t('devices.name')} aria-label={t('devices.name')} /></div>
@@ -159,8 +178,8 @@
 				<span class="imghint">{t('devices.imageHint')}</span>
 			</div>
 			<div class="factions">
-				<button class="btn btn-ghost" onclick={() => (adding = false)}>{t('devices.cancel')}</button>
-				<button class="btn btn-primary" onclick={submitAdd}>{t('devices.addBtn')}</button>
+				<button class="btn btn-ghost" onclick={closeForm}>{t('devices.cancel')}</button>
+				<button class="btn btn-primary" onclick={submitAdd}>{editing ? t('devices.saveBtn') : t('devices.addBtn')}</button>
 			</div>
 		</div>
 	</Modal>
@@ -214,6 +233,9 @@
 				<div class="actions">
 					<button class="btn btn-ghost connect" onclick={() => onConnect({ name: d.name, id: d.id })}>
 						{t('devices.connect')}
+					</button>
+					<button class="rm" aria-label={t('devices.edit')} title={t('devices.edit')} onclick={() => openEdit(d)}>
+						<Icon name="edit" size={14} />
 					</button>
 					<button class="rm" aria-label={t('devices.remove')} onclick={() => removePeer(d.id)}>
 						<Icon name="x" size={15} />

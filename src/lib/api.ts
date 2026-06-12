@@ -44,6 +44,7 @@ export {
 	onOverlayClose,
 	onOverlayChat,
 	onOverlayFs,
+	onOverlayFiles,
 	onWindowBlur,
 	onPlayEnded,
 	onPlayReady,

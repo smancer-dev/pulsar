@@ -17,6 +17,8 @@ static STATS: Mutex<[f32; 4]> = Mutex::new([0.0; 4]); // fps, latency_ms, decode
 /// Chat log fed over stdin (`chat in|out <text>`, same protocol as linux.rs) —
 /// shown in the overlay's Chat view while it is open.
 static CHAT_LOG: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
+/// Host messages not yet seen in the overlay Chat view — badge on the open button.
+static CHAT_UNREAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Files view, REMOTE pane: (HOME-relative path, rows) from `fsjson …` (same
 /// one-line JSON as linux.rs) — copied into the overlay state each frame.
 static FS_REMOTE: Mutex<(String, Vec<overlay::FsRow>)> = Mutex::new((String::new(), Vec::new()));
@@ -52,6 +54,9 @@ fn stdin_control() {
 				log.push((dir == "out", text));
 				if log.len() > 200 {
 					log.remove(0);
+				}
+				if dir != "out" {
+					CHAT_UNREAD.fetch_add(1, Ordering::SeqCst);
 				}
 			}
 		} else if let Some(json) = l.strip_prefix("fsjson ") {
@@ -115,6 +120,12 @@ impl eframe::App for Overlay {
 				self.state.mbps = s[3];
 			}
 			self.state.chat = CHAT_LOG.lock().unwrap().clone();
+			// Reading the chat clears the unread badge (this backend only paints while
+			// the overlay is open — the badge itself shows on Windows/Linux paths).
+			if self.ov_ui.view == overlay::View::Chat {
+				CHAT_UNREAD.store(0, Ordering::SeqCst);
+			}
+			self.state.chat_unread = CHAT_UNREAD.load(Ordering::SeqCst);
 			{
 				let (p, rows) = &*FS_REMOTE.lock().unwrap();
 				self.state.fs_remote_path = p.clone();
@@ -148,6 +159,7 @@ impl eframe::App for Overlay {
 					OverlayCmd::FsLs(p) => println!("ov fsls {p}"),
 					OverlayCmd::FsGet(p) => println!("ov fsget {p}"),
 					OverlayCmd::FsSend(p) => println!("ov fssend {p}"),
+					OverlayCmd::OpenFiles => println!("ov files"),
 				}
 			}
 			use std::io::Write;

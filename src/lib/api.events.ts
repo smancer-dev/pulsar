@@ -97,6 +97,10 @@ export const onOverlayChat = (cb: (e: { id: number; text: string }) => void) =>
  * 'fsls' (list dir) / 'fsget' (download) / 'fssend' (upload a LOCAL absolute path). */
 export const onOverlayFs = (cb: (e: { id: number; op: string; path: string }) => void) =>
 	listenTo<[number, string, string]>('overlay-fs', (p) => cb({ id: p[0], op: p[1], path: p[2] }));
+/** Client (native overlay): the Files box was clicked — open the per-session
+ * file-manager WINDOW (the session supplies the peer label). Payload = play id. */
+export const onOverlayFiles = (cb: (id: number) => void) =>
+	listenTo<number>('overlay-files', (id) => cb(id));
 /** The Pulsar window lost focus — close the overlay so the focus-gated combo can't strand it. */
 export const onWindowBlur = (cb: () => void) => listenTo<null>('window-blur', () => cb());
 /** Client: the stream is REALLY up (first decoded frames/bitrate) — the Connecting

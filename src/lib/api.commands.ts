@@ -59,6 +59,9 @@ export const api = {
 		>('list_connections'),
 	/** Host: reveal/focus the dedicated connections window (sidebar button). */
 	showConnections: () => invoke<void>('show_connections'),
+	/** Client: open (or focus) the per-session file-manager window for play `id`;
+	 * `peer` decorates the title/header so multi-session windows stay tellable apart. */
+	openFilesWindow: (id: number, peer: string) => invoke<void>('open_files_window', { id, peer }),
 	/** Host: revoke/restore a connected client's CONTROL ("Sadece izleme") — its
 	 * input is dropped while set; the stream keeps running. */
 	setViewOnly: (peer: string, on: boolean) => invoke<void>('set_view_only', { peer, on }),

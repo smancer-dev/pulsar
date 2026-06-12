@@ -22,6 +22,7 @@ mod commands;
 mod connections;
 mod events;
 mod files;
+mod files_window;
 mod i18n;
 mod fs_browse;
 mod host;
@@ -60,6 +61,7 @@ use commands::{
 	steam_path,
 };
 use connections::{list_connections, set_view_only, show_connections};
+use files_window::open_files_window;
 use fs_browse::local_ls;
 use host::go_online;
 use io_cmds::{
@@ -423,6 +425,7 @@ pub fn run() {
 			disconnect_peer,
 			list_connections,
 			show_connections,
+			open_files_window,
 			set_view_only,
 			input_pointer,
 			input_button,

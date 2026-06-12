@@ -66,6 +66,8 @@ static POINTER: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
 /// Chat log fed over stdin (`chat in|out <text>`, same protocol as linux.rs) —
 /// shown in the overlay's Chat view while it is open.
 static CHAT_LOG: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
+/// Host messages not yet seen in the overlay Chat view — badge on the open button.
+static CHAT_UNREAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Files view, REMOTE pane: (HOME-relative path, rows) from `fsjson …` (same
 /// one-line JSON as linux.rs) — copied into the overlay state each frame.
 static FS_REMOTE: Mutex<(String, Vec<crate::overlay::FsRow>)> =
@@ -328,6 +330,9 @@ fn stdin_control() {
 				log.push((dir == "out", text));
 				if log.len() > 200 {
 					log.remove(0);
+				}
+				if dir != "out" {
+					CHAT_UNREAD.fetch_add(1, Ordering::SeqCst);
 				}
 			}
 		} else if let Some(json) = l.strip_prefix("fsjson ") {
@@ -749,6 +754,12 @@ impl Renderer {
 		// Run the shared overlay UI; collect interaction commands.
 		let ostate = &mut self.ostate;
 		ostate.chat = CHAT_LOG.lock().unwrap().clone();
+		// Reading the chat clears the unread badge; new arrivals while the Chat view
+		// is on screen count as read immediately.
+		if self.ov_ui.view == crate::overlay::View::Chat {
+			CHAT_UNREAD.store(0, Ordering::SeqCst);
+		}
+		ostate.chat_unread = CHAT_UNREAD.load(Ordering::SeqCst);
 		{
 			let (p, rows) = &*FS_REMOTE.lock().unwrap();
 			ostate.fs_remote_path = p.clone();
@@ -796,6 +807,7 @@ impl Renderer {
 				crate::overlay::OverlayCmd::FsLs(p) => println!("ov fsls {p}"),
 				crate::overlay::OverlayCmd::FsGet(p) => println!("ov fsget {p}"),
 				crate::overlay::OverlayCmd::FsSend(p) => println!("ov fssend {p}"),
+				crate::overlay::OverlayCmd::OpenFiles => println!("ov files"),
 			}
 		}
 		use std::io::Write;
@@ -942,6 +954,7 @@ impl Renderer {
 			events: Vec::new(),
 			..Default::default()
 		};
+		self.ostate.chat_unread = CHAT_UNREAD.load(Ordering::SeqCst);
 		let ostate = &self.ostate;
 		let out = self.egui_ctx.run(raw, |ctx| {
 			if stats_hud {

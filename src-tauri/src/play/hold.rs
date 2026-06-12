@@ -446,6 +446,8 @@ pub(super) async fn hold_session(
 	// frontend so it tears the session down — release the evdev/input grab + drop the tab —
 	// instead of freezing on mpv's last frame with the keyboard/mouse still captured.
 	let _ = app_ev.emit("play-ended", id);
+	// The session's file-manager window (if open) dies with the session.
+	crate::files_window::close(&app_ev, id);
 	let _ = pulsar_core::service::send_bye(&mut sess).await;
 	drop(sess);
 }

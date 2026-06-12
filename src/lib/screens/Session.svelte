@@ -22,6 +22,7 @@
 		onOverlayClose,
 		onOverlayChat,
 		onOverlayFs,
+		onOverlayFiles,
 		onFsEntries,
 		onPeerAvatar,
 		onPeerName,
@@ -583,6 +584,11 @@
 			api
 				.renderFs(playId, JSON.stringify({ path: e.path, entries: e.entries }))
 				.catch(() => {});
+		}));
+		// Overlay Files box → the dedicated per-session file window (we own the
+		// peer label; the renderer only signals the click).
+		scope.add(onOverlayFiles((id) => {
+			if (id === playId) api.openFilesWindow(playId, displayTarget.name).catch(() => {});
 		}));
 		// End/Close carry the play id — gate like onOverlayChat/onOverlayFs, or one
 		// native overlay's End would terminate EVERY mounted session tab.

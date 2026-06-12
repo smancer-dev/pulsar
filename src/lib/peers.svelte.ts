@@ -170,6 +170,37 @@ export function addPeer(name: string, id: string, cat: PeerCategory = 'pc', imag
 	return true;
 }
 
+/** Edit a saved device in place. A changed id re-keys the entry (merging into an
+ * existing entry of that id if one exists — saved wins, history stamp kept). */
+export function updatePeer(
+	id: string,
+	patch: { name?: string; newId?: string; image?: string }
+): boolean {
+	const nid = normalizeId(id);
+	const p = peers.find((x) => x.id === nid);
+	if (!p) return false;
+	if (patch.name !== undefined && patch.name.trim()) p.name = patch.name.trim();
+	if (patch.image !== undefined) p.image = patch.image;
+	if (patch.newId !== undefined) {
+		const target = normalizeId(patch.newId);
+		if (target && target !== nid) {
+			const clash = peers.find((x) => x.id === target);
+			if (clash) {
+				clash.saved = clash.saved || p.saved;
+				clash.fav = clash.fav || p.fav;
+				clash.name = p.name;
+				clash.image = p.image ?? clash.image;
+				clash.lastConnected = Math.max(clash.lastConnected ?? 0, p.lastConnected ?? 0) || null;
+				peers.splice(peers.indexOf(p), 1);
+			} else {
+				p.id = target;
+			}
+		}
+	}
+	persist();
+	return true;
+}
+
 /** Whether `id` is already in the address book — reactive (reads the $state list),
  * so Save buttons can hide themselves the moment a device is saved. */
 export function isSaved(id: string): boolean {
