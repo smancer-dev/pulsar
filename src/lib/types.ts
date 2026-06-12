@@ -10,6 +10,8 @@ export interface Config {
 	device_name: string;
 	language: Language;
 	unattended_access: boolean;
+	/** Optional persistent connect password (alternative to the rotating one-time password). */
+	connect_password?: string;
 	/** Stream this host's audio to the client (host → client). */
 	transmit_audio: boolean;
 	/** Silence this host's local speakers while streaming. */

@@ -125,7 +125,7 @@
 		{:else if tab === 'network'}
 			<NetworkTab bind:config {saved} {saveConfig} {setMode} />
 		{:else if tab === 'security'}
-			<SecurityTab bind:config {toggleUnattended} />
+			<SecurityTab bind:config {toggleUnattended} {saveConfig} />
 		{:else}
 			<GeneralTab bind:config {saveConfig} {setAvatar} />
 		{/if}

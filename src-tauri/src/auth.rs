@@ -14,6 +14,77 @@ use tokio::sync::oneshot;
 use crate::events::{AuthPrompt, SessionEvent};
 use crate::state::AppState;
 
+/// Per-peer auth throttle (brute-force / prompt-spam protection). Both passwords
+/// (the rotating one-time pw and the persistent connect password) and the
+/// Allow/Deny popup are remotely triggerable, so a hostile peer could spam
+/// attempts or popups. After [`MAX_FAILURES`] wrong passwords the peer is locked
+/// out for [`LOCKOUT`]: further sessions are rejected *without* opening a popup.
+/// Keyed by the peer label (relay id or socket addr) — process-lifetime map, tiny.
+pub(crate) mod throttle {
+	use std::collections::HashMap;
+	use std::sync::{LazyLock, Mutex};
+	use std::time::{Duration, Instant};
+
+	const MAX_FAILURES: u32 = 5;
+	const LOCKOUT: Duration = Duration::from_secs(300);
+	/// Failure counts reset if the last failure is older than this (a genuinely
+	/// forgetful user shouldn't accumulate into a lockout across hours).
+	const WINDOW: Duration = Duration::from_secs(600);
+
+	static ATTEMPTS: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
+		LazyLock::new(|| Mutex::new(HashMap::new()));
+
+	/// Throttle key: a relay id passes through, but a direct peer's label is
+	/// "ip:port" with a NEW EPHEMERAL PORT per connection — keyed verbatim, an
+	/// attacker reconnecting per guess would never accumulate failures. Strip
+	/// the port so the counter sticks to the address.
+	fn key(peer: &str) -> &str {
+		match peer.rsplit_once(':') {
+			Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+			_ => peer,
+		}
+	}
+
+	/// Remaining lockout, if the peer is currently locked out.
+	pub(crate) fn locked_out(peer: &str) -> Option<Duration> {
+		let peer = key(peer);
+		let g = ATTEMPTS.lock().unwrap();
+		let (n, at) = g.get(peer)?;
+		if *n >= MAX_FAILURES {
+			let end = *at + LOCKOUT;
+			let now = Instant::now();
+			if now < end {
+				return Some(end - now);
+			}
+		}
+		None
+	}
+
+	/// Record a wrong-password attempt; returns true when the peer just crossed
+	/// into lockout (callers should stop prompting and deny).
+	pub(crate) fn record_failure(peer: &str) -> bool {
+		let peer = key(peer);
+		let mut g = ATTEMPTS.lock().unwrap();
+		let e = g.entry(peer.to_string()).or_insert((0, Instant::now()));
+		if e.1.elapsed() > WINDOW {
+			*e = (0, Instant::now());
+		}
+		e.0 += 1;
+		e.1 = Instant::now();
+		if e.0 >= MAX_FAILURES {
+			tracing::warn!(peer, failures = e.0, "auth throttle: peer locked out");
+			true
+		} else {
+			false
+		}
+	}
+
+	/// Successful auth clears the slate.
+	pub(crate) fn clear(peer: &str) {
+		ATTEMPTS.lock().unwrap().remove(key(peer));
+	}
+}
+
 /// Spawn the Allow/Deny popup as a separate, focused, always-on-top window that
 /// requests the user's attention (they may be in another app).
 pub(crate) fn open_approval_window(app: &AppHandle, id: u64, peer: &str, pw_status: &str) {
@@ -76,7 +147,7 @@ pub(crate) async fn race_host_auth(
 	pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
 	next_req: &Arc<AtomicU64>,
 	peer: &str,
-	host_pw: &str,
+	accepted_pws: &[String],
 ) -> bool {
 	let id = next_req.fetch_add(1, Ordering::SeqCst);
 	let (tx, mut rx) = oneshot::channel::<bool>();
@@ -106,8 +177,15 @@ pub(crate) async fn race_host_auth(
 				deadline.as_mut().reset(tokio::time::Instant::now() + IDLE);
 				match msg {
 					ClientAuth::Password(pw) => {
-						if !host_pw.is_empty() && pw == host_pw {
+						// Either the rotating one-time password or the persistent
+						// connect password (Settings → Güvenlik) unlocks the session.
+						if accepted_pws.iter().any(|a| !a.is_empty() && pw == *a) {
 							break true; // correct password → accept
+						}
+						// Wrong: count it. Crossing the throttle threshold ends the
+						// race as a deny (no more retries for this peer for a while).
+						if throttle::record_failure(peer) {
+							break false;
 						}
 						let _ = need_password(session).await; // wrong → ask client to retry
 					}

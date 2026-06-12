@@ -255,6 +255,9 @@ fn stdin_control() {
 				*HINT.lock().unwrap() =
 					Some((rest.to_string(), std::time::Instant::now(), TOAST_SECS));
 			}
+		} else if let Some(rest) = l.strip_prefix("fit ") {
+			// View-fit mode pushed by the frontend (persisted value / respawn re-seed).
+			present::set_fit(rest.trim());
 		} else if let Some(rest) = l.strip_prefix("hostenc ") {
 			*HOST_ENC.lock().unwrap() = rest.trim().to_string();
 		} else if let Some(rest) = l.strip_prefix("statshud ") {
@@ -724,6 +727,9 @@ impl Renderer {
 		self.ostate.stats_hud = STATS_HUD.load(Ordering::SeqCst);
 		self.ostate.overlay_btn = OVERLAY_BTN.load(Ordering::SeqCst);
 		self.ostate.btn_pos = *OVBTN_POS.lock().unwrap();
+		// Live fit-mode truth (the Display section's highlight follows whatever set
+		// it last — the overlay click or a `fit` stdin line). Linux-parity.
+		self.ostate.fit = present::fit_label().to_string();
 
 		// Build RawInput (ppp = 1.0, so points == physical px). Drain the wndproc events.
 		let events = std::mem::take(&mut *EGUI_EVENTS.lock().unwrap());
@@ -773,6 +779,9 @@ impl Renderer {
 						// (`statshud`/`ovbtn`) just confirms the same value later.
 						"statshud" => STATS_HUD.store(val == "on", Ordering::SeqCst),
 						"ovbtn" => OVERLAY_BTN.store(val == "on", Ordering::SeqCst),
+						// View fit is renderer-local (instant Blt rect change) + forwarded
+						// so the frontend mirrors/persists it — Linux-parity (linux.rs).
+						"fit" => present::set_fit(&val),
 						_ => {}
 					}
 					println!("ov set {field} {val}");
@@ -838,11 +847,12 @@ impl Renderer {
 		}
 		let (iw, ih) = (self.src_w as f32, self.src_h as f32);
 		let (ow, oh) = (self.width as f32, self.height as f32);
-		let scale = (ow / iw).min(oh / ih);
-		let (vw, vh) = (iw * scale, ih * scale);
-		let (vx, vy) = ((ow - vw) / 2.0, (oh - vh) / 2.0);
-		let px = vx + nx * vw;
-		let py = vy + ny * vh;
+		// Same fit-mode rects the video Blt uses — the cursor must track the video
+		// through fit/stretch/original (original = a center CROP, so the source
+		// position maps through the visible source window, not the full frame).
+		let ((sx, sy, sw, sh), (dx, dy, dw, dh)) = present::fit_rects(iw, ih, ow, oh);
+		let px = dx + (nx * iw - sx) * (dw / sw.max(1.0));
+		let py = dy + (ny * ih - sy) * (dh / sh.max(1.0));
 		let pos = egui::pos2(
 			(px - self.cursor_hot.0) / OVERLAY_PPP,
 			(py - self.cursor_hot.1) / OVERLAY_PPP,

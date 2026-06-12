@@ -56,14 +56,22 @@
 	<div class="field" style="width:150px">
 		<Icon name="plug" size={15} />
 		{#if config}
+			<!-- Unset (0) renders as EMPTY with a "random" placeholder — a literal 0 in
+			     the box read like a (nonsense) port. Clearing the field returns to the
+			     random-port default; the live port shows on Home's ip:port line. -->
 			<input
 				type="number"
-				min="0"
+				min="1"
 				max="65535"
-				bind:value={config.node_port}
-				onchange={saveConfig}
+				value={config.node_port > 0 ? config.node_port : ''}
+				onchange={(e) => {
+					if (!config) return;
+					const v = parseInt((e.currentTarget as HTMLInputElement).value, 10);
+					config.node_port = Number.isFinite(v) && v > 0 && v <= 65535 ? v : 0;
+					saveConfig();
+				}}
 				aria-label={t('settings.nodePort')}
-				placeholder="0"
+				placeholder={t('settings.portRandom')}
 				style="font-family:var(--font-mono);font-size:12.5px;width:90px"
 			/>
 		{/if}

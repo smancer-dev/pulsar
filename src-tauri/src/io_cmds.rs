@@ -356,6 +356,7 @@ pub(crate) fn set_window_fullscreen(
 	state: State<'_, AppState>,
 	on: bool,
 ) -> Result<(), String> {
+	tracing::info!(on, "set_window_fullscreen");
 	if on {
 		if let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) {
 			// Save only when ENTERING from windowed state: an on=true while already

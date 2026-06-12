@@ -16,5 +16,6 @@
 	"tray.show": "Show Pulsar",
 	"tray.quit": "Quit",
 	"stream.mbitTarget": "Mbit target",
-	"stream.msEncode": "ms encode"
+	"stream.msEncode": "ms encode",
+	"err.portInUse": "Port is in use — pick a different one in Settings → Network, or leave it empty"
 }

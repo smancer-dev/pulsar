@@ -16,7 +16,7 @@ use pulsar_core::service::{
 	InputEvent, QualityPref, StreamReq,
 };
 use pulsar_core::{Discovery, Node};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager as _, State};
 use tokio::sync::oneshot;
 
 use crate::audio_io::spawn_audio_player;
@@ -99,15 +99,13 @@ pub(crate) async fn go_online(
 			n.to_string()
 		}
 	};
-	// Prefer the user's configured node port (Settings → Ağ), else the well-known
-	// port so bare-IP direct connects can reach us; fall back to an ephemeral port if
-	// it's already taken (e.g. a 2nd instance/seat).
-	let want_port = if cfg.node_port != 0 {
-		cfg.node_port
-	} else {
-		pulsar_core::proto::DEFAULT_NODE_PORT
-	};
-	let preferred = SocketAddr::new(local.ip(), want_port);
+	// Port policy: an explicitly configured port (Settings → Ağ) is binding — if it's
+	// already taken, FAIL with a clear error instead of silently sliding to another
+	// port (the user pinned it for a firewall rule / port-forward; a silent ephemeral
+	// fallback made those rules quietly useless). Unset (0) = a RANDOM ephemeral port
+	// every launch — the LAN beacon and the Home screen's "ip:port" always carry the
+	// real port, so discovery/direct connects keep working.
+	let preferred = SocketAddr::new(local.ip(), cfg.node_port);
 	// Persisted per-user identity → the relay hands back the SAME 9-digit ID every
 	// launch (stable device ID). Different OS users keep separate identity files.
 	let identity = pulsar_core::crypto::Identity::load_or_create(identity_path(&app));
@@ -121,15 +119,14 @@ pub(crate) async fn go_online(
 	.await
 	{
 		Ok(n) => n,
-		Err(_) => Node::bind_with_identity(
-			local,
-			relay,
-			cfg.network_mode,
-			announce_name.clone(),
-			identity,
-		)
-		.await
-		.map_err(|e| e.to_string())?,
+		Err(e) if cfg.node_port != 0 => {
+			return Err(format!(
+				"{} ({}): {e}",
+				crate::i18n::t("err.portInUse"),
+				cfg.node_port
+			));
+		}
+		Err(e) => return Err(e.to_string()),
 	};
 
 	// Start LAN discovery BEFORE registering so it works even when the relay is
@@ -239,26 +236,57 @@ pub(crate) async fn go_online(
 				// Auth: a correct up-front password is accepted immediately. Otherwise
 				// the host's Allow/Deny popup AND the client's password prompt appear
 				// at the SAME time; accept on whichever lands first (so the host can
-				// approve passwordlessly). Unattended hosts auto-allow.
+				// approve passwordlessly). Unattended hosts auto-allow. The persistent
+				// connect password (Settings → Güvenlik) is accepted alongside the
+				// one-time password; wrong attempts are rate-limited per peer, and a
+				// locked-out peer is rejected up front WITHOUT an Allow/Deny popup
+				// (otherwise repeated connects could spam attention-grabbing windows).
 				let approved = if require_auth {
-					let host_pw = password_store.lock().unwrap().clone();
-					if !host_pw.is_empty() && provided == host_pw {
-						true
+					if let Some(rem) = crate::auth::throttle::locked_out(&peer) {
+						tracing::warn!(%peer, secs = rem.as_secs(), "auth throttled: rejecting without prompt");
+						false
 					} else {
-						let _ = need_password(&mut session).await;
-						crate::auth::race_host_auth(
-							&mut session,
-							&app_h,
-							&pending,
-							&next_req,
-							&peer,
-							&host_pw,
-						)
-						.await
+						let host_pw = password_store.lock().unwrap().clone();
+						let custom_pw = app_h
+							.state::<crate::state::AppState>()
+							.config
+							.lock()
+							.unwrap()
+							.connect_password
+							.clone();
+						let accepted: Vec<String> = [host_pw, custom_pw]
+							.into_iter()
+							.filter(|p| !p.is_empty())
+							.collect();
+						if !accepted.is_empty() && accepted.iter().any(|a| provided == *a) {
+							true
+						} else {
+							if !provided.is_empty() {
+								// A wrong up-front guess counts toward the throttle too.
+								crate::auth::throttle::record_failure(&peer);
+							}
+							if crate::auth::throttle::locked_out(&peer).is_some() {
+								false
+							} else {
+								let _ = need_password(&mut session).await;
+								crate::auth::race_host_auth(
+									&mut session,
+									&app_h,
+									&pending,
+									&next_req,
+									&peer,
+									&accepted,
+								)
+								.await
+							}
+						}
 					}
 				} else {
 					true
 				};
+				if approved {
+					crate::auth::throttle::clear(&peer);
+				}
 				if !approved {
 					let _ = reject(&mut session).await;
 					tracing::info!(%peer, "connection rejected");

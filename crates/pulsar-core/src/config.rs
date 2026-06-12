@@ -47,6 +47,12 @@ pub struct Config {
 	pub language: Language,
 	/// Allow unattended (gözetimsiz) access to this host.
 	pub unattended_access: bool,
+	/// Optional PERSISTENT connect password (empty = none). Accepted alongside the
+	/// rotating one-time password — a client presenting either is let in without
+	/// the Allow/Deny prompt. Wrong attempts are rate-limited host-side (the
+	/// password is a standing secret, so it must not be brute-forceable).
+	#[serde(default)]
+	pub connect_password: String,
 	/// Stream this host's audio to the client (host → client). When off, the
 	/// session is video-only. See [`crate::audio`] for how game mode overrides this.
 	/// `#[serde(default)]` so configs written before this field still load.
@@ -96,6 +102,7 @@ impl Default for Config {
 			device_name: default_device_name(),
 			language: Language::Tr,
 			unattended_access: false,
+			connect_password: String::new(),
 			transmit_audio: true,
 			mute_host_audio: false,
 			audio_input: String::new(),

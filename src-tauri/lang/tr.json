@@ -16,5 +16,6 @@
 	"tray.show": "Pulsar'ı Göster",
 	"tray.quit": "Çıkış",
 	"stream.mbitTarget": "Mbit hedef",
-	"stream.msEncode": "ms kodlama"
+	"stream.msEncode": "ms kodlama",
+	"err.portInUse": "Port kullanımda — Ayarlar → Ağ bölümünden farklı bir port seçin ya da boş bırakın"
 }

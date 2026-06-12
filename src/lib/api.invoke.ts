@@ -14,6 +14,7 @@ const DEFAULT_CONFIG: Config = {
 	device_name: 'Bu Cihaz',
 	language: 'tr',
 	unattended_access: false,
+	connect_password: '',
 	transmit_audio: true,
 	mute_host_audio: false,
 	audio_input: '',
