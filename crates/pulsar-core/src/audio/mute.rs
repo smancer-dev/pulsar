@@ -55,8 +55,16 @@ pub fn set_host_muted(mute: bool) -> Result<(), String> {
 	}
 }
 
-/// Windows host-mute via Core Audio (`IMMDeviceEnumerator` →
-/// `IAudioEndpointVolume::SetMute` on the default render endpoint).
+/// Windows host-mute via Core Audio on the default render endpoint.
+///
+/// NOT `SetMute`: WASAPI **loopback capture taps the engine mix POST-mute** — an
+/// endpoint mute zeroes the loopback stream too, so the "silence the host, keep
+/// streaming" contract broke (the client went silent the moment the host muted;
+/// observed live Pi←PC). Master VOLUME, by contrast, is applied after the loopback
+/// tap (OBS's desktop capture famously ignores the system volume slider), so we
+/// silence the host by dropping the master volume to 0 and restore the user's
+/// previous level on unmute. ALSO clears the endpoint mute flag while "muted":
+/// a user-muted endpoint would otherwise still kill the stream.
 #[cfg(windows)]
 mod win_mute {
 	use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
@@ -66,6 +74,10 @@ mod win_mute {
 	use windows::Win32::System::Com::{
 		CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 	};
+
+	/// The user's master-volume scalar saved when we silenced the host, restored on
+	/// unmute. NaN-free sentinel: negative = nothing saved (we never silenced).
+	static SAVED_VOL: std::sync::Mutex<f32> = std::sync::Mutex::new(-1.0);
 
 	pub fn set_default_render_muted(mute: bool) -> Result<(), String> {
 		unsafe {
@@ -80,9 +92,26 @@ mod win_mute {
 			let volume: IAudioEndpointVolume = device
 				.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
 				.map_err(|e| format!("IAudioEndpointVolume: {e}"))?;
-			volume
-				.SetMute(mute, std::ptr::null())
-				.map_err(|e| format!("SetMute: {e}"))?;
+			if mute {
+				// Save the user's level once (a repeated mute call must not overwrite
+				// it with the 0 we set last time), then silence via volume.
+				let mut saved = SAVED_VOL.lock().unwrap();
+				if *saved < 0.0 {
+					*saved = volume.GetMasterVolumeLevelScalar().unwrap_or(-1.0);
+				}
+				volume
+					.SetMasterVolumeLevelScalar(0.0, std::ptr::null())
+					.map_err(|e| format!("SetMasterVolumeLevelScalar: {e}"))?;
+				// Keep the endpoint UN-muted so the loopback capture stays live.
+				let _ = volume.SetMute(false, std::ptr::null());
+			} else {
+				let mut saved = SAVED_VOL.lock().unwrap();
+				if *saved >= 0.0 {
+					let _ = volume.SetMasterVolumeLevelScalar(*saved, std::ptr::null());
+					*saved = -1.0;
+				}
+				let _ = volume.SetMute(false, std::ptr::null());
+			}
 		}
 		Ok(())
 	}

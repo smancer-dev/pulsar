@@ -823,6 +823,7 @@ pub(crate) async fn start_remote_play(
 		req.cursor_external,
 	));
 
+	let audio_is_native = audio_native.is_some();
 	state.plays.lock().unwrap().insert(
 		id,
 		PlaySession {
@@ -851,7 +852,11 @@ pub(crate) async fn start_remote_play(
 		id,
 		transport,
 		ws_port,
-		audio_ws_port,
+		// When the NATIVE audio player runs (Linux ffmpeg→PulseAudio), the webview must
+		// NOT also open the audio WebSocket — on WebKits whose WebCodecs CAN decode Opus
+		// the same stream played twice (native + WebAudio, offset by the webview's
+		// buffering) as a delayed echo. Port 0 = the frontend skips its audio path.
+		audio_ws_port: if audio_is_native { 0 } else { audio_ws_port },
 		local,
 		native,
 		embedded: single_surface,

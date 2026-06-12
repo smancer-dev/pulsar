@@ -517,12 +517,35 @@ unsafe fn win_size(xd: *mut xlib::Display, win: u64) -> (u32, u32) {
 	}
 }
 
+/// Non-fatal Xlib error handler. Xlib's DEFAULT handler prints "X Error of failed
+/// request" and EXITS the process — which killed the renderer mid-session whenever
+/// an async X call hit a stale window id (proven live: `XSetInputFocus` on the
+/// embedding toplevel after a fullscreen toggle re-created it → BadWindow → the
+/// video froze and the overlay stopped taking clicks; only Ctrl+Shift+Q worked).
+/// Every XID we touch (parent, focus_top) is owned by ANOTHER process (the Tauri
+/// GTK window) and can die/respawn at any time, so a stale-id race is unavoidable —
+/// log and carry on; the per-frame geometry/focus logic self-heals next frame.
+unsafe extern "C" fn x_error_ignore(
+	_xd: *mut xlib::Display,
+	ev: *mut xlib::XErrorEvent,
+) -> std::os::raw::c_int {
+	let (code, req) = if ev.is_null() {
+		(0, 0)
+	} else {
+		((*ev).error_code, (*ev).request_code)
+	};
+	eprintln!("pulsar-render: X error ignored (code={code} request={req})");
+	0
+}
+
 unsafe fn real_run(wid: u64, mode: Mode) {
 	let xd = xlib::XOpenDisplay(std::ptr::null());
 	if xd.is_null() {
 		eprintln!("pulsar-render: XOpenDisplay failed");
 		return;
 	}
+	// Survive stale-XID races instead of dying with Xlib's exit-on-error default.
+	xlib::XSetErrorHandler(Some(x_error_ignore));
 	// No `--wid` = STANDALONE: the X11 embed into the app window failed (e.g. the client
 	// runs native Wayland, so the Tauri toplevel has no XID). Then this is its own normal,
 	// WM-managed window — WINDOWED by default (the user maximizes/fullscreens it themself),
