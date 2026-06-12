@@ -145,7 +145,6 @@ pub(super) async fn hold_session(
 			},
 			inbound = sess.recv() => match inbound {
 				Some(bytes) => {
-					last_inbound = std::time::Instant::now();
 					// Media-over-session fast path: [tag][rtp…] frames → forward the raw
 					// RTP datagram to its local consumer (renderer / audio viewer port).
 					// Checked FIRST — these are the highest-rate payloads on the session.
@@ -197,6 +196,12 @@ pub(super) async fn hold_session(
 						}
 						continue;
 					}
+						// Reached only by NON-media (control) datagrams -- the media fast-path
+						// continue-d above. Reset the grab-release watchdog HERE so it tracks CONTROL
+						// liveness (keepalive Pong + any DataMsg), not the video flow: a dead control
+						// link with live video must still trip the timeout below and tear the session
+						// down instead of leaving it frozen-but-grabbed.
+						last_inbound = std::time::Instant::now();
 						if pulsar_core::service::is_pong(&bytes) {
 						if let Some(t0) = ping_at.take() {
 							let rtt = t0.elapsed().as_secs_f64() * 1000.0;

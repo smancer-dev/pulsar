@@ -821,6 +821,9 @@ impl Renderer {
 						"amute" => AUDIO_MUTE.store(val == "on", Ordering::SeqCst),
 						"mic" => MIC_ON.store(val == "on", Ordering::SeqCst),
 						// Voice call = mic + host audio together (paired optimistic update).
+						// ON enables BOTH; OFF drops ONLY the mic and leaves host audio
+						// as-is (it has its own `atx` row). The overlay highlight derives
+						// from MIC_ON alone (overlay::draw_audio) so it stays in sync.
 						"call" => {
 							let on = val == "on";
 							MIC_ON.store(on, Ordering::SeqCst);
@@ -1162,10 +1165,21 @@ impl Renderer {
 				(-1, -1, 1u32, 1u32)
 			}
 			Some((vx, vy, vw, vh)) => (vx, vy, vw as u32, vh as u32),
-			// No viewrect yet: stay PARKED instead of filling the parent — filling first
-			// covered the session top bar until the frontend's first report landed, so
-			// the tabs "appeared late". The frontend always reports on session mount.
-			None => (-1, -1, 1, 1),
+			// No viewrect yet: FILL the parent client area as a safe fallback. Parking the
+			// child 1×1 offscreen here meant that if the frontend's first `viewrect` report
+			// never arrived (lost/late on some session mounts), the video stayed permanently
+			// invisible — the same "connected but nothing renders" failure. Linux fills the
+			// parent by default in this situation; match it. A real `viewrect` still wins the
+			// instant it lands (it switches this arm to the Some branch above), so the only
+			// cost is that the tabs may be briefly covered before that first report — far
+			// better than no video at all.
+			None => {
+				let mut rc = RECT::default();
+				let _ = GetClientRect(self.parent, &mut rc);
+				let w = (rc.right - rc.left).max(1) as u32;
+				let h = (rc.bottom - rc.top).max(1) as u32;
+				(0, 0, w, h)
+			}
 		};
 		if x == self.x && y == self.y && w == self.width && h == self.height {
 			return;

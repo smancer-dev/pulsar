@@ -65,8 +65,14 @@
 		const timer = setInterval(refreshLan, 3000);
 		return () => clearInterval(timer);
 	});
+	// Address-host equality (NOT startsWith — "192.168.1.4" prefix-matches ".40"/".42"):
+	// strip the :port and compare the host exactly, or compare the full addr verbatim.
+	const addrHost = (a: string) => {
+		const i = a.lastIndexOf(':');
+		return i > a.indexOf(']') ? a.slice(0, i) : a; // keep IPv6 (":"-rich) intact unless :port follows
+	};
 	const isOnline = (id: string) =>
-		lan.some((d) => (d.id && normalizeId(d.id) === id) || d.addr.startsWith(id));
+		lan.some((d) => (d.id && normalizeId(d.id) === id) || d.addr === id || addrHost(d.addr) === addrHost(id));
 
 	// Display id input as-is (IPs welcome); a pure 9-digit relay id gets grouped.
 	const tidyId = (v: string) => {

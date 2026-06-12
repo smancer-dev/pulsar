@@ -85,6 +85,13 @@ pub(crate) async fn go_online(
 	// A previous serve loop's sessions may not have torn down cleanly (independent
 	// spawns survive the accept-loop abort) — never carry a stale host-mute over.
 	handlers::reset_mute_all();
+	// Crash-restore: a PRIOR PROCESS that silenced the host output and then died
+	// abnormally (crash / taskkill / tray-quit) without unmuting would leave the
+	// machine stuck at volume 0. Recover the user's saved level from the on-disk
+	// marker now (no-op when there's no marker — the common clean-exit case).
+	// reset_mute_all above already cleared any marker belonging to THIS process, so
+	// this only ever acts on a genuinely stale one.
+	handlers::restore_stale_host_mute();
 	tracing::info!(relay = %cfg.relay, "go_online: resolving relay");
 	let relay = resolve_relay(&cfg.relay)
 		.await
@@ -257,31 +264,53 @@ pub(crate) async fn go_online(
 							.unwrap()
 							.connect_password
 							.clone();
-						let accepted: Vec<String> = [host_pw, custom_pw]
+						let accepted: Vec<String> = [host_pw.clone(), custom_pw]
 							.into_iter()
 							.filter(|p| !p.is_empty())
 							.collect();
+						// Distinguish the two credentials: the ONE-TIME password (`host_pw`)
+						// is single-use and must be rotated the moment it authenticates a
+						// connection, so the same code never unlocks a second one. The
+						// persistent connect password (Settings → Güvenlik) is intentionally
+						// reusable and is NEVER rotated. `matched_otp` is true only when the
+						// provided secret equals the (non-empty) OTP.
+						let matched_otp =
+							|p: &str| !host_pw.is_empty() && p == host_pw;
 						if !accepted.is_empty() && accepted.iter().any(|a| provided == *a) {
+							if matched_otp(&provided) {
+								crate::commands::rotate_session_password(&app_h);
+							}
 							true
 						} else {
+							// Count a NON-EMPTY wrong up-front guess here: otherwise an
+							// attacker who sends one wrong code and then goes silent never
+							// enters the race (it just times out recording nothing), so the
+							// lockout never accumulates — a free uncounted attempt per connect.
+							// An EMPTY provided is the client's automatic "I have no password
+							// yet" probe (the real attempt comes from the password prompt →
+							// race), so it is NOT counted, which also avoids double-counting a
+							// genuine human attempt (client sends empty up-front, then the
+							// typed code in the race).
 							if !provided.is_empty() {
-								// A wrong up-front guess counts toward the throttle too.
 								crate::auth::throttle::record_failure(&peer);
 							}
-							if crate::auth::throttle::locked_out(&peer).is_some() {
-								false
-							} else {
-								let _ = need_password(&mut session).await;
-								crate::auth::race_host_auth(
-									&mut session,
-									&app_h,
-									&pending,
-									&next_req,
-									&peer,
-									&accepted,
-								)
-								.await
+							let _ = need_password(&mut session).await;
+							let outcome = crate::auth::race_host_auth(
+								&mut session,
+								&app_h,
+								&pending,
+								&next_req,
+								&peer,
+								&accepted,
+								&host_pw,
+							)
+							.await;
+							// If the race accepted via the one-time password, rotate it
+							// (single-use) — race_host_auth reports which credential matched.
+							if outcome.matched_one_time {
+								crate::commands::rotate_session_password(&app_h);
 							}
+							outcome.approved
 						}
 					}
 				} else {

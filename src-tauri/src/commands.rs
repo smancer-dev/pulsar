@@ -207,6 +207,29 @@ pub(crate) async fn new_password(state: State<'_, AppState>) -> Result<String, S
 	Ok(pw)
 }
 
+/// Rotate the one-time password after it has successfully authenticated a
+/// connection (single-use security): mint a fresh code, store it, and emit
+/// `session-password` so the Home screen's displayed code updates without a
+/// reconnect. NOT called for the persistent connect password (that one is
+/// intentionally reusable) — only when the rotating OTP was the credential that
+/// matched. No-op when unattended access made the OTP empty (no code to rotate).
+pub(crate) fn rotate_session_password(app: &AppHandle) {
+	use tauri::{Emitter, Manager};
+	let state = app.state::<AppState>();
+	let fresh = {
+		let mut g = state.password.lock().unwrap();
+		if g.is_empty() {
+			return; // unattended (no OTP in use) — nothing to rotate
+		}
+		let pw = gen_password();
+		*g = pw.clone();
+		pw
+	};
+	// Reuse the existing UI refresh channel: the Home screen polls `session_password`,
+	// and this event lets a live screen update immediately on rotation.
+	let _ = app.emit("session-password", fresh);
+}
+
 /// Publish the host's games so connecting clients can list/launch them.
 #[tauri::command]
 pub(crate) async fn publish_games(

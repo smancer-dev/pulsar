@@ -56,11 +56,18 @@
 		api
 			.chatLog()
 			.then((log) => {
+				// Prepend the backlog BEFORE anything onHostChat already delivered in the gap
+				// between listener registration and this async resolve — replacing `history`
+				// wholesale would drop those just-arrived live messages.
 				const seeded: Record<string, Msg[]> = {};
 				for (const [peer, text, me] of log) {
 					(seeded[peer] ??= []).push({ me, text });
 				}
-				history = seeded;
+				const merged: Record<string, Msg[]> = { ...seeded };
+				for (const [peer, live] of Object.entries(history)) {
+					merged[peer] = [...(seeded[peer] ?? []), ...live];
+				}
+				history = merged;
 			})
 			.catch(() => {});
 		// Inbound chat from clients → the per-peer history + an unread badge until

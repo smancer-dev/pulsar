@@ -75,11 +75,15 @@ impl VirtualGamepad for UinputGamepad {
 			events.push(InputEvent::new(EventType::KEY, key.code(), val));
 		}
 		let abs = |axis: AbsoluteAxisType, v: i32| InputEvent::new(EventType::ABSOLUTE, axis.0, v);
+		// evdev Y points down; gamepad up is +, so invert. Clamp to i16::MIN+1 BEFORE
+		// negating: -(i16::MIN) = 32768 overflows the i16 range and exceeds the declared
+		// AbsInfo max (32767) by one, which some consumers reject / wrap. Clamping the
+		// low end to -32767 makes the negated value land exactly on the +32767 max.
+		let inv_y = |v: i16| -(v.max(i16::MIN + 1) as i32);
 		events.push(abs(AbsoluteAxisType::ABS_X, state.left_x as i32));
-		// evdev Y points down; gamepad up is +, so invert.
-		events.push(abs(AbsoluteAxisType::ABS_Y, -(state.left_y as i32)));
+		events.push(abs(AbsoluteAxisType::ABS_Y, inv_y(state.left_y)));
 		events.push(abs(AbsoluteAxisType::ABS_RX, state.right_x as i32));
-		events.push(abs(AbsoluteAxisType::ABS_RY, -(state.right_y as i32)));
+		events.push(abs(AbsoluteAxisType::ABS_RY, inv_y(state.right_y)));
 		events.push(abs(AbsoluteAxisType::ABS_Z, state.left_trigger as i32));
 		events.push(abs(AbsoluteAxisType::ABS_RZ, state.right_trigger as i32));
 		let _ = self.dev.emit(&events);
@@ -96,6 +100,11 @@ const ABS_MAX: i32 = 65535;
 pub struct DesktopInput {
 	pointer: VirtualDevice,
 	keyboard: VirtualDevice,
+	/// Carried-over fractional scroll (in wheel notches). A single small/precision
+	/// wheel delta (< one notch) used to `round()` to 0 and silently do nothing; we
+	/// instead accumulate the remainder so successive fine scrolls eventually move.
+	scroll_acc_v: f64,
+	scroll_acc_h: f64,
 }
 
 impl DesktopInput {
@@ -131,7 +140,12 @@ impl DesktopInput {
 			.name("Pulsar Virtual Keyboard")
 			.with_keys(&keys)?
 			.build()?;
-		Ok(Self { pointer, keyboard })
+		Ok(Self {
+			pointer,
+			keyboard,
+			scroll_acc_v: 0.0,
+			scroll_acc_h: 0.0,
+		})
 	}
 
 	/// Move the pointer to a normalized (0..1) position on the screen.
@@ -182,8 +196,16 @@ impl DesktopInput {
 
 	/// Scroll by a delta (browser wheel pixels → wheel clicks).
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		let v = -(dy / 100.0).round() as i32; // evdev wheel up is +; browser down is +
-		let h = (dx / 100.0).round() as i32;
+		// Accumulate fractional notches so fine/precision scroll (< 100px) isn't lost to
+		// rounding. We keep the leftover sub-notch remainder for the next call; the sign
+		// of the truncation matters, so use trunc() (toward zero) and carry the rest.
+		// evdev wheel up is +, browser down is +, so negate the vertical delta.
+		self.scroll_acc_v += -dy / 100.0;
+		self.scroll_acc_h += dx / 100.0;
+		let v = self.scroll_acc_v.trunc() as i32;
+		let h = self.scroll_acc_h.trunc() as i32;
+		self.scroll_acc_v -= v as f64;
+		self.scroll_acc_h -= h as f64;
 		let mut ev = Vec::new();
 		if v != 0 {
 			ev.push(InputEvent::new(

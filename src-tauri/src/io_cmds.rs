@@ -281,7 +281,14 @@ pub(crate) async fn kbd_capture_start(
 	match tx {
 		Some(tx) => {
 			// `mouse` = also capture the mouse (native-renderer mode, no canvas).
-			kbdhook::enable(app, tx, mouse, id);
+			// Compute the desired suspend state from the authoritative overlay set (the
+			// source of truth, owned here in the Tauri layer — the kbdhook static can't
+			// see it). A re-arm while THIS session's overlay is still on screen must start
+			// SUSPENDED so the evdev grab doesn't eat local input; enable() blindly
+			// clearing SUSPENDED was the desync bug. (Per-id, not "any tab" — another
+			// tab's open overlay must not suspend this one.)
+			let start_suspended = state.overlay_open.lock().unwrap().contains(&id);
+			kbdhook::enable(app, tx, mouse, id, start_suspended);
 			Ok(())
 		}
 		None => Err(crate::i18n::t("err.session").into()),

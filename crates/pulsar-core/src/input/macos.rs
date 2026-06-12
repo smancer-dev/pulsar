@@ -170,6 +170,11 @@ pub struct DesktopInput {
 	held_keys: HashSet<u16>,
 	/// Current modifier mask, kept in sync as modifier keys go down/up.
 	flags: CGEventFlags,
+	/// Carried-over fractional scroll (in lines). Fine/precision wheel deltas (< one
+	/// line) used to `round()` to 0 and do nothing; we accumulate the remainder so
+	/// successive small scrolls eventually move (big deltas behave as before).
+	scroll_acc_v: f64,
+	scroll_acc_h: f64,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -199,6 +204,8 @@ impl DesktopInput {
 			held_buttons: HashSet::new(),
 			held_keys: HashSet::new(),
 			flags: CGEventFlags::empty(),
+			scroll_acc_v: 0.0,
+			scroll_acc_h: 0.0,
 		})
 	}
 
@@ -248,12 +255,20 @@ impl DesktopInput {
 	}
 
 	/// Move the pointer to a normalized (0..1) position on the main display.
+	///
+	/// CGEvent global coordinates live in the **points** space (the desktop's logical
+	/// coordinate system), NOT backing pixels. Using `pixels_wide()/pixels_high()`
+	/// here put clicks at e.g. 2× the right spot on a Retina/scaled display (a 2880px
+	/// backing on a 1440pt display). `CGDisplay::bounds()` is in points, so map the
+	/// normalized position onto its `size` for a correct Retina mapping.
+	///
+	/// TODO(multi-monitor): this maps onto the MAIN display only. A capture of a
+	/// non-primary display would land the pointer on the wrong screen — a full fix
+	/// needs the captured display's bounds/origin threaded through here.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let display = CGDisplay::main();
-		let w = display.pixels_wide() as f64;
-		let h = display.pixels_high() as f64;
-		let px = x.clamp(0.0, 1.0) * w;
-		let py = y.clamp(0.0, 1.0) * h;
+		let bounds = CGDisplay::main().bounds();
+		let px = bounds.origin.x + x.clamp(0.0, 1.0) * bounds.size.width;
+		let py = bounds.origin.y + y.clamp(0.0, 1.0) * bounds.size.height;
 		let ty = self.move_event_type();
 		self.post_mouse(ty, CGPoint::new(px, py));
 	}
@@ -286,8 +301,15 @@ impl DesktopInput {
 
 	/// Scroll by a delta (browser wheel pixels → wheel lines).
 	pub fn scroll(&mut self, dx: f64, dy: f64) {
-		let v = (dy / 100.0).round() as i32; // browser down(+) → scroll down (CG: negative is down)
-		let h = (dx / 100.0).round() as i32;
+		// Accumulate fractional lines so fine/precision scroll (< 100px) isn't lost to
+		// rounding; carry the sub-line remainder to the next call (trunc toward zero
+		// preserves direction).
+		self.scroll_acc_v += dy / 100.0; // browser down(+); negated below for CG's axis
+		self.scroll_acc_h += dx / 100.0;
+		let v = self.scroll_acc_v.trunc() as i32;
+		let h = self.scroll_acc_h.trunc() as i32;
+		self.scroll_acc_v -= v as f64;
+		self.scroll_acc_h -= h as f64;
 		if v == 0 && h == 0 {
 			return;
 		}

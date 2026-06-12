@@ -98,7 +98,8 @@ pub(super) fn release_mute(sid: u64) {
 /// go_online re-run hook: a reconnect aborts the accept loop but the per-session
 /// tasks are independent spawns — one wedged mid-teardown can strand its
 /// MUTE_OWNERS entry and leave the host audio muted forever. A fresh serve loop
-/// has no live sessions yet, so clear the slate and audibly un-mute.
+/// has no live sessions yet, so clear the slate and audibly un-mute to a known-good
+/// baseline (owner set empty + the saved-volume sentinel reset inside set_host_muted).
 pub(super) fn reset_mute_all() {
 	let mut owners = MUTE_OWNERS.lock().unwrap();
 	if !owners.is_empty() {
@@ -107,6 +108,22 @@ pub(super) fn reset_mute_all() {
 		if let Err(e) = pulsar_core::audio::set_host_muted(false) {
 			tracing::warn!("host unmute on go_online failed: {e}");
 		}
+	}
+}
+
+/// Startup crash-restore: a PRIOR process that silenced the host output and then
+/// died abnormally (crash / taskkill / tray-quit) never ran its unmute, so the
+/// machine is stuck at volume 0 with the in-memory saved level gone. The mute
+/// backend persists the user's level to a marker file on the true mute transition
+/// and restores it the first time the mute control is touched in a new process;
+/// this hook makes that "first touch" happen at go_online. With the owner set empty
+/// (a fresh serve loop), the unmute call is a harmless no-op for the volume but
+/// triggers the one-time stale-marker recovery. Best-effort.
+pub(super) fn restore_stale_host_mute() {
+	// Triggers the backend's one-time stale-marker restore (mute.rs); a no-op for a
+	// clean previous exit (no marker) and for the volume when nothing is muted.
+	if let Err(e) = pulsar_core::audio::set_host_muted(false) {
+		tracing::warn!("host mute crash-restore probe failed: {e}");
 	}
 }
 
@@ -152,6 +169,38 @@ fn start_audio_and_mute(
 /// Retransmit ring depth for media-over-session video (packets ≈ a few hundred ms
 /// at 60 fps / 15 Mbit; ~1.5 MB worst case).
 const NACK_RING: usize = 1024;
+
+/// Sane lower bounds + defaults for the resolved stream geometry. The client
+/// request and the host config can BOTH be 0 (request unset → fall to cfg; cfg
+/// never configured → 0), and a 0 here is poison downstream: `-r 0` / GStreamer
+/// `framerate=0/1` make ffmpeg/gst error out, and a 0×0 size reaches the native
+/// NVENC/DXGI capture on Windows (where the `display_size` clamp is compiled out
+/// and only ever shrinks) → an init crash or a dead stream. Clamp every resolved
+/// value to a usable floor on ALL platforms before it flows into an encoder.
+const MIN_FPS: u32 = 15;
+const DEFAULT_FPS: u32 = 60;
+const MIN_DIM: u32 = 320;
+const DEFAULT_W: u32 = 1280;
+const DEFAULT_H: u32 = 720;
+
+/// Clamp a resolved fps to the usable floor: a 0 (both request and config unset)
+/// becomes a sensible default rather than `-r 0`/`framerate=0/1`.
+fn clamp_fps(fps: u32) -> u32 {
+	if fps == 0 {
+		DEFAULT_FPS
+	} else {
+		fps.max(MIN_FPS)
+	}
+}
+
+/// Clamp resolved width/height to a usable floor: a 0 (both request and config
+/// unset) becomes a default size; anything positive is floored to `MIN_DIM` so a
+/// tiny/degenerate request can't crash the encoder.
+fn clamp_dims(w: u32, h: u32) -> (u32, u32) {
+	let w = if w == 0 { DEFAULT_W } else { w.max(MIN_DIM) };
+	let h = if h == 0 { DEFAULT_H } else { h.max(MIN_DIM) };
+	(w, h)
+}
 
 /// Media-over-session: bind the two LOOPBACK intake sockets the encoders will
 /// target, and spawn the forwarder tasks that ship every received RTP datagram
@@ -417,6 +466,8 @@ pub(super) fn make_on_stream(
 				Some(hz) => req_fps.min(hz),
 				None => req_fps,
 			};
+			// Floor it: req_fps/cfg.fps can both be 0 → GStreamer framerate=0/1 errors.
+			let eff_fps = clamp_fps(eff_fps);
 			tracing::info!(
 				req_fps,
 				cfg_fps = cfg.fps,
@@ -579,6 +630,10 @@ pub(super) fn make_on_stream(
 			Some(m) => eff_fps.min(m),
 			None => eff_fps,
 		};
+		// Floor it AFTER every adjustment: req_fps, cfg.fps, the panel clamp and the
+		// diagnostic ceiling can all drive this to 0 → `-r 0` / native NVENC with a
+		// 0 fps. A 0 here is poison on every path, so clamp last.
+		let eff_fps = clamp_fps(eff_fps);
 		tracing::info!(
 			req_fps,
 			cfg_fps = cfg.fps,
@@ -601,6 +656,11 @@ pub(super) fn make_on_stream(
 			Some((sw, sh)) if eff_w > sw || eff_h > sh => (sw, sh),
 			_ => (eff_w, eff_h),
 		};
+		// Floor the resolved size on ALL platforms: req+cfg can both be 0 (0×0 reaches
+		// native NVENC/DXGI on Windows, where the clamp above is compiled out and only
+		// shrinks anyway) → encoder init crash / dead stream. Apply after the Unix
+		// screen-clamp so a legitimately-clamped size is preserved, only floored.
+		let (eff_w, eff_h) = clamp_dims(eff_w, eff_h);
 		let ffmpeg = ffmpeg_bin(&app_h);
 		// The viewer picks the encoder live from the session menu (sent in the
 		// stream request); an empty request falls back to the host's own setting.

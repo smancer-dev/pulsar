@@ -52,8 +52,18 @@ static FOCUSED: AtomicBool = AtomicBool::new(true);
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
 /// The play id the capture is currently armed for — lets a re-arm of the SAME live
 /// session (effect re-run / hotplug restart) preserve ENGAGED instead of silently
-/// disengaging the user mid-control.
+/// disengaging the user mid-control. Crucially this is NOT reset by `disable()`: the
+/// real tab deactivate→reactivate path is Session.svelte's $effect cleanup calling
+/// kbdCaptureStop()→disable() and THEN the re-run calling enable(), so the engagement
+/// memory has to survive a disable() for `same_session` to ever be true (see ENGAGED_MEMO).
 static LAST_PLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// Engagement intent for `LAST_PLAY`, remembered ACROSS `disable()`. disable() clears the
+/// live ENGAGED (the grab must drop on a stop), but a stop that is immediately followed by
+/// an enable() for the SAME id (the tab-switch churn above) has to restore the user's
+/// engagement — otherwise the recently-added same-session preservation is a no-op for its
+/// only real trigger. A genuinely new session (different id) ignores this and starts
+/// disengaged (click-to-engage).
+static ENGAGED_MEMO: AtomicBool = AtomicBool::new(false);
 /// Click-to-engage gate: the grab is held ONLY while engaged. Sessions start
 /// DISENGAGED (except CLI `--connect` kiosk starts) so the user keeps their own
 /// keyboard/mouse until they explicitly click the session video. Set by a
@@ -175,21 +185,27 @@ fn chord_mods(devs: &[evdev::Device]) -> (bool, bool, bool) {
 	(ctrl, shift, alt)
 }
 
-pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
+pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, start_suspended: bool) {
 	// Supersede any prior capture thread (a tab switch is stop+start back-to-back;
 	// the bumped generation makes the old thread exit on its next loop pass).
 	let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
-	// A re-arm of the SAME live play session (enable while already running, same id —
-	// e.g. an effect re-run or a device-hotplug-triggered restart) must PRESERVE the
-	// user's engagement: resetting it mid-control silently dropped the grab semantics
-	// ("keys stopped working after Ctrl+Shift+F12", seen live Pi→PC) with no UI cue.
-	// A genuinely new session (stop→start, different id) still starts disengaged.
-	let same_session =
-		RUNNING.swap(true, Ordering::SeqCst) && LAST_PLAY.load(Ordering::SeqCst) == id;
+	// A re-arm of the SAME live play session must PRESERVE the user's engagement:
+	// resetting it mid-control silently dropped the grab semantics ("keys stopped
+	// working after Ctrl+Shift+F12", seen live Pi→PC) with no UI cue. The real
+	// trigger (Session.svelte tab switch) is a disable()→enable() pair, so RUNNING is
+	// already FALSE here — same-session must therefore key off LAST_PLAY (which
+	// survives disable()), NOT off RUNNING. A genuinely new session (different id)
+	// still starts disengaged.
+	RUNNING.store(true, Ordering::SeqCst);
+	let same_session = LAST_PLAY.load(Ordering::SeqCst) == id;
 	LAST_PLAY.store(id, Ordering::SeqCst);
-	// A fresh session never starts suspended (a prior overlay close may have
-	// raced teardown). The capture thread re-grabs from a clean state below.
-	SUSPENDED.store(false, Ordering::SeqCst);
+	// Honor an actually-open overlay: the caller computes this from AppState.overlay_open
+	// (the source of truth, which lives in the Tauri layer and can't be reached from this
+	// static). Blindly clearing SUSPENDED here desynced from that set — a re-arm while
+	// tab A's overlay was still on screen revived the grab and ate local input. We still
+	// keep the "fresh session never starts stale" intent: a clean session passes
+	// start_suspended=false.
+	SUSPENDED.store(start_suspended, Ordering::SeqCst);
 	RENDER_FOCUSED.store(false, Ordering::SeqCst);
 	// Click-to-engage: a manual session starts DISENGAGED — the user keeps local
 	// input until they click the session video. A CLI `--connect` (kiosk/appliance,
@@ -205,14 +221,21 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
 	// re-engaging them all is correct (an appliance has no manual sessions).
 	let kiosk = KIOSK_ENGAGE.load(Ordering::SeqCst);
 	KIOSK_SESSION.store(kiosk, Ordering::SeqCst);
-	// Same-session re-arm keeps whatever engagement the user already had (see above);
-	// everything else starts at the kiosk default (engaged for appliances, off manual).
+	// Same-session re-arm restores whatever engagement the user had when this id was last
+	// active. The live ENGAGED was cleared by the intervening disable(), so read the memory
+	// that survives it (ENGAGED_MEMO) instead — that's what makes preservation work for the
+	// disable()→enable() tab-switch path. Everything else (new id) starts at the kiosk
+	// default (engaged for appliances, off for manual sessions).
 	let engaged = if same_session {
-		ENGAGED.load(Ordering::SeqCst) || kiosk
+		ENGAGED_MEMO.load(Ordering::SeqCst) || kiosk
 	} else {
 		kiosk
 	};
 	ENGAGED.store(engaged, Ordering::SeqCst);
+	// Seed the cross-disable() memory with the engagement this enable() chose; the live
+	// transitions below (engage/release/combos/focus) keep ENGAGED current, and disable()
+	// snapshots it back into ENGAGED_MEMO so the NEXT same-session enable() can restore it.
+	ENGAGED_MEMO.store(engaged, Ordering::SeqCst);
 	tracing::info!(gen, kiosk, same_session, engaged, "evdev capture armed");
 	if kiosk {
 		// Keep the frontend's engage hint in sync with the auto-engage.
@@ -238,6 +261,10 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
 		// one ioctl per device, no re-enumerate (contrast the leave path which
 		// drops `grabbed` and closes fds).
 		let mut applied_suspend = false;
+		// Thread-local memory of the last engaged state, updated each loop. The exit-flush
+		// below can't read the ENGAGED static: disable() clears ENGAGED *before* this thread
+		// observes the GEN bump, so by exit it's always false. This local survives that.
+		let mut was_engaged = false;
 		// Shortcut modifiers (Ctrl/LeftAlt/Win): when ANY is held a key is a shortcut → forward the
 		// raw keycode (VK path) so Ctrl+C etc. work. RightAlt (AltGr=100) is deliberately NOT here —
 		// it's a char-composition modifier (Turkish AltGr chars), consumed by the xkb resolution.
@@ -366,19 +393,29 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
 			if is_focused() {
 				unfocused_since = None;
 				// Kiosk sessions RE-engage on focus (appliance: no local desktop to
-				// protect) — see KIOSK_SESSION for why the one-shot wasn't enough.
+				// protect) — see KIOSK_SESSION for why the one-shot wasn't enough. Emit
+				// kbd-engaged only on the actual edge (false→true) so the renderer hides
+				// the local cursor / updates its hint instead of staying stale.
 				if KIOSK_SESSION.load(Ordering::SeqCst) && !SUSPENDED.load(Ordering::SeqCst) {
-					ENGAGED.store(true, Ordering::SeqCst);
+					if !ENGAGED.swap(true, Ordering::SeqCst) {
+						let _ = app.emit("kbd-engaged", ());
+					}
 				}
 			} else {
 				let t = *unfocused_since.get_or_insert_with(std::time::Instant::now);
 				if t.elapsed() >= std::time::Duration::from_millis(200) {
-					ENGAGED.store(false, Ordering::SeqCst);
+					// Focus-loss disengage: emit kbd-released only on the edge (true→false),
+					// otherwise the renderer keeps the cursor hidden / the UI hint stale after
+					// an alt-tab away from the session.
+					if ENGAGED.swap(false, Ordering::SeqCst) {
+						let _ = app.emit("kbd-released", ());
+					}
 				}
 			}
+			was_engaged = ENGAGED.load(Ordering::SeqCst);
 			let want_suspend = SUSPENDED.load(Ordering::SeqCst)
 				|| !is_focused()
-				|| !ENGAGED.load(Ordering::SeqCst);
+				|| !was_engaged;
 			if want_suspend != applied_suspend {
 				if want_suspend {
 					// Release any keys the host is still holding for this combo.
@@ -655,6 +692,42 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
 				}
 			}
 		}
+		// Thread exit (GEN bump / disable — session end, host disconnect, tab close). Before
+		// dropping the grabs, RELEASE anything still held so the HOST doesn't end up with a
+		// stuck key/button (a session that ends abnormally — not via the leave combo, which
+		// already flushes through the want_suspend path — otherwise left modifiers/letters or
+		// a mid-drag BTN_LEFT pressed on the host forever). Windows disable() flushes via
+		// flush_held(); this matches that guarantee on Linux. We were only forwarding while
+		// engaged + not suspended, so only flush then — otherwise nothing was sent down.
+		if was_engaged && !applied_suspend {
+			// Query the kernel for every key currently down on each grabbed device (same
+			// authoritative EVIOCGKEY path chord_mods uses) and send a key-UP for each — this
+			// catches modifiers AND letters regardless of whether we tracked their press.
+			let mut released: std::collections::HashSet<u16> = std::collections::HashSet::new();
+			for d in grabbed.iter() {
+				if let Ok(st) = d.get_key_state() {
+					for key in st.iter() {
+						let code = key.code();
+						// Mouse buttons (272..=274) are flushed explicitly below as
+						// PointerButton; everything else is a keyboard key.
+						if !(272..=274).contains(&code) && released.insert(code) {
+							let _ = tx.try_send(InputEvent::Key {
+								code: code as u32,
+								down: false,
+							});
+						}
+					}
+				}
+			}
+			// And any held mouse buttons (a disengage mid-drag otherwise left the host's
+			// uinput holding BTN_LEFT) — same set the suspend path releases.
+			for button in 0..3u8 {
+				let _ = tx.try_send(InputEvent::PointerButton {
+					button,
+					down: false,
+				});
+			}
+		}
 		// `grabbed` drops here → fds close → every EVIOCGRAB is released.
 	});
 }
@@ -667,6 +740,11 @@ pub fn disable() {
 	// Clear the overlay gate so a teardown mid-overlay leaves clean state and the
 	// next session never starts suspended.
 	SUSPENDED.store(false, Ordering::SeqCst);
+	// Remember whether the user was engaged BEFORE clearing the live flag: the tab-switch
+	// path is disable()→enable() for the SAME id, so a same-session enable() restores from
+	// here. LAST_PLAY is deliberately NOT reset (a different id still starts disengaged;
+	// only the matching id revives this engagement).
+	ENGAGED_MEMO.store(ENGAGED.load(Ordering::SeqCst), Ordering::SeqCst);
 	ENGAGED.store(false, Ordering::SeqCst);
 	RENDER_FOCUSED.store(false, Ordering::SeqCst);
 	// KIOSK_SESSION is NOT cleared here — it is recomputed from the latched

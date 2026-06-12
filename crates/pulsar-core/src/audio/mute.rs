@@ -76,28 +76,69 @@ mod win_mute {
 	};
 
 	/// The user's master-volume scalar saved when we silenced the host, restored on
-	/// unmute. NaN-free sentinel: negative = nothing saved (we never silenced).
+	/// unmute. NaN-free sentinel: negative = nothing saved (we never silenced, or we
+	/// already restored). Never holds 0.0 as a "saved level" — see `set_default_render_muted`.
 	static SAVED_VOL: std::sync::Mutex<f32> = std::sync::Mutex::new(-1.0);
 
+	/// Crash-restore marker: the saved volume is also written to a tiny file when we
+	/// silence the host, so an abnormal exit (crash / taskkill / tray-quit) that
+	/// skips the unmute path doesn't strand the host at volume 0. The NEXT launch
+	/// (`restore_stale_mute`) reads it, restores the level, and deletes it. The file
+	/// is removed on a clean unmute so a normal session leaves no stale marker.
+	fn marker_path() -> std::path::PathBuf {
+		std::env::temp_dir().join("pulsar-host-mute.vol")
+	}
+
+	/// Open the default render endpoint's volume interface (shared by mute/unmute and
+	/// the crash-restore path). COM is MTA-initialized on the calling thread
+	/// (S_FALSE = already initialized — harmless).
+	unsafe fn endpoint_volume() -> Result<IAudioEndpointVolume, String> {
+		let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+		let enumerator: IMMDeviceEnumerator =
+			CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+				.map_err(|e| format!("MMDeviceEnumerator: {e}"))?;
+		let device = enumerator
+			.GetDefaultAudioEndpoint(eRender, eConsole)
+			.map_err(|e| format!("GetDefaultAudioEndpoint: {e}"))?;
+		device
+			.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+			.map_err(|e| format!("IAudioEndpointVolume: {e}"))
+	}
+
+	/// Restore a stale crash marker exactly once per process, the FIRST time the
+	/// mute control is touched. `set_default_render_muted` calls this up front so a
+	/// previous run that died mid-mute (marker on disk, SAVED_VOL gone with the dead
+	/// process) gets the user's level back before we do anything else. Guarded so the
+	/// restore never fights an active mute later in the same process.
+	static RESTORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 	pub fn set_default_render_muted(mute: bool) -> Result<(), String> {
+		// One-time crash-restore: if a prior process left a marker, recover the level
+		// before this call's own mute/unmute logic runs (and before we'd overwrite the
+		// marker). Only meaningful on the very first touch of the mute control.
+		if !RESTORED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			restore_stale_mute();
+		}
 		unsafe {
-			// S_FALSE just means COM was already initialized on this thread — fine.
-			let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-			let enumerator: IMMDeviceEnumerator =
-				CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-					.map_err(|e| format!("MMDeviceEnumerator: {e}"))?;
-			let device = enumerator
-				.GetDefaultAudioEndpoint(eRender, eConsole)
-				.map_err(|e| format!("GetDefaultAudioEndpoint: {e}"))?;
-			let volume: IAudioEndpointVolume = device
-				.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-				.map_err(|e| format!("IAudioEndpointVolume: {e}"))?;
+			let volume = endpoint_volume()?;
 			if mute {
-				// Save the user's level once (a repeated mute call must not overwrite
-				// it with the 0 we set last time), then silence via volume.
+				// Save the user's level ONCE per unmuted→muted transition (a repeated
+				// mute call — e.g. a re-stream while another client still wants mute —
+				// must not overwrite it with the 0 we set last time). MUTE_OWNERS in
+				// handlers.rs only calls us on the true empty↔non-empty edge, but guard
+				// here too so the scalar swap can never drift from the owner set.
 				let mut saved = SAVED_VOL.lock().unwrap();
 				if *saved < 0.0 {
-					*saved = volume.GetMasterVolumeLevelScalar().unwrap_or(-1.0);
+					let cur = volume.GetMasterVolumeLevelScalar().unwrap_or(-1.0);
+					// NEVER record 0.0 (or a read error) as the "user level": if we did,
+					// a later unmute would restore the host to silence FOREVER. A current
+					// reading of 0 means there is nothing meaningful to restore — leave
+					// the sentinel negative so unmute simply doesn't touch the volume.
+					if cur > 0.0 {
+						*saved = cur;
+						// Persist for crash-restore (best-effort; mute still works without it).
+						let _ = std::fs::write(marker_path(), cur.to_le_bytes());
+					}
 				}
 				volume
 					.SetMasterVolumeLevelScalar(0.0, std::ptr::null())
@@ -106,13 +147,42 @@ mod win_mute {
 				let _ = volume.SetMute(false, std::ptr::null());
 			} else {
 				let mut saved = SAVED_VOL.lock().unwrap();
-				if *saved >= 0.0 {
+				if *saved > 0.0 {
 					let _ = volume.SetMasterVolumeLevelScalar(*saved, std::ptr::null());
-					*saved = -1.0;
 				}
+				// Always reset the sentinel + clear the crash marker on unmute, even if
+				// nothing was saved (cur read 0 at mute time): a clean unmute must leave
+				// NO stale "muted" state behind for the next launch to act on.
+				*saved = -1.0;
+				let _ = std::fs::remove_file(marker_path());
 				let _ = volume.SetMute(false, std::ptr::null());
 			}
 		}
 		Ok(())
+	}
+
+	/// Next-launch crash-restore: if a previous run silenced the host and then died
+	/// before unmuting, its marker file holds the user's level — restore it and
+	/// delete the marker so the host is never stranded at volume 0. Safe to call
+	/// unconditionally; a no-op when no marker exists.
+	fn restore_stale_mute() {
+		let path = marker_path();
+		let Ok(bytes) = std::fs::read(&path) else {
+			return; // no marker → clean previous exit, nothing to restore
+		};
+		let _ = std::fs::remove_file(&path);
+		if bytes.len() != 4 {
+			return;
+		}
+		let level = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+		if !(level > 0.0) {
+			return; // never restore to silence / a garbage value
+		}
+		unsafe {
+			if let Ok(volume) = endpoint_volume() {
+				let _ = volume.SetMasterVolumeLevelScalar(level, std::ptr::null());
+				let _ = volume.SetMute(false, std::ptr::null());
+			}
+		}
 	}
 }

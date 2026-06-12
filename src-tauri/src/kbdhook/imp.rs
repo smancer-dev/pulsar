@@ -52,7 +52,16 @@ static THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 /// `ov engage` line), cleared by `release_engage()` / the 3×RightCtrl combo.
 static ENGAGED: AtomicBool = AtomicBool::new(false);
 /// The play id the capture is currently armed for (same-session re-arm detection).
+/// NOT reset by `disable()`: the real tab deactivate→reactivate path is the frontend
+/// calling kbd_capture_stop()→disable() and THEN kbd_capture_start()→enable() for the
+/// same id, so the engagement memory must survive disable() (see ENGAGED_MEMO).
 static LAST_PLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// Engagement intent for `LAST_PLAY`, remembered ACROSS `disable()`. disable() drops the
+/// live ENGAGED (capture must stop on a stop), but a stop immediately followed by an
+/// enable() for the SAME id (the tab-switch churn) restores the user's engagement from
+/// here — otherwise same-session preservation never fires (ENABLED is already false by
+/// the time enable() runs). A different id ignores this and starts disengaged.
+static ENGAGED_MEMO: AtomicBool = AtomicBool::new(false);
 /// CLI kiosk (`--connect`) auto-engages on the next `enable()` (same as Linux).
 static KIOSK_ENGAGE: AtomicBool = AtomicBool::new(false);
 /// True for the lifetime of a kiosk-started session: focus loss must NOT disengage
@@ -470,12 +479,16 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 /// Arm capture for `tx`'s session. The first call picks a mechanism: the
 /// Interception driver if present (works under ASTER), else WH_KEYBOARD_LL. Later
 /// calls just swap in the active sender + app handle and flip ENABLED.
-pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
+pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, _start_suspended: bool) {
 	// A re-arm of the SAME live play session must preserve the user's engagement —
 	// resetting it mid-control silently stopped forwarding with no UI cue (Linux
-	// parity; see kbdhook/linux.rs enable).
-	let same_session =
-		ENABLED.load(Ordering::SeqCst) && LAST_PLAY.load(Ordering::SeqCst) == id;
+	// parity; see kbdhook/linux.rs enable). The real trigger is a disable()→enable()
+	// pair (tab switch), so ENABLED is already false here — key same_session off
+	// LAST_PLAY (which survives disable()), NOT off ENABLED.
+	// (`start_suspended` is the Linux overlay-grab gate; Windows has no evdev grab —
+	// the overlay floats over the live canvas — so it's unused here, kept for a shared
+	// signature.)
+	let same_session = LAST_PLAY.load(Ordering::SeqCst) == id;
 	LAST_PLAY.store(id, Ordering::SeqCst);
 	{
 		let mut g = globals().lock().unwrap();
@@ -494,7 +507,16 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
 	KIOSK_SESSION.store(kiosk, Ordering::SeqCst);
 	if kiosk {
 		engage(&app);
-	} else if !same_session {
+	} else if same_session {
+		// Restore the engagement this id had when last active (disable() cleared the live
+		// ENGAGED but stashed it in ENGAGED_MEMO). engage() emits kbd-engaged on the edge so
+		// the renderer cursor/hint resyncs; a remembered-disengaged session stays off.
+		if ENGAGED_MEMO.load(Ordering::SeqCst) {
+			engage(&app);
+		} else {
+			ENGAGED.store(false, Ordering::SeqCst);
+		}
+	} else {
 		ENGAGED.store(false, Ordering::SeqCst);
 	}
 	// Native-renderer sessions also capture the mouse (relative); webview sessions
@@ -535,6 +557,10 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
 /// thread down cleanly (posts WM_QUIT, which exits the pump and unhooks).
 pub fn disable() {
 	ENABLED.store(false, Ordering::SeqCst);
+	// Remember the engagement before dropping the live flag so a same-id re-arm (tab
+	// switch = disable()→enable()) can restore it. LAST_PLAY is deliberately kept too;
+	// a different id still starts disengaged.
+	ENGAGED_MEMO.store(ENGAGED.load(Ordering::SeqCst), Ordering::SeqCst);
 	ENGAGED.store(false, Ordering::SeqCst);
 	KIOSK_SESSION.store(false, Ordering::SeqCst);
 	// Interception: drop the filter so we stop capturing (frees keys for any other

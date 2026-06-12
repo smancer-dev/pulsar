@@ -128,6 +128,12 @@ export const ui = $state<UiSettings>(load());
 // saveUi() directly, so this is the only channel back up to the screen.
 export const saveTick = $state({ n: 0 });
 
+// A separate tick bumped ONLY when the CORE config (relay/unattended/avatar/audio…)
+// is persisted — distinct from saveTick, which fires on every UI-only twiddle too
+// (overlay-button drag, in-session stream controls). The shell (+page) re-fetches its
+// config copy off THIS, so it doesn't churn IPC on UI-only saves.
+export const configTick = $state({ n: 0 });
+
 export function saveUi() {
 	if (hasLS) localStorage.setItem(KEY, JSON.stringify($state.snapshot(ui)));
 	saveTick.n++;

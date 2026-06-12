@@ -25,16 +25,26 @@
 	const isDeviceId = (p: string) => /^\d{9}$/.test(p.replace(/\s/g, '')) || /[.:]/.test(p);
 
 	$effect(() => {
-		let offs: Array<() => void> = [];
+		// Dead-flag guard (same as Connections/Connecting): a listen() resolving AFTER
+		// this teardown must unlisten immediately, not land in a dead array (it would leak).
+		let dead = false;
+		const offs: Array<() => void> = [];
+		const track = (o: () => void) => {
+			if (dead) o();
+			else offs.push(o);
+		};
 		onClipboardIn((e) => {
 			copyText(e.text).catch(() => {});
 			pushToast({ kind: 'clip', peer: e.peer, text: e.text });
-		}).then((o) => offs.push(o));
+		}).then(track);
 		onFileRecv((e) => {
 			if (!isDeviceId(e.peer)) return;
 			pushToast({ kind: e.ok ? 'file' : 'fileFail', peer: e.peer, text: e.name });
-		}).then((o) => offs.push(o));
-		return () => offs.forEach((o) => o());
+		}).then(track);
+		return () => {
+			dead = true;
+			offs.forEach((o) => o());
+		};
 	});
 
 	async function copyToast(toa: Toast) {

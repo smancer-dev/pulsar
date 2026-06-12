@@ -38,18 +38,26 @@ pub(crate) mod throttle {
 	/// "ip:port" with a NEW EPHEMERAL PORT per connection — keyed verbatim, an
 	/// attacker reconnecting per guess would never accumulate failures. Strip
 	/// the port so the counter sticks to the address.
-	fn key(peer: &str) -> &str {
-		match peer.rsplit_once(':') {
-			Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-			_ => peer,
+	///
+	/// Parse with `SocketAddr` so the port is stripped ONLY for an unambiguous
+	/// host:port — this handles IPv4 ("1.2.3.4:9000" → "1.2.3.4") AND bracketed
+	/// IPv6 ("[fe80::1]:9000" → "fe80::1"). The old naive `rsplit_once(':')`
+	/// mangled BARE IPv6 ("fe80::1:9000" → "fe80::1") differently each reconnect
+	/// (the ephemeral port looks like just another hextet), so an IPv6 attacker
+	/// never accumulated failures → no lockout. Anything that isn't a real
+	/// socket address (a bare hostname, a relay id) is keyed verbatim.
+	fn key(peer: &str) -> String {
+		if let Ok(sa) = peer.parse::<std::net::SocketAddr>() {
+			return sa.ip().to_string();
 		}
+		peer.to_string()
 	}
 
 	/// Remaining lockout, if the peer is currently locked out.
 	pub(crate) fn locked_out(peer: &str) -> Option<Duration> {
 		let peer = key(peer);
 		let g = ATTEMPTS.lock().unwrap();
-		let (n, at) = g.get(peer)?;
+		let (n, at) = g.get(&peer)?;
 		if *n >= MAX_FAILURES {
 			let end = *at + LOCKOUT;
 			let now = Instant::now();
@@ -65,14 +73,14 @@ pub(crate) mod throttle {
 	pub(crate) fn record_failure(peer: &str) -> bool {
 		let peer = key(peer);
 		let mut g = ATTEMPTS.lock().unwrap();
-		let e = g.entry(peer.to_string()).or_insert((0, Instant::now()));
+		let e = g.entry(peer).or_insert((0, Instant::now()));
 		if e.1.elapsed() > WINDOW {
 			*e = (0, Instant::now());
 		}
 		e.0 += 1;
 		e.1 = Instant::now();
 		if e.0 >= MAX_FAILURES {
-			tracing::warn!(peer, failures = e.0, "auth throttle: peer locked out");
+			tracing::warn!(failures = e.0, "auth throttle: peer locked out");
 			true
 		} else {
 			false
@@ -81,7 +89,7 @@ pub(crate) mod throttle {
 
 	/// Successful auth clears the slate.
 	pub(crate) fn clear(peer: &str) {
-		ATTEMPTS.lock().unwrap().remove(key(peer));
+		ATTEMPTS.lock().unwrap().remove(&key(peer));
 	}
 }
 
@@ -138,9 +146,20 @@ pub(crate) async fn respond_request(
 	Ok(())
 }
 
+/// Result of [`race_host_auth`]: whether the connection was approved, and (when
+/// approved by a password) whether that password was the single-use ONE-TIME
+/// password — the caller rotates the OTP in that case, but never for the
+/// reusable persistent connect password or a passwordless Allow.
+pub(crate) struct RaceOutcome {
+	pub approved: bool,
+	pub matched_one_time: bool,
+}
+
 /// Host: open the Allow/Deny popup AND, at the same time, race it against a correct
 /// password arriving over the session. Accept on whichever lands first — so the
 /// host can approve passwordlessly while the client is still being asked for one.
+/// `one_time_pw` is the rotating session password (may be empty); a password match
+/// against it sets [`RaceOutcome::matched_one_time`] so the caller can rotate it.
 pub(crate) async fn race_host_auth(
 	session: &mut pulsar_core::Session,
 	app: &AppHandle,
@@ -148,7 +167,8 @@ pub(crate) async fn race_host_auth(
 	next_req: &Arc<AtomicU64>,
 	peer: &str,
 	accepted_pws: &[String],
-) -> bool {
+	one_time_pw: &str,
+) -> RaceOutcome {
 	let id = next_req.fetch_add(1, Ordering::SeqCst);
 	let (tx, mut rx) = oneshot::channel::<bool>();
 	pending.lock().unwrap().insert(id, tx);
@@ -168,11 +188,13 @@ pub(crate) async fn race_host_auth(
 	const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 	let deadline = tokio::time::sleep(IDLE);
 	tokio::pin!(deadline);
-	let result = loop {
+	// (approved, matched_one_time): a passwordless Allow never rotates the OTP, a
+	// password match reports whether it was the single-use OTP vs the reusable one.
+	let result: (bool, bool) = loop {
 		tokio::select! {
 			biased;
-			d = &mut rx => break matches!(d, Ok(true)),
-			_ = &mut deadline => break false, // client silent too long → deny
+			d = &mut rx => break (matches!(d, Ok(true)), false),
+			_ = &mut deadline => break (false, false), // client silent too long → deny
 			msg = recv_client_auth(session) => {
 				deadline.as_mut().reset(tokio::time::Instant::now() + IDLE);
 				match msg {
@@ -180,17 +202,20 @@ pub(crate) async fn race_host_auth(
 						// Either the rotating one-time password or the persistent
 						// connect password (Settings → Güvenlik) unlocks the session.
 						if accepted_pws.iter().any(|a| !a.is_empty() && pw == *a) {
-							break true; // correct password → accept
+							// correct password → accept; flag if it was the OTP so the
+							// caller rotates it (single-use).
+							let otp = !one_time_pw.is_empty() && pw == one_time_pw;
+							break (true, otp);
 						}
 						// Wrong: count it. Crossing the throttle threshold ends the
 						// race as a deny (no more retries for this peer for a while).
 						if throttle::record_failure(peer) {
-							break false;
+							break (false, false);
 						}
 						let _ = need_password(session).await; // wrong → ask client to retry
 					}
 					ClientAuth::Keepalive => {}
-					ClientAuth::Gone => break false,
+					ClientAuth::Gone => break (false, false),
 				}
 			}
 		}
@@ -199,7 +224,10 @@ pub(crate) async fn race_host_auth(
 	if let Some(win) = app.get_webview_window(&format!("approve-{id}")) {
 		let _ = win.close();
 	}
-	result
+	RaceOutcome {
+		approved: result.0,
+		matched_one_time: result.1,
+	}
 }
 
 /// Client: open a password prompt on the UI; returns the receiver for the answer.

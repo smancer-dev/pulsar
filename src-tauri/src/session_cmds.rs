@@ -126,23 +126,30 @@ pub(crate) async fn set_play_codec(
 #[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
 fn reopen_render_for_codec(state: &State<'_, AppState>, id: u64, codec: &str) {
 	use std::io::Write as _;
-	let mut plays = state.plays.lock().unwrap();
-	let Some(p) = plays.get_mut(&id) else { return };
-	if p.render_child.is_none() {
-		return; // mpv/ffplay fallback paths keep their old behavior
-	}
-	let Ok(sdp) = crate::native_view::write_sdp(p.video_port, codec) else {
+	// Pull the render_stdin + caps_line Arcs out under the lock, then DROP the plays guard
+	// before the blocking child-stdin write — a slow/backed-up pipe must not stall every
+	// other state.plays user (forward() on each input event, the setters). Mirrors the
+	// drop-guard-first pattern stop_stream uses. video_port is read here; mpv_sdp (a plain
+	// field) is re-stored under a brief re-lock after the write.
+	let (video_port, stdin, caps_line) = {
+		let plays = state.plays.lock().unwrap();
+		let Some(p) = plays.get(&id) else { return };
+		if p.render_child.is_none() {
+			return; // mpv/ffplay fallback paths keep their old behavior
+		}
+		(p.video_port, p.render_stdin.clone(), p.caps_line.clone())
+	};
+	let Ok(sdp) = crate::native_view::write_sdp(video_port, codec) else {
 		return;
 	};
-	let sent = if let Some(si) = p.render_stdin.lock().unwrap().as_mut() {
+	let sent = if let Some(si) = stdin.lock().unwrap().as_mut() {
 		writeln!(si, "reopen {}", sdp.display()).and_then(|()| si.flush()).is_ok()
 	} else {
 		false
 	};
-	p.mpv_sdp = Some(sdp);
 	// Keep the stored caps line's codec field in sync for any later respawn/replay.
 	{
-		let mut line = p.caps_line.lock().unwrap();
+		let mut line = caps_line.lock().unwrap();
 		if !line.is_empty() {
 			*line = line
 				.split_whitespace()
@@ -156,6 +163,11 @@ fn reopen_render_for_codec(state: &State<'_, AppState>, id: u64, codec: &str) {
 				.collect::<Vec<_>>()
 				.join(" ");
 		}
+	}
+	// Re-store mpv_sdp (plain field) under a brief lock — the play may have been torn
+	// down while the pipe write was in flight, in which case there's nothing to update.
+	if let Some(p) = state.plays.lock().unwrap().get_mut(&id) {
+		p.mpv_sdp = Some(sdp);
 	}
 	tracing::info!(id, codec, sent, "renderer demuxer reopened for codec switch");
 }
@@ -230,13 +242,28 @@ async fn respawn_render_for_codec(
 			crate::render_stats::start_render_reader(app, id, out);
 		}
 		let si = c.stdin.take();
-		let mut plays = state.plays.lock().unwrap();
-		if let Some(p) = plays.get_mut(&id) {
-			*p.render_stdin.lock().unwrap() = si;
-			p.mpv_sdp = Some(sdp);
+		// Pull the per-id Arcs out under the lock, install the fresh stdin + mpv_sdp, then
+		// DROP the plays guard BEFORE the blocking re-seed writes below — a backed-up child
+		// pipe must not stall every other state.plays user (forward() on each input event,
+		// the live setters). Mirrors stop_stream's drop-guard-first pattern. The Arcs
+		// (render_stdin / caps_line / render_seed) outlive the guard, so the writes target
+		// the same channels without holding the map locked.
+		let chans = {
+			let mut plays = state.plays.lock().unwrap();
+			plays.get_mut(&id).map(|p| {
+				*p.render_stdin.lock().unwrap() = si;
+				p.mpv_sdp = Some(sdp);
+				(
+					p.render_stdin.clone(),
+					p.caps_line.clone(),
+					p.render_seed.clone(),
+				)
+			})
+		};
+		if let Some((stdin, caps_line, render_seed)) = chans {
 			// Re-seed the fresh renderer's overlay: take the last caps line, update its
 			// codec=… field to the new codec, store + send it.
-			let mut line = p.caps_line.lock().unwrap().clone();
+			let mut line = caps_line.lock().unwrap().clone();
 			if !line.is_empty() {
 				line = line
 					.split_whitespace()
@@ -250,18 +277,18 @@ async fn respawn_render_for_codec(
 					.collect::<Vec<_>>()
 					.join(" ");
 				use std::io::Write as _;
-				if let Some(si) = p.render_stdin.lock().unwrap().as_mut() {
+				if let Some(si) = stdin.lock().unwrap().as_mut() {
 					let _ = writeln!(si, "{line}");
 				}
-				*p.caps_line.lock().unwrap() = line;
+				*caps_line.lock().unwrap() = line;
 			}
 			// Re-push stdin-only overlay state the fresh process would otherwise
 			// reset to defaults: open-button toggle + position, stats HUD, frame
 			// pacing, view fit and the audio truth line.
-			let seed = p.render_seed.lock().unwrap().clone();
+			let seed = render_seed.lock().unwrap().clone();
 			{
 				use std::io::Write as _;
-				if let Some(si) = p.render_stdin.lock().unwrap().as_mut() {
+				if let Some(si) = stdin.lock().unwrap().as_mut() {
 					if let Some(on) = seed.ovbtn {
 						let _ = writeln!(si, "ovbtn {}", if on { 1 } else { 0 });
 					}
@@ -713,11 +740,19 @@ pub(crate) async fn set_overlay(
 			// Hide the (now empty) in-app container while open so it can't sit over the
 			// webview menu; show it again once mpv is respawned into it.
 			if open {
-				if let Some(p) = state.plays.lock().unwrap().get_mut(&id) {
-					if let Some(mut c) = p.ffplay.take() {
-						let _ = c.kill();
-						let _ = c.wait(); // reap so the X window is destroyed → webview repaints
-					}
+				// Take the old mpv child out under the lock, DROP the guard, THEN
+				// kill/wait — c.wait() blocks until the process exits, and holding the
+				// plays guard across it stalls every other state.plays user (forward() on
+				// each input event, the setters). Mirrors stop_stream's drop-first pattern.
+				let old = state
+					.plays
+					.lock()
+					.unwrap()
+					.get_mut(&id)
+					.and_then(|p| p.ffplay.take());
+				if let Some(mut c) = old {
+					let _ = c.kill();
+					let _ = c.wait(); // reap so the X window is destroyed → webview repaints
 				}
 				crate::render::set_container_visible(&app, id, false);
 			} else if let Some(ipc) = &ipc {

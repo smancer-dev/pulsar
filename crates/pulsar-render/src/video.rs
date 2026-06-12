@@ -850,9 +850,32 @@ impl Presenter {
 			a.push(vw);
 			a.push(EGL_HEIGHT);
 			a.push(vh);
-			for i in 0..layer.nb_planes as usize {
+			// Crash hardening: the EXT attribute tables are fixed [i32; 3] and the
+			// descriptor's object array is fixed-capacity, so a malformed/exotic DRM
+			// descriptor (>3 planes, or a plane whose object_index points past the
+			// reported objects) would index out of bounds and PANIC. Clamp the plane
+			// count to the 3 attribute slots we have, and skip any plane with a bad
+			// object_index instead of dereferencing it. Log once if we ever clamp so a
+			// real multi-plane format isn't silently truncated unnoticed.
+			let nb_planes = layer.nb_planes as usize;
+			if nb_planes > FD_EXT.len() {
+				static WARNED: AtomicBool = AtomicBool::new(false);
+				if !WARNED.swap(true, Ordering::Relaxed) {
+					eprintln!(
+						"pulsar-render: DRM descriptor has {nb_planes} planes; clamping to {} (rest ignored)",
+						FD_EXT.len()
+					);
+				}
+			}
+			let nb_objects = (*d).nb_objects as usize;
+			for i in 0..nb_planes.min(FD_EXT.len()) {
 				let p = &layer.planes[i];
-				let o = &(*d).objects[p.object_index as usize];
+				let oi = p.object_index as usize;
+				if oi >= nb_objects || oi >= (*d).objects.len() {
+					// Bad object_index → skip this plane rather than OOB-deref.
+					continue;
+				}
+				let o = &(*d).objects[oi];
 				a.push(FD_EXT[i]);
 				a.push(o.fd);
 				a.push(OFFSET_EXT[i]);

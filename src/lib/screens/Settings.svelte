@@ -4,7 +4,7 @@
 	import { api } from '$lib/api';
 	import type { Config, NetworkMode } from '$lib/types';
 	import { t } from '$lib/i18n.svelte';
-	import { saveTick } from '$lib/settings.svelte';
+	import { saveTick, configTick } from '$lib/settings.svelte';
 	import DisplayTab from './Settings/DisplayTab.svelte';
 	import NetworkTab from './Settings/NetworkTab.svelte';
 	import SecurityTab from './Settings/SecurityTab.svelte';
@@ -78,6 +78,7 @@
 		// change immediately instead of only after the next go-online.
 		saveTick.n += 1;
 		lastTick = saveTick.n; // our own bump — don't double-toast via the effect
+		configTick.n += 1; // shell re-fetches its config copy off this (core saves only)
 		const key = reconnectKey(config);
 		if (key !== lastReconnectKey) {
 			lastReconnectKey = key;

@@ -10,11 +10,12 @@
 		onFullscreenToggle,
 		onLocalCaps,
 		onPeerAvatar,
-		onPeerName
+		onPeerName,
+		onSessionPassword
 	} from '$lib/api';
 	import { setPeerIdentity } from '$lib/peers.svelte';
 	import { gameStore } from '$lib/games.svelte';
-	import { ui, saveTick } from '$lib/settings.svelte';
+	import { ui, configTick } from '$lib/settings.svelte';
 	import { initCaps } from '$lib/caps.svelte';
 	import { t, i18n } from '$lib/i18n.svelte';
 	import { theme, toggleTheme } from '$lib/theme.svelte';
@@ -92,11 +93,17 @@
 	let pwInput = $state('');
 	let pwError = $state('');
 	let pwChecking = $state(false);
+	// The exact req id we last submitted a password for (the head being checked). A
+	// wrong-password re-fire must replace THIS prompt, not any prompt that merely shares
+	// the same peer id — two concurrent connects to the same peer would otherwise swap
+	// the wrong head. Reset on close.
+	let pwCheckingReq = $state<number | null>(null);
 
 	function submitPw() {
 		if (!pwPrompt) return;
 		api.submitPassword(pwPrompt.req, pwInput).catch(() => {});
 		pwChecking = true;
+		pwCheckingReq = pwPrompt.req;
 		pwError = '';
 	}
 	function cancelPw() {
@@ -109,6 +116,7 @@
 		pwInput = '';
 		pwError = '';
 		pwChecking = false;
+		pwCheckingReq = null;
 	}
 	// A finished connect dismisses only ITS OWN queued prompt: with concurrent tabs,
 	// dequeuing the head would remove the prompt the user is typing into whenever an
@@ -128,8 +136,20 @@
 			pwInput = '';
 			pwError = '';
 			pwChecking = false;
+			pwCheckingReq = null;
 		}
 	}
+	// Does a queued password prompt belong to this connect target? Same despaced
+	// id/ip:port matching as closePwFor — used to show "awaiting approval" only on the
+	// tab whose connect actually has a pending prompt (not every concurrent Connecting).
+	function hasPendingPromptFor(targetId: string): boolean {
+		const want = targetId.replace(/\s/g, '');
+		return pwQueue.some((q) => {
+			const p = q.peer.replace(/\s/g, '');
+			return p === want || p.startsWith(want + ':') || want.startsWith(p + ':');
+		});
+	}
+
 	// Host-side activity: who's connected + a recent event log.
 	let hostSessions = $state<{ peer: string; since: number }[]>([]);
 	let activity = $state<string[]>([]);
@@ -161,11 +181,13 @@
 	// the core into ITS OWN config snapshot, and this copy (driving the Home screen's
 	// unattended-access warning + blanked one-time password) otherwise refreshed only
 	// inside goOnline() — a toggle in Settings didn't reach Home until a reconnect.
-	// `saveTick` bumps on every save (core + ui-only); re-fetch on it.
-	let lastSaveTick = saveTick.n;
+	// `configTick` bumps ONLY on CORE config saves (not UI-only twiddles like the
+	// overlay-button drag or in-session stream controls) — re-fetch on it so the shell
+	// reflects unattended/avatar changes without churning IPC on every UI save.
+	let lastConfigTick = configTick.n;
 	$effect(() => {
-		if (saveTick.n === lastSaveTick || isPopup || !isTauri) return;
-		lastSaveTick = saveTick.n;
+		if (configTick.n === lastConfigTick || isPopup || !isTauri) return;
+		lastConfigTick = configTick.n;
 		api.getConfig().then((c) => (config = c)).catch(() => {});
 	});
 
@@ -261,6 +283,11 @@
 		initCaps();
 		boot();
 		if (isPopup) return; // approval popup: nothing else to bootstrap
+		// The one-time password rotates after each successful auth (host-side) — reflect
+		// the fresh code in the SelfCard immediately instead of waiting for a re-poll.
+		onSessionPassword((pw) => {
+			if (!config?.unattended_access) selfPw = pw;
+		});
 		await goOnline();
 		// Surface incoming connections on the host UI.
 		await onSessionEvent((e) => {
@@ -310,10 +337,13 @@
 			}
 			// A re-fire for the connection currently being checked (same peer, fresh req) means
 			// the previous password was wrong — replace the head's req in place and flag the error.
-			if (pwPrompt && pwChecking && pwPrompt.peer === e.peer) {
+			// Match on the SPECIFIC req we submitted (pwCheckingReq), not just the peer: two
+			// concurrent connects to the same peer id would otherwise swap the wrong head.
+			if (pwPrompt && pwChecking && pwPrompt.req === pwCheckingReq && pwPrompt.peer === e.peer) {
 				pwQueue = [{ req: e.req, peer: e.peer }, ...pwQueue.slice(1)];
 				pwError = t('pw.error');
 				pwChecking = false;
+				pwCheckingReq = null;
 				return;
 			}
 			// Otherwise it's a (possibly concurrent) new connection's prompt — queue it. If it
@@ -491,7 +521,7 @@
 					<Connecting
 						target={s.target}
 						mode={s.mode}
-						awaitingApproval={!!pwPrompt}
+						awaitingApproval={hasPendingPromptFor(s.target.id)}
 						preparing={s.playId >= 0}
 						onCancel={() => sm.endSession(s.tabId)}
 					/>

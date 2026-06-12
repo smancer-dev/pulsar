@@ -188,8 +188,11 @@ export function updatePeer(
 			if (clash) {
 				clash.saved = clash.saved || p.saved;
 				clash.fav = clash.fav || p.fav;
-				clash.name = p.name;
-				clash.image = p.image ?? clash.image;
+				// Don't clobber the existing device's user-chosen name with this entry's:
+				// only fill in when the clash has no real name (still the id placeholder).
+				if (p.name && (!clash.name || clash.name === fmtPeerId(clash.id))) clash.name = p.name;
+				clash.image = clash.image ?? p.image;
+				clash.avatar = clash.avatar ?? p.avatar;
 				clash.lastConnected = Math.max(clash.lastConnected ?? 0, p.lastConnected ?? 0) || null;
 				peers.splice(peers.indexOf(p), 1);
 			} else {
@@ -228,8 +231,10 @@ export function setPeerIdentity(id: string, patch: { name?: string; avatar?: str
 		peers.push(p);
 		// Cap the invisible identity-only entries (oldest first — array order is
 		// insertion order) so inbound clients can't grow the store unboundedly.
-		const ghosts = peers.filter((x) => !x.saved && x.lastConnected == null);
-		for (const g of ghosts.slice(0, Math.max(0, ghosts.length - IDENTITY_MAX))) {
+		// Exclude the just-pushed entry from the cap so it can never be the one
+		// spliced out at the IDENTITY_MAX boundary (its name/avatar set below).
+		const ghosts = peers.filter((x) => x !== p && !x.saved && x.lastConnected == null);
+		for (const g of ghosts.slice(0, Math.max(0, ghosts.length - (IDENTITY_MAX - 1)))) {
 			peers.splice(peers.indexOf(g), 1);
 		}
 	}

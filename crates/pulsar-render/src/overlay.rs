@@ -100,6 +100,11 @@ pub struct UiState {
 	/// (the counter keys a fresh egui animation id per transition).
 	pub anim_view: View,
 	pub anim_gen: u64,
+	/// Overlay open-state from the previous draw, so the enter animation can be
+	/// (re)triggered on the closed→open edge even when the view is unchanged (e.g.
+	/// reopening while the last view was Root — without this the fade never plays
+	/// because anim_view already equals view). See `draw`.
+	pub was_open: bool,
 	pub chat_input: String,
 	pub local_path: String, // HOME-relative ("" = home)
 	pub local_rows: Vec<FsRow>,
@@ -236,8 +241,16 @@ pub fn apply_theme(ctx: &egui::Context) {
 pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> Vec<OverlayCmd> {
 	let mut cmds = Vec::new();
 	if !st.open {
+		// Remember we're closed so the next open is detected as an edge below.
+		ui_state.was_open = false;
 		return cmds;
 	}
+	// Closed→open edge: force the enter animation to restart even if the view didn't
+	// change since last open (the backends reset `view` to Root on open but the fade
+	// is keyed off an anim_view != view mismatch — reopening on Root would otherwise
+	// skip the fade). Resetting anim_view to a sentinel guarantees the mismatch fires.
+	let open_edge = !ui_state.was_open;
+	ui_state.was_open = true;
 	// Dim scrim behind the panel; clicking it closes the overlay.
 	egui::Area::new("scrim".into())
 		.order(egui::Order::Background)
@@ -317,7 +330,7 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 			// Section enter/leave animation: a quick fade + downward slide-in instead of
 			// the old instant swap. The transition restarts on every view change (the
 			// bumped counter keys a fresh animation id, primed at 0 the first frame).
-			if ui_state.anim_view != ui_state.view {
+			if ui_state.anim_view != ui_state.view || open_edge {
 				ui_state.anim_view = ui_state.view;
 				ui_state.anim_gen = ui_state.anim_gen.wrapping_add(1);
 				ui.ctx().animate_value_with_time(
@@ -554,7 +567,13 @@ fn draw_display(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>
 fn draw_audio(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
 	// "Sesli görüşme" = both directions at once (host audio here + our mic there);
 	// the host already plays inbound mic audio, so this is just a paired toggle.
-	let call_on = st.mic_on && st.audio_tx;
+	// SEMANTIC (must match the backends' `call` handler): turning the call ON enables
+	// BOTH mic and host audio; turning it OFF drops ONLY the mic and leaves host audio
+	// as the user had it (host audio has its own row). So the highlight must derive from
+	// `mic_on` ALONE — keying it off `mic_on && audio_tx` made "call off" (which clears
+	// only mic) still read as ON whenever host audio stayed on, so the highlight and the
+	// real state disagreed.
+	let call_on = st.mic_on;
 	ui.horizontal(|ui| {
 		ui.label(format!("📞 {}", t("audio.call")));
 		info(ui, t("info.call"));

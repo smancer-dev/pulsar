@@ -1221,6 +1221,9 @@ fn emit_cmd(state: &mut OverlayState, c: OverlayCmd) {
 				"amute" => AUDIO_MUTE.store(val == "on", Ordering::SeqCst),
 				"mic" => MIC_ON.store(val == "on", Ordering::SeqCst),
 				// Voice call = mic + host audio together (paired optimistic update).
+				// ON enables BOTH; OFF drops ONLY the mic and leaves host audio as-is
+				// (it has its own `atx` row). The overlay highlight derives from MIC_ON
+				// alone (overlay::draw_audio), so highlight + state stay in sync.
 				"call" => {
 					let on = val == "on";
 					MIC_ON.store(on, Ordering::SeqCst);

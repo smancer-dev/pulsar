@@ -72,13 +72,41 @@ struct Announce {
 }
 
 /// A peer found on the local network.
+///
+/// SECURITY — everything here is an **UNVERIFIED hint** supplied by whoever sent the
+/// multicast beacon. A beacon is unauthenticated: any host on the LAN (or anything
+/// that can reach the multicast group) can spoof another machine's `name`, `id` and
+/// `pubkey`. So this struct is only safe as input to the "devices on your network"
+/// *list* — never as an established trusted identity:
+///
+/// * `pubkey` is the beacon's *claimed* X25519 key and is **UNVERIFIED**. It MUST NOT
+///   be used for the direct-connect key path: deriving a session key from a beacon-
+///   announced pubkey would let an attacker impersonate a peer and MITM the
+///   "connect by name" flow. The real key must come from a verified channel (the
+///   relay's rendezvous handshake, or a user-confirmed id), not from a beacon. It is
+///   kept here only for display/debugging — callers deriving session keys go through
+///   the relay handshake, never through this field.
+/// * `id` is the beacon's *claimed* relay id. It is **not** corroborated against the
+///   relay here, so it is only a hint to pre-fill the connect field; the actual trust
+///   is still established by the normal relay-authenticated `connect()` (which verifies
+///   the target via its token/handshake), not by the beacon alone.
+///
+/// Connecting by **IP** (the LAN direct path) stays fine: the IP is the observed
+/// source of the datagram, and the session's own E2E handshake authenticates the peer.
+///
+/// (Field names are kept as `id`/`pubkey` for the existing UI callers; the contract is
+/// "unverified hint" — see each field's note. A larger fix would type-wrap them as an
+/// explicit `Unverified<…>`, but that is out of scope for this contained change.)
 #[derive(Clone, Debug)]
 pub struct DiscoveredPeer {
-	/// Relay id, if the peer is registered (lets the UI connect via the normal flow).
+	/// The beacon's *claimed* relay id, if announced. UNVERIFIED — a UI hint, NOT proof
+	/// the peer holds this relay id. Trust is established by the authenticated connect().
 	pub id: Option<DeviceId>,
 	pub name: String,
 	/// Source IP + the announced node port (where a direct LAN link would aim).
 	pub addr: SocketAddr,
+	/// The beacon's *claimed* X25519 pubkey. UNVERIFIED and spoofable — do NOT use it to
+	/// derive a session key (that path goes through the relay handshake). Display only.
 	pub pubkey: [u8; 32],
 	pub platform: String,
 	pub last_seen: Instant,
@@ -197,6 +225,16 @@ impl Discovery {
 		if a.nonce == self.inner.lock().await.announce.nonce {
 			return;
 		}
+		// SECURITY: a beacon is unauthenticated, so EVERYTHING below is an attacker-
+		// controllable hint, not a trusted fact. We keep it ONLY for the on-screen
+		// "devices on your network" list. We do NOT let the beacon establish identity:
+		// `relay_id`/`beacon_pubkey` are stored as unverified claims and are not used to
+		// derive any session key — real trust comes from the relay rendezvous handshake
+		// (or a user-confirmed id) when the user actually connects. The one value we do
+		// trust is `from.ip()` (the observed datagram source); the LAN direct-connect's
+		// own E2E handshake then authenticates the peer. Residual risk: the list can show
+		// a spoofed name/id, so the UI must not present a beacon entry as a verified
+		// identity — connecting still runs the authenticated path before any trust.
 		let peer = DiscoveredPeer {
 			id: a.id.and_then(DeviceId::new),
 			name: a.name,

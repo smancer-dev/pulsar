@@ -57,7 +57,8 @@ export {
 	onPlayDims,
 	onSessionEvent,
 	onAuthPrompt,
-	onNodePort
+	onNodePort,
+	onSessionPassword
 } from './api.events';
 
 export { copyText, setFullscreen, readClipboard, windowControl } from './api.dom';

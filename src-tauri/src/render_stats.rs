@@ -177,37 +177,3 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 		}
 	});
 }
-
-/// Read `pulsar-render`'s stdout — the user's overlay interactions — and forward them to the
-/// frontend (which calls the existing setters → host) so the overlay drives the real session:
-/// `ov set <field> <val>` → `overlay-cmd`; `ov end` → `overlay-end`; `ov close` → `overlay-close`.
-pub(crate) fn start_overlay_cmd_reader(
-	app: &AppHandle,
-	id: u64,
-	stdout: std::process::ChildStdout,
-) {
-	use std::io::BufRead;
-	use tauri::Emitter;
-	let app = app.clone();
-	std::thread::spawn(move || {
-		let reader = std::io::BufReader::new(stdout);
-		for line in reader.lines() {
-			let Ok(line) = line else { break };
-			let mut it = line.split_whitespace();
-			match (it.next(), it.next()) {
-				(Some("ov"), Some("set")) => {
-					if let (Some(field), Some(val)) = (it.next(), it.next()) {
-						let _ = app.emit("overlay-cmd", (id, field.to_string(), val.to_string()));
-					}
-				}
-				(Some("ov"), Some("end")) => {
-					let _ = app.emit("overlay-end", id);
-				}
-				(Some("ov"), Some("close")) => {
-					let _ = app.emit("overlay-close", id);
-				}
-				_ => {}
-			}
-		}
-	});
-}

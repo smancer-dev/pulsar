@@ -274,6 +274,12 @@ pub(crate) async fn start_remote_play(
 	// later phase (needs a Mac to build), but this already removes the webview video path there.
 	let use_native = true;
 	if use_native {
+		// TODO(port-toctou): free_udp_port() binds an ephemeral UDP port, reads it, and
+		// drops the socket — the renderer child below re-binds it moments later, so a
+		// racing process can grab the port in the gap. A clean fix can't live here (the
+		// CHILD owns the bind, not us, so we can't hold the socket open across the spawn
+		// without blocking the child's bind); it belongs in native_view/spawn.rs (out of
+		// scope), e.g. passing the bound socket fd to the child or retrying on bind failure.
 		if let Some(vport) = native_view::free_udp_port() {
 			match native_view::write_sdp(vport, &codec) {
 				Ok(sdp) => {
@@ -935,9 +941,8 @@ pub(crate) async fn stop_stream(
 		// destroys its EGL context, which corrupts the WebKitGTK webview's shared Mali GL on RK3588
 		// and wedges the webview (clicks dead) with no in-session recovery (needs a reboot). Instead
 		// tell it to `hide` (unmap its window → the webview shows through) and idle; its
-		// `PR_SET_PDEATHSIG` reaps it when the app exits. We `forget` the handle so Child's drop
-		// doesn't close its stdout pipe (the idle render writes no stats, so nothing fills). If
-		// there's no stdin to send `hide` (shouldn't happen for pulsar-render), fall back to a kill.
+		// `PR_SET_PDEATHSIG` reaps it when the app exits. If there's no stdin to send `hide`
+		// (shouldn't happen for pulsar-render), fall back to a kill.
 		if let Some(mut child) = play.render_child.take() {
 			// Linux: hide + keep resident (don't destroy the EGL context → no WebKit GL corruption).
 			#[cfg(all(unix, not(target_os = "macos")))]
@@ -950,7 +955,13 @@ pub(crate) async fn stop_stream(
 					}
 				};
 				if hidden {
-					std::mem::forget(child);
+					// DROP the handle (don't `forget` it): the renderer's stdin AND stdout
+					// were already moved out at spawn (render_stdin Arc + start_render_reader),
+					// so the Child owns no pipe fds to close — the only reason `forget` was
+					// used. Dropping a Child on Unix neither kills nor waits the process, so the
+					// resident renderer keeps running exactly as intended; `forget` additionally
+					// LEAKED the Child struct (and any fds it still held) on every reconnect.
+					drop(child);
 				} else {
 					stop_render_child(&mut child);
 				}

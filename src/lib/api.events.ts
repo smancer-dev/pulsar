@@ -40,6 +40,10 @@ export const onLocalCaps = (cb: (caps: LocalCaps) => void) => listenTo<LocalCaps
 /** The node (re)bound its UDP socket on `go_online` — the ACTUAL port for direct
  * `ip:port` connects (Home shows it next to the local IP). */
 export const onNodePort = (cb: (port: number) => void) => listenTo<number>('node-port', cb);
+/** Host: the one-time connect password was rotated (after a successful auth) — the
+ * Home SelfCard updates instantly instead of waiting for the next poll. */
+export const onSessionPassword = (cb: (pw: string) => void) =>
+	listenTo<string>('session-password', cb);
 /** Client: a chat line arrived from the host (`peer` = play id as string). */
 export const onChatMsg = (cb: (e: DataText) => void) => listenTo<DataText>('chat-msg', cb);
 /** Host: a chat line arrived from a connected client. */
