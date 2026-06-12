@@ -40,6 +40,12 @@ pub(crate) struct AppState {
 	/// Active outbound remote-play sessions, keyed by play id (this client can be
 	/// connected to several hosts at once — one per tab).
 	pub(crate) plays: Arc<Mutex<HashMap<u64, PlaySession>>>,
+	/// Play ids whose in-session overlay is currently OPEN. The evdev capture's
+	/// SUSPENDED latch is global while the overlay is per-tab, so the latch is
+	/// derived from this set (suspend ⇔ non-empty): a tab closed with its overlay
+	/// open, or a second tab opened next to it, can no longer strand the capture
+	/// in "suspended" forever (= connected but uncontrollable — seen live Pi→PC).
+	pub(crate) overlay_open: Arc<Mutex<std::collections::HashSet<u64>>>,
 	/// Monotonic id for play sessions.
 	pub(crate) next_play: Arc<AtomicU64>,
 	/// Pending Allow/Deny approval requests (request id → decision sender),

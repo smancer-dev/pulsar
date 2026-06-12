@@ -909,6 +909,15 @@ pub(crate) async fn stop_stream(
 	// otherwise every other state.plays user (forward() on each mouse-move/keystroke,
 	// the setters, mic/kbd commands) stalls until the closed session's children exit.
 	let play = state.plays.lock().unwrap().remove(&id);
+	// A session torn down with its overlay still open must release the global
+	// SUSPENDED latch (see AppState::overlay_open) — otherwise the next session
+	// starts permanently un-engageable.
+	{
+		let mut set = state.overlay_open.lock().unwrap();
+		if set.remove(&id) {
+			crate::kbdhook::overlay_suspend(!set.is_empty());
+		}
+	}
 	if let Some(mut play) = play {
 		play.running.store(false, Ordering::SeqCst);
 		play.viewer.stop();

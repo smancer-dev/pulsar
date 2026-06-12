@@ -659,8 +659,19 @@ pub(crate) async fn set_overlay(
 	open: bool,
 ) -> Result<(), String> {
 	// Release/restore the evdev grab so the local OS + native overlay drive the menu
-	// (no-op on Windows — the overlay floats over the live canvas there).
-	kbdhook::overlay_suspend(open);
+	// (no-op on Windows — the overlay floats over the live canvas there). The latch is
+	// derived from the SET of open-overlay tabs, not this one call: with several tabs,
+	// "my overlay closed" must not resume capture while another tab's is still open —
+	// and a session that dies with its overlay open is cleaned up in stop_stream.
+	{
+		let mut set = state.overlay_open.lock().unwrap();
+		if open {
+			set.insert(id);
+		} else {
+			set.remove(&id);
+		}
+		kbdhook::overlay_suspend(!set.is_empty());
+	}
 	// Opening the overlay DISENGAGES control (Parsec model): closing leaves the user
 	// out of focus mode — the renderer prompts the click-to-control step — instead of
 	// silently re-grabbing their keyboard/mouse.
