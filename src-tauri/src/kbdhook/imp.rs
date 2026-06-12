@@ -592,6 +592,28 @@ pub fn overlay_suspend(_suspend: bool) {}
 /// away) but every keystroke still went to the remote.
 pub fn set_focused(focused: bool) {
 	tracing::info!(focused, "app focus changed");
+	// A click over the live video lands on the pulsar-render CHILD (a separate
+	// process), which momentarily deactivates the Tauri webview window — Windows
+	// reports focused=false then true within milliseconds. Disengaging on that flap
+	// released the capture mid-click (host input devices re-armed → the click fell
+	// into the recreate gap: "cursor moves but clicks do nothing"). Focus moving to
+	// a window whose TOP-LEVEL root is still ours is NOT the user leaving the app.
+	if !focused {
+		use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+		use windows_sys::Win32::UI::WindowsAndMessaging::{
+			GetAncestor, GetForegroundWindow, GetWindowThreadProcessId, GA_ROOT,
+		};
+		let fg = unsafe { GetForegroundWindow() };
+		if !fg.is_null() {
+			let root = unsafe { GetAncestor(fg, GA_ROOT) };
+			let mut pid = 0u32;
+			unsafe { GetWindowThreadProcessId(root, &mut pid) };
+			if !root.is_null() && pid == unsafe { GetCurrentProcessId() } {
+				tracing::debug!("focus moved within our own window tree — keeping engagement");
+				return;
+			}
+		}
+	}
 	APP_FOCUSED.store(focused, Ordering::SeqCst);
 	// Kiosk sessions ignore focus loss entirely (see KIOSK_SESSION).
 	if KIOSK_SESSION.load(Ordering::SeqCst) {

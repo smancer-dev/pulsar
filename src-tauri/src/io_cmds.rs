@@ -384,6 +384,12 @@ pub(crate) fn set_window_fullscreen(
 	// Native decorations are on now, so hide the OS title bar / frame while fullscreen (e.g. a
 	// game) and restore it on exit — otherwise the title bar would sit across the top.
 	let _ = window.set_decorations(!on);
+	// Frameless-but-resizable windows keep invisible 8px WS_THICKFRAME hit-test
+	// borders that INSET the client area — in fullscreen the webview/video child then
+	// sits (8,1)-(w-8,h-8) inside the monitor-covering window and the transparent
+	// gutter shows the desktop through. Dropping resizability while fullscreen removes
+	// the frame so the client area truly covers the monitor; restored on exit.
+	let _ = window.set_resizable(!on);
 	#[cfg(windows)]
 	{
 		let w = window.clone();
@@ -435,7 +441,19 @@ fn win_fullscreen(
 		return;
 	};
 	let hwnd: HWND = handle.0 as _;
+	use windows_sys::Win32::UI::WindowsAndMessaging::{
+		GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_CAPTION, WS_THICKFRAME,
+	};
 	unsafe {
+		// Tauri's set_decorations/set_resizable are queued through the event loop and can
+		// land AFTER this SetWindowPos — the frame change then never re-lays anything out
+		// and the client area keeps an 8px WS_THICKFRAME inset inside the fullscreen
+		// window (transparent gutter → desktop visible around the video). Toggle the
+		// styles synchronously here instead.
+		let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+		let strip = (WS_THICKFRAME | WS_CAPTION) as isize;
+		let new_style = if on { style & !strip } else { style | (WS_THICKFRAME as isize) };
+		SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
 		if on {
 			// Clear any maximize/minimize first, else SetWindowPos is clamped to the
 			// work area (taskbar stays visible).
@@ -468,5 +486,46 @@ fn win_fullscreen(
 		} else {
 			SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 		}
+		// The webview child (WRY_WEBVIEW) keeps its PRE-toggle bounds: wry only re-lays
+		// it out on size events of the OLD frame, so after the style change it sits
+		// inset by the former 8px resize borders — a transparent gutter showing the
+		// desktop around the fullscreen video. Snap every direct child to the fresh
+		// client rect (webview AND the render child; the frontend's viewrect then
+		// repositions the video inside it).
+		fill_children_to_client(hwnd);
 	}
+}
+
+/// Resize all direct children of `hwnd` to its current client rect (Win32 child
+/// coords are client-relative, so that's (0,0,w,h)).
+#[cfg(windows)]
+unsafe fn fill_children_to_client(hwnd: windows_sys::Win32::Foundation::HWND) {
+	use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+	use windows_sys::Win32::UI::WindowsAndMessaging::{
+		EnumChildWindows, GetAncestor, GetClientRect, MoveWindow, GA_PARENT,
+	};
+	let mut rc: RECT = std::mem::zeroed();
+	if GetClientRect(hwnd, &mut rc) == 0 || rc.right <= 0 || rc.bottom <= 0 {
+		return;
+	}
+	struct Ctx {
+		parent: HWND,
+		w: i32,
+		h: i32,
+	}
+	unsafe extern "system" fn cb(child: HWND, lp: LPARAM) -> i32 {
+		let ctx = &*(lp as *const Ctx);
+		// Direct children only — grandchildren (the webview's internal chain) follow
+		// their own parent's resize.
+		if GetAncestor(child, GA_PARENT) == ctx.parent {
+			MoveWindow(child, 0, 0, ctx.w, ctx.h, 1);
+		}
+		1
+	}
+	let ctx = Ctx {
+		parent: hwnd,
+		w: rc.right,
+		h: rc.bottom,
+	};
+	EnumChildWindows(hwnd, Some(cb), &ctx as *const Ctx as LPARAM);
 }

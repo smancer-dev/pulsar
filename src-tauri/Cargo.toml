@@ -59,6 +59,7 @@ windows-sys = { version = "0.59", features = [
 	"Win32_System_JobObjects", # job.rs: kill orphaned ffmpeg/ffplay when Pulsar dies (needs Threading + Security)
 	"Win32_System_LibraryLoader",
 	"Win32_Security", # SECURITY_ATTRIBUTES (CreateMutexW single-instance); also CreateJobObjectW
+	"Win32_System_Diagnostics_Debug", # SetErrorMode: probe ffmpeg crashes must not pop a WER dialog
 ] }
 # Self-avatar resolution (avatar.rs): decode the account picture / wallpaper, center-crop
 # + downscale (same pipeline as the Linux block below).

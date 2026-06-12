@@ -232,6 +232,16 @@ pub fn run() {
 		)
 		.init();
 	tracing::info!("Pulsar starting");
+	#[cfg(windows)]
+	unsafe {
+		// Children inherit the error mode: a crashing ffmpeg encoder probe (h264_vulkan
+		// access-violates on some hybrid AMD+NVIDIA boxes) must fail silently, not hang
+		// startup behind a WER "Application Error" dialog.
+		use windows_sys::Win32::System::Diagnostics::Debug::{
+			SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
+		};
+		SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+	}
 	{
 		// Parse the auto-connect CLI: `--connect <id|ip> [--connect-pw <pw>] [--mode
 		// game|remote] [--app <name|id>]`. `--mode` defaults to remote (an unrecognized

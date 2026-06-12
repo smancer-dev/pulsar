@@ -67,7 +67,31 @@ pub fn probe_ddagrab_zerocopy(ffmpeg: &str) -> bool {
 	no_window(&mut cmd);
 	cmd.stdout(std::process::Stdio::null());
 	cmd.stderr(std::process::Stdio::null());
-	matches!(cmd.status().map(|st| st.success()), Ok(true))
+	probe_ok(cmd)
+}
+
+/// Run a one-frame probe command, treating "still running after 15s" as a failure:
+/// a probe ffmpeg that crashed into a (suppressed) WER report or wedged a broken
+/// driver would otherwise block startup caps probing forever.
+fn probe_ok(mut cmd: std::process::Command) -> bool {
+	let Ok(mut child) = cmd.spawn() else {
+		return false;
+	};
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+	loop {
+		match child.try_wait() {
+			Ok(Some(st)) => return st.success(),
+			Ok(None) => {
+				if std::time::Instant::now() >= deadline {
+					let _ = child.kill();
+					let _ = child.wait();
+					return false;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(50));
+			}
+			Err(_) => return false,
+		}
+	}
 }
 
 /// Raw `ffmpeg -encoders` stdout (bundled binary). Empty on failure. Used both to detect
@@ -299,7 +323,7 @@ fn probe_encoder_codec(
 			no_window(&mut cmd);
 			cmd.stdout(std::process::Stdio::null());
 			cmd.stderr(std::process::Stdio::null());
-			matches!(cmd.status().map(|st| st.success()), Ok(true))
+			probe_ok(cmd)
 		}
 		None => false,
 	};
