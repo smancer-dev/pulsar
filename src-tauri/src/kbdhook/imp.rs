@@ -51,6 +51,8 @@ static THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 /// broken session can't trap the keyboard. Set by `engage()` (video click → renderer
 /// `ov engage` line), cleared by `release_engage()` / the 3×RightCtrl combo.
 static ENGAGED: AtomicBool = AtomicBool::new(false);
+/// The play id the capture is currently armed for (same-session re-arm detection).
+static LAST_PLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 /// CLI kiosk (`--connect`) auto-engages on the next `enable()` (same as Linux).
 static KIOSK_ENGAGE: AtomicBool = AtomicBool::new(false);
 /// True for the lifetime of a kiosk-started session: focus loss must NOT disengage
@@ -468,7 +470,13 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 /// Arm capture for `tx`'s session. The first call picks a mechanism: the
 /// Interception driver if present (works under ASTER), else WH_KEYBOARD_LL. Later
 /// calls just swap in the active sender + app handle and flip ENABLED.
-pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
+pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
+	// A re-arm of the SAME live play session must preserve the user's engagement —
+	// resetting it mid-control silently stopped forwarding with no UI cue (Linux
+	// parity; see kbdhook/linux.rs enable).
+	let same_session =
+		ENABLED.load(Ordering::SeqCst) && LAST_PLAY.load(Ordering::SeqCst) == id;
+	LAST_PLAY.store(id, Ordering::SeqCst);
 	{
 		let mut g = globals().lock().unwrap();
 		g.tx = Some(tx);
@@ -486,7 +494,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 	KIOSK_SESSION.store(kiosk, Ordering::SeqCst);
 	if kiosk {
 		engage(&app);
-	} else {
+	} else if !same_session {
 		ENGAGED.store(false, Ordering::SeqCst);
 	}
 	// Native-renderer sessions also capture the mouse (relative); webview sessions

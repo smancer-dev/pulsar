@@ -17,7 +17,7 @@ use tauri::AppHandle;
 
 // macOS (and any non-Windows, non-Linux target): no client-side capture yet.
 #[cfg(not(any(windows, target_os = "linux")))]
-pub fn enable(_app: AppHandle, _tx: tokio::sync::mpsc::Sender<InputEvent>, _mouse: bool) {}
+pub fn enable(_app: AppHandle, _tx: tokio::sync::mpsc::Sender<InputEvent>, _mouse: bool, _id: u64) {}
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn disable() {}
 // No grab to release on these targets (the webview floats over the live video).

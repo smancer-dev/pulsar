@@ -50,6 +50,10 @@ static FOCUSED: AtomicBool = AtomicBool::new(true);
 /// re-grab instantly on close. Driven by `overlay_suspend()` (called from the
 /// `set_overlay` command), NOT by the leave combo — the session stays alive.
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// The play id the capture is currently armed for — lets a re-arm of the SAME live
+/// session (effect re-run / hotplug restart) preserve ENGAGED instead of silently
+/// disengaging the user mid-control.
+static LAST_PLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 /// Click-to-engage gate: the grab is held ONLY while engaged. Sessions start
 /// DISENGAGED (except CLI `--connect` kiosk starts) so the user keeps their own
 /// keyboard/mouse until they explicitly click the session video. Set by a
@@ -171,11 +175,18 @@ fn chord_mods(devs: &[evdev::Device]) -> (bool, bool, bool) {
 	(ctrl, shift, alt)
 }
 
-pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
+pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64) {
 	// Supersede any prior capture thread (a tab switch is stop+start back-to-back;
 	// the bumped generation makes the old thread exit on its next loop pass).
 	let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
-	RUNNING.store(true, Ordering::SeqCst);
+	// A re-arm of the SAME live play session (enable while already running, same id —
+	// e.g. an effect re-run or a device-hotplug-triggered restart) must PRESERVE the
+	// user's engagement: resetting it mid-control silently dropped the grab semantics
+	// ("keys stopped working after Ctrl+Shift+F12", seen live Pi→PC) with no UI cue.
+	// A genuinely new session (stop→start, different id) still starts disengaged.
+	let same_session =
+		RUNNING.swap(true, Ordering::SeqCst) && LAST_PLAY.load(Ordering::SeqCst) == id;
+	LAST_PLAY.store(id, Ordering::SeqCst);
 	// A fresh session never starts suspended (a prior overlay close may have
 	// raced teardown). The capture thread re-grabs from a clean state below.
 	SUSPENDED.store(false, Ordering::SeqCst);
@@ -194,8 +205,15 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 	// re-engaging them all is correct (an appliance has no manual sessions).
 	let kiosk = KIOSK_ENGAGE.load(Ordering::SeqCst);
 	KIOSK_SESSION.store(kiosk, Ordering::SeqCst);
-	ENGAGED.store(kiosk, Ordering::SeqCst);
-	tracing::info!(gen, kiosk, "evdev capture armed");
+	// Same-session re-arm keeps whatever engagement the user already had (see above);
+	// everything else starts at the kiosk default (engaged for appliances, off manual).
+	let engaged = if same_session {
+		ENGAGED.load(Ordering::SeqCst) || kiosk
+	} else {
+		kiosk
+	};
+	ENGAGED.store(engaged, Ordering::SeqCst);
+	tracing::info!(gen, kiosk, same_session, engaged, "evdev capture armed");
 	if kiosk {
 		// Keep the frontend's engage hint in sync with the auto-engage.
 		let _ = app.emit("kbd-engaged", ());

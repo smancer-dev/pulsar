@@ -281,7 +281,7 @@ pub(crate) async fn kbd_capture_start(
 	match tx {
 		Some(tx) => {
 			// `mouse` = also capture the mouse (native-renderer mode, no canvas).
-			kbdhook::enable(app, tx, mouse);
+			kbdhook::enable(app, tx, mouse, id);
 			Ok(())
 		}
 		None => Err(crate::i18n::t("err.session").into()),
