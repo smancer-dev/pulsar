@@ -163,7 +163,9 @@ fn evdev_modifier_flag(code: u32) -> Option<CGEventFlags> {
 /// modifier mask are released on `Drop` so a client that disconnects mid-press
 /// can't leave the host with a stuck button/modifier.
 pub struct DesktopInput {
-	source: CGEventSource,
+	// NOTE: no stored CGEventSource — its NonNull pointer isn't Send, and the host
+	// serve loop holds DesktopInput across awaits (tokio task ⇒ the type must be
+	// Send). A fresh source per event is cheap and keeps this struct plain data.
 	held_buttons: HashSet<u8>,
 	held_keys: HashSet<u16>,
 	/// Current modifier mask, kept in sync as modifier keys go down/up.
@@ -185,29 +187,35 @@ fn button_events(button: u8, down: bool) -> (CGMouseButton, CGEventType) {
 
 impl DesktopInput {
 	pub fn new() -> std::io::Result<Self> {
-		// HIDSystemState: events appear to come from the HID layer (a real device),
-		// which is what foreground apps expect from injected input.
-		let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
+		// Validate once that a source CAN be created (catches "no window-server
+		// session" early); the per-event sources below repeat this cheaply.
+		Self::source().ok_or_else(|| {
 			std::io::Error::new(
 				std::io::ErrorKind::Other,
 				"failed to create CGEventSource (no window-server session?)",
 			)
 		})?;
 		Ok(Self {
-			source,
 			held_buttons: HashSet::new(),
 			held_keys: HashSet::new(),
 			flags: CGEventFlags::empty(),
 		})
 	}
 
+	/// A fresh HIDSystemState event source. HIDSystemState: events appear to come
+	/// from the HID layer (a real device), which is what foreground apps expect.
+	/// Created per event because CGEventSource is not Send (see struct note).
+	fn source() -> Option<CGEventSource> {
+		CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()
+	}
+
 	/// The current pointer location in global display (pixel) coordinates, read
 	/// back from CoreGraphics. Used to anchor relative moves.
 	fn current_location(&self) -> CGPoint {
 		// A throwaway null event carries the live cursor location.
-		match CGEvent::new(self.source.clone()) {
-			Ok(ev) => ev.location(),
-			Err(_) => CGPoint::new(0.0, 0.0),
+		match Self::source().and_then(|s| CGEvent::new(s).ok()) {
+			Some(ev) => ev.location(),
+			None => CGPoint::new(0.0, 0.0),
 		}
 	}
 
@@ -233,7 +241,7 @@ impl DesktopInput {
 		} else {
 			CGMouseButton::Left
 		};
-		if let Ok(ev) = CGEvent::new_mouse_event(self.source.clone(), ty, point, btn) {
+		if let Some(ev) = Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, btn).ok()) {
 			ev.set_flags(self.flags);
 			ev.post(CGEventTapLocation::HID);
 		}
@@ -268,7 +276,9 @@ impl DesktopInput {
 		}
 		let (cg_btn, ty) = button_events(button, down);
 		let point = self.current_location();
-		if let Ok(ev) = CGEvent::new_mouse_event(self.source.clone(), ty, point, cg_btn) {
+		if let Some(ev) =
+			Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
+		{
 			ev.set_flags(self.flags);
 			ev.post(CGEventTapLocation::HID);
 		}
@@ -283,14 +293,9 @@ impl DesktopInput {
 		}
 		// CGEvent scroll: positive Y scrolls content up (toward the top), so negate
 		// the browser delta (browser positive = scroll down).
-		if let Ok(ev) = CGEvent::new_scroll_event(
-			self.source.clone(),
-			ScrollEventUnit::LINE,
-			2,
-			-v,
-			-h,
-			0,
-		) {
+		if let Some(ev) = Self::source()
+			.and_then(|s| CGEvent::new_scroll_event(s, ScrollEventUnit::LINE, 2, -v, -h, 0).ok())
+		{
 			ev.post(CGEventTapLocation::HID);
 		}
 	}
@@ -315,7 +320,8 @@ impl DesktopInput {
 		} else {
 			self.held_keys.remove(&vk);
 		}
-		if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
+		if let Some(ev) = Self::source().and_then(|s| CGEvent::new_keyboard_event(s, vk, down).ok())
+		{
 			ev.set_flags(self.flags);
 			ev.post(CGEventTapLocation::HID);
 		}
@@ -335,13 +341,23 @@ impl DesktopInput {
 		let units = c.encode_utf16(&mut buf);
 		for &down in &[true, false] {
 			// vk=0 is fine; the Unicode string overrides the keycode's character.
-			if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, down) {
+			if let Some(ev) =
+				Self::source().and_then(|s| CGEvent::new_keyboard_event(s, 0, down).ok())
+			{
 				ev.set_string_from_utf16_unchecked(units);
 				ev.post(CGEventTapLocation::HID);
 			}
 		}
 	}
 }
+
+// Compile-time guarantee: the host serve loop holds DesktopInput across awaits
+// (tokio task), so it MUST be Send — this is exactly what broke the first CI mac
+// build when a CGEventSource (non-Send NonNull) was stored in the struct.
+const _: fn() = || {
+	fn assert_send<T: Send>() {}
+	assert_send::<DesktopInput>();
+};
 
 impl Drop for DesktopInput {
 	/// Release anything still held when the session tears down, so a mid-press
@@ -351,7 +367,9 @@ impl Drop for DesktopInput {
 		let point = self.current_location();
 		for b in self.held_buttons.clone() {
 			let (cg_btn, ty) = button_events(b, false);
-			if let Ok(ev) = CGEvent::new_mouse_event(self.source.clone(), ty, point, cg_btn) {
+			if let Some(ev) =
+				Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
+			{
 				ev.post(CGEventTapLocation::HID);
 			}
 		}
@@ -360,7 +378,9 @@ impl Drop for DesktopInput {
 		// don't re-assert a flag we're tearing down.
 		self.flags = CGEventFlags::empty();
 		for vk in self.held_keys.clone() {
-			if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, false) {
+			if let Some(ev) =
+				Self::source().and_then(|s| CGEvent::new_keyboard_event(s, vk, false).ok())
+			{
 				ev.post(CGEventTapLocation::HID);
 			}
 		}
