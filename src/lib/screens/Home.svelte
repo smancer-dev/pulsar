@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { historyPeers, removeFromHistory, fmtPeerId } from '$lib/peers.svelte';
+	import { historyPeers, removeFromHistory, fmtPeerId, addPeer, isSaved } from '$lib/peers.svelte';
 	import { api, onNodePort, type GameInfo } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 	import SelfCard from './Home/SelfCard.svelte';
@@ -234,6 +234,15 @@
 						</span>
 						<Icon name="arrowRight" size={15} class="push" />
 					</button>
+					<!-- Save to the address book (Devices) — hidden once it's saved. -->
+					{#if !isSaved(r.id)}
+						<button
+							class="rsave"
+							title={t('home.saveRecent')}
+							aria-label={t('home.saveRecent')}
+							onclick={() => addPeer(r.name, r.id)}><Icon name="star" size={13} /></button
+						>
+					{/if}
 					<button
 						class="rdel"
 						title={t('home.removeRecent')}
@@ -341,6 +350,23 @@
 	.rrow .recent-row {
 		flex: 1;
 		min-width: 0;
+	}
+	.rsave {
+		flex: none;
+		width: 26px;
+		height: 26px;
+		margin-bottom: 6px;
+		border: none;
+		border-radius: 7px;
+		background: transparent;
+		color: var(--text-faint);
+		cursor: pointer;
+		display: grid;
+		place-items: center;
+	}
+	.rsave:hover {
+		color: var(--warn);
+		background: var(--surface-3);
 	}
 	.rdel {
 		flex: none;

@@ -1,7 +1,9 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import Modal from '$lib/Modal.svelte';
-	import { savedPeers, addPeer, removePeer, toggleFav, fmtPeerId, type PeerCategory } from '$lib/peers.svelte';
+	import { savedPeers, addPeer, removePeer, toggleFav, fmtPeerId, normalizeId } from '$lib/peers.svelte';
+	import { api, type LanDevice } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
 	type Target = { name: string; id: string };
@@ -9,24 +11,15 @@
 	let { onConnect }: Props = $props();
 
 	let q = $state('');
-	let filter = $state<'all' | PeerCategory>('all');
 
-	// add-device form
+	// add-device form: name + id-or-IP + an image (a built-in icon or an upload).
 	let adding = $state(false);
 	let newName = $state('');
 	let newId = $state('');
-	let newCat = $state<PeerCategory>('pc');
+	let newImage = $state('icon:monitor');
+	let fileInput = $state<HTMLInputElement | null>(null);
 
-	// Full status label ("Oyun PC’si") vs. short segment label ("Oyun").
-	const catFull = (c: PeerCategory) => t('cat.' + c);
-	const catShort = (c: PeerCategory) => (c === 'console' ? t('cat.consoleShort') : t('cat.' + c));
-	const catIcon: Record<PeerCategory, string> = {
-		pc: 'monitor',
-		server: 'devices',
-		console: 'gaming'
-	};
-	const CATS: PeerCategory[] = ['pc', 'server', 'console'];
-	const FILTERS = ['all', 'pc', 'server', 'console'] as const;
+	const ICONS = ['monitor', 'devices', 'gaming', 'keyboard'] as const;
 
 	const peers = $derived(savedPeers());
 	// Ids are stored canonical (despaced) — despace the query too so typing the
@@ -35,26 +28,70 @@
 		const ql = q.trim().toLowerCase();
 		const qd = ql.replace(/\s/g, '');
 		return peers.filter(
-			(d) =>
-				(filter === 'all' || d.cat === filter) &&
-				(!ql || d.name.toLowerCase().includes(ql) || (!!qd && d.id.includes(qd)))
+			(d) => !ql || d.name.toLowerCase().includes(ql) || (!!qd && d.id.includes(qd))
 		);
 	});
 
-	const fmtId = (v: string) =>
-		v
-			.replace(/\D/g, '')
-			.slice(0, 9)
-			.replace(/(\d{3})(?=\d)/g, '$1 ')
-			.trim();
+	// Online presence: a saved device is "online" when its id (or address) is seen
+	// in the LAN discovery beacon list. Poll like the Home LAN section does.
+	let lan = $state<LanDevice[]>([]);
+	async function refreshLan() {
+		try {
+			lan = await api.lanDevices();
+		} catch {
+			/* core not bound yet — keep the last list */
+		}
+	}
+	onMount(() => {
+		refreshLan();
+		const timer = setInterval(refreshLan, 3000);
+		return () => clearInterval(timer);
+	});
+	const isOnline = (id: string) =>
+		lan.some((d) => (d.id && normalizeId(d.id) === id) || d.addr.startsWith(id));
+
+	// Display id input as-is (IPs welcome); a pure 9-digit relay id gets grouped.
+	const tidyId = (v: string) => {
+		const despaced = v.replace(/\s/g, '');
+		return /^\d{1,9}$/.test(despaced)
+			? despaced.replace(/(\d{3})(?=\d)/g, '$1 ').trim()
+			: v.trim();
+	};
+
+	// Uploaded picture → small cover-cropped data URL (96px) so the persisted
+	// store never carries multi-MB originals.
+	function onPickImage(e: Event) {
+		const file = (e.currentTarget as HTMLInputElement).files?.[0];
+		(e.currentTarget as HTMLInputElement).value = '';
+		if (!file) return;
+		const url = URL.createObjectURL(file);
+		const img = new Image();
+		img.onload = () => {
+			const S = 96;
+			const c = document.createElement('canvas');
+			c.width = S;
+			c.height = S;
+			const g = c.getContext('2d');
+			if (g) {
+				const scale = Math.max(S / img.width, S / img.height);
+				const w = img.width * scale;
+				const h = img.height * scale;
+				g.drawImage(img, (S - w) / 2, (S - h) / 2, w, h);
+				newImage = c.toDataURL('image/jpeg', 0.82);
+			}
+			URL.revokeObjectURL(url);
+		};
+		img.onerror = () => URL.revokeObjectURL(url);
+		img.src = url;
+	}
 
 	function submitAdd() {
-		const id = fmtId(newId);
-		if (id.replace(/\D/g, '').length < 6) return;
-		addPeer(newName.trim() || t('devices.defaultName'), id, newCat);
+		const id = normalizeId(newId);
+		if (!id) return;
+		addPeer(newName.trim() || t('devices.defaultName'), id, 'pc', newImage);
 		newName = '';
 		newId = '';
-		newCat = 'pc';
+		newImage = 'icon:monitor';
 		adding = false;
 	}
 
@@ -66,6 +103,15 @@
 		const h = Math.floor(m / 60);
 		if (h < 24) return t('devices.hourAgo', { n: h });
 		return t('devices.dayAgo', { n: Math.floor(h / 24) });
+	}
+
+	function initials(name: string) {
+		return name
+			.split(' ')
+			.map((w) => w[0])
+			.slice(0, 2)
+			.join('')
+			.toUpperCase();
 	}
 </script>
 
@@ -81,23 +127,36 @@
 		<div class="addform">
 			<span class="fl">{t('devices.name')}</span>
 			<div class="field"><input bind:value={newName} placeholder={t('devices.name')} aria-label={t('devices.name')} /></div>
-			<span class="fl">{t('devices.id')}</span>
+			<span class="fl">{t('devices.idOrIp')}</span>
 			<div class="field">
 				<Icon name="connect" size={15} />
 				<input
 					value={newId}
-					oninput={(e) => (newId = fmtId(e.currentTarget.value))}
-					placeholder="000 000 000"
-					inputmode="numeric"
-					aria-label={t('devices.id')}
+					oninput={(e) => (newId = tidyId(e.currentTarget.value))}
+					placeholder="000 000 000 · 192.168.1.42"
+					aria-label={t('devices.idOrIp')}
 					style="font-family:var(--font-mono)"
 				/>
 			</div>
-			<span class="fl">{t('devices.type')}</span>
-			<div class="seg">
-				{#each CATS as v (v)}
-					<button class:active={newCat === v} onclick={() => (newCat = v)}>{catShort(v)}</button>
+			<span class="fl">{t('devices.image')}</span>
+			<div class="imgrow">
+				{#each ICONS as ic (ic)}
+					<button
+						class="imgopt"
+						class:active={newImage === 'icon:' + ic}
+						aria-label={ic}
+						onclick={() => (newImage = 'icon:' + ic)}><Icon name={ic} size={20} /></button
+					>
 				{/each}
+				<button class="imgopt upload" class:active={!newImage.startsWith('icon:')} onclick={() => fileInput?.click()}>
+					{#if !newImage.startsWith('icon:')}
+						<img class="uimg" src={newImage} alt="" />
+					{:else}
+						<Icon name="upload" size={18} />
+					{/if}
+				</button>
+				<input type="file" accept="image/*" bind:this={fileInput} onchange={onPickImage} style="display:none" />
+				<span class="imghint">{t('devices.imageHint')}</span>
 			</div>
 			<div class="factions">
 				<button class="btn btn-ghost" onclick={() => (adding = false)}>{t('devices.cancel')}</button>
@@ -112,11 +171,6 @@
 		<Icon name="search" size={16} />
 		<input bind:value={q} placeholder={t('devices.search')} aria-label={t('devices.searchAria')} />
 	</div>
-	<div class="seg">
-		{#each FILTERS as v (v)}
-			<button class:active={filter === v} onclick={() => (filter = v)}>{v === 'all' ? t('filter.all') : catShort(v)}</button>
-		{/each}
-	</div>
 </div>
 
 {#if peers.length === 0}
@@ -130,7 +184,17 @@
 	<div class="grid">
 		{#each filtered as d (d.id)}
 			<div class="device-tile">
-				<div class="tico"><Icon name={catIcon[d.cat]} size={22} /></div>
+				<div class="tico">
+					{#if d.image && !d.image.startsWith('icon:')}
+						<img class="timg" src={d.image} alt="" />
+					{:else if d.image?.startsWith('icon:')}
+						<Icon name={d.image.slice(5)} size={22} />
+					{:else if d.avatar}
+						<img class="timg" src={d.avatar} alt="" />
+					{:else}
+						<span class="tinit">{initials(d.name)}</span>
+					{/if}
+				</div>
 				<div class="meta">
 					<div class="nrow">
 						<button
@@ -142,14 +206,14 @@
 						<span class="dname">{d.name}</span>
 					</div>
 					<div class="did mono">{fmtPeerId(d.id)}</div>
-					<div class="dstatus">{relTime(d.lastConnected) + ' · ' + catFull(d.cat)}</div>
+					<div class="dstatus">
+						<span class="dot" class:on={isOnline(d.id)}></span>
+						{isOnline(d.id) ? t('devices.online') : t('devices.offline')} · {relTime(d.lastConnected)}
+					</div>
 				</div>
 				<div class="actions">
-					<button
-						class="btn btn-ghost connect"
-						onclick={() => onConnect({ name: d.name, id: d.id }, d.cat === 'console' ? 'game' : 'remote')}
-					>
-						{d.cat === 'console' ? t('devices.play') : t('devices.connect')}
+					<button class="btn btn-ghost connect" onclick={() => onConnect({ name: d.name, id: d.id })}>
+						{t('devices.connect')}
 					</button>
 					<button class="rm" aria-label={t('devices.remove')} onclick={() => removePeer(d.id)}>
 						<Icon name="x" size={15} />
@@ -193,6 +257,39 @@
 		justify-content: flex-end;
 		gap: 10px;
 		margin-top: 18px;
+	}
+	.imgrow {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.imgopt {
+		width: 42px;
+		height: 42px;
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		background: var(--surface);
+		color: var(--text-muted);
+		cursor: pointer;
+		display: grid;
+		place-items: center;
+		overflow: hidden;
+		padding: 0;
+	}
+	.imgopt.active {
+		border-color: var(--accent);
+		color: var(--accent);
+		background: var(--accent-soft);
+	}
+	.uimg {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
+	.imghint {
+		font-size: 11.5px;
+		color: var(--text-faint);
+		margin-left: 4px;
 	}
 	.toolbar {
 		display: flex;
@@ -238,6 +335,17 @@
 		place-items: center;
 		background: var(--accent-soft);
 		color: var(--accent);
+		overflow: hidden;
+	}
+	.timg {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
+	.tinit {
+		font-weight: 700;
+		font-size: 13px;
+		font-family: var(--font-display);
 	}
 	.meta {
 		flex: 1;
@@ -276,6 +384,19 @@
 		font-size: 11.5px;
 		color: var(--text-faint);
 		margin-top: 5px;
+		display: flex;
+		align-items: center;
+		gap: 5px;
+	}
+	.dot {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--border-strong);
+		flex: none;
+	}
+	.dot.on {
+		background: var(--ok);
 	}
 	.actions {
 		display: flex;

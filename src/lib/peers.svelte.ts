@@ -17,6 +17,10 @@ export interface Peer {
 	/** The peer's LAST-SEEN identity image (data URL, pushed over the session) —
 	 * cached so recents / LAN rows / devices show a face without a live session. */
 	avatar?: string;
+	/** USER-CHOSEN device image (add-device modal): either `icon:<name>` for one of
+	 * the built-in line icons, or a small data URL for an uploaded picture. Takes
+	 * precedence over the pushed `avatar` when displaying a saved device. */
+	image?: string;
 }
 
 const KEY = 'pulsar.peers.v1';
@@ -150,19 +154,27 @@ export function removeFromHistory(id: string) {
 
 /** Manually save a device to the address book (Devices). Marks an existing
  * history-only entry as saved, or adds a new saved one. */
-export function addPeer(name: string, id: string, cat: PeerCategory = 'pc'): boolean {
+export function addPeer(name: string, id: string, cat: PeerCategory = 'pc', image?: string): boolean {
 	id = normalizeId(id);
 	const existing = peers.find((p) => p.id === id);
 	if (existing) {
 		if (existing.saved) return false; // already in the address book
 		existing.saved = true;
 		if (name) existing.name = name;
+		if (image) existing.image = image;
 		persist();
 		return true;
 	}
-	peers.push({ id, name: name || id, cat, fav: false, saved: true, lastConnected: null });
+	peers.push({ id, name: name || id, cat, fav: false, saved: true, lastConnected: null, image });
 	persist();
 	return true;
+}
+
+/** Whether `id` is already in the address book — reactive (reads the $state list),
+ * so Save buttons can hide themselves the moment a device is saved. */
+export function isSaved(id: string): boolean {
+	const nid = normalizeId(id);
+	return peers.some((p) => p.id === nid && p.saved);
 }
 
 /** Clear connection history (drops history-only entries; keeps saved devices). */
