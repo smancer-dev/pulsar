@@ -201,6 +201,14 @@
 	let screenEl = $state<HTMLDivElement | null>(null);
 	$effect(() => {
 		const el = screenEl;
+		// Track the fullscreen prop: while the native video is up the webview is
+		// render-suspended (data-occluded), and WebKitGTK then starves the
+		// ResizeObserver — a fullscreen toggle resized the window but the video
+		// container KEPT its old rect (small video with bars in fullscreen, an
+		// oversized one back in windowed). Re-running this effect on the toggle
+		// (plus the window resize listener + settle-delayed reports below) pushes
+		// the fresh rect without relying on RO delivery.
+		void fullscreen;
 		if (!native || embedded || playId < 0 || !el) return;
 		const report = () => {
 			const r = el.getBoundingClientRect();
@@ -216,9 +224,25 @@
 		};
 		const ro = new ResizeObserver(report);
 		ro.observe(el);
+		window.addEventListener('resize', report);
 		report();
+		// The OS fullscreen transition lands a few frames later than the prop flip;
+		// re-measure after it settles (and once more for slow WMs/animations).
+		const t1 = setTimeout(report, 120);
+		const t2 = setTimeout(report, 450);
 		return () => {
+			clearTimeout(t1);
+			clearTimeout(t2);
 			ro.disconnect();
+			window.removeEventListener('resize', report);
+		};
+	});
+	// The 0×0 "unmap" report lives in its OWN effect (no `fullscreen` dependency):
+	// the reporter above re-runs on every fullscreen toggle, and unmapping the
+	// container from ITS cleanup blanked the video for a frame on each toggle.
+	$effect(() => {
+		if (!native || embedded || playId < 0) return;
+		return () => {
 			api.nativeViewRect(playId, 0, 0, 0, 0).catch(() => {});
 		};
 	});
