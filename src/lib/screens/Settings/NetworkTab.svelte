@@ -1,7 +1,9 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import type { Config, NetworkMode } from '$lib/types';
 	import { ui, saveUi } from '$lib/settings.svelte';
+	import { api, onNodePort } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
 	let {
@@ -15,6 +17,24 @@
 		saveConfig: () => void;
 		setMode: (m: NetworkMode) => void;
 	} = $props();
+
+	// When no port is pinned (node_port == 0) the box shows the ACTUAL random port
+	// in use as its placeholder. Snapshot at mount; the node-port event keeps it
+	// live across go_online rebinds. Falls back to "Random" while unknown/0.
+	let livePort = $state(0);
+	onMount(() => {
+		api.nodePort().then((p) => (livePort = p)).catch(() => {});
+		let off: (() => void) | undefined;
+		let dead = false;
+		onNodePort((p) => (livePort = p)).then((o) => {
+			if (dead) o();
+			else off = o;
+		});
+		return () => {
+			dead = true;
+			off?.();
+		};
+	});
 </script>
 
 <div class="srow">
@@ -71,7 +91,7 @@
 					saveConfig();
 				}}
 				aria-label={t('settings.nodePort')}
-				placeholder={t('settings.portRandom')}
+				placeholder={livePort > 0 ? String(livePort) : t('settings.portRandom')}
 				style="font-family:var(--font-mono);font-size:12.5px;width:90px"
 			/>
 		{/if}

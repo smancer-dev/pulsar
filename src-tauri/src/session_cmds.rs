@@ -181,16 +181,23 @@ async fn respawn_render_for_codec(
 	if old_child.is_none() {
 		return; // mpv/ffplay fallback paths keep their old behavior
 	}
+	// Write the new SDP BEFORE killing the old renderer: a transient write failure
+	// used to leave the session with render_child = None and no video for the rest
+	// of its life. On failure, put the old child back and keep the old stream.
+	let sdp = match crate::native_view::write_sdp(vport, codec) {
+		Ok(s) => s,
+		Err(_) => {
+			if let Some(p) = state.plays.lock().unwrap().get_mut(&id) {
+				p.render_child = old_child;
+			}
+			return;
+		}
+	};
 	#[cfg(not(windows))]
 	crate::render::set_container_visible(app, id, false);
 	if let Some(mut c) = old_child {
 		crate::play::stop_render_child(&mut c);
 	}
-	let Ok(sdp) = crate::native_view::write_sdp(vport, codec) else {
-		#[cfg(not(windows))]
-		crate::render::set_container_visible(app, id, true);
-		return;
-	};
 	let pace_default = std::env::var("PULSAR_PACE")
 		.map(|v| v == "1" || v == "on" || v == "true")
 		.unwrap_or(true);

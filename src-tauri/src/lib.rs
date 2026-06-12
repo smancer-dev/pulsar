@@ -53,7 +53,8 @@ use auth::{disconnect_peer, respond_request, submit_password};
 use avatar::{device_user_name, self_avatar};
 use commands::{
 	auto_connect_target, available_encoders, connect, controllers, get_config, lan_devices,
-	launch_remote_game, list_remote_games, local_ip, new_password, node_port, publish_games,
+	launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password, node_port,
+	publish_games,
 	relaunch_to_home, run_command, scan_folder, session_password, set_config, set_language,
 	set_stream_settings,
 	steam_path,
@@ -387,6 +388,7 @@ pub fn run() {
 			list_remote_games,
 			launch_remote_game,
 			available_encoders,
+			list_audio_sources,
 			set_stream_settings,
 			start_remote_play,
 			stop_stream,

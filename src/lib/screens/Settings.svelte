@@ -4,6 +4,7 @@
 	import { api } from '$lib/api';
 	import type { Config, NetworkMode } from '$lib/types';
 	import { t } from '$lib/i18n.svelte';
+	import { saveTick } from '$lib/settings.svelte';
 	import DisplayTab from './Settings/DisplayTab.svelte';
 	import NetworkTab from './Settings/NetworkTab.svelte';
 	import SecurityTab from './Settings/SecurityTab.svelte';
@@ -17,6 +18,26 @@
 	let saved = $state(false);
 	let saveErr = $state('');
 	let detected = $state<string[]>([]);
+
+	// Centered "saved" toast, shared by both save paths. Rapid saves restart the
+	// fade timer instead of stacking toasts (debounce), so a burst of changes
+	// shows one steady toast that fades 3s after the LAST save.
+	let toast = $state(false);
+	let toastTimer: ReturnType<typeof setTimeout> | undefined;
+	function notifySaved() {
+		toast = true;
+		clearTimeout(toastTimer);
+		toastTimer = setTimeout(() => (toast = false), 3000);
+	}
+	// The tabs call saveUi() directly (it bumps saveTick) — react here so UI-only
+	// saves get the same toast. Skip the initial mount value.
+	let lastTick = saveTick.n;
+	$effect(() => {
+		if (saveTick.n !== lastTick) {
+			lastTick = saveTick.n;
+			notifySaved();
+		}
+	});
 
 	const tabs = [
 		{ id: 'display', icon: 'monitor' },
@@ -53,6 +74,13 @@
 		}
 		saved = true;
 		setTimeout(() => (saved = false), 1200);
+		notifySaved();
+		// Bump the shared tick for CORE saves too: the shell (+page) re-fetches its
+		// own config copy off this, so screens reading shell config (the Home
+		// unattended-access warning / blanked one-time password) reflect a Settings
+		// change immediately instead of only after the next go-online.
+		saveTick.n += 1;
+		lastTick = saveTick.n; // our own bump — don't double-toast via the effect
 		const key = reconnectKey(config);
 		if (key !== lastReconnectKey) {
 			lastReconnectKey = key;
@@ -135,6 +163,10 @@
 	</div>
 </div>
 
+{#if toast}
+	<div class="toast" role="status" aria-live="polite">{t('settings.savedToast')}</div>
+{/if}
+
 <style>
 	.head {
 		margin-bottom: 28px;
@@ -184,5 +216,44 @@
 		color: var(--danger);
 		padding-top: 12px;
 		word-break: break-word;
+	}
+	/* Centered semi-transparent confirmation; never intercepts clicks. The 3s
+	 * lifetime is owned by the JS timer — this only plays the visual fade. */
+	.toast {
+		position: fixed;
+		inset: 0;
+		margin: auto;
+		width: max-content;
+		height: max-content;
+		z-index: 50;
+		pointer-events: none;
+		padding: 14px 26px;
+		border-radius: var(--r-md);
+		background: color-mix(in oklch, var(--text) 78%, transparent);
+		color: var(--surface);
+		font-size: 14.5px;
+		font-weight: 600;
+		box-shadow: var(--shadow-lg);
+		animation: toast-fade 3s ease forwards;
+	}
+	@keyframes toast-fade {
+		0% {
+			opacity: 0;
+			transform: translateY(6px) scale(0.98);
+		}
+		8%,
+		70% {
+			opacity: 1;
+			transform: translateY(0) scale(1);
+		}
+		100% {
+			opacity: 0;
+			transform: translateY(0) scale(1);
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.toast {
+			animation: none;
+		}
 	}
 </style>

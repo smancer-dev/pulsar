@@ -123,6 +123,12 @@ function load(): UiSettings {
 
 export const ui = $state<UiSettings>(load());
 
+// A monotonically-rising tick bumped on every successful save. The Settings
+// screen watches it (via $effect) to surface the "saved" toast — the tabs call
+// saveUi() directly, so this is the only channel back up to the screen.
+export const saveTick = $state({ n: 0 });
+
 export function saveUi() {
 	if (hasLS) localStorage.setItem(KEY, JSON.stringify($state.snapshot(ui)));
+	saveTick.n++;
 }

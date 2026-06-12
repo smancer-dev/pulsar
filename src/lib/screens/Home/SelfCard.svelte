@@ -8,6 +8,9 @@
 		selfPw?: string;
 		online?: boolean;
 		connecting?: boolean;
+		/** Host has unattended access ON → no one-time password is issued; anyone with
+		 * the ID can connect without approval. */
+		unattended?: boolean;
 		hostSessions: { peer: string; since: number }[];
 		activity: string[];
 		debug?: boolean;
@@ -22,6 +25,7 @@
 		selfPw = '',
 		online = false,
 		connecting = false,
+		unattended = false,
 		hostSessions,
 		activity,
 		debug = false,
@@ -41,7 +45,7 @@
 	}
 	let pwCopied = $state(false);
 	async function copyPw() {
-		if (!online || !selfPw) return;
+		if (unattended || !online || !selfPw) return;
 		if (await copyText(selfPw)) {
 			pwCopied = true;
 			setTimeout(() => (pwCopied = false), 1400);
@@ -88,13 +92,13 @@
 	<div class="sep"></div>
 	<div class="lab">{t('home.otp')}</div>
 	<div class="row">
-		<span class="pw mono">{online ? selfPw || '—' : '—'}</span>
+		<span class="pw mono">{unattended ? '—' : online ? selfPw || '—' : '—'}</span>
 		<button
 			class="icon-btn push"
 			title={t('home.copy')}
 			aria-label={t('home.copyPw')}
 			onclick={copyPw}
-			disabled={!online || !selfPw}
+			disabled={unattended || !online || !selfPw}
 		>
 			<Icon name={pwCopied ? 'check' : 'copy'} size={16} />
 		</button>
@@ -103,11 +107,22 @@
 			title={t('home.refresh')}
 			aria-label={t('home.refreshPw')}
 			onclick={onRefreshPw}
-			disabled={!online}
+			disabled={unattended || !online}
 		>
 			<Icon name="refresh" size={16} />
 		</button>
 	</div>
+	{#if unattended}
+		<!-- Unattended access bypasses the one-time-password gate entirely: warn loudly so
+		     the operator knows anyone who can reach this ID connects without approval. -->
+		<div class="warn" role="alert">
+			<Icon name="shield" size={15} />
+			<div>
+				<div class="warn-title">{t('home.unattendedOn')}</div>
+				<div class="warn-body">{t('home.unattendedWarn')}</div>
+			</div>
+		</div>
+	{/if}
 	<div class="sep"></div>
 	<div class="connhdr">{t('home.connectedHdr')}</div>
 	{#if hostSessions.length === 0}
@@ -184,6 +199,31 @@
 		font-size: 22px;
 		font-weight: 500;
 		letter-spacing: 0.12em;
+	}
+	.warn {
+		display: flex;
+		align-items: flex-start;
+		gap: 9px;
+		margin-top: 12px;
+		padding: 10px 12px;
+		border-radius: var(--r-sm);
+		background: color-mix(in oklch, var(--warn) 14%, var(--surface));
+		border: 1px solid color-mix(in oklch, var(--warn) 45%, var(--border));
+		color: color-mix(in oklch, var(--warn) 65%, var(--text));
+	}
+	.warn :global(svg) {
+		flex: none;
+		margin-top: 1px;
+	}
+	.warn-title {
+		font-size: 12.5px;
+		font-weight: 700;
+	}
+	.warn-body {
+		font-size: 12px;
+		line-height: 1.45;
+		margin-top: 2px;
+		color: var(--text-muted);
 	}
 	.sep {
 		height: 1px;

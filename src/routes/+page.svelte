@@ -14,9 +14,10 @@
 	} from '$lib/api';
 	import { setPeerIdentity } from '$lib/peers.svelte';
 	import { gameStore } from '$lib/games.svelte';
-	import { ui } from '$lib/settings.svelte';
+	import { ui, saveTick } from '$lib/settings.svelte';
 	import { initCaps } from '$lib/caps.svelte';
 	import { t, i18n } from '$lib/i18n.svelte';
+	import { theme, toggleTheme } from '$lib/theme.svelte';
 	import type { Config } from '$lib/types';
 	import Connecting from '$lib/screens/Connecting.svelte';
 	import SessionView from '$lib/screens/Session.svelte';
@@ -63,7 +64,6 @@
 
 	let view = $state<View>('home');
 	let mode = $state<'remote' | 'game'>('remote');
-	let dark = $state(false);
 	let selfId = $state('—');
 	let selfPw = $state('');
 	let online = $state(false);
@@ -147,6 +147,18 @@
 			connecting = false;
 		}
 	}
+
+	// Keep the shell's config copy in sync with Settings saves: Settings persists via
+	// the core into ITS OWN config snapshot, and this copy (driving the Home screen's
+	// unattended-access warning + blanked one-time password) otherwise refreshed only
+	// inside goOnline() — a toggle in Settings didn't reach Home until a reconnect.
+	// `saveTick` bumps on every save (core + ui-only); re-fetch on it.
+	let lastSaveTick = saveTick.n;
+	$effect(() => {
+		if (saveTick.n === lastSaveTick || isPopup || !isTauri) return;
+		lastSaveTick = saveTick.n;
+		api.getConfig().then((c) => (config = c)).catch(() => {});
+	});
 
 	// Unattended hosts must come online without a human: a machine that boots before
 	// its network is up (or loses the relay) would otherwise stay offline until someone
@@ -327,8 +339,12 @@
 		}
 	});
 
+	// Theme lives in the shared `theme` store (persisted + cross-window via a storage
+	// event), so every window — main and the approval/connections popups — reflects
+	// the current theme and follows live toggles. Reading `theme.dark` here makes this
+	// re-apply whenever any window changes it.
 	$effect(() => {
-		document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+		document.documentElement.setAttribute('data-theme', theme.dark ? 'dark' : 'light');
 	});
 
 	// Keep <html lang> in sync so CSS text-transform uses the right casing rules
@@ -417,8 +433,8 @@
 		{#if !sm.fullscreen}
 			<Chrome
 				title={sm.activeTab === 'home' ? t('nav.' + view) : ''}
-				{dark}
-				onToggleTheme={() => (dark = !dark)}
+				dark={theme.dark}
+				onToggleTheme={toggleTheme}
 			/>
 			{#if sm.sessions.length}
 				<Tabs
@@ -442,6 +458,7 @@
 				{online}
 				{connecting}
 				{connError}
+				unattended={config?.unattended_access ?? false}
 				connectErr={sm.connectErr}
 				{hostSessions}
 				{activity}

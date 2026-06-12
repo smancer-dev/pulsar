@@ -29,7 +29,14 @@
 			})
 			.catch(() => {});
 		// Live updates: the same `session` events the host emits broadcast to every window.
+		// Dead-flag guard (same as Home/Connecting): a listen() resolving AFTER this
+		// window tears down must unlisten immediately, not land in a dead array.
+		let dead = false;
 		const unlistens: (() => void)[] = [];
+		const track = (u: () => void) => {
+			if (dead) u();
+			else unlistens.push(u);
+		};
 		onSessionEvent((e) => {
 			if (e.kind === 'connected') {
 				if (!rows.some((r) => r.peer === e.peer))
@@ -37,19 +44,13 @@
 			} else if (e.kind === 'disconnected') {
 				rows = rows.filter((r) => r.peer !== e.peer);
 			}
-		}).then((u) => {
-			unlistens.push(u);
-		});
+		}).then(track);
 		onPeerAvatar((e) => {
 			avatars = { ...avatars, [e.peer]: e.dataUrl };
-		}).then((u) => {
-			unlistens.push(u);
-		});
+		}).then(track);
 		onPeerName((e) => {
 			names = { ...names, [e.peer]: e.name };
-		}).then((u) => {
-			unlistens.push(u);
-		});
+		}).then(track);
 		// Seed the modal's history from the host-side backlog: events broadcast only
 		// to live windows, so lines from before this window opened live there.
 		api
@@ -67,10 +68,11 @@
 		onHostChat((e) => {
 			pushMsg(e.peer, { me: false, text: e.text });
 			if (msgFor !== e.peer) unread = { ...unread, [e.peer]: (unread[e.peer] ?? 0) + 1 };
-		}).then((u) => {
-			unlistens.push(u);
-		});
-		return () => unlistens.forEach((u) => u());
+		}).then(track);
+		return () => {
+			dead = true;
+			unlistens.forEach((u) => u());
+		};
 	});
 
 	// Live "for N" elapsed label, refreshed each second.

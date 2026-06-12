@@ -95,6 +95,21 @@ pub(super) fn release_mute(sid: u64) {
 	set_mute_request(sid, false);
 }
 
+/// go_online re-run hook: a reconnect aborts the accept loop but the per-session
+/// tasks are independent spawns — one wedged mid-teardown can strand its
+/// MUTE_OWNERS entry and leave the host audio muted forever. A fresh serve loop
+/// has no live sessions yet, so clear the slate and audibly un-mute.
+pub(super) fn reset_mute_all() {
+	let mut owners = MUTE_OWNERS.lock().unwrap();
+	if !owners.is_empty() {
+		owners.clear();
+		drop(owners);
+		if let Err(e) = pulsar_core::audio::set_host_muted(false) {
+			tracing::warn!("host unmute on go_online failed: {e}");
+		}
+	}
+}
+
 /// Start the host→client audio stream (Opus/RTP) and apply the requested host-mute.
 /// Shared by the X11/Windows fall-through path and the Wayland branch so a Wayland
 /// host streams audio + honors game-mode mute exactly like the X11 path. Synchronous:

@@ -85,6 +85,12 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 			return Promise.resolve(undefined as unknown as T);
 		case 'available_encoders':
 			return Promise.resolve(['software'] as unknown as T);
+		case 'list_audio_sources':
+			// Sample sources so the browser preview shows the dropdown populated.
+			return Promise.resolve([
+				'alsa_output.pci-0000_00_1f.3.analog-stereo.monitor',
+				'alsa_input.pci-0000_00_1f.3.analog-stereo'
+			] as unknown as T);
 		case 'start_remote_play':
 			return Promise.resolve({ id: 0, transport: 'direct', ws_port: 0, audio_ws_port: 0, local: false, native: false, embedded: false, host_codecs: ['h264'], host_encoders: ['software'], client_codecs: ['h264', 'h265'] } as unknown as T);
 		case 'local_caps':

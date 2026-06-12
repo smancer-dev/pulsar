@@ -75,6 +75,11 @@ export const api = {
 	localCaps: () => invoke<LocalCaps | null>('local_caps'),
 	/** Hardware encoders ffmpeg reports as available on this machine. */
 	availableEncoders: () => invoke<string[]>('available_encoders'),
+	/** Audio capture devices this host can record from (for the Settings dropdown).
+	 * Can change at runtime (USB unplug), so the Settings screen re-queries on mount
+	 * and polls periodically. Windows = DirectShow device names; Linux = pactl
+	 * source names; macOS = empty. */
+	listAudioSources: () => invoke<string[]>('list_audio_sources'),
 	/** Push host stream settings (resolution/fps/bitrate/encoder/display) to the core. */
 	setStreamSettings: (cfg: Record<string, unknown>) =>
 		invoke<void>('set_stream_settings', { cfg }),

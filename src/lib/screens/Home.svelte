@@ -13,6 +13,8 @@
 		selfPw?: string;
 		online?: boolean;
 		connecting?: boolean;
+		/** Host's unattended-access toggle — no one-time password is issued when ON. */
+		unattended?: boolean;
 		mode: 'remote' | 'game';
 		hostSessions: { peer: string; since: number }[];
 		activity: string[];
@@ -31,6 +33,7 @@
 		selfPw = '',
 		online = false,
 		connecting = false,
+		unattended = false,
 		mode,
 		hostSessions,
 		activity,
@@ -150,6 +153,7 @@
 		{selfId}
 		{selfPw}
 		{online}
+		{unattended}
 		{connecting}
 		{hostSessions}
 		{activity}

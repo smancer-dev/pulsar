@@ -82,6 +82,9 @@ pub(crate) async fn go_online(
 		.node_port
 		.store(0, std::sync::atomic::Ordering::SeqCst);
 	let _ = app.emit("node-port", 0u16);
+	// A previous serve loop's sessions may not have torn down cleanly (independent
+	// spawns survive the accept-loop abort) — never carry a stale host-mute over.
+	handlers::reset_mute_all();
 	tracing::info!(relay = %cfg.relay, "go_online: resolving relay");
 	let relay = resolve_relay(&cfg.relay)
 		.await

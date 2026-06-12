@@ -79,6 +79,9 @@ export const en: Dict = {
 	'home.otp': 'One-time password',
 	'home.refresh': 'Refresh',
 	'home.refreshPw': 'Refresh password',
+	'home.unattendedOn': 'Unattended access is on',
+	'home.unattendedWarn':
+		'The one-time password is disabled. Anyone who can reach this PC’s ID can connect without approval.',
 	'home.help':
 		'This ID is assigned by the relay server. If you share it, others can connect to your device; the link is made over P2P first, falling back to the relay if needed. The password is renewed after every session.',
 	'home.connectedHdr': 'Connected to this device',
@@ -131,8 +134,14 @@ export const en: Dict = {
 
 	// Settings
 	'settings.title': 'Settings',
-	'settings.sub': 'Manage display, network and security preferences.',
-	'settings.tab.display': 'Display',
+	'settings.sub': 'Manage streaming, network and security preferences.',
+	'settings.tab.display': 'Streaming',
+	'settings.sectionStreaming': 'Streaming',
+	'settings.sectionStreamingDesc':
+		'What this device receives when connecting to a host: codec, decoder, frame pacing and viewing prefs.',
+	'settings.sectionHost': 'Host',
+	'settings.sectionHostDesc':
+		'What this device sends when it shares its screen: resolution, encoder, HDR and audio transmit.',
 	'settings.tab.network': 'Network',
 	'settings.tab.security': 'Security',
 	'settings.tab.general': 'General',
@@ -166,8 +175,10 @@ export const en: Dict = {
 	'settings.audioMute': 'Mute host audio',
 	'settings.audioMuteDesc': 'Silence the host speakers while streaming; sound plays only on the client. Auto-on in game mode.',
 	'settings.audioInput': 'Audio source',
-	'settings.audioInputDesc': 'Capture device (empty = platform default). On Windows a DirectShow device name; on Linux a Pulse source (a sink .monitor).',
+	'settings.audioInputDesc': 'Capture device (empty = platform default). The list is the currently available capture devices and refreshes itself if a device is unplugged.',
 	'settings.audioInputPh': 'default',
+	'settings.audioInputDefault': 'Default (automatic)',
+	'settings.audioInputMissing': '(missing)',
 	'settings.displayName': 'Display name',
 	'settings.displayNameDesc': 'The name shown to the other side when you connect.',
 	'settings.avatar': 'Identity image',
@@ -197,7 +208,7 @@ export const en: Dict = {
 	'host.elapsedMin': '{n}m',
 	'host.elapsedHour': '{h}h {m}m',
 	'settings.nodePort': 'Local port',
-	'settings.nodePortDesc': 'Listen port for direct/P2P connections. Left empty, a random port is picked each launch; pin one for port forwarding. Going online fails with an error if the chosen port is taken.',
+	'settings.nodePortDesc': 'Listen port for direct/P2P connections. Left empty, a random port is picked each launch (the box shows the one in use); pin one for port forwarding. Going online fails with an error if the chosen port is taken.',
 	'settings.portRandom': 'Random',
 	'settings.connMethod': 'Connection method',
 	'settings.connMethodDesc':
@@ -212,6 +223,7 @@ export const en: Dict = {
 	'settings.bwlimit': 'Bandwidth limit',
 	'settings.bwlimitDesc': 'Throttle upload speed (keep off for gaming).',
 	'settings.saved': '✓ saved',
+	'settings.savedToast': 'Changes saved',
 	'settings.saveFailed': 'Could not save the setting',
 	'settings.unattended': 'Unattended access',
 	'settings.unattendedDesc': 'Allow connecting with a fixed password, without approval.',

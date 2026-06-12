@@ -80,6 +80,108 @@ pub(crate) async fn available_encoders(app: AppHandle) -> Vec<String> {
 	ids
 }
 
+/// The audio capture devices this host can record from, for the Settings dropdown.
+/// The stored value (`Config.audio_input`) is the device-name string the user picks
+/// (empty = platform default). The list is platform-specific and can change at any
+/// time (USB mics unplugged), so the UI re-queries on mount and polls periodically.
+#[tauri::command]
+pub(crate) async fn list_audio_sources(app: AppHandle) -> Vec<String> {
+	let _ = &app;
+	#[cfg(windows)]
+	{
+		audio_sources_dshow(&ffmpeg_bin(&app))
+	}
+	#[cfg(target_os = "linux")]
+	{
+		audio_sources_pactl()
+	}
+	#[cfg(target_os = "macos")]
+	{
+		Vec::new()
+	}
+}
+
+/// Windows: enumerate DirectShow audio capture devices via the bundled ffmpeg.
+/// `ffmpeg -list_devices true -f dshow -i dummy` prints the devices to STDERR; the
+/// audio devices follow a `DirectShow audio devices` header, each on its own line as
+/// a quoted name. We collect those quoted names.
+#[cfg(windows)]
+fn audio_sources_dshow(ffmpeg: &str) -> Vec<String> {
+	let mut cmd = std::process::Command::new(ffmpeg);
+	cmd.args([
+		"-hide_banner",
+		"-list_devices",
+		"true",
+		"-f",
+		"dshow",
+		"-i",
+		"dummy",
+	]);
+	no_window(&mut cmd);
+	let out = match cmd.output() {
+		Ok(out) => out,
+		Err(_) => return Vec::new(),
+	};
+	let text = String::from_utf8_lossy(&out.stderr);
+	// Two stderr dialects: old ffmpeg groups devices under a "DirectShow audio
+	// devices" header; ffmpeg ≥6 prints one line per device suffixed "(audio)" /
+	// "(video)" with no headers. Handle both.
+	let mut in_audio = false;
+	let mut names = Vec::new();
+	for line in text.lines() {
+		let lower = line.to_ascii_lowercase();
+		if lower.contains("directshow") && lower.contains("audio") && lower.contains("devices") {
+			in_audio = true;
+			continue;
+		}
+		if lower.contains("directshow") && lower.contains("video") && lower.contains("devices") {
+			in_audio = false;
+			continue;
+		}
+		let trimmed = line.trim_end();
+		let tagged_audio = trimmed.ends_with("(audio)");
+		let tagged_video = trimmed.ends_with("(video)");
+		if !(in_audio && !tagged_video) && !tagged_audio {
+			continue;
+		}
+		// A device line carries the name in double quotes; the following
+		// "Alternative name" line also has quotes — skip it (it's not user-facing).
+		if line.contains("Alternative name") {
+			continue;
+		}
+		if let Some(start) = line.find('"') {
+			let rest = &line[start + 1..];
+			if let Some(end) = rest.find('"') {
+				let name = rest[..end].trim();
+				if !name.is_empty() {
+					names.push(name.to_string());
+				}
+			}
+		}
+	}
+	names
+}
+
+/// Linux: list PulseAudio/PipeWire sources via `pactl list short sources`. The source
+/// name is the second tab-separated column; capturing a sink's playback uses its
+/// `.monitor` source, which appears here. Empty if `pactl` is missing.
+#[cfg(target_os = "linux")]
+fn audio_sources_pactl() -> Vec<String> {
+	let out = match std::process::Command::new("pactl")
+		.args(["list", "short", "sources"])
+		.output()
+	{
+		Ok(out) => out,
+		Err(_) => return Vec::new(),
+	};
+	String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.filter_map(|line| line.split('\t').nth(1))
+		.map(|name| name.trim().to_string())
+		.filter(|name| !name.is_empty())
+		.collect()
+}
+
 /// Set the host's stream settings (resolution/fps/bitrate/encoder/display).
 #[tauri::command]
 pub(crate) async fn set_stream_settings(

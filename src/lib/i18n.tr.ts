@@ -79,6 +79,9 @@ export const tr: Dict = {
 	'home.otp': 'Tek seferlik şifre',
 	'home.refresh': 'Yenile',
 	'home.refreshPw': 'Şifreyi yenile',
+	'home.unattendedOn': 'Gözetimsiz erişim açık',
+	'home.unattendedWarn':
+		'Tek seferlik şifre devre dışı. Bu bilgisayarın kimliğine (ID) ulaşabilen herkes onay gerekmeden bağlanabilir.',
 	'home.help':
 		'Bu kimlik relay sunucusundan atanır. Paylaşırsan başkaları cihazına bağlanabilir; bağlantı önce P2P, gerekirse relay üzerinden kurulur. Şifre her oturumdan sonra yenilenir.',
 	'home.connectedHdr': 'Bu cihaza bağlananlar',
@@ -131,8 +134,14 @@ export const tr: Dict = {
 
 	// Settings
 	'settings.title': 'Ayarlar',
-	'settings.sub': 'Görüntü, ağ ve güvenlik tercihlerini yönet.',
-	'settings.tab.display': 'Görüntü',
+	'settings.sub': 'Yayın, ağ ve güvenlik tercihlerini yönet.',
+	'settings.tab.display': 'Yayın',
+	'settings.sectionStreaming': 'Yayın',
+	'settings.sectionStreamingDesc':
+		'Bir host’a bağlandığında bu cihazın aldığı görüntü: kodek, çözücü, kare eşitleme ve görüntüleme tercihleri.',
+	'settings.sectionHost': 'Host',
+	'settings.sectionHostDesc':
+		'Bu cihaz ekranını paylaşırken gönderdiği yayın: çözünürlük, encoder, HDR ve ses aktarımı.',
 	'settings.tab.network': 'Ağ',
 	'settings.tab.security': 'Güvenlik',
 	'settings.tab.general': 'Genel',
@@ -166,8 +175,10 @@ export const tr: Dict = {
 	'settings.audioMute': 'Host’ta sesi sustur',
 	'settings.audioMuteDesc': 'Akış sırasında host hoparlörlerini sustur; ses yalnızca istemcide çalar. Oyun modunda otomatik açılır.',
 	'settings.audioInput': 'Ses kaynağı',
-	'settings.audioInputDesc': 'Yakalanacak ses aygıtı (boş = platform varsayılanı). Windows’ta DirectShow aygıt adı, Linux’ta bir Pulse kaynağı (sink .monitor).',
+	'settings.audioInputDesc': 'Yakalanacak ses aygıtı (boş = platform varsayılanı). Liste mevcut yakalama aygıtlarından oluşur ve aygıt çıkarılırsa kendiliğinden güncellenir.',
 	'settings.audioInputPh': 'varsayılan',
+	'settings.audioInputDefault': 'Varsayılan (otomatik)',
+	'settings.audioInputMissing': '(yok)',
 	'settings.displayName': 'Görünen ad',
 	'settings.displayNameDesc': 'Bağlandığında karşı tarafta gösterilecek ad.',
 	'settings.avatar': 'Kimlik görseli',
@@ -197,7 +208,7 @@ export const tr: Dict = {
 	'host.elapsedMin': '{n} dk',
 	'host.elapsedHour': '{h} sa {m} dk',
 	'settings.nodePort': 'Yerel port',
-	'settings.nodePortDesc': 'Doğrudan/P2P bağlantılar için dinleme portu. Boş bırakılırsa her açılışta rastgele bir port seçilir; port yönlendirme için sabitle. Seçilen port kullanımdaysa çevrimiçi olma hata verir.',
+	'settings.nodePortDesc': 'Doğrudan/P2P bağlantılar için dinleme portu. Boş bırakılırsa her açılışta rastgele bir port seçilir (kutuda kullanılan port gösterilir); port yönlendirme için sabitle. Seçilen port kullanımdaysa çevrimiçi olma hata verir.',
 	'settings.portRandom': 'Rastgele',
 	'settings.connMethod': 'Bağlantı yöntemi',
 	'settings.connMethodDesc':
@@ -211,6 +222,7 @@ export const tr: Dict = {
 	'settings.bwlimit': 'Bant genişliği sınırı',
 	'settings.bwlimitDesc': 'Yükleme hızını kısıtla (oyun için kapalı tut).',
 	'settings.saved': '✓ kaydedildi',
+	'settings.savedToast': 'Değişiklikler kaydedildi',
 	'settings.saveFailed': 'Ayar kaydedilemedi',
 	'settings.unattended': 'Gözetimsiz erişim',
 	'settings.unattendedDesc': 'Kalıcı şifre ile, onay olmadan bağlanmaya izin ver.',

@@ -20,6 +20,8 @@
 		online: boolean;
 		connecting: boolean;
 		connError: string;
+		/** Host's unattended-access toggle — when ON no one-time password is issued. */
+		unattended: boolean;
 		connectErr: string;
 		hostSessions: { peer: string; since: number }[];
 		activity: string[];
@@ -43,6 +45,7 @@
 		online,
 		connecting,
 		connError,
+		unattended,
 		connectErr,
 		hostSessions,
 		activity,
@@ -78,6 +81,7 @@
 				{selfPw}
 				{online}
 				{connecting}
+				{unattended}
 				{mode}
 				{hostSessions}
 				{activity}
