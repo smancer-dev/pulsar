@@ -1,12 +1,12 @@
 //! Host-output mute control (the [`AudioPolicy::mute_host`] action). Best-effort
-//! and reversible: Linux via `pactl`, Windows via Core Audio, macOS is a TODO.
+//! and reversible: Linux via `pactl`, Windows via Core Audio, macOS via `osascript`.
 //!
 //! [`AudioPolicy::mute_host`]: super::AudioPolicy::mute_host
 
 /// Mute or unmute the host's **default output device** for the duration of a
 /// session (the [`AudioPolicy::mute_host`] action). Best-effort + reversible:
-/// Linux uses `pactl`, Windows uses Core Audio (`IAudioEndpointVolume`), macOS is
-/// a TODO. Returns an error string the caller can log; failing to mute never
+/// Linux uses `pactl`, Windows uses Core Audio (`IAudioEndpointVolume`), macOS uses
+/// `osascript`. Returns an error string the caller can log; failing to mute never
 /// breaks streaming.
 ///
 /// [`AudioPolicy::mute_host`]: super::AudioPolicy::mute_host
@@ -30,7 +30,25 @@ pub fn set_host_muted(mute: bool) -> Result<(), String> {
 	{
 		win_mute::set_default_render_muted(mute)
 	}
-	#[cfg(not(any(target_os = "linux", windows)))]
+	#[cfg(target_os = "macos")]
+	{
+		// macOS has no headless mute API like pactl/Core Audio, but AppleScript's
+		// `set volume output muted` toggles the default output's mute flag. Best-effort
+		// + reversible, same contract as the other platforms.
+		let arg = if mute { "true" } else { "false" };
+		std::process::Command::new("osascript")
+			.args(["-e", &format!("set volume output muted {arg}")])
+			.status()
+			.map_err(|e| format!("osascript: {e}"))
+			.and_then(|st| {
+				if st.success() {
+					Ok(())
+				} else {
+					Err(format!("osascript exited {st}"))
+				}
+			})
+	}
+	#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 	{
 		let _ = mute;
 		Err("host mute not implemented on this platform".to_string())

@@ -35,7 +35,7 @@ mod play;
 mod process;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod render;
-#[cfg(any(all(unix, not(target_os = "macos")), target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 mod render_stats;
 mod session_cmds;
 mod state;
@@ -172,11 +172,56 @@ fn signal_existing_instance() {
 	}
 }
 
+/// Unix (Linux/macOS) analog of the Windows named-mutex guard: take an advisory
+/// `flock(LOCK_EX|LOCK_NB)` on a per-user lock file. Like the named mutex, the lock
+/// is scoped per-user (the path carries the uid), so ASTER-style seats / separate OS
+/// users each get their own Pulsar while a second instance for the *same* user gets
+/// `false`. The fd is held for the whole process lifetime (stashed in a static and
+/// never closed) — the kernel drops the lock automatically on exit/crash.
 #[cfg(not(windows))]
 fn acquire_single_instance() -> bool {
-	// TODO(per-user lock on Linux/macOS): advisory flock on a file in the per-user
-	// runtime dir. No-op for now — the Windows/ASTER case is what needs guarding.
-	true
+	use std::os::unix::ffi::OsStrExt;
+	use std::sync::OnceLock;
+
+	// Keep the locked fd alive for the process lifetime; dropping/closing it releases
+	// the flock. `OnceLock` both stores it and makes a redundant call idempotent.
+	static LOCK_FD: OnceLock<i32> = OnceLock::new();
+	if let Some(&fd) = LOCK_FD.get() {
+		return fd >= 0;
+	}
+
+	let uid = unsafe { libc::getuid() };
+	let mut path = std::env::temp_dir();
+	path.push(format!("pulsar-{uid}.lock"));
+
+	// Build a NUL-terminated C path for open(2).
+	let mut c_path: Vec<u8> = path.as_os_str().as_bytes().to_vec();
+	c_path.push(0);
+
+	let fd = unsafe {
+		libc::open(
+			c_path.as_ptr() as *const libc::c_char,
+			libc::O_RDWR | libc::O_CREAT,
+			0o600,
+		)
+	};
+	if fd < 0 {
+		// Can't even open the lock file — fail open (let the app run) rather than block it.
+		let _ = LOCK_FD.set(-1);
+		return true;
+	}
+
+	let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
+	if locked {
+		// Leak the fd via the static so the lock is held until the process exits.
+		let _ = LOCK_FD.set(fd);
+		true
+	} else {
+		// Another instance for this user holds the lock — release our fd and bail.
+		unsafe { libc::close(fd) };
+		let _ = LOCK_FD.set(-1);
+		false
+	}
 }
 
 pub fn run() {

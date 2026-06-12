@@ -87,6 +87,12 @@ static OVERLAY_BTN: AtomicBool = AtomicBool::new(true);
 static OVBTN_POS: Mutex<(f32, f32)> = Mutex::new(crate::overlay::BTN_POS_DEFAULT);
 /// Live engage state from the app (`engaged 0|1`) — drives cursor visibility.
 static ENGAGED_R: AtomicBool = AtomicBool::new(false);
+/// Session audio truth (app stdin `audio tx=1 mute=0 mic=0`) for the overlay's Ses
+/// section — same statics + defaults as linux.rs; synced into `ostate` each frame so
+/// the Ses toggles highlight the real state (the app re-seeds these on respawn).
+static AUDIO_TX: AtomicBool = AtomicBool::new(true);
+static AUDIO_MUTE: AtomicBool = AtomicBool::new(false);
+static MIC_ON: AtomicBool = AtomicBool::new(false);
 /// Transient helper tooltip / toast: (text, armed-at, visible-secs).
 static HINT: Mutex<Option<(String, std::time::Instant, f32)>> = Mutex::new(None);
 /// Host's active encode summary (`hostenc <label>` stdin) — the overlay's per-field
@@ -249,6 +255,21 @@ fn stdin_control() {
 			// Live engage state (cursor visibility) — app-side edges, like linux.rs.
 			let v = rest.trim();
 			ENGAGED_R.store(v == "1" || v == "on" || v == "true", Ordering::SeqCst);
+		} else if let Some(rest) = l.strip_prefix("audio ") {
+			// Session audio truth from the app (`audio tx=1 mute=0 mic=0`) so the
+			// overlay's Ses toggles highlight the real state — same key=value parse
+			// as linux.rs (the app sends this platform-agnostically + on respawn).
+			for kv in rest.split_whitespace() {
+				if let Some((k, v)) = kv.split_once('=') {
+					let on = v == "1" || v == "on";
+					match k {
+						"tx" => AUDIO_TX.store(on, Ordering::SeqCst),
+						"mute" => AUDIO_MUTE.store(on, Ordering::SeqCst),
+						"mic" => MIC_ON.store(on, Ordering::SeqCst),
+						_ => {}
+					}
+				}
+			}
 		} else if let Some(rest) = l.strip_prefix("hint ") {
 			arm_hint(rest.trim());
 		} else if let Some(rest) = l.strip_prefix("toast ") {
@@ -394,9 +415,9 @@ fn stdin_control() {
 				_ => {}
 			}
 		}
-		// `toast <text>` is tolerated but not drawn yet: this backend has no
-		// closed-state paint pass (paint_overlay no-ops while the overlay is
-		// closed) — wiring that is the documented follow-up.
+		// `toast <text>` (and `hint …`) are drawn by the closed-state paint pass
+		// (`paint_closed` via `draw_hint`), alongside the mini stats HUD and the
+		// overlay-open button — see paint_closed below.
 	}
 }
 
@@ -732,6 +753,10 @@ impl Renderer {
 		self.ostate.stats_hud = STATS_HUD.load(Ordering::SeqCst);
 		self.ostate.overlay_btn = OVERLAY_BTN.load(Ordering::SeqCst);
 		self.ostate.btn_pos = *OVBTN_POS.lock().unwrap();
+		// Session audio truth (linux.rs parity) → the Ses section's live highlight.
+		self.ostate.audio_tx = AUDIO_TX.load(Ordering::SeqCst);
+		self.ostate.audio_mute = AUDIO_MUTE.load(Ordering::SeqCst);
+		self.ostate.mic_on = MIC_ON.load(Ordering::SeqCst);
 		// Live fit-mode truth (the Display section's highlight follows whatever set
 		// it last — the overlay click or a `fit` stdin line). Linux-parity.
 		self.ostate.fit = present::fit_label().to_string();
@@ -790,6 +815,19 @@ impl Renderer {
 						// (`statshud`/`ovbtn`) just confirms the same value later.
 						"statshud" => STATS_HUD.store(val == "on", Ordering::SeqCst),
 						"ovbtn" => OVERLAY_BTN.store(val == "on", Ordering::SeqCst),
+						// Audio toggles apply optimistically (linux.rs parity); the app's
+						// `audio …` line re-syncs the truth after the host acknowledges.
+						"atx" => AUDIO_TX.store(val == "on", Ordering::SeqCst),
+						"amute" => AUDIO_MUTE.store(val == "on", Ordering::SeqCst),
+						"mic" => MIC_ON.store(val == "on", Ordering::SeqCst),
+						// Voice call = mic + host audio together (paired optimistic update).
+						"call" => {
+							let on = val == "on";
+							MIC_ON.store(on, Ordering::SeqCst);
+							if on {
+								AUDIO_TX.store(true, Ordering::SeqCst);
+							}
+						}
 						// View fit is renderer-local (instant Blt rect change) + forwarded
 						// so the frontend mirrors/persists it — Linux-parity (linux.rs).
 						"fit" => present::set_fit(&val),
@@ -1031,6 +1069,14 @@ impl Renderer {
 		if self.present.is_none() || sw != self.src_w || sh != self.src_h {
 			self.src_w = sw;
 			self.src_h = sh;
+			// Report the STREAM pixel size on stdout (first frame + live resolution
+			// switch) so the app sizes the windowed session to the host's aspect —
+			// render_stats.rs parses this into `play-dims` (linux.rs/video.rs parity).
+			if sw > 0 && sh > 0 {
+				println!("vidsink-dims {sw}x{sh}");
+				use std::io::Write as _;
+				let _ = std::io::stdout().flush();
+			}
 			match self.present.as_mut() {
 				Some(p) => {
 					let _ = p.resize(sw, sh, self.width, self.height);

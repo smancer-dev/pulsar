@@ -159,9 +159,9 @@ export class SessionInput {
 	};
 	onKey(e: KeyboardEvent, down: boolean) {
 		if (!this.controlling) return;
-		// Parsec-style leave combo: Ctrl+Shift+F12 releases control. preventDefault
-		// also stops F12 from opening webview devtools.
-		if (down && e.ctrlKey && e.shiftKey && e.code === 'F12') {
+		// Parsec-style leave combo: Ctrl+Shift+F12 (or Cmd+Shift+F12 for mac users)
+		// releases control. preventDefault also stops F12 from opening webview devtools.
+		if (down && (e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'F12') {
 			e.preventDefault();
 			this.stopControl();
 			return;

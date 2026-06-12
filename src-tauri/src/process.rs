@@ -596,8 +596,11 @@ pub fn vidsink_bin(app: &AppHandle) -> String {
 
 /// Pulsar's native renderer (`pulsar-render`). On Linux: rkmpp video + egui overlay in a child
 /// X11 window. On Windows: Media Foundation decode + D3D11 present in a child HWND (Moonlight-
-/// style, replacing the webview WebCodecs path). A workspace crate, dropped next to the app exe.
-#[cfg(any(all(unix, not(target_os = "macos")), target_os = "windows"))]
+/// style, replacing the webview WebCodecs path). On macOS: an OVERLAY-ONLY eframe window (the
+/// video is the separate native mpv child until the Metal renderer phase) — same egui overlay.
+/// A workspace crate, dropped next to the app exe. Resolution is path-based (bundled resources
+/// dir, then next to the exe), so it is platform-agnostic.
+#[cfg(any(unix, target_os = "windows"))]
 pub fn render_bin(app: &AppHandle) -> String {
 	bundled_bin(app, "pulsar-render")
 }

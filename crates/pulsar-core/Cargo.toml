@@ -52,6 +52,16 @@ windows = { version = "0.59", features = [
 	"Win32_Media_Audio_Endpoints",
 ] }
 
+# Host-side mouse + keyboard injection on macOS via CoreGraphics CGEvent — the
+# standard user-mode synthetic-input path (same as Parsec/VNC/RustDesk). Requires
+# the Accessibility (TCC) grant at runtime, or posted events silently no-op; see
+# input/macos.rs. core-foundation is core-graphics' base layer (pinned for CF types).
+[target.'cfg(target_os = "macos")'.dependencies]
+# "highsierra" gates CGEvent::new_scroll_event (CGEventCreateScrollWheelEvent2);
+# our min macOS is well past 10.13, so it's always available.
+core-graphics = { version = "0.24", features = ["highsierra"] }
+core-foundation = "0.10"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }
 pulsar-relay = { path = "../../../relay" }

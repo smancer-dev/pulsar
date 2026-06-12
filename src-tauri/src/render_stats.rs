@@ -2,9 +2,12 @@
 //! into `play-vstats` events and the `ov …` overlay-interaction lines into the
 //! frontend overlay events. Split out of `render` to keep each file cohesive.
 //!
-//! Linux/X11 + Windows (the native `pulsar-render` stdout uses the same `vidsink-fps`/`ov …`
-//! protocol on both) — see `render` for the rest of the Linux renderer plumbing.
-#![cfg(any(all(unix, not(target_os = "macos")), target_os = "windows"))]
+//! Linux/X11 + Windows + macOS (the native `pulsar-render` stdout uses the same `vidsink-fps`/
+//! `ov …` protocol on all three; on macOS the renderer is overlay-only, so it emits the `ov …`
+//! interaction lines but no `vidsink-fps` video stats — both readers tolerate that) — see
+//! `render` for the rest of the Linux renderer plumbing. The functions only use portable std
+//! APIs (`ChildStdout` + `Emitter`), so they compile on every platform.
+#![cfg(any(unix, target_os = "windows"))]
 
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +20,10 @@ use crate::events::PlayVStats;
 /// has no JSON-IPC socket). Unlike mpv 0.34, the vidsink reports a TRUE client fps. Runs on a
 /// blocking thread (line-buffered pipe reads); exits when the child closes stdout (killed on
 /// overlay-open or session end).
+/// Linux-only: the legacy standalone-vidsink stats channel (the single-surface `pulsar-render`
+/// path uses `start_render_reader` instead). Gated to Linux so Windows/macOS — which never call
+/// it — don't trip a dead-code warning now that this module compiles on every platform.
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn start_vidsink_stats(
 	app: &AppHandle,
 	id: u64,

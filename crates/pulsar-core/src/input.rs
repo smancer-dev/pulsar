@@ -29,21 +29,28 @@ mod uinput;
 #[cfg(windows)]
 mod windows;
 
+/// macOS host-side mouse + keyboard injection via CoreGraphics `CGEvent`.
+#[cfg(target_os = "macos")]
+mod macos;
+
 /// No-op desktop-input stub for platforms without a real backend.
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod desktop_stub;
 
 /// Host-side mouse + keyboard injection for remote control. Linux uses uinput
-/// (works on Wayland and X11), Windows uses the Win32 `SendInput` API (the same
-/// user-mode approach Parsec uses for desktop control); other platforms are
-/// no-op stubs for now.
+/// (works on Wayland and X11), Windows uses the Win32 `SendInput` API, and macOS
+/// uses CoreGraphics `CGEvent` (the same user-mode approach Parsec uses for desktop
+/// control on each OS); any remaining platform is a no-op stub.
 #[cfg(target_os = "linux")]
 pub use uinput::DesktopInput;
 
 #[cfg(windows)]
 pub use windows::DesktopInput;
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+pub use macos::DesktopInput;
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub use desktop_stub::DesktopInput;
 
 pub use hub::ControllerHub;

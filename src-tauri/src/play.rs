@@ -481,11 +481,112 @@ pub(crate) async fn start_remote_play(
 					}
 					#[cfg(target_os = "macos")]
 					{
+						// macOS video: the native mpv child (VideoToolbox HW decode → zero-copy
+						// GL), in its OWN window for now — the embedded zero-copy Metal renderer is
+						// a later phase (needs a Mac to build). This already removes the webview
+						// video path here.
 						let ipc = std::env::temp_dir().join(format!("pulsar-mpv-{id}.sock"));
-						if let Some(c) = native_view::spawn_mpv(&sdp, None, &ipc) {
-							native_child = Some(c);
-							video_port = vport;
-							mpv_ipc_sock = Some(ipc);
+						match native_view::spawn_mpv(&sdp, None, &ipc) {
+							Some(c) => {
+								tracing::info!(pid = c.id(), port = vport, "macOS mpv video renderer spawned");
+								native_child = Some(c);
+								video_port = vport;
+								mpv_ipc_sock = Some(ipc);
+							}
+							// mpv missing/unrunnable used to be SILENTLY swallowed (the old
+							// `Err(_) => {}`), leaving the user on a black session with no idea why.
+							// Surface it now: a clear `tracing::error` AND a `host-stats` label line
+							// (the channel the session UI already renders as a status string — see
+							// play/hold.rs's `host-stats` emit) telling the user to install mpv
+							// (`brew install mpv`). The session still proceeds — the overlay below +
+							// the control channel come up; only the video is missing — so this is a
+							// degraded-not-fatal notice, NOT a `play-ended` teardown.
+							None => {
+								tracing::error!("macOS: mpv failed to spawn — video unavailable (install mpv: brew install mpv)");
+								// Turkish UI copy (project default). Kept inline rather than as an i18n
+								// key so this stays within the renderer-wiring change set; if an EN
+								// catalog entry is wanted later, swap to crate::i18n::t.
+								let _ = app.emit(
+									"host-stats",
+									crate::events::PlayStats {
+										id,
+										label: "Video yok — mpv kurulu değil (brew install mpv)"
+											.to_string(),
+									},
+								);
+							}
+						}
+
+						// ALSO bring up the native OVERLAY renderer (`pulsar-render`, overlay-only on
+						// macOS) alongside mpv, exactly like Windows/Linux: it draws the same egui
+						// overlay (menu + closed-state HUD/button/hint) in a transparent always-on-top
+						// eframe window. Overlay-only here (the video is the mpv child above), so no
+						// `--wid`; open/close arrive over stdin from session_cmds::set_overlay (its
+						// non-Linux branch writes `open`/`close` lines).
+						let rbin = process::render_bin(&app);
+						let pace_default = std::env::var("PULSAR_PACE")
+							.map(|v| v == "1" || v == "on" || v == "true")
+							.unwrap_or(true);
+						// No mac-specific spawn helper (spawn_render is Linux-only, spawn_render_win
+						// Windows-only); build the overlay-only command inline — same flags as the
+						// other backends minus `--wid` (nothing to embed into).
+						let mut cmd = std::process::Command::new(&rbin);
+						cmd.arg(&*sdp)
+							.arg("--mode")
+							.arg(if game_mode { "game" } else { "remote" })
+							.arg("--pace")
+							.arg(if pace_default { "on" } else { "off" })
+							.arg("--lang")
+							.arg(crate::i18n::lang());
+						cmd.stdin(std::process::Stdio::piped());
+						cmd.stdout(std::process::Stdio::piped());
+						match cmd.spawn() {
+							Ok(mut c) => {
+								tracing::info!(pid = c.id(), "macOS native overlay (pulsar-render) spawned");
+								// Read the overlay-only renderer's stdout (`ov …` interaction lines; it
+								// emits no `vidsink-fps` video stats). start_render_reader matches an
+								// overlay-only process and tolerates the missing stats.
+								if let Some(out) = c.stdout.take() {
+									crate::render_stats::start_render_reader(&app, id, out);
+								}
+								// Capture its stdin into the SHARED render_stdin slot the other
+								// platforms use, so set_overlay (`open`/`close`), the HUD `stat …`
+								// writer, render_chat/fsjson/audio etc. all reach it.
+								if let Some(si) = c.stdin.take() {
+									*overlay_stdin.lock().unwrap() = Some(si);
+								}
+								render_child = Some(c);
+								// Seed the egui overlay: host caps filter the codec/encoder rows; the
+								// audio line seeds the Ses toggles (same seed as the Win/Linux paths).
+								{
+									use std::io::Write as _;
+									let enc = if encoder.is_empty() { "auto" } else { &encoder };
+									let line = format!(
+										"caps codecs={} encoders={} codec={} encoder={} conn={}",
+										allowed.join(","),
+										host_caps.encoders.join(","),
+										codec,
+										enc,
+										if transport == "relay" { "Relay" } else { "P2P" }
+									);
+									if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
+										let _ = writeln!(si, "{line}");
+										let _ = writeln!(
+											si,
+											"audio tx=1 mute={} mic=0",
+											if game_mode { 1 } else { 0 }
+										);
+									}
+									*caps_line.lock().unwrap() = line;
+									render_seed.lock().unwrap().audio = Some((true, game_mode, false));
+								}
+							}
+							// The overlay binary may be missing (e.g. a dev build that didn't bundle
+							// it) — the session still works without it (video + control are
+							// independent), so log it and carry on rather than failing the connect.
+							Err(e) => {
+								tracing::warn!(error = %e, "macOS: pulsar-render overlay failed to spawn — overlay unavailable");
+							}
 						}
 					}
 				}
