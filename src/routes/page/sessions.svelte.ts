@@ -38,20 +38,16 @@ export type Session = {
 const STREAM_PORT = 9000;
 
 // Known core connect errors arrive as raw English Rust strings (ConnError) — map them
-// to friendly Turkish copy for the connect flash (substring match so wrapped/formatted
-// variants still hit). Unknown/already-Turkish messages fall through verbatim.
+// to friendly copy IN THE ACTIVE UI LANGUAGE for the connect flash (substring match
+// so wrapped/formatted variants still hit). Unknown messages fall through verbatim.
 function friendlyConnectError(raw: string): string {
 	const m = raw.toLowerCase();
-	if (m.includes('relay did not respond'))
-		return 'Aktarıcı sunucuya ulaşılamadı — internet bağlantınızı ve aktarıcı ayarını kontrol edin.';
-	if (m.includes('could not be reached via the relay'))
-		return 'Cihaza ulaşılamadı — çevrimdışı olabilir ya da kimlik hatalı.';
-	if (m.includes('not registered with a relay yet'))
-		return 'Henüz çevrimiçi değilsiniz — önce çevrimiçi olun.';
-	if (m.includes('p2p connection failed'))
-		return 'Doğrudan bağlantı kurulamadı ve aktarıcı kullanımı kapalı (Ağ ayarlarına bakın).';
+	if (m.includes('relay did not respond')) return t('connErr.relayDown');
+	if (m.includes('could not be reached via the relay')) return t('connErr.peerUnreachable');
+	if (m.includes('not registered with a relay yet')) return t('connErr.notOnline');
+	if (m.includes('p2p connection failed')) return t('connErr.p2pFailed');
 	if (m.includes('network is unreachable') || m.includes('connection refused') || m.includes('timed out'))
-		return 'Hedefe bağlanılamadı — adresi ve ağ bağlantınızı kontrol edin.';
+		return t('connErr.unreachable');
 	return raw;
 }
 

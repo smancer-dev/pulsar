@@ -17,5 +17,9 @@
 	"tray.quit": "Çıkış",
 	"stream.mbitTarget": "Mbit hedef",
 	"stream.msEncode": "ms kodlama",
-	"err.portInUse": "Port kullanımda — Ayarlar → Ağ bölümünden farklı bir port seçin ya da boş bırakın"
+	"err.portInUse": "Port kullanımda — Ayarlar → Ağ bölümünden farklı bir port seçin ya da boş bırakın",
+	"err.relayResolve": "Relay sunucusu çözümlenemedi",
+	"err.badTarget": "Geçersiz kimlik veya IP",
+	"host.gstFailed": "(gst başlamadı)",
+	"host.ffmpegFailed": "(ffmpeg başlamadı)"
 }

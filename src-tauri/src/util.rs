@@ -97,7 +97,7 @@ pub(crate) async fn connect_target(
 			.map_err(|e| e.to_string())?;
 		return Ok((sess, addr.to_string()));
 	}
-	let id = DeviceId::parse(s).ok_or("geçersiz kimlik veya IP")?;
+	let id = DeviceId::parse(s).ok_or_else(|| crate::i18n::t("err.badTarget").to_string())?;
 	// Relay-only must NOT take the same-LAN direct shortcut — the whole point of
 	// that mode is that traffic goes through the relay (policy/diagnostics).
 	let lan_allowed = !matches!(

@@ -845,7 +845,7 @@ pub(super) fn make_on_stream(
 								kind: "stream".into(),
 								peer: peer.clone(),
 								detail: format!("{} · {}p", genc.label(), eff_h)
-									+ if started { "" } else { " (gst başlamadı)" },
+									+ if started { "" } else { crate::i18n::t("host.gstFailed") },
 							},
 						);
 						return;
@@ -991,7 +991,7 @@ pub(super) fn make_on_stream(
 				kind: "stream".into(),
 				peer: peer.clone(),
 				detail: format!("{} · {}p", encoder.label(), eff_h)
-					+ if started { "" } else { " (ffmpeg başlamadı)" },
+					+ if started { "" } else { crate::i18n::t("host.ffmpegFailed") },
 			},
 		);
 	}

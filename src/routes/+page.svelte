@@ -142,7 +142,7 @@
 			const msg = e instanceof Error ? e.message : String(e);
 			// The sidebar shows this as the offline tooltip; the auto-retry effect below
 			// keeps trying, so say so instead of presenting a dead end.
-			connError = isTauri ? `${msg} — otomatik olarak yeniden denenecek` : msg;
+			connError = isTauri ? `${msg} — ${t('status.willRetry')}` : msg;
 		} finally {
 			connecting = false;
 		}

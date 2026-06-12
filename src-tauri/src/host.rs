@@ -88,7 +88,7 @@ pub(crate) async fn go_online(
 	tracing::info!(relay = %cfg.relay, "go_online: resolving relay");
 	let relay = resolve_relay(&cfg.relay)
 		.await
-		.ok_or_else(|| format!("relay çözümlenemedi: {}", cfg.relay))?;
+		.ok_or_else(|| format!("{}: {}", crate::i18n::t("err.relayResolve"), cfg.relay))?;
 	tracing::info!(%relay, "go_online: binding node + registering");
 	let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
 	// Identity advertised on the network: the user's chosen device name, or — when
