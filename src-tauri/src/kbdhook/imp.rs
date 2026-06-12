@@ -167,11 +167,24 @@ fn set_capture_filter(on: bool) {
 	}
 }
 
-/// Load interception.dll (shipped next to the exe) and open a context. Returns
-/// None if the DLL is missing or the driver isn't installed/active — the caller
-/// then falls back to the WH_KEYBOARD_LL hook.
+/// Load interception.dll and open a context. Returns None if the DLL is missing
+/// or the driver isn't installed/active — the caller then falls back to the
+/// WH_KEYBOARD_LL hook.
 fn init_interception() -> Option<Interception> {
-	let lib = unsafe { Library::new("interception.dll") }.ok()?;
+	// Search order: next to the exe / PATH (the dev layout), then the bundled copy
+	// under resources/interception/ — the INSTALLED app ships it there (NSIS
+	// `resources` list), and without this fallback an installed Pulsar silently
+	// dropped to the WH_KEYBOARD_LL hook, which ASTER bypasses ("engaged but
+	// nothing forwards" on multiseat machines).
+	let lib = unsafe { Library::new("interception.dll") }.ok().or_else(|| {
+		let p = std::env::current_exe()
+			.ok()?
+			.parent()?
+			.join("resources")
+			.join("interception")
+			.join("interception.dll");
+		unsafe { Library::new(p) }.ok()
+	})?;
 	unsafe {
 		let create: ItCreate = *lib.get(b"interception_create_context\0").ok()?;
 		let set_filter: ItSetFilter = *lib.get(b"interception_set_filter\0").ok()?;
@@ -484,10 +497,15 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool) {
 		0 => {
 			// First arm — decide the capture mechanism once.
 			if let Some(it) = init_interception() {
+				tracing::info!("kbd capture mechanism: Interception driver");
 				let _ = INTERCEPT.set(it);
 				MECHANISM.store(1, Ordering::SeqCst);
 				std::thread::spawn(capture_thread);
 			} else {
+				// Visible in the log on machines where this matters (ASTER multiseat
+				// physical input is INVISIBLE to the LL hook — capture will look
+				// engaged but forward nothing).
+				tracing::warn!("kbd capture mechanism: WH_KEYBOARD_LL fallback (interception.dll not loaded)");
 				MECHANISM.store(2, Ordering::SeqCst);
 				THREAD_STARTED.store(true, Ordering::SeqCst);
 				std::thread::spawn(hook_thread);
