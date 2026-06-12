@@ -98,7 +98,18 @@ const ABS_MAX: i32 = 65535;
 /// absolute pointer (maps directly to the screen) and a keyboard. Works on
 /// Wayland and X11 (kernel input layer), unlike `x11grab`/`xdotool`.
 pub struct DesktopInput {
+	/// ABSOLUTE pointer (INPUT_PROP_DIRECT + ABS_X/Y) — used only by `pointer()` for
+	/// direct-to-screen positioning (the old webview-canvas path / Wayland-less x11).
 	pointer: VirtualDevice,
+	/// RELATIVE mouse (REL_X/Y + wheel + buttons, NO direct/abs prop) — used by
+	/// `pointer_relative()`, `button()`, `scroll()` (the native-renderer path). Buttons
+	/// and relative motion MUST live on a non-DIRECT device: a single device carrying
+	/// both INPUT_PROP_DIRECT/ABS and REL is classified by libinput as a touch/tablet,
+	/// so its relative motion leaks through but BTN_LEFT (no BTN_TOUCH + no abs coord)
+	/// is dropped — the live "cursor moves but clicks don't register" bug. Splitting the
+	/// relative pointer onto its own plain-mouse device fixes it; X shares one cursor
+	/// across both devices, so abs-position-then-click still lands correctly.
+	mouse: VirtualDevice,
 	keyboard: VirtualDevice,
 	/// Carried-over fractional scroll (in wheel notches). A single small/precision
 	/// wheel delta (< one notch) used to `round()` to 0 and silently do nothing; we
@@ -113,13 +124,8 @@ impl DesktopInput {
 		btns.insert(Key::BTN_LEFT);
 		btns.insert(Key::BTN_RIGHT);
 		btns.insert(Key::BTN_MIDDLE);
-		let mut rels = AttributeSet::<RelativeAxisType>::new();
-		rels.insert(RelativeAxisType::REL_WHEEL);
-		rels.insert(RelativeAxisType::REL_HWHEEL);
-		rels.insert(RelativeAxisType::REL_X); // relative pointer (native renderer)
-		rels.insert(RelativeAxisType::REL_Y);
-		// INPUT_PROP_DIRECT → coordinates map directly to the screen (touchscreen
-		// style) so absolute positioning matches the streamed display.
+		// ABSOLUTE pointer: INPUT_PROP_DIRECT + ABS_X/Y. Buttons stay here too so an
+		// absolute-path tap (set position, then click on THIS device) still works.
 		let mut props = AttributeSet::<PropType>::new();
 		props.insert(PropType::DIRECT);
 		let abs = |axis| UinputAbsSetup::new(axis, AbsInfo::new(0, 0, ABS_MAX, 0, 0, 1));
@@ -129,6 +135,20 @@ impl DesktopInput {
 			.with_keys(&btns)?
 			.with_absolute_axis(&abs(AbsoluteAxisType::ABS_X))?
 			.with_absolute_axis(&abs(AbsoluteAxisType::ABS_Y))?
+			.build()?;
+
+		// RELATIVE mouse: plain REL_X/Y + wheel + buttons, NO direct/abs prop, so
+		// libinput classifies it as an ordinary mouse and its BTN_LEFT clicks land
+		// (the native-renderer path). Kept SEPARATE from the absolute device above —
+		// mixing DIRECT/ABS with REL on one node is exactly what dropped the clicks.
+		let mut rels = AttributeSet::<RelativeAxisType>::new();
+		rels.insert(RelativeAxisType::REL_X);
+		rels.insert(RelativeAxisType::REL_Y);
+		rels.insert(RelativeAxisType::REL_WHEEL);
+		rels.insert(RelativeAxisType::REL_HWHEEL);
+		let mouse = VirtualDeviceBuilder::new()?
+			.name("Pulsar Virtual Mouse")
+			.with_keys(&btns)?
 			.with_relative_axes(&rels)?
 			.build()?;
 
@@ -142,6 +162,7 @@ impl DesktopInput {
 			.build()?;
 		Ok(Self {
 			pointer,
+			mouse,
 			keyboard,
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
@@ -178,7 +199,7 @@ impl DesktopInput {
 			));
 		}
 		if !ev.is_empty() {
-			let _ = self.pointer.emit(&ev);
+			let _ = self.mouse.emit(&ev);
 		}
 	}
 
@@ -190,7 +211,7 @@ impl DesktopInput {
 			_ => Key::BTN_LEFT,
 		};
 		let _ = self
-			.pointer
+			.mouse
 			.emit(&[InputEvent::new(EventType::KEY, key.code(), down as i32)]);
 	}
 
@@ -222,7 +243,7 @@ impl DesktopInput {
 			));
 		}
 		if !ev.is_empty() {
-			let _ = self.pointer.emit(&ev);
+			let _ = self.mouse.emit(&ev);
 		}
 	}
 
