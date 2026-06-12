@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import Icon from '$lib/Icon.svelte';
 	import { addPeer, avatarFor, isSaved } from '$lib/peers.svelte';
 	import { api, type LanDevice } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
@@ -64,13 +63,8 @@
 							<button class="btn btn-primary lbtn" onclick={() => onConnect({ name: d.name, id: d.id }, mode)}>
 								{t('home.connect')}
 							</button>
-							<!-- Already in the address book → no Save button (it used to keep
-							     offering Save with zero feedback); a quiet check marks it. -->
-							{#if isSaved(d.id)}
-								<span class="savedmark" title={t('devices.savedBadge')}>
-									<Icon name="check" size={13} />{t('devices.savedBadge')}
-								</span>
-							{:else}
+							<!-- Already in the address book → nothing at all (no Save button). -->
+							{#if !isSaved(d.id)}
 								<button class="btn btn-ghost lbtn" onclick={() => addPeer(d.name, d.id, 'pc')}>
 									{t('devices.lanSave')}
 								</button>
@@ -175,13 +169,5 @@
 	.lbtn {
 		padding: 7px 12px;
 		font-size: 13px;
-	}
-	.savedmark {
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-		font-size: 12px;
-		color: var(--ok);
-		padding: 7px 6px;
 	}
 </style>
