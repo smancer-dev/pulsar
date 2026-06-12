@@ -15,7 +15,6 @@
 
 	let tab = $state<'display' | 'network' | 'security' | 'general'>('display');
 	let config = $state<Config | null>(null);
-	let saved = $state(false);
 	let saveErr = $state('');
 	let detected = $state<string[]>([]);
 
@@ -72,8 +71,6 @@
 			saveErr = e instanceof Error ? e.message : String(e);
 			return;
 		}
-		saved = true;
-		setTimeout(() => (saved = false), 1200);
 		notifySaved();
 		// Bump the shared tick for CORE saves too: the shell (+page) re-fetches its
 		// own config copy off this, so screens reading shell config (the Home
@@ -151,7 +148,7 @@
 				{toggleMute}
 			/>
 		{:else if tab === 'network'}
-			<NetworkTab bind:config {saved} {saveConfig} {setMode} />
+			<NetworkTab bind:config {saveConfig} {setMode} />
 		{:else if tab === 'security'}
 			<SecurityTab bind:config {toggleUnattended} {saveConfig} />
 		{:else}
@@ -164,7 +161,9 @@
 </div>
 
 {#if toast}
-	<div class="toast" role="status" aria-live="polite">{t('settings.savedToast')}</div>
+	<div class="toast" role="status" aria-live="polite">
+		<span class="tick"><Icon name="check" size={13} /></span>{t('settings.savedToast')}
+	</div>
 {/if}
 
 <style>
@@ -217,24 +216,39 @@
 		padding-top: 12px;
 		word-break: break-word;
 	}
-	/* Centered semi-transparent confirmation; never intercepts clicks. The 3s
-	 * lifetime is owned by the JS timer — this only plays the visual fade. */
+	/* Bottom-center semi-transparent confirmation pill (green check + text);
+	 * never intercepts clicks. The 3s lifetime is owned by the JS timer — this
+	 * only plays the visual fade. */
 	.toast {
 		position: fixed;
-		inset: 0;
-		margin: auto;
+		left: 0;
+		right: 0;
+		bottom: 36px;
+		margin: 0 auto;
 		width: max-content;
-		height: max-content;
 		z-index: 50;
 		pointer-events: none;
-		padding: 14px 26px;
-		border-radius: var(--r-md);
-		background: color-mix(in oklch, var(--text) 78%, transparent);
+		display: flex;
+		align-items: center;
+		gap: 9px;
+		padding: 11px 20px;
+		border-radius: 999px;
+		background: color-mix(in oklch, var(--text) 80%, transparent);
 		color: var(--surface);
-		font-size: 14.5px;
+		font-size: 14px;
 		font-weight: 600;
 		box-shadow: var(--shadow-lg);
 		animation: toast-fade 3s ease forwards;
+	}
+	.tick {
+		width: 19px;
+		height: 19px;
+		border-radius: 50%;
+		background: var(--ok);
+		color: #fff;
+		display: grid;
+		place-items: center;
+		flex: none;
 	}
 	@keyframes toast-fade {
 		0% {

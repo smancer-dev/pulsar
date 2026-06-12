@@ -8,12 +8,10 @@
 
 	let {
 		config = $bindable(),
-		saved,
 		saveConfig,
 		setMode
 	}: {
 		config: Config | null;
-		saved: boolean;
 		saveConfig: () => void;
 		setMode: (m: NetworkMode) => void;
 	} = $props();
@@ -101,7 +99,6 @@
 	<div class="st"><b>{t('settings.bwlimit')}</b><span>{t('settings.bwlimitDesc')}</span></div>
 	<button class="toggle" aria-label={t('settings.bwlimit')} class:on={ui.bwlimit} aria-pressed={ui.bwlimit} onclick={() => { ui.bwlimit = !ui.bwlimit; saveUi(); }}><span class="knob"></span></button>
 </div>
-{#if saved}<div class="saved mono">{t('settings.saved')}</div>{/if}
 
 <style>
 	.srow {
@@ -129,10 +126,5 @@
 	}
 	.relayfield {
 		width: 250px;
-	}
-	.saved {
-		font-size: 12px;
-		color: var(--ok);
-		padding-top: 12px;
 	}
 </style>
