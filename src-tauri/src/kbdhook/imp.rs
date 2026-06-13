@@ -138,14 +138,18 @@ fn clear_confine() {
 	}
 }
 
-/// Trap the cursor to the streamed video (the `PulsarRenderChild` window's screen rect)
-/// while engaged, so the local pointer can't wander onto another monitor. `on=false`
-/// frees it (ClipCursor(NULL)). Finds the render child under our main window; falls back
-/// to the main window's client area, and to no-confine if neither resolves.
+/// Confine the cursor to the MONITOR showing the streamed video while engaged, so the
+/// pointer can't wander onto another screen — but it can still move freely on that whole
+/// monitor (NOT trapped to the Pulsar window: the user can reach the rest of the screen
+/// and a click outside implicitly releases). `on=false` frees it (ClipCursor(NULL)).
+/// Picks the monitor under the Pulsar main window; no-confine if it can't resolve.
 fn confine_to_video(app: &AppHandle, on: bool) {
 	use tauri::Manager as _;
-	use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
-	use windows_sys::Win32::UI::WindowsAndMessaging::{ClipCursor, EnumChildWindows, GetWindowRect};
+	use windows_sys::Win32::Foundation::HWND;
+	use windows_sys::Win32::Graphics::Gdi::{
+		GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+	};
+	use windows_sys::Win32::UI::WindowsAndMessaging::ClipCursor;
 
 	if !on {
 		*CONFINE.lock().unwrap() = None;
@@ -161,31 +165,15 @@ fn confine_to_video(app: &AppHandle, on: bool) {
 	else {
 		return;
 	};
-	// Find the PulsarRenderChild (the native video surface) among the window's children.
-	unsafe extern "system" fn find_render(child: HWND, out: LPARAM) -> i32 {
-		use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
-		let mut buf = [0u16; 64];
-		let n = GetClassNameW(child, buf.as_mut_ptr(), buf.len() as i32);
-		let cls = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-		if cls == "PulsarRenderChild" {
-			*(out as *mut HWND) = child;
-			return 0; // found — stop enumerating
+	unsafe {
+		let mon = MonitorFromWindow(main_hwnd, MONITOR_DEFAULTTONEAREST);
+		let mut mi: MONITORINFO = std::mem::zeroed();
+		mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+		if GetMonitorInfoW(mon, &mut mi) == 0 {
+			return;
 		}
-		1
-	}
-	let mut found: HWND = std::ptr::null_mut();
-	unsafe {
-		EnumChildWindows(main_hwnd, Some(find_render), &mut found as *mut HWND as LPARAM);
-	}
-	let target = if !found.is_null() { found } else { main_hwnd };
-	let mut rc = RECT {
-		left: 0,
-		top: 0,
-		right: 0,
-		bottom: 0,
-	};
-	unsafe {
-		if GetWindowRect(target, &mut rc) == 0 || rc.right <= rc.left || rc.bottom <= rc.top {
+		let rc = mi.rcMonitor;
+		if rc.right <= rc.left || rc.bottom <= rc.top {
 			return;
 		}
 		*CONFINE.lock().unwrap() = Some((rc.left, rc.top, rc.right, rc.bottom));

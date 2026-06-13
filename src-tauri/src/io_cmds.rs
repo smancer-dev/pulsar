@@ -381,22 +381,19 @@ pub(crate) fn set_window_fullscreen(
 	} else {
 		state.fs_geom.lock().unwrap().take()
 	};
-	// Native decorations are on now, so hide the OS title bar / frame while fullscreen (e.g. a
-	// game) and restore it on exit — otherwise the title bar would sit across the top.
+	// Hide the OS title bar / frame while fullscreen and restore on exit. WINDOWS does
+	// this synchronously inside `win_fullscreen` (style strip in the same closure as the
+	// SetWindowPos) — calling tauri's async set_decorations/set_resizable here too RACED
+	// the strip and intermittently left the 8px WS_THICKFRAME inset back in (the "bazen
+	// 8px boşluk"). So the tauri calls are non-Windows only.
+	#[cfg(not(windows))]
 	let _ = window.set_decorations(!on);
 	#[cfg(windows)]
 	{
-		// Frameless-but-resizable windows keep invisible 8px WS_THICKFRAME hit-test
-		// borders that INSET the client area — in fullscreen the webview/video child then
-		// sits (8,1)-(w-8,h-8) inside the monitor-covering window and the transparent
-		// gutter shows the desktop through. Dropping resizability while fullscreen removes
-		// the frame so the client area truly covers the monitor; restored on exit.
-		// WINDOWS ONLY: on GTK/Mutter a non-resizable toplevel can't be fullscreened
-		// (set_fullscreen no-ops / the WM won't let it cover the screen), which regressed
-		// the Linux client's fullscreen — so this must not run there.
-		let _ = window.set_resizable(!on);
 		let w = window.clone();
 		// Drive Win32 on the UI thread so SetWindowPos targets the window correctly.
+		// win_fullscreen strips WS_THICKFRAME|WS_CAPTION + covers the monitor + snaps the
+		// children to the client rect, all synchronously (no async tauri style races).
 		let _ = window.run_on_main_thread(move || win_fullscreen(&w, on, saved));
 	}
 	#[cfg(not(windows))]
