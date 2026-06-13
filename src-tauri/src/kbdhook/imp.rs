@@ -105,11 +105,101 @@ pub(super) fn arm_kiosk() {
 	KIOSK_ENGAGE.store(true, Ordering::SeqCst);
 }
 
+/// Cursor-confine rectangle (screen px, LTRB) re-asserted on every mouse event while
+/// engaged — the OS clears ClipCursor on focus changes / display events, so a one-shot
+/// clip wouldn't survive. `None` = not confined (released). Set by `confine_to_video`.
+static CONFINE: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+
+/// Re-apply the stored confine rect (cheap ClipCursor syscall; no window lookup). Called
+/// from the mouse handler so the trap survives focus flaps. No-op when not confined.
+fn reassert_confine() {
+	use windows_sys::Win32::Foundation::RECT;
+	use windows_sys::Win32::UI::WindowsAndMessaging::ClipCursor;
+	if let Some((l, t, r, b)) = *CONFINE.lock().unwrap() {
+		let rc = RECT {
+			left: l,
+			top: t,
+			right: r,
+			bottom: b,
+		};
+		unsafe {
+			ClipCursor(&rc);
+		}
+	}
+}
+
+/// Free the cursor (ClipCursor(NULL)) and forget the confine rect — for disengage paths
+/// that don't go through `release_engage` (disable / implicit click-outside release).
+fn clear_confine() {
+	use windows_sys::Win32::UI::WindowsAndMessaging::ClipCursor;
+	*CONFINE.lock().unwrap() = None;
+	unsafe {
+		ClipCursor(std::ptr::null());
+	}
+}
+
+/// Trap the cursor to the streamed video (the `PulsarRenderChild` window's screen rect)
+/// while engaged, so the local pointer can't wander onto another monitor. `on=false`
+/// frees it (ClipCursor(NULL)). Finds the render child under our main window; falls back
+/// to the main window's client area, and to no-confine if neither resolves.
+fn confine_to_video(app: &AppHandle, on: bool) {
+	use tauri::Manager as _;
+	use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+	use windows_sys::Win32::UI::WindowsAndMessaging::{ClipCursor, EnumChildWindows, GetWindowRect};
+
+	if !on {
+		*CONFINE.lock().unwrap() = None;
+		unsafe {
+			ClipCursor(std::ptr::null());
+		}
+		return;
+	}
+	let Some(main_hwnd) = app
+		.get_webview_window("main")
+		.and_then(|w| w.hwnd().ok())
+		.map(|h| h.0 as HWND)
+	else {
+		return;
+	};
+	// Find the PulsarRenderChild (the native video surface) among the window's children.
+	unsafe extern "system" fn find_render(child: HWND, out: LPARAM) -> i32 {
+		use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
+		let mut buf = [0u16; 64];
+		let n = GetClassNameW(child, buf.as_mut_ptr(), buf.len() as i32);
+		let cls = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+		if cls == "PulsarRenderChild" {
+			*(out as *mut HWND) = child;
+			return 0; // found — stop enumerating
+		}
+		1
+	}
+	let mut found: HWND = std::ptr::null_mut();
+	unsafe {
+		EnumChildWindows(main_hwnd, Some(find_render), &mut found as *mut HWND as LPARAM);
+	}
+	let target = if !found.is_null() { found } else { main_hwnd };
+	let mut rc = RECT {
+		left: 0,
+		top: 0,
+		right: 0,
+		bottom: 0,
+	};
+	unsafe {
+		if GetWindowRect(target, &mut rc) == 0 || rc.right <= rc.left || rc.bottom <= rc.top {
+			return;
+		}
+		*CONFINE.lock().unwrap() = Some((rc.left, rc.top, rc.right, rc.bottom));
+		ClipCursor(&rc);
+	}
+}
+
 /// Take control: start forwarding + suppressing input. Idempotent; emits
 /// `kbd-engaged` on the rising edge (drives the UI hint + renderer cursor state).
 pub(super) fn engage(app: &AppHandle) {
 	if !ENGAGED.swap(true, Ordering::SeqCst) {
 		tracing::info!("kbd capture ENGAGED");
+		// Trap the cursor to the streamed screen so it can't roam to another monitor.
+		confine_to_video(app, true);
 		let _ = app.emit("kbd-engaged", ());
 	}
 }
@@ -120,6 +210,7 @@ pub(super) fn engage(app: &AppHandle) {
 pub(super) fn release_engage(app: &AppHandle) {
 	if ENGAGED.swap(false, Ordering::SeqCst) {
 		tracing::info!("kbd capture RELEASED");
+		confine_to_video(app, false); // free the cursor — local desktop usable again
 		flush_held(&mut globals().lock().unwrap());
 		let _ = app.emit("kbd-released", ());
 	}
@@ -433,6 +524,7 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 			if !root.is_null() && pid != unsafe { GetCurrentProcessId() } {
 				tracing::info!("click outside Pulsar while engaged → implicit release, click passes through");
 				ENGAGED.store(false, Ordering::SeqCst);
+				clear_confine();
 				flush_held(&mut g);
 				if let Some(app) = &g.app {
 					let _ = app.emit("kbd-released", ());
@@ -442,6 +534,9 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 		}
 	}
 	let Some(tx) = &g.tx else { return false };
+	// Keep the cursor trapped to the streamed screen — the OS drops ClipCursor on focus
+	// flaps (e.g. the render-child activation), so re-assert it on each mouse event.
+	reassert_confine();
 	// Relative movement (skip absolute-coordinate mice — 0x001 = ABSOLUTE flag).
 	if flags & 0x001 == 0 && (x != 0 || y != 0) {
 		let _ = tx.try_send(InputEvent::PointerRelative {
@@ -562,6 +657,7 @@ pub fn disable() {
 	// a different id still starts disengaged.
 	ENGAGED_MEMO.store(ENGAGED.load(Ordering::SeqCst), Ordering::SeqCst);
 	ENGAGED.store(false, Ordering::SeqCst);
+	clear_confine(); // free the cursor when the session is torn down / tab switched away
 	KIOSK_SESSION.store(false, Ordering::SeqCst);
 	// Interception: drop the filter so we stop capturing (frees keys for any other
 	// instance + the local OS).

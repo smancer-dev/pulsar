@@ -338,7 +338,22 @@
 		// The overlay-button hotspot opens the overlay; it must never count as the
 		// click-to-engage opt-in.
 		if ((e.target as HTMLElement | null)?.closest?.('.ovbtn-hotspot')) return;
-		if (native && !nativeEngaged) api.kbdEngage().catch(() => {});
+		if (native && !nativeEngaged) {
+			api.kbdEngage().catch(() => {});
+			// Start the host cursor where the user clicked: map the click into the video
+			// rect (normalized 0..1) and send it as one absolute move before the relative
+			// capture takes over — so control begins at the clicked spot, not wherever the
+			// host pointer happened to be.
+			const el = screenEl;
+			if (el && playId >= 0) {
+				const r = el.getBoundingClientRect();
+				if (r.width > 0 && r.height > 0) {
+					const nx = Math.min(1, Math.max(0, (e.clientX - r.x) / r.width));
+					const ny = Math.min(1, Math.max(0, (e.clientY - r.y) / r.height));
+					api.inputPointer(playId, nx, ny).catch(() => {});
+				}
+			}
+		}
 	}
 
 	// Size the windowed session to the HOST's aspect ratio on the first decoded frame
