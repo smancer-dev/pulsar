@@ -7,8 +7,6 @@
 </script>
 
 <script lang="ts">
-	import Menu from './Session/Menu.svelte';
-	import Overlay from './Session/Overlay.svelte';
 	import VideoStatus from './Session/VideoStatus.svelte';
 	import { SessionMedia } from './Session/media.svelte';
 	import {
@@ -657,128 +655,10 @@
 		onStartControl={input.startControl}
 	/>
 
-	<!-- Floating control handle + expandable menu — WEBVIEW path only (Windows/macOS).
-	     On the Linux NATIVE path this whole surface is retired: the egui overlay now
-	     owns every feature (Yayın/Görüntü/Ses/Sohbet/Dosyalar/Araçlar), and the old
-	     dock handle would sit uselessly under the opaque video anyway. -->
-	{#if !native}
-	<Menu
-		{playId}
-		menuOpen={dock.menuOpen}
-		controlling={input.controlling}
-		floating={dock.floating}
-		pos={dock.pos}
-		keepVisible={ui.keepVisible}
-		bind:statsHover={dock.statsHover}
-		netClass={media.netClass}
-		fps={media.fps}
-		latencyMs={media.latencyMs}
-		spark={media.spark}
-		hostCodec={media.hostCodec}
-		hostRes={media.hostRes}
-		hostEncoder={media.hostEncoder}
-		hostFps={media.hostFps}
-		decoderCodec={media.decoderCodec}
-		decodeMs={media.decodeMs}
-		{connLabel}
-		rttMs={media.rttMs}
-		jitterMs={media.jitterMs}
-		lossPct={media.lossPct}
-		mbps={media.mbps}
-		target={displayTarget}
-		{peerAvatar}
-		{mode}
-		{fullscreen}
-		bind:panel={sidechan.panel}
-		messages={sidechan.messages}
-		bind:chatInput={sidechan.chatInput}
-		bind:chatBox={sidechan.chatBox}
-		unread={sidechan.unread}
-		note={sidechan.note}
-		micOn={sidechan.micOn}
-		transmitAudio={controls.transmitAudio}
-		muteHost={controls.muteHost}
-		framePacing={controls.framePacing}
-		bind:fitMode
-		codec={ui.codec}
-		encoder={ui.encoder}
-		{hostCodecs}
-		{hostEncoders}
-		{hostDisplays}
-		{activeInfo}
-		streamRes={controls.streamRes}
-		streamFps={controls.streamFps}
-		streamBitrate={controls.streamBitrate}
-		streamQuality={controls.streamQuality}
-		streamDisplay={controls.streamDisplay}
-		onMonitor={controls.setMonitor}
-		onCloseMenu={dock.closeMenu}
-		onHandleClick={dock.handleClick}
-		onHandleDown={dock.onHandleDown}
-		onHandleMove={dock.onHandleMove}
-		onHandleUp={dock.onHandleUp}
-		onHandleCancel={dock.onHandleCancel}
-		onCodec={controls.setCodec}
-		onEncoder={controls.setEncoder}
-		onRes={controls.setRes}
-		onFps={controls.setFps}
-		onBitrate={controls.setBitrate}
-		onQuality={controls.setQuality}
-		onFullscreen={dock.doFullscreen}
-		onSendClipboard={sidechan.sendClipboard}
-		onPickFile={sidechan.pickFile}
-		onToggleMic={sidechan.toggleMic}
-		onOpenChat={sidechan.openChat}
-		onToggleFloating={dock.toggleFloating}
-		onReverse={reverse}
-		onToggleTransmit={controls.toggleTransmit}
-		onToggleMute={controls.toggleMute}
-		onToggleKeepVisible={controls.toggleKeepVisible}
-		onToggleFramePacing={controls.toggleFramePacing}
-		onSendChat={sidechan.sendChatLine}
-		onEnd={dock.endSession}
-	/>
-	{/if}
-
-	<!-- Game-only overlay (Ctrl+Shift+M). Opaque dialog so it stays visible while mpv is
-	     paused on Linux. Perf HUD + the slim game controls (codec/encoder/decoder/res/fps/
-	     bitrate/quality) + controllers + end — NO file/clipboard/mic/chat (remote-only). -->
-	{#if mode === 'game' && dock.overlayOpen}
-		<Overlay
-			{target}
-			{connLabel}
-			netClass={media.netClass}
-			fps={media.fps}
-			latencyMs={media.latencyMs}
-			decodeMs={media.decodeMs}
-			mbps={media.mbps}
-			codec={ui.codec}
-			encoder={ui.encoder}
-			{hostCodecs}
-			{hostEncoders}
-			{hostDisplays}
-			decoderInfo={media.decoderCodec}
-			{activeInfo}
-			activeFps={media.hostFps}
-			activeRes={media.hostRes}
-			streamRes={controls.streamRes}
-			streamFps={controls.streamFps}
-			streamBitrate={controls.streamBitrate}
-			streamQuality={controls.streamQuality}
-			streamDisplay={controls.streamDisplay}
-			onMonitor={controls.setMonitor}
-			framePacing={controls.framePacing}
-			onCodec={controls.setCodec}
-			onEncoder={controls.setEncoder}
-			onRes={controls.setRes}
-			onFps={controls.setFps}
-			onBitrate={controls.setBitrate}
-			onQuality={controls.setQuality}
-			onFramePacing={controls.setFramePacing}
-			onClose={dock.closeOverlay}
-			onEnd={dock.endSession}
-		/>
-	{/if}
+	<!-- The in-session UI (menu/overlay/HUD) is the NATIVE egui overlay drawn by
+	     pulsar-render over the video on every platform — `native` is always true, so the
+	     old webview Menu/Overlay surfaces were removed. Everything else here is non-visual
+	     plumbing (input capture, viewrect, engage, overlay-cmd handlers). -->
 
 	<!-- Parsec-style overlay-open hotspot: the VISUAL button is drawn by the native
 	     renderer (egui, over the video); this invisible webview button sits at the
