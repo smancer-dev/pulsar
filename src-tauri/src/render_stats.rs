@@ -125,6 +125,7 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 				match (it.next(), it.next()) {
 					(Some("ov"), Some("set")) => {
 						if let (Some(field), Some(val)) = (it.next(), it.next()) {
+							tracing::info!(field, val, "overlay-cmd from renderer");
 							let _ =
 								app.emit("overlay-cmd", (id, field.to_string(), val.to_string()));
 						}

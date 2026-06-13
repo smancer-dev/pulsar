@@ -575,23 +575,39 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 /// view-fit modes (renderer-local, instant).
 fn draw_display(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
 	// Host monitor picker — only meaningful when the host exposes more than one.
+	// Rendered as selectable TILES (one box per screen), not a dropdown.
 	if st.displays.len() > 1 {
 		ui.label(
 			egui::RichText::new(format!("🖵 {}", t("monitor.title")))
 				.small()
 				.color(egui::Color32::GRAY),
 		);
-		let cur = st.display_idx.to_string();
-		// Build owned (value, label) pairs, then borrow for `combo`.
-		let owned: Vec<(String, String)> = st
-			.displays
-			.iter()
-			.map(|(idx, label)| (idx.to_string(), label.clone()))
-			.collect();
-		let opts: Vec<(&str, &str)> = owned.iter().map(|(v, l)| (v.as_str(), l.as_str())).collect();
-		if let Some(v) = combo(ui, t("monitor.title"), "display", &cur, &opts, "") {
-			cmds.push(OverlayCmd::Set("display", v));
-		}
+		ui.add_space(4.0);
+		ui.horizontal_wrapped(|ui| {
+			for (idx, label) in &st.displays {
+				let selected = *idx == st.display_idx;
+				let fill = if selected {
+					ACCENT
+				} else {
+					egui::Color32::from_rgb(40, 44, 54)
+				};
+				// A monitor glyph over the screen's label (name + WxH) — a square-ish tile.
+				let text = egui::RichText::new(format!("🖥\n{label}"))
+					.size(12.0)
+					.color(egui::Color32::WHITE);
+				if ui
+					.add(
+						egui::Button::new(text)
+							.fill(fill)
+							.min_size(egui::vec2(120.0, 56.0)),
+					)
+					.clicked()
+					&& !selected
+				{
+					cmds.push(OverlayCmd::Set("display", idx.to_string()));
+				}
+			}
+		});
 		ui.add_space(8.0);
 	}
 	ui.label(

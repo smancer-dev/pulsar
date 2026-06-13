@@ -130,7 +130,7 @@ export const api = {
 	setPlayFps: (id: number, fps: number) => invoke<void>('set_play_fps', { id, fps }),
 	/** Switch which HOST monitor is streamed (session menu); idx into host_displays, 0 = primary. */
 	setPlayMonitor: (id: number, displayIdx: number) =>
-		invoke<void>('set_play_monitor', { id, display_idx: displayIdx }),
+		invoke<void>('set_play_monitor', { id, displayIdx }),
 	/** Change the target bitrate live in kbps (0 = host default; UI converts Mbit→kbps). */
 	setPlayBitrate: (id: number, kbps: number) => invoke<void>('set_play_bitrate', { id, kbps }),
 	/** Switch the encode quality/perf profile live (the host restarts ffmpeg with it). */

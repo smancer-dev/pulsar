@@ -439,6 +439,7 @@ pub(crate) async fn set_play_monitor(
 	id: u64,
 	display_idx: u32,
 ) -> Result<(), String> {
+	tracing::info!(id, display_idx, "set_play_monitor command");
 	let tx = state
 		.plays
 		.lock()
@@ -449,6 +450,8 @@ pub(crate) async fn set_play_monitor(
 		tx.send(Restream::Display(display_idx))
 			.await
 			.map_err(|e| e.to_string())?;
+	} else {
+		tracing::warn!(id, "set_play_monitor: no play session for id");
 	}
 	Ok(())
 }
