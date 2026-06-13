@@ -446,7 +446,9 @@ pub(super) async fn hold_session(
 						cursor_external,
 						display_idx: cur_display,
 					};
-					if request_stream(&mut sess, &req).await.is_err() {
+					let rs = request_stream(&mut sess, &req).await;
+					tracing::info!(display_idx = cur_display, ok = rs.is_ok(), "restream request_stream sent");
+					if rs.is_err() {
 						break;
 					}
 				}

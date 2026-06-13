@@ -435,23 +435,45 @@ pub(crate) async fn set_play_quality(
 /// host restarts capture on the selected output.
 #[tauri::command]
 pub(crate) async fn set_play_monitor(
+	app: AppHandle,
 	state: State<'_, AppState>,
 	id: u64,
 	display_idx: u32,
 ) -> Result<(), String> {
 	tracing::info!(id, display_idx, "set_play_monitor command");
-	let tx = state
-		.plays
-		.lock()
-		.unwrap()
-		.get(&id)
-		.map(|p| p.restream_tx.clone());
-	if let Some(tx) = tx {
-		tx.send(Restream::Display(display_idx))
-			.await
-			.map_err(|e| e.to_string())?;
-	} else {
-		tracing::warn!(id, "set_play_monitor: no play session for id");
+	// Pull the restream channel + the active codec (from the stored caps line) under one lock.
+	let (tx, codec) = {
+		let plays = state.plays.lock().unwrap();
+		let Some(p) = plays.get(&id) else {
+			tracing::warn!(id, "set_play_monitor: no play session for id");
+			return Ok(());
+		};
+		let codec = p
+			.caps_line
+			.lock()
+			.unwrap()
+			.split_whitespace()
+			.find_map(|kv| kv.strip_prefix("codec=").map(str::to_string))
+			.unwrap_or_default();
+		(p.restream_tx.clone(), codec)
+	};
+	tx.send(Restream::Display(display_idx))
+		.await
+		.map_err(|e| e.to_string())?;
+	// Monitors can differ in resolution (e.g. 2560×1440 vs 1920×1200), so the host's
+	// restarted capture emits a stream with NEW dimensions/SPS. The renderer's demuxer +
+	// decoder are fixed at spawn, so — exactly like a codec switch — they must resync or
+	// the video freezes on the old params. Reuse the codec-switch reopen/respawn path with
+	// the UNCHANGED codec.
+	let _ = &app;
+	if !codec.is_empty() {
+		#[cfg(any(
+			all(unix, not(target_os = "macos"), not(target_arch = "aarch64")),
+			windows
+		))]
+		respawn_render_for_codec(&app, &state, id, &codec).await;
+		#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+		reopen_render_for_codec(&state, id, &codec);
 	}
 	Ok(())
 }

@@ -150,6 +150,7 @@ pub async fn serve_with(
 				let _ = session.send(&enc(&Msg::Ok)).await;
 			}
 			Some(Msg::StartStream(req)) => {
+				tracing::info!(display_idx = req.display_idx, "host received StartStream");
 				if let Some(addr) = session.peer_addr().await {
 					on_stream(req, addr);
 				}

@@ -365,6 +365,12 @@ unsafe fn decode_once(sdp: &CString) {
 			let pkt = ff::av_packet_alloc();
 			let frame = ff::av_frame_alloc();
 			let mut last_pub_pace = std::time::Instant::now();
+			// Wait for the first KEYFRAME before feeding the decoder. A fresh pass (initial start
+			// OR a reopen after a monitor/codec switch) joins the stream at an arbitrary point;
+			// decoding P-frames with no reference yet makes rkmpp emit GREEN/mosaic frames until
+			// the next IDR (GOP≈2 s). Dropping pre-keyframe packets makes the presenter HOLD the
+			// last good frame across the switch instead of flashing green.
+			let mut seen_key = false;
 			while !STOP.load(Ordering::Relaxed) && !REOPEN.load(Ordering::Relaxed) {
 				let r = ff::av_read_frame(fmt, pkt);
 				if r == ff::AVERROR_EOF {
@@ -373,6 +379,15 @@ unsafe fn decode_once(sdp: &CString) {
 				if r < 0 {
 					ff::av_packet_unref(pkt);
 					continue;
+				}
+				// Gate on the first keyframe (video stream only) — kills the pre-IDR green smear.
+				if (*pkt).stream_index == vs && !seen_key {
+					if (*pkt).flags & ff::AV_PKT_FLAG_KEY != 0 {
+						seen_key = true;
+					} else {
+						ff::av_packet_unref(pkt);
+						continue;
+					}
 				}
 				// Time the decode work for this packet (send + frame drain), EMA'd per frame into the
 				// overlay's "Çözme ms" tile. rkmpp is async HW: timing avcodec_receive_frame alone
