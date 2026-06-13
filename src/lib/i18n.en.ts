@@ -429,6 +429,8 @@ export const en: Dict = {
 	'session.back': 'Back',
 	'session.send': 'Send',
 	'session.bitrate': 'Bitrate',
+	'session.monitor': 'Monitor',
+	'session.monitorPrimary': 'primary',
 	'session.quality': 'Quality / perf',
 	'session.qLatency': 'Low latency',
 	'session.qQuality': 'High quality',

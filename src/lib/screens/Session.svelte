@@ -53,6 +53,8 @@
 		/** Host's validated stream caps (QueryStreamCaps) — gate the menu options. */
 		hostCodecs?: string[];
 		hostEncoders?: string[];
+		/** Host's streamable monitors (primary first); the session menu's screen picker. */
+		hostDisplays?: import('$lib/api.types').HostDisplay[];
 		fullscreen?: boolean;
 		/** True while this is the ACTIVE tab. Inactive session tabs stay mounted (just
 		 * CSS-hidden), so the GLOBAL keyboard/mouse capture and the payload-less combo
@@ -74,6 +76,7 @@
 		embedded = false,
 		hostCodecs = [],
 		hostEncoders = [],
+		hostDisplays = [],
 		fullscreen = false,
 		active = true,
 		onToggleFullscreen,
@@ -685,11 +688,14 @@
 		encoder={ui.encoder}
 		{hostCodecs}
 		{hostEncoders}
+		{hostDisplays}
 		{activeInfo}
 		streamRes={controls.streamRes}
 		streamFps={controls.streamFps}
 		streamBitrate={controls.streamBitrate}
 		streamQuality={controls.streamQuality}
+		streamDisplay={controls.streamDisplay}
+		onMonitor={controls.setMonitor}
 		onCloseMenu={dock.closeMenu}
 		onHandleClick={dock.handleClick}
 		onHandleDown={dock.onHandleDown}
@@ -734,6 +740,7 @@
 			encoder={ui.encoder}
 			{hostCodecs}
 			{hostEncoders}
+			{hostDisplays}
 			decoderInfo={media.decoderCodec}
 			{activeInfo}
 			activeFps={media.hostFps}
@@ -742,6 +749,8 @@
 			streamFps={controls.streamFps}
 			streamBitrate={controls.streamBitrate}
 			streamQuality={controls.streamQuality}
+			streamDisplay={controls.streamDisplay}
+			onMonitor={controls.setMonitor}
 			framePacing={controls.framePacing}
 			onCodec={controls.setCodec}
 			onEncoder={controls.setEncoder}

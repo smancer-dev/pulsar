@@ -156,8 +156,19 @@ pub fn x11_pipeline(
 	ip: &str,
 	port: u16,
 	direct_bgrx: bool,
+	region: Option<(i32, i32, u32, u32)>,
 ) -> String {
 	let fps = fps.max(1);
+	// Multi-monitor: ximagesrc captures the whole X root by default; constrain it to the
+	// selected monitor's rectangle with startx/starty/endx/endy (inclusive end coords).
+	let region = match region {
+		Some((x, y, w, h)) if w > 0 && h > 0 => format!(
+			" startx={x} starty={y} endx={} endy={}",
+			x + w as i32 - 1,
+			y + h as i32 - 1
+		),
+		_ => String::new(),
+	};
 	// Both variants keep the leaky queue right after capture, so stale frames drop
 	// BEFORE any further work when the encoder can't keep up (bounded latency).
 	let convert = if direct_bgrx {
@@ -186,7 +197,7 @@ pub fn x11_pipeline(
 		(0, "")
 	};
 	format!(
-		"ximagesrc display-name={display} use-damage={damage} show-pointer=true \
+		"ximagesrc display-name={display}{region} use-damage={damage} show-pointer=true \
 		 {rate}{convert}\
 		 ! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"

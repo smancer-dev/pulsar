@@ -102,6 +102,9 @@ pub(super) async fn hold_session(
 	let mut cur_fps = req_fps;
 	let mut cur_transmit = true;
 	let mut cur_mute = game_mode;
+	// Host monitor index (0 = primary). Changed live by the session menu's monitor
+	// picker (Restream::Display); preserved across every re-request below.
+	let mut cur_display: u32 = 0;
 	// Starts at the INITIAL request's bitrate (0 = host default) so a menu-driven
 	// re-request doesn't silently reset an explicit starting target; the adaptive
 	// controller moves it within [ADAPT_MIN_KBPS, base_kbps].
@@ -385,6 +388,7 @@ pub(super) async fn hold_session(
 							decode_codecs: decode_codecs.clone(),
 							media_over_session: mos,
 							cursor_external,
+							display_idx: cur_display,
 						};
 						if request_stream(&mut sess, &req).await.is_err() {
 							break;
@@ -415,6 +419,10 @@ pub(super) async fn hold_session(
 							cur_transmit = t;
 							cur_mute = m;
 						}
+						Restream::Display(d) => {
+							tracing::info!(display = d, "host monitor switch requested");
+							cur_display = d;
+						}
 					}
 					let req = StreamReq {
 						port: video_port,
@@ -436,6 +444,7 @@ pub(super) async fn hold_session(
 						decode_codecs: decode_codecs.clone(),
 						media_over_session: mos,
 						cursor_external,
+						display_idx: cur_display,
 					};
 					if request_stream(&mut sess, &req).await.is_err() {
 						break;

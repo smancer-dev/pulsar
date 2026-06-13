@@ -630,6 +630,7 @@ pub(crate) async fn go_online(
 								codecs,
 								encoders,
 								features: media_features(),
+								displays: crate::process::host_displays(),
 							};
 						}
 						// Fallback (probe still running): compute inline, same chain.
@@ -664,6 +665,7 @@ pub(crate) async fn go_online(
 								codecs,
 								encoders,
 								features: media_features(),
+								displays: crate::process::host_displays(),
 							};
 						}
 						let cfg = stream_cfg.lock().unwrap().clone();
@@ -726,6 +728,7 @@ pub(crate) async fn go_online(
 							codecs,
 							encoders,
 							features: media_features(),
+							displays: crate::process::host_displays(),
 						}
 					}
 				};

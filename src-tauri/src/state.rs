@@ -133,6 +133,8 @@ pub(crate) enum Restream {
 	Quality(QualityPref),
 	/// Audio toggles: (transmit_audio, mute_host).
 	Audio(bool, bool),
+	/// New host monitor to capture (index into `StreamCaps::displays`, 0 = primary).
+	Display(u32),
 }
 
 /// Stdin-only renderer state re-pushed after a codec-switch renderer respawn: a

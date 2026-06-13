@@ -714,6 +714,16 @@ pub(super) fn make_on_stream(
 		// gst x264 is NOT used here — ffmpeg's own libx264 path has more knobs.
 		#[cfg(target_os = "linux")]
 		{
+			// Client-selected host monitor → ximagesrc capture region (None = whole root /
+			// single-monitor host). The idx indexes process::linux_displays() (xrandr order),
+			// the same list StreamCaps advertised.
+			let region: Option<(i32, i32, u32, u32)> = {
+				let displays = crate::process::linux_displays();
+				displays
+					.get(req.display_idx as usize)
+					.filter(|_| displays.len() > 1)
+					.map(|(_, x, y, w, h, _)| (*x, *y, *w, *h))
+			};
 			let want_gst = enc_pref == "rkmpp" || encoder == HwEncoder::Software;
 			if want_gst {
 				let hw: Vec<_> = crate::process::validated_gst_encoders()
@@ -782,6 +792,7 @@ pub(super) fn make_on_stream(
 								&vdest.ip().to_string(),
 								vdest.port(),
 								direct_bgrx,
+								region,
 							)
 						};
 						let fps_part = if eff_fps != req_fps {
@@ -850,6 +861,7 @@ pub(super) fn make_on_stream(
 											&vdest.ip().to_string(),
 											vdest.port(),
 											false,
+											region,
 										);
 										let procs_fb = procs.clone();
 										let stats_fb = stats_out.clone();
@@ -969,7 +981,10 @@ pub(super) fn make_on_stream(
 				bitrate_kbps: eff_bitrate,
 				dest: format!("rtp://{vdest}"),
 				codec: ncodec,
-				output_idx: 0,
+				// Client-selected host monitor (session menu); DXGI maps this index 1:1
+				// to the attached-output list `StreamCaps::displays` was built from. An
+				// out-of-range index falls back to the first output inside find_output.
+				output_idx: req.display_idx,
 				low_latency: plan.low_latency,
 				draw_mouse: true,
 			}) {

@@ -30,6 +30,8 @@ export type Session = {
 	/** Host's validated stream caps (empty = unknown) — gates the session-menu options. */
 	hostCodecs?: string[];
 	hostEncoders?: string[];
+	/** Host's streamable monitors (primary first); the session menu's screen picker. */
+	hostDisplays?: import('$lib/api.types').HostDisplay[];
 	// For a local host-game tab: the game's stop command, run when this tab closes.
 	// Per-session (not a shared global) so closing one tab never stops another game.
 	stopCmd?: string;
@@ -154,7 +156,8 @@ export class SessionManager {
 				native: info.native,
 				embedded: info.embedded,
 				hostCodecs: info.host_codecs ?? [],
-				hostEncoders: info.host_encoders ?? []
+				hostEncoders: info.host_encoders ?? [],
+				hostDisplays: info.host_displays ?? []
 			});
 			setTimeout(() => this.#activateByPlayId(pid), 10_000);
 			recordConnection(target.id, target.name, useMode === 'game' ? 'console' : 'pc');

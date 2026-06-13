@@ -39,6 +39,9 @@ export class SessionControls {
 	// Live quality/perf profile. Two-tier (latency|quality); ephemeral (default latency in
 	// game mode for lowest latency, quality in remote). The host maps it to its encode flag.
 	streamQuality: 'latency' | 'quality';
+	// Which HOST monitor is streamed (index into host_displays; 0 = primary, the default).
+	// Changed live from the menu's screen picker.
+	streamDisplay = $state<number>(0);
 	// Moonlight-style frame pacing on the Linux native renderer (client-local, persisted).
 	framePacing = $state<boolean>(ui.framePacing);
 	// Audio session-menu toggles. Defaults mirror the host: transmit on; mute the host only
@@ -108,6 +111,11 @@ export class SessionControls {
 		this.streamQuality = v;
 		const playId = this.#in.playId();
 		if (playId >= 0) api.setPlayQuality(playId, v).catch(() => {});
+	};
+	setMonitor = (idx: number) => {
+		this.streamDisplay = idx;
+		const playId = this.#in.playId();
+		if (playId >= 0) api.setPlayMonitor(playId, idx).catch(() => {});
 	};
 	setFramePacing = (on: boolean) => {
 		this.framePacing = on;

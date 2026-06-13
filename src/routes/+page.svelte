@@ -537,6 +537,7 @@
 						embedded={s.embedded ?? false}
 						hostCodecs={s.hostCodecs ?? []}
 						hostEncoders={s.hostEncoders ?? []}
+						hostDisplays={s.hostDisplays ?? []}
 						{selfId}
 						active={sm.activeTab === s.tabId}
 						fullscreen={sm.fullscreen}

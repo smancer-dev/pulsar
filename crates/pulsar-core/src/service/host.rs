@@ -46,6 +46,7 @@ impl Default for DataHandlers {
 				codecs: vec!["h264".to_string()],
 				encoders: vec!["software".to_string()],
 				features: Vec::new(),
+				displays: Vec::new(),
 			}),
 			on_nack: Box::new(|_| {}),
 			on_avatar: Box::new(|_| {}),

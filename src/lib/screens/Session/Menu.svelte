@@ -59,11 +59,14 @@
 		encoder: Encoder;
 		hostCodecs?: string[];
 		hostEncoders?: string[];
+		hostDisplays?: import('$lib/api.types').HostDisplay[];
 		activeInfo?: string;
 		streamRes: 'auto' | '1080p' | '1440p' | '4K';
 		streamFps: 'auto' | '30' | '60' | '120';
 		streamBitrate: number;
 		streamQuality: 'latency' | 'quality';
+		streamDisplay: number;
+		onMonitor: (idx: number) => void;
 		onCloseMenu: () => void;
 		onHandleClick: () => void;
 		onHandleDown: (e: PointerEvent) => void;
@@ -132,11 +135,14 @@
 		encoder,
 		hostCodecs = [],
 		hostEncoders = [],
+		hostDisplays = [],
 		activeInfo = '',
 		streamRes,
 		streamFps,
 		streamBitrate,
 		streamQuality,
+		streamDisplay,
+		onMonitor,
 		onCloseMenu,
 		onHandleClick,
 		onHandleDown,
@@ -238,6 +244,7 @@
 						{encoder}
 						{hostCodecs}
 						{hostEncoders}
+						{hostDisplays}
 						decoderInfo={decoderCodec}
 						{activeInfo}
 						activeFps={hostFps}
@@ -246,6 +253,7 @@
 						{streamFps}
 						{streamBitrate}
 						{streamQuality}
+						{streamDisplay}
 						bind:fitMode
 						{onCodec}
 						{onEncoder}
@@ -253,6 +261,7 @@
 						{onFps}
 						{onBitrate}
 						{onQuality}
+						{onMonitor}
 					/>
 					<SessionActions
 						{mode}

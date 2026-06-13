@@ -274,6 +274,28 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 	}
 }
 
+/// One enumerated host monitor: `(idx, name, width, height, primary)`. `idx` is the
+/// 0-based position in the attached-to-desktop output list — the same index
+/// `CaptureConfig::output_idx` / `CaptureDevice::create` expect, so the host can
+/// advertise these and capture the chosen one with no mapping. `name` is the GDI
+/// device name (`\\.\DISPLAY1`, trimmed to `DISPLAY1`); `primary` is the output
+/// anchored at the virtual-desktop origin (0,0).
+pub type DisplayDesc = (u32, String, u32, u32, bool);
+
+/// Enumerate the host's attached monitors in DXGI output order (Windows). Empty on
+/// non-Windows or when enumeration fails — the caller then advertises no picker and
+/// streams the default output.
+#[cfg(windows)]
+pub fn list_displays() -> Vec<DisplayDesc> {
+	unsafe { dxgi::CaptureDevice::list_outputs().unwrap_or_default() }
+}
+
+/// Non-Windows stub (see [`list_displays`]).
+#[cfg(not(windows))]
+pub fn list_displays() -> Vec<DisplayDesc> {
+	Vec::new()
+}
+
 /// Non-Windows stub: the native path is Windows-only, so callers `cfg`-gate the call site and
 /// this exists purely to keep the symbol present for a clean cross-platform `cargo check`.
 #[cfg(not(windows))]

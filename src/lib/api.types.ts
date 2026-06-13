@@ -46,8 +46,21 @@ export interface PlayInfo {
 	 * (QueryStreamCaps). Empty = unknown (old host / timeout) — no menu gating then. */
 	host_codecs: string[];
 	host_encoders: string[];
+	/** The host's streamable monitors (primary at index 0). The session menu lists
+	 * these so the user can pick which screen to view. Empty = no picker. */
+	host_displays: HostDisplay[];
 	/** This client's own decodable codecs (startup probe). */
 	client_codecs: string[];
+}
+
+/** One host monitor advertised by QueryStreamCaps. `idx` is what `setPlayMonitor`
+ * echoes back (0 = primary); `name` is human-facing; `width`/`height` are pixels. */
+export interface HostDisplay {
+	idx: number;
+	name: string;
+	width: number;
+	height: number;
+	primary: boolean;
 }
 
 /** A side-channel text message: `peer` is the host-side peer id, or (for client

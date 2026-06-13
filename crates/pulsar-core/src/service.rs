@@ -29,7 +29,9 @@ pub use client::{
 	send_bye, send_data, send_input, send_keepalive,
 };
 pub use host::{serve, serve_with, DataHandlers};
-pub use wire::{DataMsg, FsEntry, GameInfo, InputEvent, QualityPref, StreamCaps, StreamReq};
+pub use wire::{
+	DataMsg, DisplayInfo, FsEntry, GameInfo, InputEvent, QualityPref, StreamCaps, StreamReq,
+};
 
 /// If a connected peer sends nothing (not even a keepalive) for this long, treat
 /// it as gone and tear the session down. Clients send a keepalive every ~2s.

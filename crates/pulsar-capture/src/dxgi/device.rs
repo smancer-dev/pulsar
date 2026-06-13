@@ -124,6 +124,53 @@ impl CaptureDevice {
 		Ok(me)
 	}
 
+	/// Walk adapters/outputs the SAME way `find_output` indexes them (attached-to-desktop,
+	/// in adapter→output order) and return `(idx, name, width, height, primary)` per monitor.
+	/// `idx` here is exactly what `find_output`/`create` accept, so an advertised list maps
+	/// 1:1 to a capturable output. `primary` = anchored at the virtual-desktop origin (0,0).
+	pub unsafe fn list_outputs() -> windows::core::Result<Vec<crate::DisplayDesc>> {
+		let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+		let mut out = Vec::new();
+		let mut idx: u32 = 0;
+		let mut ai = 0u32;
+		loop {
+			let adapter = match factory.EnumAdapters1(ai) {
+				Ok(a) => a,
+				Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+				Err(e) => return Err(e),
+			};
+			let mut oi = 0u32;
+			loop {
+				let o: IDXGIOutput = match adapter.EnumOutputs(oi) {
+					Ok(o) => o,
+					Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+					Err(e) => return Err(e),
+				};
+				let desc = o.GetDesc()?;
+				if desc.AttachedToDesktop.as_bool() {
+					let r = desc.DesktopCoordinates;
+					let w = (r.right - r.left).max(0) as u32;
+					let h = (r.bottom - r.top).max(0) as u32;
+					// DeviceName is a UTF-16 `\\.\DISPLAYn`; trim the `\\.\` prefix for the UI.
+					let name = String::from_utf16_lossy(
+						&desc.DeviceName[..desc
+							.DeviceName
+							.iter()
+							.position(|&c| c == 0)
+							.unwrap_or(desc.DeviceName.len())],
+					);
+					let name = name.trim_start_matches(r"\\.\").to_string();
+					let primary = r.left == 0 && r.top == 0;
+					out.push((idx, name, w, h, primary));
+					idx += 1;
+				}
+				oi += 1;
+			}
+			ai += 1;
+		}
+		Ok(out)
+	}
+
 	/// Walk adapters/outputs, returning the (adapter, output1) pair for `output_idx`,
 	/// preferring outputs actually attached to the desktop.
 	pub(super) unsafe fn find_output(

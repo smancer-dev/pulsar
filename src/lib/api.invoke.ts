@@ -92,7 +92,7 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 				'alsa_input.pci-0000_00_1f.3.analog-stereo'
 			] as unknown as T);
 		case 'start_remote_play':
-			return Promise.resolve({ id: 0, transport: 'direct', ws_port: 0, audio_ws_port: 0, local: false, native: false, embedded: false, host_codecs: ['h264'], host_encoders: ['software'], client_codecs: ['h264', 'h265'] } as unknown as T);
+			return Promise.resolve({ id: 0, transport: 'direct', ws_port: 0, audio_ws_port: 0, local: false, native: false, embedded: false, host_codecs: ['h264'], host_encoders: ['software'], host_displays: [{ idx: 0, name: 'DISPLAY1', width: 2560, height: 1440, primary: true }, { idx: 1, name: 'DISPLAY2', width: 1920, height: 1080, primary: false }], client_codecs: ['h264', 'h265'] } as unknown as T);
 		case 'local_caps':
 			return Promise.resolve({
 				platform: 'linux',
@@ -123,6 +123,7 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'set_overlay':
 		case 'set_play_bitrate':
 		case 'set_play_quality':
+		case 'set_play_monitor':
 		case 'set_frame_pacing':
 		case 'set_stats_hud':
 		case 'set_overlay_button':

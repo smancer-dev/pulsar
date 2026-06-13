@@ -707,6 +707,9 @@ pub(crate) async fn start_remote_play(
 		// the Pi; default OFF keeps the embedded-cursor behavior. The webview client
 		// never sets it (no native overlay to draw the pointer into).
 		cursor_external: cursor_external_enabled(),
+		// First stream always targets the host's primary monitor; the session menu's
+		// monitor picker changes it live via Restream::Display (see hold.rs).
+		display_idx: 0,
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
 		// Clean up the viewer + native renderer we already brought up before bailing.
@@ -868,6 +871,7 @@ pub(crate) async fn start_remote_play(
 		embedded: single_surface,
 		// The UI gates codec options on the NEGOTIATED set (host ∩ client).
 		host_codecs: allowed,
+		host_displays: host_caps.displays,
 		host_encoders: host_caps.encoders,
 		client_codecs,
 	})

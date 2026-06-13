@@ -430,6 +430,29 @@ pub(crate) async fn set_play_quality(
 	Ok(())
 }
 
+/// Client: switch which HOST monitor is streamed (session menu), as an index into the
+/// host's advertised `StreamCaps::displays` (0 = primary). Re-requests the stream — the
+/// host restarts capture on the selected output.
+#[tauri::command]
+pub(crate) async fn set_play_monitor(
+	state: State<'_, AppState>,
+	id: u64,
+	display_idx: u32,
+) -> Result<(), String> {
+	let tx = state
+		.plays
+		.lock()
+		.unwrap()
+		.get(&id)
+		.map(|p| p.restream_tx.clone());
+	if let Some(tx) = tx {
+		tx.send(Restream::Display(display_idx))
+			.await
+			.map_err(|e| e.to_string())?;
+	}
+	Ok(())
+}
+
 /// Client (Linux native renderer): toggle Moonlight-style frame pacing live. Writes a
 /// `pace 0|1` line to the `pulsar-render` child's stdin (the same channel the HUD `stat`
 /// lines use); the renderer flips its present path between FIFO-drain (smooth) and

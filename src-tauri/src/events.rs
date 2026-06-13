@@ -116,6 +116,10 @@ pub(crate) struct PlayInfo {
 	/// Empty = unknown (old host / timeout) — the UI then only trusts "auto".
 	pub(crate) host_codecs: Vec<String>,
 	pub(crate) host_encoders: Vec<String>,
+	/// The host's streamable monitors (QueryStreamCaps): primary at index 0. The
+	/// session menu lists these so the user can pick which screen to view. Empty =
+	/// the host advertised none (old host / Wayland / single-monitor) → no picker.
+	pub(crate) host_displays: Vec<pulsar_core::service::DisplayInfo>,
 	/// This client's own decodable codecs (probe), for completeness/diagnostics.
 	pub(crate) client_codecs: Vec<String>,
 }

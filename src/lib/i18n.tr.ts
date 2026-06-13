@@ -428,6 +428,8 @@ export const tr: Dict = {
 	'session.back': 'Geri',
 	'session.send': 'Gönder',
 	'session.bitrate': 'Bit hızı',
+	'session.monitor': 'Ekran',
+	'session.monitorPrimary': 'ana',
 	'session.quality': 'Kalite / hız',
 	'session.qLatency': 'Düşük gecikme',
 	'session.qQuality': 'Yüksek kalite',

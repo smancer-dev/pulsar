@@ -68,6 +68,27 @@ pub struct StreamCaps {
 	/// the field, so the client sees no features and uses the legacy direct flows.
 	#[serde(default)]
 	pub features: Vec<String>,
+	/// Monitors the host can stream, best-first with the PRIMARY at index 0 (the
+	/// default the client streams when it sends `StreamReq::display_idx = 0`). The
+	/// session menu lists these so the user can pick another. `#[serde(default)]`
+	/// (empty) — an old host omits it; the client then shows no monitor picker and
+	/// streams the host default. The `idx` is what travels back in `display_idx`.
+	#[serde(default)]
+	pub displays: Vec<DisplayInfo>,
+}
+
+/// One host monitor advertised in [`StreamCaps::displays`]. `idx` is the selector the
+/// client echoes in [`StreamReq::display_idx`] (0 = primary); `name` is human-facing
+/// ("DISPLAY1" / "HDMI-1"); `width`/`height` are the monitor's pixel size; `primary`
+/// marks the host's main display.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+	pub idx: u32,
+	pub name: String,
+	pub width: u32,
+	pub height: u32,
+	#[serde(default)]
+	pub primary: bool,
 }
 
 /// A client's request to start receiving a video stream.
@@ -142,6 +163,12 @@ pub struct StreamReq {
 	/// keeps the embedded-cursor behavior for old peers.
 	#[serde(default)]
 	pub cursor_external: bool,
+	/// Which host monitor to capture, as an index into [`StreamCaps::displays`]
+	/// (`0` = the host's primary/default monitor). The client picks it from the
+	/// session menu and changes it live by re-requesting the stream — exactly like
+	/// resolution/fps. `#[serde(default)]` (0) keeps the primary for old clients.
+	#[serde(default)]
+	pub display_idx: u32,
 }
 
 fn default_true() -> bool {
@@ -285,6 +312,7 @@ mod tests {
 			!req.media_over_session,
 			"missing media_over_session defaults to false (legacy direct flows)"
 		);
+		assert_eq!(req.display_idx, 0, "missing display_idx defaults to 0 (host primary)");
 	}
 
 	#[test]
@@ -293,14 +321,22 @@ mod tests {
 			codecs: vec!["av1".into(), "h265".into(), "h264".into()],
 			encoders: vec!["rkmpp".into(), "software".into()],
 			features: vec!["mos".into(), "nack".into()],
+			displays: vec![DisplayInfo {
+				idx: 0,
+				name: "DISPLAY1".into(),
+				width: 2560,
+				height: 1440,
+				primary: true,
+			}],
 		};
 		let json = serde_json::to_string(&caps).unwrap();
 		let back: StreamCaps = serde_json::from_str(&json).unwrap();
 		assert_eq!(caps, back);
-		// An OLD host's reply has no `features` — must deserialize to empty.
+		// An OLD host's reply has no `features`/`displays` — must deserialize to empty.
 		let old = r#"{"codecs":["h264"],"encoders":["software"]}"#;
 		let caps: StreamCaps = serde_json::from_str(old).unwrap();
 		assert!(caps.features.is_empty());
+		assert!(caps.displays.is_empty());
 	}
 
 	#[test]

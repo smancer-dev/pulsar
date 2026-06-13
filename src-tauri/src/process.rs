@@ -11,6 +11,100 @@ use tauri::{AppHandle, Manager};
 
 use pulsar_core::pipeline::{self, CaptureMethod, HwEncoder, VCodec};
 
+/// A host monitor with its capture geometry: `(name, x, y, w, h, primary)`. The
+/// X/Y origin is in the virtual-desktop / X11 root space — what x11grab's
+/// `-i :0.0+x,y` and gst `ximagesrc startx/starty` need to capture that monitor.
+#[cfg(target_os = "linux")]
+pub type LinuxDisplay = (String, i32, i32, u32, u32, bool);
+
+/// Enumerate connected X11 outputs via `xrandr --query`, in xrandr order, returning
+/// each monitor's name + geometry. Empty on Wayland / when xrandr is missing (the
+/// caller then advertises no picker and captures the whole root as before).
+#[cfg(target_os = "linux")]
+pub fn linux_displays() -> Vec<LinuxDisplay> {
+	if pulsar_core::capture::is_wayland() {
+		// The XDG ScreenCast portal owns monitor choice via its own dialog; we don't
+		// enumerate Wayland outputs here.
+		return Vec::new();
+	}
+	let mut cmd = std::process::Command::new("xrandr");
+	cmd.arg("--query");
+	no_window(&mut cmd);
+	let Ok(out) = cmd.output() else {
+		return Vec::new();
+	};
+	let text = String::from_utf8_lossy(&out.stdout);
+	let mut displays = Vec::new();
+	for line in text.lines() {
+		// Connected-output lines look like:
+		//   HDMI-1 connected primary 1920x1080+0+0 (normal ...) 520mm x 290mm
+		//   DP-2 connected 2560x1440+1920+0 (normal ...) ...
+		if !line.contains(" connected") {
+			continue;
+		}
+		let mut it = line.split_whitespace();
+		let Some(name) = it.next() else { continue };
+		let primary = line.contains(" primary ");
+		// The geometry token is the first `WxH+X+Y`.
+		let geom = line
+			.split_whitespace()
+			.find(|t| t.contains('x') && t.contains('+'));
+		let Some(geom) = geom else { continue };
+		// Parse WxH+X+Y.
+		let parse = || -> Option<(u32, u32, i32, i32)> {
+			let (wh, rest) = geom.split_once('+')?;
+			let (w, h) = wh.split_once('x')?;
+			let (x, y) = rest.split_once('+')?;
+			Some((w.parse().ok()?, h.parse().ok()?, x.parse().ok()?, y.parse().ok()?))
+		};
+		if let Some((w, h, x, y)) = parse() {
+			displays.push((name.to_string(), x, y, w, h, primary));
+		}
+	}
+	// Primary first so it lands at idx 0 (the client's default), then the rest in
+	// xrandr order. A stable order matters: the idx is what travels in display_idx.
+	displays.sort_by_key(|d| !d.5);
+	displays
+}
+
+/// Host monitors to advertise in `StreamCaps::displays`, primary at idx 0. Windows
+/// uses the DXGI output list (same index the native capture takes); Linux/X11 uses
+/// xrandr. Empty elsewhere / on Wayland — the client then shows no picker.
+pub fn host_displays() -> Vec<pulsar_core::service::DisplayInfo> {
+	use pulsar_core::service::DisplayInfo;
+	#[cfg(windows)]
+	{
+		return pulsar_capture::list_displays()
+			.into_iter()
+			.map(|(idx, name, width, height, primary)| DisplayInfo {
+				idx,
+				name,
+				width,
+				height,
+				primary,
+			})
+			.collect();
+	}
+	#[cfg(target_os = "linux")]
+	{
+		return linux_displays()
+			.into_iter()
+			.enumerate()
+			.map(|(i, (name, _x, _y, w, h, primary))| DisplayInfo {
+				idx: i as u32,
+				name,
+				width: w,
+				height: h,
+				primary,
+			})
+			.collect();
+	}
+	#[cfg(not(any(windows, target_os = "linux")))]
+	{
+		Vec::new()
+	}
+}
+
 pub fn capture_from_str(s: &str) -> CaptureMethod {
 	match s {
 		"x11grab" => CaptureMethod::X11grab,

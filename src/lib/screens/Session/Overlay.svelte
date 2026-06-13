@@ -4,6 +4,7 @@
 	import VideoControls from './VideoControls.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import { type Encoder, type VideoCodec } from '$lib/settings.svelte';
+	import type { HostDisplay } from '$lib/api.types';
 
 	// Game-only overlay (Ctrl+Shift+M). Opaque dialog so it stays visible while mpv is
 	// paused on Linux. Perf HUD + the slim game controls (codec/encoder/decoder/res/fps/
@@ -21,6 +22,7 @@
 		encoder: Encoder;
 		hostCodecs?: string[];
 		hostEncoders?: string[];
+		hostDisplays?: HostDisplay[];
 		decoderInfo?: string;
 		activeInfo?: string;
 		activeFps?: string;
@@ -29,6 +31,7 @@
 		streamFps: 'auto' | '30' | '60' | '120';
 		streamBitrate: number;
 		streamQuality: 'latency' | 'quality';
+		streamDisplay: number;
 		framePacing: boolean;
 		onCodec: (v: VideoCodec) => void;
 		onEncoder: (v: Encoder) => void;
@@ -36,6 +39,7 @@
 		onFps: (v: 'auto' | '30' | '60' | '120') => void;
 		onBitrate: (v: number) => void;
 		onQuality: (v: 'latency' | 'quality') => void;
+		onMonitor: (idx: number) => void;
 		onFramePacing: (on: boolean) => void;
 		onClose: () => void;
 		onEnd: () => void;
@@ -52,6 +56,7 @@
 		encoder,
 		hostCodecs = [],
 		hostEncoders = [],
+		hostDisplays = [],
 		decoderInfo = '',
 		activeInfo = '',
 		activeFps = '',
@@ -60,6 +65,7 @@
 		streamFps,
 		streamBitrate,
 		streamQuality,
+		streamDisplay,
 		framePacing,
 		onCodec,
 		onEncoder,
@@ -67,6 +73,7 @@
 		onFps,
 		onBitrate,
 		onQuality,
+		onMonitor,
 		onFramePacing,
 		onClose,
 		onEnd
@@ -114,6 +121,22 @@
 			{onFps}
 			{onBitrate}
 		/>
+		{#if hostDisplays.length > 1}
+			<div class="m-field ov-wide">
+				<span class="m-flab">{t('session.monitor')}</span>
+				<select
+					class="m-sel mono"
+					value={streamDisplay}
+					onchange={(e) => onMonitor(Number(e.currentTarget.value))}
+				>
+					{#each hostDisplays as d (d.idx)}
+						<option value={d.idx}>
+							{d.name}{d.primary ? ` (${t('session.monitorPrimary')})` : ''} · {d.width}×{d.height}
+						</option>
+					{/each}
+				</select>
+			</div>
+		{/if}
 		<div class="m-field ov-wide">
 			<span class="m-flab">{t('session.quality')}</span>
 			<div class="m-seg" role="group" aria-label={t('session.quality')}>
@@ -150,6 +173,28 @@
 	.m-flab {
 		font-size: 11px;
 		color: oklch(0.7 0.02 265);
+	}
+	.m-sel {
+		width: 100%;
+		min-width: 0;
+		padding: 6px 26px 6px 8px;
+		border: 1px solid oklch(0.32 0.016 265 / 0.7);
+		border-radius: var(--r-sm);
+		background-color: oklch(0.22 0.013 265 / 0.6);
+		color: oklch(0.92 0.01 265);
+		font-size: 11.5px;
+		font-weight: 500;
+		cursor: pointer;
+		appearance: none;
+		-webkit-appearance: none;
+		color-scheme: dark;
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23aab2c5' stroke-width='1.5'/%3E%3C/svg%3E");
+		background-repeat: no-repeat;
+		background-position: right 9px center;
+	}
+	.m-sel option {
+		background: oklch(0.18 0.012 265);
+		color: oklch(0.92 0.01 265);
 	}
 	.net-dot {
 		width: 7px;

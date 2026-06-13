@@ -74,8 +74,8 @@ use play::{start_remote_play, stop_stream};
 use session_cmds::{
 	fs_get, fs_list, render_chat, render_fs, render_hint, render_kin, render_toast, reverse_play,
 	set_frame_pacing, set_overlay, set_overlay_button, set_overlay_button_pos, set_play_audio,
-	set_play_bitrate, set_play_codec, set_play_encoder, set_play_fps, set_play_quality,
-	set_play_resolution, set_stats_hud,
+	set_play_bitrate, set_play_codec, set_play_encoder, set_play_fps, set_play_monitor,
+	set_play_quality, set_play_resolution, set_stats_hud,
 };
 
 // Headless `pulsar --relay` mode lives in its own module to keep this file focused.
@@ -455,6 +455,7 @@ pub fn run() {
 			set_play_fps,
 			set_play_bitrate,
 			set_play_quality,
+			set_play_monitor,
 			set_frame_pacing,
 			set_stats_hud,
 			set_overlay_button,
