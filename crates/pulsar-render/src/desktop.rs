@@ -54,6 +54,9 @@ static CONN_LABEL: Mutex<String> = Mutex::new(String::new());
 /// (host_codecs, host_encoders, active codec, active encoder). Copied into the OverlayState the
 /// next frame, then cleared (take()), exactly like linux.rs.
 static CAPS: Mutex<Option<(Vec<String>, Vec<String>, String, String)>> = Mutex::new(None);
+/// Host monitors `(idx, label)` from the caps line `displays=` field — the overlay's
+/// Display-section screen picker. Empty / single = no picker. Copied into OverlayState.
+static DISPLAYS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
 /// Session audio truth (app stdin `audio tx=1 mute=0 mic=0`) for the Ses section.
 static AUDIO_TX: AtomicBool = AtomicBool::new(true);
 static AUDIO_MUTE: AtomicBool = AtomicBool::new(false);
@@ -179,6 +182,9 @@ fn stdin_control() {
 							"codec" => codec = v.to_string(),
 							"encoder" => encoder = v.to_string(),
 							"conn" => *CONN_LABEL.lock().unwrap() = v.to_string(),
+							"displays" => {
+								*DISPLAYS.lock().unwrap() = crate::overlay::parse_displays(v)
+							}
 							"statshud" => STATS_HUD
 								.store(v == "1" || v == "on" || v == "true", Ordering::SeqCst),
 							// Persisted overlay-button state rides the caps line so a respawn
@@ -339,6 +345,8 @@ impl Overlay {
 				self.state.encoder = encoder;
 			}
 		}
+		// Host monitor list (persists; cloned each frame so the Display picker stays populated).
+		self.state.displays = DISPLAYS.lock().unwrap().clone();
 		{
 			let he = HOST_ENC.lock().unwrap();
 			if self.state.host_active != *he {
@@ -504,6 +512,13 @@ impl Overlay {
 					"fps" => self.state.fps_sel = val.clone(),
 					"bitrate" => self.state.bitrate = val.clone(),
 					"quality" => self.state.quality = val.clone(),
+					// Host monitor pick: optimistic selection; emitted `ov set display <idx>`
+					// drives the app's set_play_monitor (host restream on the chosen output).
+					"display" => {
+						if let Ok(idx) = val.parse::<u32>() {
+							self.state.display_idx = idx;
+						}
+					}
 					// Settings reflected locally at once (instant feel) + emitted so the frontend
 					// persists them; the video renderer applies the real effect of pace/fit.
 					"pace" => {

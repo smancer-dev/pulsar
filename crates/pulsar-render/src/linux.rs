@@ -26,6 +26,9 @@ static IDLE: AtomicBool = AtomicBool::new(false);
 /// copies them into the OverlayState each frame.
 static CAPS: std::sync::Mutex<Option<(Vec<String>, Vec<String>, String, String)>> =
 	std::sync::Mutex::new(None);
+/// Host monitors `(idx, label)` from the caps line `displays=` field — the overlay's
+/// Display-section screen picker. Empty / single = no picker. Copied into OverlayState.
+static DISPLAYS: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
 /// The host's ACTIVE encode summary ("H.265 · Rockchip MPP · 1080p · 60fps"),
 /// pushed by the app over stdin (`hostenc <label>`); shown faintly under the
 /// overlay's selectors so the user sees what is REALLY in use.
@@ -451,6 +454,9 @@ pub fn run() {
 								"codec" => codec = v.to_string(),
 								"encoder" => encoder = v.to_string(),
 								"conn" => *CONN_LABEL.lock().unwrap() = v.to_string(),
+								"displays" => {
+									*DISPLAYS.lock().unwrap() = crate::overlay::parse_displays(v)
+								}
 								"statshud" => STATS_HUD
 									.store(v == "1" || v == "on" || v == "true", Ordering::SeqCst),
 								// Persisted overlay-button state rides the caps line so a
@@ -782,6 +788,8 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 				state.encoder = encoder;
 			}
 		}
+		// Host monitor list (persists; cloned each frame so the Display picker stays populated).
+		state.displays = DISPLAYS.lock().unwrap().clone();
 		{
 			let dec = video::DEC_LABEL.lock().unwrap();
 			if !dec.is_empty() && state.decoder != *dec {
@@ -1196,6 +1204,13 @@ fn emit_cmd(state: &mut OverlayState, c: OverlayCmd) {
 				"fps" => state.fps_sel = val.clone(),
 				"bitrate" => state.bitrate = val.clone(),
 				"quality" => state.quality = val.clone(),
+				// Host monitor pick: update the selection optimistically; the emitted
+				// `ov set display <idx>` drives the app's set_play_monitor (host restream).
+				"display" => {
+					if let Ok(idx) = val.parse::<u32>() {
+						state.display_idx = idx;
+					}
+				}
 				// Pacing flips the renderer locally AT ONCE (instant feel) and is also emitted
 				// so the frontend persists it as the default for next session.
 				"pace" => {

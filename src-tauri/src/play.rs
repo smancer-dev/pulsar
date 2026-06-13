@@ -37,6 +37,27 @@ fn cursor_external_enabled() -> bool {
 	)
 }
 
+/// Format the host's monitors for the renderer's `caps` line `displays=` field, as
+/// `idx:name:w:h:primary` comma-joined — NO spaces (the caps line is whitespace-tokenized,
+/// and session_cmds patches it token-wise, so a spaced value would corrupt both). The
+/// egui overlay parses this back into its Display-section monitor picker.
+fn fmt_displays(displays: &[pulsar_core::service::DisplayInfo]) -> String {
+	displays
+		.iter()
+		.map(|d| {
+			format!(
+				"{}:{}:{}:{}:{}",
+				d.idx,
+				d.name,
+				d.width,
+				d.height,
+				if d.primary { 1 } else { 0 }
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(",")
+}
+
 /// Tear down the viewer relay + any native renderer child spawned before the play
 /// session was registered. Called on the `request_launch`/`request_stream` early
 /// returns so a connect that fails after auth (but before `state.plays` insert)
@@ -326,12 +347,13 @@ pub(crate) async fn start_remote_play(
 								use std::io::Write as _;
 								let enc = if encoder.is_empty() { "auto" } else { &encoder };
 								let line = format!(
-									"caps codecs={} encoders={} codec={} encoder={} conn={}",
+									"caps codecs={} encoders={} codec={} encoder={} conn={} displays={}",
 									allowed.join(","),
 									host_caps.encoders.join(","),
 									codec,
 									enc,
-									if transport == "relay" { "Relay" } else { "P2P" }
+									if transport == "relay" { "Relay" } else { "P2P" },
+									fmt_displays(&host_caps.displays)
 								);
 								if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
 									let _ = writeln!(si, "{line}");
@@ -444,12 +466,13 @@ pub(crate) async fn start_remote_play(
 									use std::io::Write as _;
 									let enc = if encoder.is_empty() { "auto" } else { &encoder };
 									let line = format!(
-										"caps codecs={} encoders={} codec={} encoder={} conn={}",
+										"caps codecs={} encoders={} codec={} encoder={} conn={} displays={}",
 										allowed.join(","),
 										host_caps.encoders.join(","),
 										codec,
 										enc,
-										if transport == "relay" { "Relay" } else { "P2P" }
+										if transport == "relay" { "Relay" } else { "P2P" },
+										fmt_displays(&host_caps.displays)
 									);
 									if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
 										let _ = writeln!(si, "{line}");
@@ -568,12 +591,13 @@ pub(crate) async fn start_remote_play(
 									use std::io::Write as _;
 									let enc = if encoder.is_empty() { "auto" } else { &encoder };
 									let line = format!(
-										"caps codecs={} encoders={} codec={} encoder={} conn={}",
+										"caps codecs={} encoders={} codec={} encoder={} conn={} displays={}",
 										allowed.join(","),
 										host_caps.encoders.join(","),
 										codec,
 										enc,
-										if transport == "relay" { "Relay" } else { "P2P" }
+										if transport == "relay" { "Relay" } else { "P2P" },
+										fmt_displays(&host_caps.displays)
 									);
 									if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
 										let _ = writeln!(si, "{line}");

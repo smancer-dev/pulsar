@@ -543,6 +543,7 @@
 				case 'encoder': controls.setEncoder(val as Encoder); break;
 				case 'res': controls.setRes(val as 'auto' | '1080p' | '1440p' | '4K'); break;
 				case 'fps': controls.setFps(val as 'auto' | '30' | '60' | '120'); break;
+				case 'display': controls.setMonitor(Number(val) || 0); break;
 				case 'bitrate': controls.setBitrate(Number(val) || 0); break;
 				case 'quality': controls.setQuality(val as 'latency' | 'quality'); break;
 				case 'pace': controls.setFramePacing(val === 'on' || val === '1' || val === 'true'); break;

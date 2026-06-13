@@ -74,7 +74,9 @@ pub fn host_displays() -> Vec<pulsar_core::service::DisplayInfo> {
 	use pulsar_core::service::DisplayInfo;
 	#[cfg(windows)]
 	{
-		return pulsar_capture::list_displays()
+		let raw = pulsar_capture::list_displays();
+		tracing::info!(count = raw.len(), ?raw, "host_displays (DXGI)");
+		return raw
 			.into_iter()
 			.map(|(idx, name, width, height, primary)| DisplayInfo {
 				idx,

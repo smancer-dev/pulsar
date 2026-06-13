@@ -30,6 +30,12 @@ pub struct OverlayState {
 	/// emit and encoder backends it has. Synced from the app via the stdin `caps` line.
 	pub host_codecs: Vec<String>,
 	pub host_encoders: Vec<String>,
+	/// Host's streamable monitors as `(idx, label)`, primary first — the Display
+	/// section's screen picker. Empty / single = no picker. Synced over the `caps` line.
+	pub displays: Vec<(u32, String)>,
+	/// Currently-streamed host monitor index (0 = primary). Owned by the overlay once
+	/// open; a change flows out as `OverlayCmd::Set("display", "<idx>")`.
+	pub display_idx: u32,
 	/// Host's ACTIVE encode summary (split per-field under the selectors).
 	pub host_active: String,
 	/// Always-on mini stats HUD while the overlay is CLOSED (user toggle, persisted
@@ -129,6 +135,8 @@ impl Default for OverlayState {
 			codec: "auto".into(),
 			encoder: "auto".into(),
 			host_codecs: Vec::new(),
+			displays: Vec::new(),
+			display_idx: 0,
 			host_active: String::new(),
 			stats_hud: false,
 			overlay_btn: true,
@@ -220,6 +228,32 @@ const CYAN: egui::Color32 = egui::Color32::from_rgb(120, 200, 240);
 use crate::i18n::t;
 
 /// Apply the Pulsar dark theme to an egui context (call once at startup).
+/// Parse the `caps` line's `displays=idx:name:w:h:primary,…` field into the overlay's
+/// `(idx, label)` monitor list (primary marked). Tolerant: skips malformed entries.
+pub fn parse_displays(s: &str) -> Vec<(u32, String)> {
+	if s.is_empty() {
+		return Vec::new();
+	}
+	s.split(',')
+		.filter_map(|e| {
+			let mut p = e.split(':');
+			let idx: u32 = p.next()?.parse().ok()?;
+			let name = p.next()?;
+			let w = p.next().unwrap_or("");
+			let h = p.next().unwrap_or("");
+			let primary = p.next() == Some("1");
+			let mut label = name.to_string();
+			if !w.is_empty() && !h.is_empty() {
+				label.push_str(&format!(" {w}×{h}"));
+			}
+			if primary {
+				label.push_str(&format!(" ({})", t("monitor.primary")));
+			}
+			Some((idx, label))
+		})
+		.collect()
+}
+
 pub fn apply_theme(ctx: &egui::Context) {
 	let mut v = egui::Visuals::dark();
 	v.panel_fill = egui::Color32::from_rgba_premultiplied(13, 14, 20, 235);
@@ -537,8 +571,29 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 	});
 }
 
-/// Display section: AnyDesk-style view-fit modes (renderer-local, instant).
+/// Display section: host monitor picker (when the host has >1) + AnyDesk-style
+/// view-fit modes (renderer-local, instant).
 fn draw_display(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
+	// Host monitor picker — only meaningful when the host exposes more than one.
+	if st.displays.len() > 1 {
+		ui.label(
+			egui::RichText::new(format!("🖵 {}", t("monitor.title")))
+				.small()
+				.color(egui::Color32::GRAY),
+		);
+		let cur = st.display_idx.to_string();
+		// Build owned (value, label) pairs, then borrow for `combo`.
+		let owned: Vec<(String, String)> = st
+			.displays
+			.iter()
+			.map(|(idx, label)| (idx.to_string(), label.clone()))
+			.collect();
+		let opts: Vec<(&str, &str)> = owned.iter().map(|(v, l)| (v.as_str(), l.as_str())).collect();
+		if let Some(v) = combo(ui, t("monitor.title"), "display", &cur, &opts, "") {
+			cmds.push(OverlayCmd::Set("display", v));
+		}
+		ui.add_space(8.0);
+	}
 	ui.label(
 		egui::RichText::new(format!("🖥 {}", t("fit.title")))
 			.small()

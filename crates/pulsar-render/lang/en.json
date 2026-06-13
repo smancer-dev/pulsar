@@ -26,6 +26,8 @@
 	"on": "On",
 	"off": "Off",
 	"muted": "Muted",
+	"monitor.title": "Monitor",
+	"monitor.primary": "primary",
 	"fit.title": "View fit",
 	"fit.fit": "Fit",
 	"fit.stretch": "Stretch",

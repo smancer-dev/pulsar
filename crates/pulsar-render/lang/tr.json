@@ -26,6 +26,8 @@
 	"on": "Açık",
 	"off": "Kapalı",
 	"muted": "Sessiz",
+	"monitor.title": "Ekran",
+	"monitor.primary": "ana",
 	"fit.title": "Ekran sığdırma",
 	"fit.fit": "Sığdır",
 	"fit.stretch": "Genişlet",
