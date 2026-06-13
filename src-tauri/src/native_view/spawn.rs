@@ -266,13 +266,14 @@ pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16, channels: u16) -> Op
 	}
 	// Cap the PulseAudio output buffer. The default `-f pulse` target length let the Pi's
 	// HDMI sink queue ~2 s of audio (measured 1.98 s Buffer Latency), so the remote sound
-	// lagged the video by seconds. `buffer_duration` (ms) + `prebuf 0` bound it to a
-	// Moonlight-class ~60–90 ms. Env-tunable via PULSAR_AUDIO_BUFMS (raise if it crackles
-	// on a jittery link, lower for even less lag); default 80 ms.
+	// lagged the video by seconds. `buffer_duration` (ms) + `prebuf 0` bound it tight so
+	// audio stays in sync with the ultra-low-latency video. 40 ms ≈ Moonlight's SDL queue
+	// (~30–50 ms); measured ~25–45 ms end-to-end on the sink-input. Env-tunable via
+	// PULSAR_AUDIO_BUFMS (raise if it crackles on a jittery link, lower for even less lag).
 	let bufms = std::env::var("PULSAR_AUDIO_BUFMS")
 		.ok()
 		.filter(|s| s.parse::<u32>().is_ok())
-		.unwrap_or_else(|| "80".into());
+		.unwrap_or_else(|| "60".into());
 	// Build the player command for a given ffmpeg binary (shared by the bundled path and
 	// the system-`ffmpeg` fallback, so the two can never drift). ffmpeg reads the Opus RTP
 	// (forwarded to this loopback port) and plays it to PulseAudio.
@@ -297,6 +298,14 @@ pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16, channels: u16) -> Op
 			"nobuffer",
 			"-flags",
 			"low_delay",
+			// THE big audio-latency fix: ffmpeg's RTP demuxer reorder/jitter buffer defaults
+			// to ~0.5 s (max_delay). On a low-reordering LAN/loopback path that buffer just sat
+			// there as a fixed ~500 ms audio lag behind the video. Pin it to 0 so packets play
+			// the instant they arrive (the mos session + loopback forward deliver in order).
+			"-max_delay",
+			"0",
+			"-reorder_queue_size",
+			"0",
 			"-i",
 		])
 		.arg(&path)

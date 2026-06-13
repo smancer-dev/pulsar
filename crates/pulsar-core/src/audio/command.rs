@@ -63,11 +63,21 @@ pub fn opus_rtp_output_layout(dest: &str, layout: ChannelLayout) -> Vec<String> 
 		s("libopus"),
 		s("-b:a"),
 		opus_bitrate(layout).to_string(),
-		// 10 ms frames + low expected packet loss keeps latency down on a LAN/relay.
 		s("-application"),
 		s("lowdelay"),
+		// 10 ms Opus frames. 5 ms halves per-packet latency but doubled the packet rate and
+		// audibly crackled here (more packets to lose/jitter, tighter timing); 10 ms is the
+		// clear, stable choice and the latency win was dwarfed by the RTP reorder buffer
+		// (fixed on the player input with -max_delay 0, see spawn.rs).
 		s("-frame_duration"),
 		s("10"),
+		// Push each RTP packet out the instant it is encoded (no muxer batching) and keep
+		// the muxer reorder/look-ahead at zero — audio must not sit buffered behind the
+		// ultra-low-latency video. Without these ffmpeg's rtp muxer adds a fixed delay.
+		s("-flush_packets"),
+		s("1"),
+		s("-max_delay"),
+		s("0"),
 		s("-f"),
 		s("rtp"),
 		s("-payload_type"),

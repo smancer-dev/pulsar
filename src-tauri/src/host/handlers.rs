@@ -42,6 +42,16 @@ pub(super) fn spawn_loopback_audio(
 		"-hide_banner".into(),
 		"-loglevel".into(),
 		"error".into(),
+		// Read the raw PCM pipe with NO input buffering / NO startup probe: ffmpeg would
+		// otherwise read + hold a chunk to "analyze" the stream (plus whatever burst the
+		// WASAPI loopback delivers at open) before emitting the first packet, baking a
+		// fixed audio delay behind the ultra-low-latency video for the whole session.
+		"-fflags".into(),
+		"nobuffer".into(),
+		"-probesize".into(),
+		"32".into(),
+		"-analyzeduration".into(),
+		"0".into(),
 		"-f".into(),
 		fmt.ffmpeg_sample_fmt().into(),
 		"-ar".into(),
