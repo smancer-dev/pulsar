@@ -384,14 +384,17 @@ pub(crate) fn set_window_fullscreen(
 	// Native decorations are on now, so hide the OS title bar / frame while fullscreen (e.g. a
 	// game) and restore it on exit — otherwise the title bar would sit across the top.
 	let _ = window.set_decorations(!on);
-	// Frameless-but-resizable windows keep invisible 8px WS_THICKFRAME hit-test
-	// borders that INSET the client area — in fullscreen the webview/video child then
-	// sits (8,1)-(w-8,h-8) inside the monitor-covering window and the transparent
-	// gutter shows the desktop through. Dropping resizability while fullscreen removes
-	// the frame so the client area truly covers the monitor; restored on exit.
-	let _ = window.set_resizable(!on);
 	#[cfg(windows)]
 	{
+		// Frameless-but-resizable windows keep invisible 8px WS_THICKFRAME hit-test
+		// borders that INSET the client area — in fullscreen the webview/video child then
+		// sits (8,1)-(w-8,h-8) inside the monitor-covering window and the transparent
+		// gutter shows the desktop through. Dropping resizability while fullscreen removes
+		// the frame so the client area truly covers the monitor; restored on exit.
+		// WINDOWS ONLY: on GTK/Mutter a non-resizable toplevel can't be fullscreened
+		// (set_fullscreen no-ops / the WM won't let it cover the screen), which regressed
+		// the Linux client's fullscreen — so this must not run there.
+		let _ = window.set_resizable(!on);
 		let w = window.clone();
 		// Drive Win32 on the UI thread so SetWindowPos targets the window correctly.
 		let _ = window.run_on_main_thread(move || win_fullscreen(&w, on, saved));
