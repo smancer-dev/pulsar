@@ -6,7 +6,7 @@
 fn main() {
 	#[cfg(windows)]
 	{
-		let fmt = pulsar_core::audio::loopback_format().expect("loopback_format");
+		let fmt = pulsar_core::audio::loopback_format(None).expect("loopback_format");
 		eprintln!(
 			"format: {} Hz, {} ch, {}",
 			fmt.rate,

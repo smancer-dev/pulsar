@@ -347,14 +347,14 @@ fn gst_pipelines_embed_fragment_and_low_latency_queue() {
 	assert!(w.contains("queue leaky=downstream"));
 	assert!(w.contains("x264enc tune=zerolatency"));
 	assert!(w.contains("udpsink host=10.0.0.2 port=9000 sync=false"));
-	let x = gst::x11_pipeline(":0", 60, &f, "10.0.0.2", 9000, false);
+	let x = gst::x11_pipeline(":0", 60, &f, "10.0.0.2", 9000, false, None);
 	assert!(x.contains("ximagesrc display-name=:0 use-damage=0"));
 	assert!(x.contains("framerate=60/1"));
 	assert!(x.contains("videoconvert"), "non-MPP keeps the CPU convert");
 	assert!(x.contains(&f));
 	// MPP path: capture's BGRx goes STRAIGHT to the encoder (RGA converts inside) —
 	// the CPU videoconvert that capped the Pi at ~49 fps must be gone.
-	let xd = gst::x11_pipeline(":0", 120, &f, "10.0.0.2", 9000, true);
+	let xd = gst::x11_pipeline(":0", 120, &f, "10.0.0.2", 9000, true, None);
 	assert!(xd.contains("format=BGRx,framerate=120/1"));
 	assert!(!xd.contains("videoconvert"));
 	assert!(xd.contains("queue leaky=downstream"));

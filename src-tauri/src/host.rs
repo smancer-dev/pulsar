@@ -83,8 +83,10 @@ pub(crate) async fn go_online(
 		.store(0, std::sync::atomic::Ordering::SeqCst);
 	let _ = app.emit("node-port", 0u16);
 	// A previous serve loop's sessions may not have torn down cleanly (independent
-	// spawns survive the accept-loop abort) — never carry a stale host-mute over.
+	// spawns survive the accept-loop abort) — never carry a stale host-mute or a stale
+	// sink-redirect over.
 	handlers::reset_mute_all();
+	handlers::reset_redirect_all();
 	// Crash-restore: a PRIOR PROCESS that silenced the host output and then died
 	// abnormally (crash / taskkill / tray-quit) without unmuting would leave the
 	// machine stuck at volume 0. Recover the user's saved level from the on-disk
@@ -92,6 +94,11 @@ pub(crate) async fn go_online(
 	// reset_mute_all above already cleared any marker belonging to THIS process, so
 	// this only ever acts on a genuinely stale one.
 	handlers::restore_stale_host_mute();
+	// Same crash-restore for the Sunshine-style sink redirect: a prior process that
+	// redirected the default render endpoint to the virtual sink and died before its
+	// guard dropped left the host on the sinkless sink (real speakers silent). Restore
+	// the saved default from the on-disk marker (no-op for a clean previous exit).
+	handlers::restore_stale_redirect();
 	tracing::info!(relay = %cfg.relay, "go_online: resolving relay");
 	let relay = resolve_relay(&cfg.relay)
 		.await
@@ -821,6 +828,11 @@ pub(crate) async fn go_online(
 				// a same-peer reconnect's newer session keeps the host muted through
 				// the OLD session's delayed teardown).
 				handlers::release_mute(sid);
+				// Same for the Sunshine-style sink redirect: drop this session's
+				// host-silent request so the default render endpoint is restored when
+				// this was the last owner (a same-peer reconnect keeps it redirected
+				// through the OLD session's delayed teardown).
+				handlers::release_redirect(sid);
 				// Compare-and-remove: only drop the entries if they still belong to THIS
 				// session. A same-peer reconnection may have already overwritten them with
 				// its own (newer) sid; removing unconditionally would kill the live one.

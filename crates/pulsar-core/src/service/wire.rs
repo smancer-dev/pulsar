@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::ChannelLayout;
 use crate::input::GamepadState;
 
 /// A game/app the host exposes to clients.
@@ -169,6 +170,15 @@ pub struct StreamReq {
 	/// resolution/fps. `#[serde(default)]` (0) keeps the primary for old clients.
 	#[serde(default)]
 	pub display_idx: u32,
+	/// The audio **channel layout** the client requests (Stereo / 5.1 / 7.1). The host
+	/// negotiates it against its own configured/capturable layout (it never emits more
+	/// channels than it actually captures) and echoes the resolved layout back via the
+	/// encode stats. On Windows host-silent this also drives the virtual sink's device
+	/// format (so the redirected loopback opens at the right channel count). Appended
+	/// with a serde default of [`ChannelLayout::Stereo`] for additive wire compat — an
+	/// older client that omits it negotiates stereo, the universally-decodable default.
+	#[serde(default)]
+	pub audio_layout: ChannelLayout,
 }
 
 fn default_true() -> bool {
@@ -313,6 +323,11 @@ mod tests {
 			"missing media_over_session defaults to false (legacy direct flows)"
 		);
 		assert_eq!(req.display_idx, 0, "missing display_idx defaults to 0 (host primary)");
+		assert_eq!(
+			req.audio_layout,
+			ChannelLayout::Stereo,
+			"missing audio_layout defaults to Stereo (the universally-decodable layout)"
+		);
 	}
 
 	#[test]

@@ -239,65 +239,91 @@ pub fn spawn_render_win(
 /// `127.0.0.1:loopback_port` (an SDP describes it; `Viewer::forward_audio_to_loopback` pumps
 /// the host's audio datagrams there) and plays it to PulseAudio. Returns None on spawn failure.
 #[cfg(target_os = "linux")]
-pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16) -> Option<Child> {
-	// Matches the host encoder (pulsar_core::audio::opus_rtp_output): Opus, 48 kHz, stereo,
+pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16, channels: u16) -> Option<Child> {
+	// Matches the host encoder (pulsar_core::audio::opus_rtp_output{,_layout}): Opus, 48 kHz,
 	// RTP payload type 97. The viewer forwards the host's datagrams to this loopback port.
+	//
+	// Per RFC 7587 the rtpmap encoding parameter MUST be `2` for Opus regardless of the real
+	// channel count — multichannel is signalled in-band (mapping_family 1) and ffmpeg's Opus
+	// decoder outputs the stream's true channel count to PulseAudio. For 5.1/7.1 we add an
+	// `a=fmtp:97` line carrying the surround hints so the depacketizer/decoder are told to
+	// expect a multistream stream rather than fold it to stereo. `channels` is the negotiated
+	// layout's channel count (2 / 6 / 8); 2 keeps the stereo SDP byte-for-byte unchanged.
+	let fmtp = if channels > 2 {
+		// `stereo=0` (program is multichannel) + `sprop-stereo=0`; ffmpeg keys multichannel
+		// decode off the in-band Opus mapping, but the hint keeps SDP-driven decoders honest.
+		"a=fmtp:97 stereo=0; sprop-stereo=0\r\n".to_string()
+	} else {
+		String::new()
+	};
 	let sdp = format!(
 		"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=PulsarAudio\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-		 m=audio {loopback_port} RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
+		 m=audio {loopback_port} RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n{fmtp}"
 	);
 	let path = std::env::temp_dir().join(format!("pulsar-audio-{loopback_port}.sdp"));
 	if std::fs::write(&path, sdp).is_err() {
 		return None;
 	}
-	let mut cmd = std::process::Command::new(ffmpeg);
-	cmd.args([
-		"-hide_banner",
-		"-loglevel",
-		"error",
-		"-protocol_whitelist",
-		"file,udp,rtp",
-		"-fflags",
-		"nobuffer",
-		"-flags",
-		"low_delay",
-		"-i",
-	])
-	.arg(&path)
-	.args(["-f", "pulse", "default"]);
-	cmd.stdin(std::process::Stdio::null());
-	cmd.stdout(std::process::Stdio::null());
-	cmd.stderr(std::process::Stdio::null());
-	die_with_parent(&mut cmd);
-	match cmd.spawn() {
+	// Cap the PulseAudio output buffer. The default `-f pulse` target length let the Pi's
+	// HDMI sink queue ~2 s of audio (measured 1.98 s Buffer Latency), so the remote sound
+	// lagged the video by seconds. `buffer_duration` (ms) + `prebuf 0` bound it to a
+	// Moonlight-class ~60–90 ms. Env-tunable via PULSAR_AUDIO_BUFMS (raise if it crackles
+	// on a jittery link, lower for even less lag); default 80 ms.
+	let bufms = std::env::var("PULSAR_AUDIO_BUFMS")
+		.ok()
+		.filter(|s| s.parse::<u32>().is_ok())
+		.unwrap_or_else(|| "80".into());
+	// Build the player command for a given ffmpeg binary (shared by the bundled path and
+	// the system-`ffmpeg` fallback, so the two can never drift). ffmpeg reads the Opus RTP
+	// (forwarded to this loopback port) and plays it to PulseAudio.
+	//
+	// SURROUND-CORRECTNESS: there is deliberately **no `-ac` on EITHER side**. ffmpeg derives
+	// the real channel count from the Opus bitstream itself (the in-band mapping_family 1
+	// header signals multistream 5.1/7.1) — the rtpmap stays `opus/48000/2` per RFC 7587, which
+	// fixes the encoding parameter at 2 and is NOT the playback channel count. So:
+	//   - no `-ac N` on the INPUT  -> we never force a downmix of the decoded surround stream;
+	//   - no `-ac N` on the OUTPUT -> the decoder's native channel count flows straight to the
+	//     PulseAudio sink (2 for stereo, 6 for 5.1, 8 for 7.1).
+	// Stereo is byte-for-byte unaffected; surround reaches the speakers un-folded.
+	let build = |bin: &str| -> std::process::Command {
+		let mut cmd = std::process::Command::new(bin);
+		cmd.args([
+			"-hide_banner",
+			"-loglevel",
+			"error",
+			"-protocol_whitelist",
+			"file,udp,rtp",
+			"-fflags",
+			"nobuffer",
+			"-flags",
+			"low_delay",
+			"-i",
+		])
+		.arg(&path)
+		.args([
+			"-f",
+			"pulse",
+			// NB: no `-ac` here — the decoder's native channel count is passed straight to
+			// PulseAudio (forcing stereo would fold 5.1/7.1 down to 2ch).
+			"-buffer_duration",
+			bufms.as_str(),
+			"-prebuf",
+			"0",
+			"default",
+		]);
+		cmd.stdin(std::process::Stdio::null());
+		cmd.stdout(std::process::Stdio::null());
+		cmd.stderr(std::process::Stdio::null());
+		die_with_parent(&mut cmd);
+		cmd
+	};
+	match build(ffmpeg).spawn() {
 		Ok(child) => Some(child),
 		// The bundled ffmpeg can be missing/unrunnable (e.g. a wrong-arch copy landed in
 		// resources/, or a build without libpulse) — that left remote audio silently dead.
 		// Fall back to a system `ffmpeg` on PATH, which on a Linux client is the distro build
 		// (carries libpulse + the Opus decoder). Better degraded-via-system than no audio.
-		Err(_) if ffmpeg != "ffmpeg" => {
-			let mut fallback = std::process::Command::new("ffmpeg");
-			fallback
-				.args([
-					"-hide_banner",
-					"-loglevel",
-					"error",
-					"-protocol_whitelist",
-					"file,udp,rtp",
-					"-fflags",
-					"nobuffer",
-					"-flags",
-					"low_delay",
-					"-i",
-				])
-				.arg(&path)
-				.args(["-f", "pulse", "default"]);
-			fallback.stdin(std::process::Stdio::null());
-			fallback.stdout(std::process::Stdio::null());
-			fallback.stderr(std::process::Stdio::null());
-			die_with_parent(&mut fallback);
-			fallback.spawn().ok()
-		}
+		Err(_) if ffmpeg != "ffmpeg" => build("ffmpeg").spawn().ok(),
 		Err(_) => None,
 	}
 }

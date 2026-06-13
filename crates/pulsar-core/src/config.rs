@@ -84,6 +84,11 @@ pub struct Config {
 	/// CPU/GPU; Windows-only, opt-in, falls back to the webview if ffplay won't run.
 	#[serde(default)]
 	pub native_player: bool,
+	/// Host audio channel layout to capture + encode (stereo / 5.1 / 7.1). Threads
+	/// into [`crate::audio::AudioSettings::layout`]. `#[serde(default)]` (stereo) so
+	/// configs written before surround support still load and stay stereo.
+	#[serde(default)]
+	pub audio_layout: crate::audio::ChannelLayout,
 }
 
 fn default_avatar_mode() -> String {
@@ -109,6 +114,7 @@ impl Default for Config {
 			node_port: 0,
 			avatar_mode: default_avatar_mode(),
 			native_player: false,
+			audio_layout: crate::audio::ChannelLayout::Stereo,
 		}
 	}
 }
@@ -137,6 +143,7 @@ impl Config {
 		crate::audio::AudioSettings {
 			transmit: self.transmit_audio,
 			mute_host: self.mute_host_audio,
+			layout: self.audio_layout,
 		}
 	}
 

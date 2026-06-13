@@ -101,10 +101,19 @@ pub(super) async fn hold_session(
 	let mut cur_codec = codec_h;
 	let mut cur_fps = req_fps;
 	let mut cur_transmit = true;
+	// Host-silent intent: game mode requests it by default (seeds the initial play.rs request);
+	// the host honors it by REDIRECTING its default output to a virtual sink (never muting the
+	// captured endpoint — see play.rs). Preserved across every re-request; the user can flip it
+	// mid-session from the overlay (sets cur_mute below).
 	let mut cur_mute = game_mode;
 	// Host monitor index (0 = primary). Changed live by the session menu's monitor
 	// picker (Restream::Display); preserved across every re-request below.
 	let mut cur_display: u32 = 0;
+	// Requested audio channel layout. Stereo today (the client default in play.rs — the
+	// audio paths expect opus/48000/2 and the host negotiates surround down anyway);
+	// kept as state so it's preserved across every re-request and a future surround
+	// picker can flip it without re-plumbing each StreamReq.
+	let cur_audio_layout = pulsar_core::audio::ChannelLayout::Stereo;
 	// Starts at the INITIAL request's bitrate (0 = host default) so a menu-driven
 	// re-request doesn't silently reset an explicit starting target; the adaptive
 	// controller moves it within [ADAPT_MIN_KBPS, base_kbps].
@@ -389,6 +398,7 @@ pub(super) async fn hold_session(
 							media_over_session: mos,
 							cursor_external,
 							display_idx: cur_display,
+							audio_layout: cur_audio_layout,
 						};
 						if request_stream(&mut sess, &req).await.is_err() {
 							break;
@@ -445,6 +455,7 @@ pub(super) async fn hold_session(
 						media_over_session: mos,
 						cursor_external,
 						display_idx: cur_display,
+						audio_layout: cur_audio_layout,
 					};
 					let rs = request_stream(&mut sess, &req).await;
 					tracing::info!(display_idx = cur_display, ok = rs.is_ok(), "restream request_stream sent");

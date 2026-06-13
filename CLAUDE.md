@@ -175,10 +175,23 @@ Capture has two paths:
   Settings (`Config::audio_input` non-empty → `audio_loopback()` is false).
 
 Two `Config` toggles drive it: `transmit_audio` (send host→client) and
-`mute_host_audio` (silence the host's local output via Core Audio on Windows /
-`pactl` on Linux — `audio::set_host_muted`). **Game mode forces both on**
-(`AudioSettings::policy`, unit-tested) so a remote game's sound moves entirely to
-the player; the host is un-muted on session teardown.
+`mute_host_audio` (silence the host's local output — Windows endpoint mute via
+`IAudioEndpointVolume::SetMute`, `pactl set-sink-mute` on Linux, `osascript` on
+macOS — `audio::set_host_muted`). **Game mode forces `transmit` on but NOT
+`mute_host`** (`AudioSettings::policy`, unit-tested): the host silences itself by
+muting the *same render endpoint its WASAPI loopback captures*, and on common
+codecs (e.g. Realtek) that loopback tap is **post-mute / post-master-volume**, so a
+capture opened while the endpoint is muted (or at volume 0) streams **pure
+silence** — the client went dead silent in game mode (verified live Pi←PC, −91 dBFS;
+fixed 2026-06-13). So we never force-mute the captured endpoint — Sunshine's
+default too (it streams the host's audio and leaves the host playing). The
+`mute_host` toggle is still honored if the user sets it, ideally mid-session (muting
+an already-live capture is safe; opening *into* a mute is what latches silence).
+Windows mute uses the endpoint **mute flag**, NOT `SetMasterVolumeLevelScalar(0)`
+(volume-0 also silences this loopback). Host is un-muted on session teardown.
+Client-side (Linux native player), the PulseAudio output buffer is capped
+(`-buffer_duration` in `spawn_native_audio`, ~80 ms) — the default queued ~2 s,
+adding seconds of audio lag behind the video.
 
 ## Stable device ID (identity persistence)
 

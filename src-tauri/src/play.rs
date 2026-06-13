@@ -705,9 +705,13 @@ pub(crate) async fn start_remote_play(
 		height: req_h,
 		fps: req_fps,
 		audio_port,
-		// Session-menu audio defaults: transmit on; mute the host only in game mode (so
-		// the sound moves entirely to the player). The client menu mirrors these and can
-		// change them live.
+		// Session-menu audio defaults: transmit on; request host-silent in GAME mode (the
+		// Moonlight/Sunshine default — "play on host" is OFF). The host satisfies host-silent by
+		// REDIRECTING its default render endpoint to a sinkless virtual sink and capturing that —
+		// NOT by muting the captured endpoint (muting taps post-mute on common codecs and would
+		// stream pure silence; that was the dead-silent bug). Because the host now uses redirect,
+		// requesting host-silent in game mode is safe again. Desktop mode leaves the host playing;
+		// a future play-on-host toggle flips this off in game mode. The menu mirrors these live.
 		transmit_audio: true,
 		mute_host: game_mode,
 		game_mode,
@@ -734,6 +738,12 @@ pub(crate) async fn start_remote_play(
 		// First stream always targets the host's primary monitor; the session menu's
 		// monitor picker changes it live via Restream::Display (see hold.rs).
 		display_idx: 0,
+		// Requested audio channel layout. Default Stereo — the universally-decodable
+		// layout the native/webview audio paths expect (the client's SDP is opus/48000/2
+		// per RFC 7587 and ffmpeg auto-detects multichannel from the bitstream). The host
+		// negotiates this down against its own captured endpoint. A surround picker can
+		// raise it later; carried across re-requests in hold.rs.
+		audio_layout: pulsar_core::audio::ChannelLayout::Stereo,
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
 		// Clean up the viewer + native renderer we already brought up before bailing.
@@ -758,7 +768,12 @@ pub(crate) async fn start_remote_play(
 		{
 			Ok(lp) => {
 				let ff = process::ffmpeg_bin(&app);
-				match native_view::spawn_native_audio(&ff, lp) {
+				// The host derives the real channel layout from its own endpoint/config
+				// (it isn't carried in StreamReq), and the client negotiates stereo by
+				// default, so pass the stereo channel count here — the SDP stays
+				// stereo-correct and ffmpeg's Opus decoder still outputs the stream's
+				// true channel count if the host ever sends multistream surround.
+				match native_view::spawn_native_audio(&ff, lp, pulsar_core::audio::CHANNELS) {
 					Some(c) => {
 						view.forward_audio_to_loopback(lp);
 						Some(c)

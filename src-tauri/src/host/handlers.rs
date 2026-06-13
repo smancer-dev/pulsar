@@ -11,14 +11,28 @@ use super::*;
 /// the default render endpoint's loopback. The ffmpeg is tracked in `procs`, so a
 /// (re-)stream or session teardown kills it — which ends the capture thread via the
 /// broken pipe. Returns whether it started (callers fall back to the dshow path).
+///
+/// `pinned_default` is the virtual-sink device-id when the host-silent sink redirect
+/// is active for this stream (`Some` = the loopback re-asserts that id as the OS
+/// default on every reinit so it keeps tapping the virtual sink — review HIGH-2);
+/// `None` when not redirecting (or the mute-fallback path). `req_layout` is the
+/// negotiated channel layout — the encode layout derives from the live endpoint's
+/// real channel count but is CLAMPED to it (we never encode more channels than the
+/// client asked for, even if the endpoint mix is wider).
 #[cfg(windows)]
 pub(super) fn spawn_loopback_audio(
 	procs: &Arc<Mutex<Vec<Child>>>,
 	ffmpeg: &str,
 	dest: &str,
+	pinned_default: Option<String>,
+	req_layout: pulsar_core::audio::ChannelLayout,
 ) -> bool {
 	use std::process::Stdio;
-	let fmt = match pulsar_core::audio::loopback_format() {
+	// Read the format of the SAME endpoint the capture will tap: the pinned virtual sink
+	// (host-silent) when set, else the OS default. Matching them keeps ffmpeg's -f/-ar/-ac
+	// in lockstep with the PCM the loopback writes (and dodges the SetDefaultEndpoint
+	// propagation race that querying the default right after a redirect would hit).
+	let fmt = match pulsar_core::audio::loopback_format(pinned_default.as_deref()) {
 		Ok(f) => f,
 		Err(_) => {
 			return false;
@@ -37,7 +51,26 @@ pub(super) fn spawn_loopback_audio(
 		"-i".into(),
 		"pipe:0".into(),
 	];
-	args.extend(pulsar_core::audio::opus_rtp_output(dest));
+	// Encode at the layout the loopback endpoint actually delivers: the WASAPI mix
+	// format's channel count (`fmt.channels`) is authoritative — a 5.1/7.1 endpoint
+	// streams 6/8 real channels, a stereo one 2 — so derive the Opus layout from it
+	// rather than blindly trusting the request, which would make ffmpeg up/down-mix
+	// silently (e.g. -ac 6 over a 2-channel capture = 4 silent surround channels).
+	let endpoint_layout = match fmt.channels {
+		6 => pulsar_core::audio::ChannelLayout::Surround51,
+		8 => pulsar_core::audio::ChannelLayout::Surround71,
+		_ => pulsar_core::audio::ChannelLayout::Stereo,
+	};
+	// Clamp to the negotiated request: never encode MORE channels than the client asked
+	// for (a stereo client must get stereo even off a 5.1 endpoint), but never claim more
+	// than the endpoint actually delivers either. The redirect already set the virtual
+	// sink's format to `req_layout`, so on the host-silent path these usually agree.
+	let cap_layout = if (req_layout.channels()) < endpoint_layout.channels() {
+		req_layout
+	} else {
+		endpoint_layout
+	};
+	args.extend(pulsar_core::audio::opus_rtp_output_layout(dest, cap_layout));
 	let mut cmd = std::process::Command::new(ffmpeg);
 	cmd.args(&args).stdin(Stdio::piped());
 	no_window(&mut cmd);
@@ -58,7 +91,11 @@ pub(super) fn spawn_loopback_audio(
 	procs.lock().unwrap().push(child);
 	std::thread::spawn(move || {
 		// Runs until the pipe breaks (ffmpeg killed on teardown) or WASAPI errors — both expected.
-		let _ = pulsar_core::audio::run_loopback_capture(stdin);
+		// When host-silent is active, `pinned_default` is the virtual sink's id: the capture
+		// re-asserts it as the OS default before every (re)open, so a default-endpoint flip
+		// mid-stream can't make us tap the host's real speakers (review HIGH-2). `None` =
+		// the plain capture (identical to the old behavior).
+		let _ = pulsar_core::audio::run_loopback_capture_pinned(stdin, pinned_default);
 	});
 	true
 }
@@ -127,12 +164,380 @@ pub(super) fn restore_stale_host_mute() {
 	}
 }
 
-/// Start the host→client audio stream (Opus/RTP) and apply the requested host-mute.
-/// Shared by the X11/Windows fall-through path and the Wayland branch so a Wayland
-/// host streams audio + honors game-mode mute exactly like the X11 path. Synchronous:
-/// it only spawns tracked children (`spawn_tracked`/`spawn_loopback_audio`) and makes
-/// the blocking `set_host_muted` call — it must run in the closure body, not the async
-/// portal-capture task. Re-evaluated on every (re-)stream so live toggles take effect.
+// ---- Host-silent via Sunshine-style default-render-endpoint REDIRECTION ----
+//
+// The host-silent intent (`req.mute_host`) is satisfied by REDIRECTING the default
+// render endpoint to our bundled sinkless virtual sink (Virtual-Audio-Driver) and
+// capturing THAT device's loopback — NOT by muting. Muting the captured endpoint
+// latches silence into the loopback on post-mute codecs (the bug fixed 2026-06-13),
+// so we never mute at capture-open. Restoring the original default on the last
+// owner leaving puts the host's real speakers back. See `pulsar_core::audio::sink`.
+
+/// Ordered candidates matched (case-insensitive substring) against the names of
+/// **active** render endpoints to locate a sinkless virtual sink to redirect to.
+///
+/// We use whatever loadable virtual sink is PRESENT (Sunshine's model) instead of
+/// hard-requiring one bundled driver. A kernel audio driver must be
+/// **Microsoft-attestation-signed** to load on modern Windows; our bundled MIT/MS-PL
+/// `Virtual-Audio-Driver` is only SignPath-code-signed, so it *installs* but won't
+/// *load* (`CM_PROB_UNSIGNED_DRIVER`, code 52) until we get it MS-signed. So we prefer
+/// **Steam Streaming Speakers** (MS-signed, present whenever Steam is installed —
+/// exactly what Sunshine uses by default), then other common virtual cables, then our
+/// own driver once it loads. [`find_render_device_by_name`] returns only ACTIVE
+/// endpoints, so a non-loadable / Error-state device is skipped automatically.
+///
+/// [`find_render_device_by_name`]: pulsar_core::audio::find_render_device_by_name
+const VIRTUAL_SINK_CANDIDATES: &[&str] = &[
+	"Steam Streaming Speakers",
+	"Virtual Audio Driver by MTT",
+	"VB-Audio",
+	"CABLE Input",
+];
+
+/// Locate the first present+active virtual sink from [`VIRTUAL_SINK_CANDIDATES`].
+/// `Ok(None)` if none is installed (→ caller falls back to the endpoint-mute path).
+#[cfg(windows)]
+fn locate_virtual_sink() -> Result<Option<pulsar_core::audio::SinkDevice>, String> {
+	for needle in VIRTUAL_SINK_CANDIDATES {
+		if let Some(dev) = pulsar_core::audio::find_render_device_by_name(needle)? {
+			return Ok(Some(dev));
+		}
+	}
+	Ok(None)
+}
+
+/// Sessions (by sid) currently requesting the host be SILENT (their `mute_host`
+/// intent). GLOBAL ownership like `MUTE_OWNERS` so a same-peer reconnect's delayed
+/// teardown can't strand the redirect. Paired with `REDIRECT_GUARD`.
+#[cfg(windows)]
+static REDIRECT_OWNERS: std::sync::LazyLock<Mutex<std::collections::HashSet<u64>>> =
+	std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// The single live sink-redirect guard. `Some` while the owner set is non-empty
+/// (the host is redirected to the virtual sink); dropping it restores the saved
+/// default. Held in a static so it outlives the per-stream closure and is released
+/// exactly when the last owner leaves (or the process dies → crash marker recovers).
+#[cfg(windows)]
+static REDIRECT_GUARD: std::sync::LazyLock<
+	Mutex<Option<pulsar_core::audio::SinkRedirectGuard>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// When the virtual sink is unavailable (driver not installed) we fall back to the
+/// endpoint mute toggle for an EXPLICIT user host-silent request — but only ever
+/// applied AFTER capture is live (mute_with_fallback is called from the per-stream
+/// path, where the loopback is already opened), never at capture-open. Tracks
+/// whether we took that fallback so the matching unmute runs on release.
+#[cfg(windows)]
+static REDIRECT_MUTE_FALLBACK: std::sync::atomic::AtomicBool =
+	std::sync::atomic::AtomicBool::new(false);
+
+/// The device-id of the virtual sink the default render endpoint is CURRENTLY
+/// redirected to (`Some` while `REDIRECT_GUARD` is `Some`). The loopback capture is
+/// pinned to this id (re-asserted as the OS default on every reinit — review HIGH-2)
+/// so it keeps tapping the virtual sink even if Windows flips the default off it.
+/// Read by `start_audio_and_mute` when spawning the loopback; cleared on release.
+#[cfg(windows)]
+static REDIRECT_SINK_ID: std::sync::LazyLock<Mutex<Option<String>>> =
+	std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Record `sid`'s host-silent wish and switch the redirect on/off when the owner set
+/// flips between empty and non-empty. Sunshine model: redirect the default render
+/// endpoint to the bundled virtual sink (never mute). `layout` is the negotiated
+/// channel layout for this stream — BEFORE redirecting we set the virtual sink's
+/// device format to that channel count (`set_render_device_format`), so the loopback
+/// capture opens at the right width (a stereo-only sink would otherwise cap a 5.1/7.1
+/// stream). A format failure is non-fatal (warn + keep the sink's existing format).
+/// If the virtual sink can't be found (driver missing), fall back to the endpoint
+/// mute toggle — but only for an explicit request and only here in the per-stream
+/// path, where capture is already live (muting an already-open loopback is safe;
+/// opening into a mute is not).
+///
+/// On the empty→non-empty transition the located virtual sink's device-id is stashed
+/// in `REDIRECT_SINK_ID` so `start_audio_and_mute` can pin the loopback capture to it
+/// (review HIGH-2 re-assert). Cleared on the non-empty→empty (restore) transition.
+#[cfg(windows)]
+fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::ChannelLayout) {
+	let mut owners = REDIRECT_OWNERS.lock().unwrap();
+	let was = !owners.is_empty();
+	if want {
+		owners.insert(sid);
+	} else {
+		owners.remove(&sid);
+	}
+	let now = !owners.is_empty();
+	if was == now {
+		return;
+	}
+	tracing::info!(sid, want, ?layout, owners = ?owners, "host-silent (sink-redirect) request");
+	drop(owners);
+	if now {
+		// Going silent: locate a virtual sink and redirect the default to it.
+		match locate_virtual_sink() {
+			Ok(Some(dev)) => {
+				// Set the sink's device format to the negotiated channel count FIRST, so
+				// the redirected loopback opens at the right width. Best-effort: a failure
+				// just leaves the sink at its existing (usually stereo) format.
+				if let Err(e) = pulsar_core::audio::set_render_device_format(&dev.id, layout) {
+					tracing::warn!(?layout, "set virtual sink device format failed: {e} — keeping existing sink format");
+				}
+				match pulsar_core::audio::SinkRedirectGuard::redirect_to(&dev.id) {
+					Ok(guard) => {
+						tracing::info!(sink = %dev.friendly_name, ?layout, "redirected default render endpoint to virtual sink (host-silent)");
+						*REDIRECT_GUARD.lock().unwrap() = Some(guard);
+						// Pin the loopback to this exact device-id (re-asserted as the OS
+						// default on every reinit — review HIGH-2).
+						*REDIRECT_SINK_ID.lock().unwrap() = Some(dev.id.clone());
+					}
+					Err(e) => {
+						tracing::warn!("sink redirect failed: {e} — falling back to endpoint mute");
+						mute_fallback(true);
+					}
+				}
+			}
+			Ok(None) => {
+				tracing::warn!(
+					candidates = ?VIRTUAL_SINK_CANDIDATES,
+					"no virtual sink present (Steam Streaming Speakers / cable / our driver) — falling back to endpoint mute"
+				);
+				mute_fallback(true);
+			}
+			Err(e) => {
+				tracing::warn!("enumerating render endpoints failed: {e} — falling back to endpoint mute");
+				mute_fallback(true);
+			}
+		}
+	} else {
+		// Last owner left: restore. Drop the guard (restores the saved default), clear
+		// the pinned-sink id, and/or undo any mute fallback we took.
+		*REDIRECT_GUARD.lock().unwrap() = None;
+		*REDIRECT_SINK_ID.lock().unwrap() = None;
+		mute_fallback(false);
+	}
+}
+
+/// Endpoint-mute fallback for the rare no-virtual-sink case. Mirrors the redirect
+/// transition: `true` mutes (only reached AFTER capture is live — see callers),
+/// `false` unmutes. Tracks whether the fallback is active so we don't unmute a host
+/// the user muted elsewhere.
+#[cfg(windows)]
+fn mute_fallback(mute: bool) {
+	use std::sync::atomic::Ordering;
+	if mute {
+		if !REDIRECT_MUTE_FALLBACK.swap(true, Ordering::SeqCst) {
+			if let Err(e) = pulsar_core::audio::set_host_muted(true) {
+				tracing::warn!("host mute fallback failed: {e}");
+			}
+		}
+	} else if REDIRECT_MUTE_FALLBACK.swap(false, Ordering::SeqCst) {
+		if let Err(e) = pulsar_core::audio::set_host_muted(false) {
+			tracing::warn!("host unmute (fallback) failed: {e}");
+		}
+	}
+}
+
+// ---- Host-silent on Linux/macOS via capture-source REDIRECTION (NOT muting) ----
+//
+// Muting a sink ALSO silences its monitor/loopback on Linux PulseAudio (verified:
+// `pactl set-sink-mute @DEFAULT_SINK@ 1` then capturing the `.monitor` reads −91 dB)
+// and on macOS, exactly like the Windows endpoint case. So the non-Windows
+// host-silent intent is satisfied by REDIRECTING capture to a sinkless device — a
+// PulseAudio null sink on Linux (Sunshine's model), a virtual-output switch on macOS
+// — and recording THAT device's monitor, never by muting. `pulsar_core::audio::
+// arm_host_silent` does the platform work and returns the capture source name + an
+// RAII teardown guard. The owner set mirrors the Windows `REDIRECT_OWNERS` so a
+// same-peer reconnect's delayed teardown can't strand the redirect.
+
+/// Sessions (by sid) currently requesting the host be SILENT on Linux/macOS. GLOBAL
+/// ownership like the Windows `REDIRECT_OWNERS`. Paired with `UNIX_SILENT_GUARD`.
+#[cfg(not(windows))]
+static UNIX_SILENT_OWNERS: std::sync::LazyLock<Mutex<std::collections::HashSet<u64>>> =
+	std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// The single live host-silent guard (null sink / virtual-output switch). `Some`
+/// while the owner set is non-empty; dropping it restores the previous default
+/// device and tears down the null sink. Held in a static so it outlives the
+/// per-stream closure and is released exactly when the last owner leaves.
+#[cfg(not(windows))]
+static UNIX_SILENT_GUARD: std::sync::LazyLock<
+	Mutex<Option<pulsar_core::audio::HostSilentGuard>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// The capture **source** the host must record from while the redirect is live
+/// (Linux: `pulsar_silent.monitor`; macOS: the virtual device name). `Some` while
+/// `UNIX_SILENT_GUARD` is `Some`; read by `start_audio_and_mute` so the audio ffmpeg
+/// taps the redirected monitor instead of the user's configured device. Cleared on
+/// release.
+#[cfg(not(windows))]
+static UNIX_SILENT_SOURCE: std::sync::LazyLock<Mutex<Option<String>>> =
+	std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// When no sinkless device could be set up (no `pactl`/null-sink on Linux, no virtual
+/// output on macOS) we fall back to the historic `set_host_muted` toggle for an
+/// EXPLICIT host-silent request — but only applied from the per-stream path AFTER
+/// capture is live (the post-mute latching caveat applies on every platform). Tracks
+/// whether we took that fallback so the matching unmute runs on release.
+#[cfg(not(windows))]
+static UNIX_SILENT_MUTE_FALLBACK: std::sync::atomic::AtomicBool =
+	std::sync::atomic::AtomicBool::new(false);
+
+/// The capture source to record from for host audio: the redirected monitor while
+/// host-silent is armed (Linux/macOS), else the user's configured input. The Linux
+/// monitor source is wrapped as `AudioInput::Pulse(...)`; macOS keeps the configured
+/// input (the virtual-device→AVFoundation index mapping is left to the user's config —
+/// the redirect still routes program audio off the speakers).
+#[cfg(not(windows))]
+fn effective_audio_input(configured: pulsar_core::audio::AudioInput) -> pulsar_core::audio::AudioInput {
+	match UNIX_SILENT_SOURCE.lock().unwrap().clone() {
+		// Linux: the null sink's monitor is a PulseAudio source — capture it directly.
+		#[cfg(target_os = "linux")]
+		Some(src) => pulsar_core::audio::AudioInput::Pulse(src),
+		// macOS: the redirect already routed output to the virtual device; capturing it
+		// by name needs an AVFoundation index we can't derive here, so keep the user's
+		// configured input. The speakers are silent regardless (output was switched).
+		#[cfg(not(target_os = "linux"))]
+		Some(_) => configured,
+		None => configured,
+	}
+}
+
+/// Record `sid`'s host-silent wish and arm/disarm the Linux/macOS capture-source
+/// redirect when the owner set flips between empty and non-empty. Sunshine model:
+/// route program audio to a sinkless device (null sink / virtual output) and capture
+/// its monitor — never mute (muting silences the monitor too). If no sinkless device
+/// is available, fall back to the `set_host_muted` toggle, but ONLY here in the
+/// per-stream path where capture is already live.
+///
+/// On the empty→non-empty transition the redirect's capture source is stashed in
+/// `UNIX_SILENT_SOURCE` so `start_audio_and_mute` taps it; cleared on restore.
+#[cfg(not(windows))]
+fn set_unix_silent_request(sid: u64, want: bool) {
+	let mut owners = UNIX_SILENT_OWNERS.lock().unwrap();
+	let was = !owners.is_empty();
+	if want {
+		owners.insert(sid);
+	} else {
+		owners.remove(&sid);
+	}
+	let now = !owners.is_empty();
+	if was == now {
+		return;
+	}
+	tracing::info!(sid, want, owners = ?owners, "host-silent (unix sink-redirect) request");
+	drop(owners);
+	if now {
+		// Going silent: arm the platform redirect (Linux null sink / macOS virtual out).
+		match pulsar_core::audio::arm_host_silent() {
+			Ok(Some(hs)) => {
+				tracing::info!(source = %hs.source, "armed host-silent capture redirect (unix)");
+				*UNIX_SILENT_SOURCE.lock().unwrap() = Some(hs.source);
+				*UNIX_SILENT_GUARD.lock().unwrap() = Some(hs.guard);
+			}
+			Ok(None) => {
+				tracing::warn!(
+					"no sinkless device for host-silent (pactl null-sink / macOS virtual output) — falling back to mute"
+				);
+				unix_mute_fallback(true);
+			}
+			Err(e) => {
+				tracing::warn!("arming host-silent redirect failed: {e} — falling back to mute");
+				unix_mute_fallback(true);
+			}
+		}
+	} else {
+		// Last owner left: restore. Drop the guard (restores the previous default
+		// device + unloads the null sink), clear the source, and undo any mute fallback.
+		*UNIX_SILENT_GUARD.lock().unwrap() = None;
+		*UNIX_SILENT_SOURCE.lock().unwrap() = None;
+		unix_mute_fallback(false);
+	}
+}
+
+/// Mute fallback for the no-sinkless-device case (Linux/macOS). Mirrors the redirect
+/// transition: `true` mutes (only reached AFTER capture is live — see callers),
+/// `false` unmutes. Tracks whether the fallback is active so we don't unmute a host
+/// the user muted elsewhere.
+#[cfg(not(windows))]
+fn unix_mute_fallback(mute: bool) {
+	use std::sync::atomic::Ordering;
+	if mute {
+		if !UNIX_SILENT_MUTE_FALLBACK.swap(true, Ordering::SeqCst) {
+			if let Err(e) = pulsar_core::audio::set_host_muted(true) {
+				tracing::warn!("host mute fallback failed: {e}");
+			}
+		}
+	} else if UNIX_SILENT_MUTE_FALLBACK.swap(false, Ordering::SeqCst) {
+		if let Err(e) = pulsar_core::audio::set_host_muted(false) {
+			tracing::warn!("host unmute (fallback) failed: {e}");
+		}
+	}
+}
+
+/// Teardown hook: drop `sid`'s host-silent request (restores the default render
+/// endpoint when it was the last owner). Paired with `release_mute`.
+#[cfg(windows)]
+pub(super) fn release_redirect(sid: u64) {
+	// Layout is irrelevant on the release path (no format set, no redirect) — pass the
+	// default; the owner-set transition only restores the saved default.
+	set_redirect_request(sid, false, pulsar_core::audio::ChannelLayout::Stereo);
+}
+#[cfg(not(windows))]
+pub(super) fn release_redirect(sid: u64) {
+	// Drop this session's host-silent request; restores the host (default sink + null
+	// sink teardown / output switch-back) when it was the last owner.
+	set_unix_silent_request(sid, false);
+}
+
+/// go_online re-run hook: a fresh serve loop has no live sessions, so clear any
+/// stranded redirect owners and restore the host to a known-good default (mirrors
+/// `reset_mute_all`).
+#[cfg(windows)]
+pub(super) fn reset_redirect_all() {
+	let mut owners = REDIRECT_OWNERS.lock().unwrap();
+	if !owners.is_empty() {
+		owners.clear();
+		drop(owners);
+		*REDIRECT_GUARD.lock().unwrap() = None;
+		*REDIRECT_SINK_ID.lock().unwrap() = None;
+		mute_fallback(false);
+	}
+}
+#[cfg(not(windows))]
+pub(super) fn reset_redirect_all() {
+	let mut owners = UNIX_SILENT_OWNERS.lock().unwrap();
+	if !owners.is_empty() {
+		owners.clear();
+		drop(owners);
+		// Drop the guard (restores the default sink + unloads the null sink / switches
+		// output back), clear the source, and undo any mute fallback.
+		*UNIX_SILENT_GUARD.lock().unwrap() = None;
+		*UNIX_SILENT_SOURCE.lock().unwrap() = None;
+		unix_mute_fallback(false);
+	}
+}
+
+/// Startup crash-restore: a prior process that redirected the default render
+/// endpoint to the virtual sink and died before its guard dropped left the host
+/// pointing at the sinkless sink (real speakers silent). Restore the saved default
+/// from the on-disk marker. No-op when there's no marker (clean previous exit).
+pub(super) fn restore_stale_redirect() {
+	pulsar_core::audio::restore_stale_redirect();
+}
+
+/// Start the host→client audio stream (Opus/RTP) and apply the requested host-silent
+/// intent. Shared by the X11/Windows fall-through path and the Wayland branch so a
+/// Wayland host streams audio + honors host-silent exactly like the X11 path.
+/// Synchronous: it only spawns tracked children (`spawn_tracked`/`spawn_loopback_audio`)
+/// and makes the (blocking) sink-redirect / mute call — it must run in the closure body,
+/// not the async portal-capture task. Re-evaluated on every (re-)stream so live toggles
+/// take effect.
+///
+/// **Host-silent is done by REDIRECTING the default render endpoint to the bundled
+/// virtual sink (Sunshine's model), never by muting the captured endpoint** — muting it
+/// latches silence into the WASAPI loopback on post-mute codecs. The redirect is applied
+/// (on Windows) BEFORE the loopback capture is spawned, so the capture taps the new
+/// (virtual-sink) default and stays live. On Linux/macOS, where capture is a separate
+/// `.monitor`/system source (not the muted endpoint), the historic endpoint-mute path is
+/// kept.
 fn start_audio_and_mute(
 	procs: &Arc<Mutex<Vec<Child>>>,
 	ffmpeg: &str,
@@ -143,27 +548,69 @@ fn start_audio_and_mute(
 ) {
 	// Audio: a second ffmpeg streams Opus/RTP to `audio_dest` — the client's audio
 	// port directly (legacy), or the local media-over-session intake (the forwarder
-	// ships it through the encrypted session). Transmit + host-mute are driven by
-	// the session-menu toggles in the request (game mode defaults both on).
+	// ships it through the encrypted session). Transmit + host-silent are driven by
+	// the session-menu toggles in the request.
 	let acfg = pulsar_core::Config::load(config_path(app_h));
+	// Negotiated channel layout = the SMALLER of what the client requested
+	// (`req.audio_layout`) and what the host is configured to capture/encode
+	// (`acfg.audio_settings().layout`): the host never claims more channels than it can
+	// deliver, and the client never receives more than it asked for. Used to set the
+	// virtual sink's device format (Windows host-silent), to pin/clamp the loopback
+	// encode layout, and as the dshow/pulse fallback's layout.
+	let host_layout = acfg.audio_settings().layout;
+	let neg_layout = if req.audio_layout.channels() < host_layout.channels() {
+		req.audio_layout
+	} else {
+		host_layout
+	};
+	// Host-silent (Windows): set the virtual sink's device format to the negotiated
+	// channel count and redirect the default render endpoint to it BEFORE opening the
+	// loopback capture below, so the capture taps the (never-muted) virtual sink at the
+	// right width and the client gets real audio while the host stays silent. The
+	// owner-set guard restores the original default when the last session releases it.
+	#[cfg(windows)]
+	set_redirect_request(sid, req.mute_host, neg_layout);
+	// Host-silent (Linux/macOS): arm the capture-source redirect BEFORE building the
+	// capture command below, so the audio ffmpeg taps the redirected monitor (a null
+	// sink on Linux) instead of the real default — the client gets audio while the
+	// host's speakers stay silent, WITHOUT muting (muting silences the monitor too).
+	// Re-evaluated every (re-)stream so a live toggle takes effect; the owner-set guard
+	// restores the host when the last session releases it. If no sinkless device is
+	// available it falls back to `set_host_muted` internally (post-capture, safe).
+	#[cfg(not(windows))]
+	set_unix_silent_request(sid, req.mute_host);
 	if req.transmit_audio && audio_dest.port() > 0 {
 		let dest = format!("rtp://{audio_dest}");
 		// Windows: prefer WASAPI loopback — it taps whatever is playing on the
-		// default output, so it works with NO virtual-audio-capturer / Stereo
-		// Mix device installed. Falls back to the dshow command if it can't
-		// start or a specific capture device name was configured.
+		// (possibly just-redirected) default output, so it works with NO
+		// virtual-audio-capturer / Stereo Mix device installed. Falls back to the
+		// dshow command if it can't start or a specific capture device name was configured.
+		// When host-silent is active, pin the loopback to the redirected virtual sink's
+		// id (re-asserted on every reinit — review HIGH-2) so a default-endpoint flip
+		// can't make it tap the host's real speakers.
 		#[cfg(windows)]
-		let started_audio = acfg.audio_loopback() && spawn_loopback_audio(procs, ffmpeg, &dest);
+		let started_audio = {
+			let pinned = REDIRECT_SINK_ID.lock().unwrap().clone();
+			acfg.audio_loopback() && spawn_loopback_audio(procs, ffmpeg, &dest, pinned, neg_layout)
+		};
 		#[cfg(not(windows))]
 		let started_audio = false;
 		if !started_audio {
-			let (_, aargs) = pulsar_core::audio::audio_command(&acfg.audio_input(), &dest);
+			// Direct-capture (dshow / pulse `.monitor` / avfoundation) fallback. Honor the
+			// NEGOTIATED channel layout so a 5.1/7.1 source is encoded as multistream Opus
+			// (the loopback path above derives the layout from the live endpoint instead).
+			// On Linux/macOS, when host-silent armed a redirect, capture its monitor source
+			// (the null sink's `.monitor`) instead of the user's configured device, so the
+			// stream carries program audio while the speakers are silent.
+			#[cfg(windows)]
+			let input = acfg.audio_input();
+			#[cfg(not(windows))]
+			let input = effective_audio_input(acfg.audio_input());
+			let (_, aargs) =
+				pulsar_core::audio::audio_command_layout(&input, &dest, neg_layout);
 			let _ = spawn_tracked(procs, ffmpeg, &aargs);
 		}
 	}
-	// Apply the requested host-mute state through the global owner set
-	// (re-evaluated on every (re-)stream so a live toggle takes effect).
-	set_mute_request(sid, req.mute_host);
 }
 
 /// Retransmit ring depth for media-over-session video (packets ≈ a few hundred ms
