@@ -277,6 +277,8 @@ pub fn run() {
 
 	tauri::Builder::default()
 		.manage(AppState::default())
+		.plugin(tauri_plugin_process::init())
+		.plugin(tauri_plugin_updater::Builder::new().build())
 		.setup(|app| {
 			use tauri::menu::{Menu, MenuItem};
 			use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
