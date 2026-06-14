@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import PulsarMark from '$lib/PulsarMark.svelte';
+	import { silentUpdateCheck } from '$lib/updater';
 	import {
 		api,
 		isTauri,
@@ -375,6 +376,14 @@
 			// Kiosk / headless start (CLI --connect): begin fullscreen so the host fills
 			// the screen with no app chrome. Toggle off with Ctrl+Shift+F12.
 			if (!sm.fullscreen) sm.toggleFullscreen();
+		}
+		// Auto-update: only when this launch is IDLE (no CLI --connect into a live
+		// session) — the updater must never interrupt a remote session. Deferred a few
+		// seconds so it never delays first paint / the splash. Self-swallows all errors.
+		if (!(ac && ac.id)) {
+			setTimeout(() => {
+				void silentUpdateCheck();
+			}, 3000);
 		}
 	});
 
