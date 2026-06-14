@@ -384,15 +384,6 @@ pub(crate) async fn go_online(
 				// re-stream aborts + replaces them (same lifecycle as `procs`).
 				let fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
 					Arc::new(Mutex::new(Vec::new()));
-				// Host display-mode watcher (non-Windows): `on_stream` records the latest StreamReq
-				// here, and a watcher task re-issues it through `restream_tx` when the host's
-				// resolution/refresh changes mid-session — the ffmpeg/Wayland capture paths have no
-				// DXGI ACCESS_LOST signal (the Windows native path self-heals in pulsar-capture), so
-				// without this they keep the old geometry and the stream freezes until reconnect.
-				#[cfg(not(windows))]
-				let last_req: Arc<Mutex<Option<StreamReq>>> = Arc::new(Mutex::new(None));
-				#[cfg(not(windows))]
-				let (restream_tx, restream_rx) = tokio::sync::mpsc::channel::<StreamReq>(1);
 
 				// Per-session: hold the screen capture so it can be stopped when this
 				// client disconnects. (Input injection is via uinput in `on_input`.)
@@ -477,8 +468,6 @@ pub(crate) async fn go_online(
 					cap_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_gen.clone(),
-					#[cfg(not(windows))]
-					last_req.clone(),
 				);
 				// Route the client's input: controllers into a virtual gamepad, and
 				// mouse/keyboard into a uinput desktop injector — both created lazily.
@@ -813,16 +802,7 @@ pub(crate) async fn go_online(
 					// File manager: FsList/FsGet from this client, answered through the
 					// same outbound queue (HOME-jailed; see fs_browse).
 					on_fs: Box::new(crate::fs_browse::make_on_fs(fs_out)),
-					// Host display-mode watcher injection (non-Windows only; inert on Windows).
-					#[cfg(not(windows))]
-					restream: Some(restream_rx),
-					#[cfg(windows)]
-					restream: None,
 				};
-				// Watch for host display-mode changes (resolution/refresh) and restart capture at the
-				// new geometry. Non-Windows only — the Windows native path self-heals in pulsar-capture.
-				#[cfg(not(windows))]
-				let mode_watcher = tokio::spawn(crate::host::watch_display_mode(last_req.clone(), restream_tx));
 				tokio::select! {
 					_ = serve_with(session, provider, on_launch, on_stream, on_input, handlers) => {}
 					_ = &mut stop_rx => {} // host kicked this client from the UI
@@ -839,9 +819,6 @@ pub(crate) async fn go_online(
 				for h in fwd_slot.lock().unwrap().drain(..) {
 					h.abort();
 				}
-				// Stop the host display-mode watcher (its session is gone).
-				#[cfg(not(windows))]
-				mode_watcher.abort();
 				// Stop the native capture thread (releases the NVENC session + DXGI duplication).
 				#[cfg(windows)]
 				if let Some(h) = native_slot.lock().unwrap().take() {
@@ -941,115 +918,4 @@ pub(crate) async fn go_online(
 		d.set_id(Some(id)).await;
 	}
 	Ok(id.grouped())
-}
-
-/// Watch the host's own display mode and restart capture when it changes (non-Windows).
-///
-/// The ffmpeg (x11grab/gdigrab/avfoundation) and Wayland capture paths fix their geometry at
-/// command-build time and have no DXGI `ACCESS_LOST` signal, so a host resolution/refresh change
-/// mid-session leaves them capturing the OLD size -> the stream freezes until reconnect. This polls
-/// the streamed display's size (`host_displays()` -- xrandr on X11; empty on Wayland/macOS, where
-/// the watcher is therefore inert) and, on a STABLE change, re-issues the last `StreamReq` through
-/// `restream_tx` so `serve_with` re-runs `on_stream` (kills the old capture, re-clamps dims to
-/// the new display size, respawns). Debounced so a restart can't loop. Exits when the channel closes.
-#[cfg(not(windows))]
-pub async fn watch_display_mode(
-	last_req: Arc<Mutex<Option<StreamReq>>>,
-	restream_tx: tokio::sync::mpsc::Sender<StreamReq>,
-) {
-	use std::time::{Duration, Instant};
-	// (display_idx, w, h) the stream is currently built for; reset when the client switches monitor.
-	let mut baseline: Option<(u32, u32, u32)> = None;
-	// A changed size seen once -- require it twice (the mode transition can briefly report
-	// intermediate/garbage geometry) before acting.
-	let mut pending: Option<(u32, u32, u32)> = None;
-	let mut last_restart = Instant::now() - Duration::from_secs(60);
-	loop {
-		tokio::time::sleep(Duration::from_millis(1500)).await;
-		// No stream yet -> nothing to watch (reset so a later stream re-baselines).
-		let req = match last_req.lock().unwrap().clone() {
-			Some(r) => r,
-			None => {
-				baseline = None;
-				pending = None;
-				continue;
-			}
-		};
-		// Current physical geometry of the streamed display. host_displays() shells xrandr on X11;
-		// on GNOME Wayland that's empty, so fall back to Mutter's DisplayConfig (works on BOTH GNOME
-		// X11 and Wayland). Both shell out → run off the async runtime. Still empty (non-GNOME
-		// Wayland / macOS) → can't poll, stay inert.
-		let idx = req.display_idx;
-		let cur = match tokio::task::spawn_blocking(move || {
-			crate::process::host_displays()
-				.into_iter()
-				.find(|d| d.idx == idx)
-				.map(|d| (d.width, d.height))
-				.or_else(gnome_current_size)
-		})
-		.await
-		{
-			Ok(Some((w, h))) => (idx, w, h),
-			_ => continue,
-		};
-		match baseline {
-			None => baseline = Some(cur),
-			// Client switched monitor: re-baseline to the new display, no restart.
-			Some(b) if b.0 != cur.0 => {
-				baseline = Some(cur);
-				pending = None;
-			}
-			// Same display, same size: steady.
-			Some(b) if (b.1, b.2) == (cur.1, cur.2) => pending = None,
-			// Same display, NEW size: the host changed resolution. Require it stable across two
-			// polls + debounce, then re-issue the last request to restart capture at the new size.
-			Some(_) => {
-				if pending == Some(cur) && last_restart.elapsed() >= Duration::from_secs(3) {
-					tracing::info!(
-						display_idx = cur.0,
-						w = cur.1,
-						h = cur.2,
-						"host display mode changed -> restarting capture"
-					);
-					if restream_tx.send(req).await.is_err() {
-						break; // serve loop gone -- session ended
-					}
-					baseline = Some(cur);
-					pending = None;
-					last_restart = Instant::now();
-				} else {
-					pending = Some(cur);
-				}
-			}
-		}
-	}
-}
-/// Best-effort current display resolution on GNOME via Mutter's DisplayConfig D-Bus
-/// (GetCurrentState) -- works on BOTH GNOME X11 and Wayland, so it covers the Wayland case where
-/// xrandr / host_displays() returns nothing. Returns the first monitor's CURRENT mode size (the
-/// streamed display on the common single-monitor setup). None on any failure (no GNOME, gdbus
-/// missing, parse miss) -> the watcher stays inert there.
-#[cfg(not(windows))]
-fn gnome_current_size() -> Option<(u32, u32)> {
-	// Inherits DBUS_SESSION_BUS_ADDRESS from the host process's session env.
-	let out = std::process::Command::new("gdbus")
-		.args([
-			"call", "--session",
-			"--dest", "org.gnome.Mutter.DisplayConfig",
-			"--object-path", "/org/gnome/Mutter/DisplayConfig",
-			"--method", "org.gnome.Mutter.DisplayConfig.GetCurrentState",
-		])
-		.output()
-		.ok()?;
-	let text = String::from_utf8_lossy(&out.stdout);
-	// Modes look like: ('1920x1080@120.00', 1920, 1080, 120.0, 1.0, [..], {.. 'is-current': <true>}).
-	// The current mode's id (WIDTHxHEIGHT@RATE) is the last such token BEFORE the first
-	// 'is-current': <true> marker. Parse WxH out of it (no regex dep).
-	let idx = text.find("'is-current': <true>")?;
-	let before = &text[..idx];
-	let at = before.rfind('@')?;
-	let quote = before[..at].rfind('\'')?;
-	let wh = &before[quote + 1..at];
-	let (w, h) = wh.split_once('x')?;
-	Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
