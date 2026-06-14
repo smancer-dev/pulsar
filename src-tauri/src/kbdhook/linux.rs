@@ -71,6 +71,11 @@ static ENGAGED_MEMO: AtomicBool = AtomicBool::new(false);
 /// the standalone render window's `ov engage` stdout line (`engage()`); cleared
 /// by the leave combos and whenever focus is lost.
 static ENGAGED: AtomicBool = AtomicBool::new(false);
+/// Set when the user EXPLICITLY detaches (Ctrl+Alt+Z / 3×RightCtrl) so a KIOSK session's
+/// focus-driven auto-RE-engage (see KIOSK_SESSION) does NOT instantly revert it — otherwise the
+/// appliance grabbed the keyboard straight back on the next loop and the detach combo "did
+/// nothing". Cleared when the user re-engages by clicking the video (`engage`) or on a fresh arm.
+static MANUAL_DISENGAGE: AtomicBool = AtomicBool::new(false);
 /// True while the STANDALONE native render window (pulsar-render with no `--wid`,
 /// e.g. a Wayland client where the X11 embed fails) has input focus. That window
 /// is a separate X(Wayland) toplevel, so focusing it UNfocuses the Tauri window —
@@ -185,6 +190,59 @@ fn chord_mods(devs: &[evdev::Device]) -> (bool, bool, bool) {
 	(ctrl, shift, alt)
 }
 
+/// Live kernel state of the SHORTCUT modifiers (Ctrl / LeftAlt / Win) for ONE printable key's
+/// char-vs-raw-VK routing decision. Kernel-authoritative (`EVIOCGKEY`), exactly like `chord_mods`:
+/// the event-tracked booleans desync (a `SYN_DROPPED` burst drops a modifier up, a combo-disengage
+/// ungrabs the device before its up is seen, a device grabbed mid-hold never saw the down), and a
+/// single stale Ctrl/Alt/Win then latched EVERY later printable onto the raw-VK path — so a
+/// Turkish-Q `ş` (evdev 39) typed as `;` (the host's VK_OEM_1) and every layout key mis-mapped on
+/// the host. Querying the kernel at the routing moment is immune to all of it. RightAlt (AltGr=100)
+/// is deliberately EXCLUDED — it's a char-composition modifier consumed by xkb, not a shortcut.
+/// OR across devices so any Ctrl/Alt/Win on any keyboard counts; works on the open fds regardless
+/// of grab state.
+fn shortcut_held(devs: &[evdev::Device]) -> bool {
+	devs.iter().any(|d| {
+		d.get_key_state().map_or(false, |st| {
+			st.contains(Key::KEY_LEFTCTRL)
+				|| st.contains(Key::KEY_RIGHTCTRL)
+				|| st.contains(Key::KEY_LEFTALT)
+				|| st.contains(Key::KEY_LEFTMETA)
+				|| st.contains(Key::KEY_RIGHTMETA)
+		})
+	})
+}
+
+/// Release EVERY key/button the host may still be holding for these grabbed devices. Queries the
+/// kernel (`EVIOCGKEY`, authoritative — covers Char-forwarded keys and untracked letters that the
+/// `ctrl`/`shift` booleans miss) and emits a key-UP for each held non-button code, plus an UP for
+/// each tracked-held mouse button. Must run on EVERY in-session disengage edge (a local combo /
+/// 3×RightCtrl release / overlay open / leave), because after that edge the modifier-up events are
+/// either suppressed (`want_suspend`) or no longer grabbed — so without this the host is left with
+/// Ctrl/Shift/Alt (or any key) latched (the "modifiers stick after Ctrl+Shift+M / Ctrl+Alt+Z"
+/// bug). The Linux analog of the Windows `imp.rs::flush_held` — same guarantee, kernel-sourced.
+fn flush_held(
+	tx: &Sender<InputEvent>,
+	grabbed: &[evdev::Device],
+	held_buttons: &mut std::collections::HashSet<u8>,
+) {
+	let mut released: std::collections::HashSet<u16> = std::collections::HashSet::new();
+	for d in grabbed.iter() {
+		if let Ok(st) = d.get_key_state() {
+			for key in st.iter() {
+				let code = key.code();
+				// 272..=274 = BTN_LEFT/RIGHT/MIDDLE — released via held_buttons below, never here
+				// (querying them would re-introduce the phantom right/middle-click).
+				if !(272..=274).contains(&code) && released.insert(code) {
+					let _ = tx.try_send(InputEvent::Key { code: code as u32, down: false });
+				}
+			}
+		}
+	}
+	for button in held_buttons.drain() {
+		let _ = tx.try_send(InputEvent::PointerButton { button, down: false });
+	}
+}
+
 pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, start_suspended: bool) {
 	// Supersede any prior capture thread (a tab switch is stop+start back-to-back;
 	// the bumped generation makes the old thread exit on its next loop pass).
@@ -232,6 +290,8 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 		kiosk
 	};
 	ENGAGED.store(engaged, Ordering::SeqCst);
+	// A fresh arm clears any prior manual-detach latch (a new/resumed session is controllable).
+	MANUAL_DISENGAGE.store(false, Ordering::SeqCst);
 	// Seed the cross-disable() memory with the engagement this enable() chose; the live
 	// transitions below (engage/release/combos/focus) keep ENGAGED current, and disable()
 	// snapshots it back into ENGAGED_MEMO so the NEXT same-session enable() can restore it.
@@ -268,10 +328,18 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 		// Shortcut modifiers (Ctrl/LeftAlt/Win): when ANY is held a key is a shortcut → forward the
 		// raw keycode (VK path) so Ctrl+C etc. work. RightAlt (AltGr=100) is deliberately NOT here —
 		// it's a char-composition modifier (Turkish AltGr chars), consumed by the xkb resolution.
-		let (mut lalt, mut win) = (false, false);
+		// Win is NOT tracked as a boolean: the char-vs-VK routing test is kernel-authoritative
+		// (shortcut_held), so a stale Win/Ctrl boolean can't latch printables onto the raw-VK
+		// path. LeftAlt stays tracked only as the combo-gate fallback (OR'd with chord_mods).
+		let mut lalt = false;
 		// Keycodes currently down that were forwarded as a resolved `Char`; their key-UP is
 		// suppressed (a Unicode insert is one-shot — there is no VK to release).
 		let mut char_keys: std::collections::HashSet<u16> = std::collections::HashSet::new();
+		// Mouse buttons currently held (forwarded down, not yet up). Tracked so a disengage flush
+		// releases ONLY genuinely-held buttons — the old `for button in 0..3` blindly sent a
+		// RIGHT+MIDDLE button-UP every flush → a phantom right-click/context-menu on the host
+		// whenever the overlay opened or control was released (the "Ctrl+Shift sends a right-tık").
+		let mut held_buttons: std::collections::HashSet<u8> = std::collections::HashSet::new();
 		// Active-layout keyboard state for WYSIWYG char resolution (None → raw-keycode VK fallback).
 		let mut xkb_state = build_xkb_state();
 		// Re-enumerate ~once a second to grab a newly plugged / KVM-switched device. This
@@ -396,7 +464,10 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 				// protect) — see KIOSK_SESSION for why the one-shot wasn't enough. Emit
 				// kbd-engaged only on the actual edge (false→true) so the renderer hides
 				// the local cursor / updates its hint instead of staying stale.
-				if KIOSK_SESSION.load(Ordering::SeqCst) && !SUSPENDED.load(Ordering::SeqCst) {
+				if KIOSK_SESSION.load(Ordering::SeqCst)
+					&& !SUSPENDED.load(Ordering::SeqCst)
+					&& !MANUAL_DISENGAGE.load(Ordering::SeqCst)
+				{
 					if !ENGAGED.swap(true, Ordering::SeqCst) {
 						let _ = app.emit("kbd-engaged", ());
 					}
@@ -418,32 +489,31 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 				|| !was_engaged;
 			if want_suspend != applied_suspend {
 				if want_suspend {
-					// Release any keys the host is still holding for this combo.
-					for code in [
-						KEY_LEFTCTRL,
-						KEY_RIGHTCTRL,
-						KEY_LEFTSHIFT,
-						KEY_RIGHTSHIFT,
-						KEY_LEFTALT,
-						KEY_M,
-						KEY_Z,
-					] {
-						let _ = tx.try_send(InputEvent::Key {
-							code: code as u32,
-							down: false,
-						});
-					}
-					// And any held MOUSE buttons: a disengage mid-drag (focus loss,
-					// release combo, overlay open) otherwise left the host's uinput
-					// holding BTN_LEFT — a stuck drag until the next engaged click.
-					for button in 0..3u8 {
+					// Release EVERYTHING the host still holds for this disengage edge — kernel-sourced
+					// (flush_held: EVIOCGKEY) so it covers modifiers (incl. Win), Char-forwarded keys
+					// AND any held letter, not just a fixed modifier list. The old hand-written list
+					// omitted Win(125/126) + letters, so an overlay/focus-loss/auto-suspend while one
+					// was held latched it on the host for the rest of the session. Runs BEFORE the
+					// ungrab below (fds still grabbed -> get_key_state valid); also drains held_buttons.
+					flush_held(&tx, &grabbed, &mut held_buttons);
+					// And any GENUINELY-held mouse button (a disengage mid-drag otherwise left the
+					// host's uinput holding BTN_LEFT — a stuck drag). Only the buttons actually down,
+					// NOT a blind 0..3 (which released RIGHT+MIDDLE → a phantom context-menu click).
+					for button in held_buttons.drain() {
 						let _ = tx.try_send(InputEvent::PointerButton {
 							button,
 							down: false,
 						});
 					}
+					// Drop the tracked modifier state too: after the ungrab the physical key-UPs go to
+					// the LOCAL OS, never to fetch_events, so a held modifier would stay latched here.
+					// lalt was NOT reset before — a stale lalt (after Ctrl+Alt+Z) forced every later
+					// printable onto the raw-VK path -> Turkish-Q keys mis-typed on the host (s->;).
+					// char_keys likewise can't trust an up that the suspend gate swallowed.
 					ctrl = false;
 					shift = false;
+					lalt = false;
+					char_keys.clear();
 					for d in grabbed.iter_mut() {
 						let _ = d.ungrab();
 					}
@@ -503,8 +573,9 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 							match code {
 								KEY_LEFTCTRL | KEY_RIGHTCTRL => ctrl = down,
 								KEY_LEFTSHIFT | KEY_RIGHTSHIFT => shift = down,
-								56 => lalt = down, // KEY_LEFTALT (RightAlt=100 = AltGr, a char modifier, not a shortcut)
-								125 | 126 => win = down, // KEY_LEFTMETA / KEY_RIGHTMETA
+								KEY_LEFTALT => lalt = down, // RightAlt=100 = AltGr (char modifier), not a shortcut
+								// Win/Meta intentionally NOT chord-tracked: the char-vs-VK router queries
+								// the kernel directly (shortcut_held), so there is no boolean to go stale.
 								_ => {}
 							}
 							// NOTE: there is deliberately NO raw-BTN_LEFT engage here. evdev can't
@@ -524,8 +595,12 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 								if rctrl_taps.len() >= 3 {
 									// RELEASE control (grab off, session + thread stay alive) —
 									// the next video click re-engages. Ending is Ctrl+Shift+Q.
+									// Release everything held FIRST so no key latches on the host.
+									flush_held(&tx, &grabbed, &mut held_buttons);
 									let _ = app.emit("kbd-released", ());
 									ENGAGED.store(false, Ordering::SeqCst);
+									// Explicit detach: don't let a kiosk session auto-re-engage it away.
+									MANUAL_DISENGAGE.store(true, Ordering::SeqCst);
 									rctrl_taps.clear();
 									continue;
 								}
@@ -550,8 +625,13 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 								// re-engages.
 								if code == KEY_Z {
 									if cmod && amod {
+										// Ctrl+Alt+Z detach: release every held key/button to the
+										// host BEFORE disengaging, or Ctrl/Alt stay latched there.
+										flush_held(&tx, &grabbed, &mut held_buttons);
 										let _ = app.emit("kbd-released", ());
 										ENGAGED.store(false, Ordering::SeqCst);
+										// Explicit detach: don't let a kiosk session auto-re-engage it away.
+										MANUAL_DISENGAGE.store(true, Ordering::SeqCst);
 										continue;
 									}
 								} else if cmod && smod {
@@ -559,7 +639,11 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										// Overlay toggle — does NOT end the session (RUNNING
 										// stays true); the ungrab/regrab is driven by
 										// set_overlay → overlay_suspend(), keeping grab state
-										// owned by this one thread.
+										// owned by this one thread. Flush held keys NOW (not after
+										// the Tauri→JS→overlay_suspend round-trip) — otherwise the
+										// Ctrl+Shift held for this combo stay latched on the host
+										// while the grab suspends + their key-up is swallowed.
+										flush_held(&tx, &grabbed, &mut held_buttons);
 										let _ = app.emit("overlay-toggle", ());
 									} else if code == KEY_F12 {
 										// Fullscreen toggle (Ctrl+Shift+F12) -- does NOT end the
@@ -571,23 +655,43 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										// media-mode keyboards (e.g. Logitech MX Keys) do not
 										// emit KEY_F12, and F12 is fullscreen now. The UI ENDS
 										// the session on kbd-leave; drop the grab right away so
-										// the user's input is free during the teardown.
+										// the user's input is free during the teardown. Flush the
+										// held chord FIRST (Windows imp.rs does the same before
+										// kbd-leave) so Ctrl/Shift don't latch on the still-alive
+										// host while the session tears down.
+										flush_held(&tx, &grabbed, &mut held_buttons);
 										let _ = app.emit("kbd-leave", ());
 										ENGAGED.store(false, Ordering::SeqCst);
 									}
 									continue;
 								}
 							}
+							// A combo trigger key (M/F12/Q/Z) AUTOREPEATING while its chord is
+							// still held is the user holding the LOCAL combo — its value==1 already
+							// fired the action above. Never leak the repeat to the host: the overlay
+							// combo (Ctrl+Shift+M) does NOT disengage synchronously (it waits for the
+							// async overlay_suspend round-trip), so in that window M's value==2 would
+							// fall through and the ctrl+shift shortcut path would forward M-down → a
+							// phantom 'm' typed on the host. Only suppress when the chord is ACTUALLY
+							// held (kernel-sourced, like the combo gate) — a BARE m/q/z still repeats.
+							if ev.value() == 2 && matches!(code, KEY_M | KEY_F12 | KEY_Q | KEY_Z) {
+								let (lc, ls, la) = chord_mods(&grabbed);
+								let (cmod, smod, amod) = (ctrl || lc, shift || ls, lalt || la);
+								if (matches!(code, KEY_M | KEY_F12 | KEY_Q) && cmod && smod)
+									|| (code == KEY_Z && cmod && amod)
+								{
+									continue;
+								}
+							}
 							// While the overlay is open we keep tracking modifiers + the two
 							// combos above, but forward NOTHING to the host (the local OS +
 							// webview drive the menu) — no phantom input during the overlay.
-							if want_suspend {
-								continue;
-							}
-							// Mouse buttons also arrive as EV_KEY (BTN_LEFT/RIGHT/MIDDLE
-							// = 272/273/274 → 0/1/2).
-							// Keep the xkb state synced with every forwarded key so Shift/AltGr affect the char a
-							// printable key resolves to (no-op when xkb is absent).
+							// Keep xkb_state synced with EVERY physical key event — even while
+							// suspended/disengaged. Skipping the releases that arrive during a
+							// suspend (overlay open / Ctrl+Alt+Z disengage) leaves a held
+							// Shift/AltGr/layout-group key's UP unseen, so xkb latches it and
+							// later keys mis-resolve: a Turkish-Q ş (code 39) came out as ':'
+							// after Ctrl+Shift+M. MUST run BEFORE the want_suspend forward-gate.
 							if let Some(st) = xkb_state.as_mut() {
 								st.update_key(
 									xkb::Keycode::new((code as u32) + 8),
@@ -598,6 +702,11 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 									},
 								);
 							}
+							if want_suspend {
+								continue;
+							}
+							// Mouse buttons also arrive as EV_KEY (BTN_LEFT/RIGHT/MIDDLE
+							// = 272/273/274 → 0/1/2).
 							match code {
 								272 | 273 | 274 => {
 									// EV_KEY values: 0=up, 1=down, 2=KERNEL AUTOREPEAT. EV_REP
@@ -608,10 +717,16 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 									// self-released after ~0.28 s. A repeat is neither a press
 									// nor a release — skip it.
 									if ev.value() != 2 {
-										let _ = tx.try_send(InputEvent::PointerButton {
-											button: (code - 272) as u8,
-											down: ev.value() == 1,
-										});
+										let button = (code - 272) as u8;
+										let down = ev.value() == 1;
+										// Track real held state so a disengage flush releases only
+										// down buttons (no phantom right/middle-up).
+										if down {
+											held_buttons.insert(button);
+										} else {
+											held_buttons.remove(&button);
+										}
+										let _ = tx.try_send(InputEvent::PointerButton { button, down });
 									}
 								}
 								_ if !down => {
@@ -633,8 +748,13 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 									// as Char (host types it regardless of ITS layout). A key already in char-mode
 									// keeps re-sending Char on autorepeat. Shortcuts, non-text keys (xkb yields no
 									// printable) and the no-xkb fallback take the raw-keycode VK path.
-									let shortcut = ctrl || lalt || win;
-									let ch = if char_keys.contains(&code) || !shortcut {
+									// KERNEL-AUTHORITATIVE shortcut test (shortcut_held -> EVIOCGKEY), NOT the
+									// tracked ctrl/lalt/win booleans: those desync (SYN_DROPPED, a combo-
+									// disengage that ungrabs before the modifier-UP is seen) and a single
+									// stale modifier latched every later printable onto the raw-VK path ->
+									// Turkish-Q keys mis-typed on the host (s->;). A key already in char-mode
+									// keeps re-sending Char on autorepeat and short-circuits the kernel query.
+									let ch = if char_keys.contains(&code) || !shortcut_held(&grabbed) {
 										xkb_state
 											.as_ref()
 											.map(|st| {
@@ -786,6 +906,9 @@ pub fn set_render_focused(focused: bool) {
 /// click through the pass-through container and invoked `kbd_engage`). The Tauri window
 /// is focused (it just received the click), so no focus bookkeeping is needed.
 pub fn engage(app: &AppHandle) {
+	// The user explicitly took control back (video click) — clear any manual-detach latch so a
+	// kiosk session resumes its normal focus-driven re-engage afterwards.
+	MANUAL_DISENGAGE.store(false, Ordering::SeqCst);
 	if RUNNING.load(Ordering::SeqCst) && !ENGAGED.swap(true, Ordering::SeqCst) {
 		let _ = app.emit("kbd-engaged", ());
 	}
