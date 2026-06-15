@@ -252,6 +252,10 @@ impl Node {
 
 		// Register a waiter, then ask the relay to rendezvous.
 		let pf = Arc::new(Notify::new());
+		// When we have a pinned key, arm an identity-mismatch flag so we can
+		// distinguish a legitimate-but-changed identity from a plain offline host.
+		let im: Option<Arc<std::sync::atomic::AtomicBool>> =
+			expected.map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 		// Mint our per-session salt and remember it: we send it now in `hello`, but
 		// derive the key later (in the `PeerFound` handler) once we have the peer's.
 		let our_salt = random_salt();
@@ -265,6 +269,9 @@ impl Node {
 			// the original accept-any (TOFU-first) behavior.
 			if let Some(pk) = expected {
 				g.expected_pubkey.insert(session, pk);
+			}
+			if let Some(flag) = &im {
+				g.identity_mismatch.insert(session, flag.clone());
 			}
 		}
 		// Handshake blob: static pubkey(32) || fresh session salt(32) || optional
@@ -291,6 +298,7 @@ impl Node {
 		{
 			let mut g = self.inner.lock().await;
 			g.peer_found.remove(&session);
+			g.identity_mismatch.remove(&session);
 			// On failure the key is never derived, so drop the stashed salt too —
 			// and a PeerFound landing between the timeout and this cleanup may
 			// already have inserted the session; nothing will ever use it.
@@ -300,7 +308,21 @@ impl Node {
 				g.sessions.remove(&session);
 			}
 		}
-		rv.map_err(|_| ConnError::TargetUnreachable(target))?;
+		if rv.is_err() {
+			// Was the timeout caused by a pinned-key mismatch? The handler sets the
+			// `im` flag before dropping the answer, so if the flag is set the peer DID
+			// answer but with a different key (legitimate identity rotation or re-mint)
+			// — a recoverable `IdentityChanged`, not a plain "target offline".
+			let mismatched = im
+				.as_ref()
+				.map(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+				.unwrap_or(false);
+			return Err(if mismatched {
+				ConnError::IdentityChanged(target)
+			} else {
+				ConnError::TargetUnreachable(target)
+			});
+		}
 
 		// Decide the transport. On failure (P2pOnly punch miss) no `Session` is
 		// ever built, so its Drop-based cleanup never runs — remove the state

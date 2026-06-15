@@ -14,7 +14,7 @@ use crate::events::{AutoConnect, ConnInfo, ControllerInfo, LanDevice, ScannedApp
 use crate::process::no_window;
 use crate::process::{detect_encoders, ffmpeg_bin, HostGame};
 use crate::state::{AppState, StreamCfg};
-use crate::util::{config_path, connect_target, is_executable, AUTO_CONNECT};
+use crate::util::{config_path, connect_target, forget_peer_key, is_executable, AUTO_CONNECT};
 
 #[tauri::command]
 pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<Config, String> {
@@ -59,6 +59,18 @@ pub(crate) async fn set_language(
 		g.clone()
 	};
 	cfg.save(config_path(&app)).map_err(|e| e.to_string())
+}
+
+/// Remove the TOFU-pinned key for a peer id from `known_peers.json`. Called when
+/// the user acknowledges an `IdentityChanged` error and wants to accept the peer's
+/// new identity — the next connect will re-pin via TOFU. `id` is the target in any
+/// format `DeviceId::parse` accepts ("641724395" or "641 724 395").
+#[tauri::command]
+pub(crate) async fn forget_peer(app: AppHandle, id: String) -> Result<(), String> {
+	let device_id =
+		pulsar_core::proto::DeviceId::parse(&id).ok_or_else(|| crate::i18n::t("err.badTarget").to_string())?;
+	forget_peer_key(&app, &device_id);
+	Ok(())
 }
 
 /// Available hardware encoders detected via ffmpeg (kebab-case values).

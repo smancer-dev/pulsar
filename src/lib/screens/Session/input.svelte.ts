@@ -175,9 +175,6 @@ export class SessionInput {
 			this.stopControl();
 			return;
 		}
-		const code = evdevCode(e.code);
-		if (!code) return;
-		e.preventDefault();
 		const playId = this.#in.playId();
 		// WYSIWYG / layout-independent text (mirrors the Linux native hook): a printable key
 		// with no SHORTCUT modifier (Ctrl/Meta/Alt — but AltGr is NOT a shortcut) resolves via
@@ -197,14 +194,27 @@ export class SessionInput {
 			e.key.length === 1 &&
 			e.key.codePointAt(0)! >= 0x20 &&
 			!isShortcut;
+		// Char path is resolved BEFORE the evdev-code guard: international/ISO keys
+		// (IntlBackslash, IntlRo, IntlYen, etc.) have no entry in the EVDEV table so
+		// evdevCode returns 0 — but they carry a valid e.key printable character and must
+		// still reach the host via inputChar. The evdev code is only required for the Key
+		// (raw scancode/VK) path below.
+		if (down && printable) {
+			e.preventDefault();
+			// One-shot char insert (no held VK on the host); remember it so the key-up is
+			// suppressed and so blur/disengage doesn't try to release a key never held.
+			this.#charKeys.add(e.code);
+			api.inputChar(playId, e.key).catch(() => {});
+			return;
+		}
+		// Key-up for a key that was sent as a one-shot Char: suppress it (no held VK to
+		// release on the host). Also checked before the evdev guard for the same reason —
+		// IntlBackslash key-ups would otherwise fall through and be dropped by !code.
+		if (!down && this.#charKeys.delete(e.code)) return;
+		const code = evdevCode(e.code);
+		if (!code) return;
+		e.preventDefault();
 		if (down) {
-			if (printable) {
-				// One-shot char insert (no held VK on the host); remember it so the key-up is
-				// suppressed and so blur/disengage doesn't try to release a key never held.
-				this.#charKeys.add(e.code);
-				api.inputChar(playId, e.key).catch(() => {});
-				return;
-			}
 			// Track held keys so focus loss (the Win key popping Start, Alt+Tab) can release
 			// them on the host — otherwise the key-up never arrives (the webview lost focus)
 			// and the key stays stuck, e.g. Win held → every letter becomes a Win+letter shortcut.
@@ -216,9 +226,6 @@ export class SessionInput {
 			this.#charKeys.delete(e.code);
 			this.#heldKeys.add(code);
 		} else {
-			// Key UP: a char key had no held VK on the host, so suppress its up. Otherwise
-			// release the tracked VK as before.
-			if (this.#charKeys.delete(e.code)) return;
 			this.#heldKeys.delete(code);
 		}
 		api.inputKey(playId, code, down).catch(() => {});

@@ -18,6 +18,12 @@ use crate::state::AppState;
 /// the display adapter is the NVIDIA GPU). Avoids re-probing every stream.
 pub(crate) static DDAGRAB_ZEROCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// Serializes all read-modify-write operations on `known_peers.json` so that two
+/// concurrent first-connects to different peers don't clobber each other's TOFU pin.
+/// A plain `std::sync::Mutex` (not tokio) is fine here: the critical section is a
+/// synchronous file read + write; holding it across an `.await` is never needed.
+static PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// CLI auto-connect target: `pulsar --connect <id|ip> [--connect-pw <pw>]` makes the app
 /// connect to that device as soon as it's online — for a kiosk/unattended client and for
 /// automated end-to-end testing (no manual ID entry / clicking). Set once in `run()`,
@@ -74,12 +80,37 @@ fn known_peer_key(app: &AppHandle, id: &DeviceId) -> Option<PublicKey> {
 	Some(key)
 }
 
+/// Remove the pinned key for `id` from known_peers.json, so the next connect
+/// re-pins via TOFU. Called by the `forget_peer` Tauri command when the user
+/// confirms they want to accept a new identity behind a known relay ID (e.g. after
+/// `ConnError::IdentityChanged` is surfaced as a UI prompt).
+pub(crate) fn forget_peer_key(app: &AppHandle, id: &DeviceId) {
+	let path = known_peers_path(app);
+	let _guard = PEERS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+	let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(&path)
+		.ok()
+		.and_then(|raw| serde_json::from_str(&raw).ok())
+		.unwrap_or_default();
+	let entry = id.0.to_string();
+	if !map.contains_key(&entry) {
+		return; // nothing to do
+	}
+	map.remove(&entry);
+	if let Ok(json) = serde_json::to_string(&map) {
+		atomic_write_json(&path, &json);
+	}
+}
+
 /// Record the pubkey first seen behind a relay id (TOFU). No-op if already pinned —
 /// a later key change must NOT silently overwrite the pin (that is the very
 /// substitution we guard against), so `connect_pinned` rejects the mismatched
 /// connect upstream and this is never reached for a changed key on a known id.
 fn pin_peer_key(app: &AppHandle, id: &DeviceId, key: &PublicKey) {
 	let path = known_peers_path(app);
+	// Hold the lock for the entire read-check-write sequence so two concurrent
+	// first-connects to different peers can't each read the same on-disk map and
+	// then clobber each other's pin with their respective std::fs::write calls.
+	let _guard = PEERS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 	let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(&path)
 		.ok()
 		.and_then(|raw| serde_json::from_str(&raw).ok())
@@ -94,7 +125,24 @@ fn pin_peer_key(app: &AppHandle, id: &DeviceId, key: &PublicKey) {
 		let _ = std::fs::create_dir_all(dir);
 	}
 	if let Ok(json) = serde_json::to_string(&map) {
-		let _ = std::fs::write(&path, json);
+		atomic_write_json(&path, &json);
+	}
+}
+
+/// Write `json` to `path` atomically: write to a sibling `.tmp` file first, then
+/// rename over `path`. On POSIX, `rename(2)` is atomic and POSIX-guaranteed; on
+/// Windows, `std::fs::rename` is NOT atomic but is still far safer than an in-place
+/// truncate-then-write (the worst outcome of a rename race is the tmp file being
+/// orphaned, not a zero-byte or half-written target). This prevents a crash during
+/// `std::fs::write` from leaving a partial/corrupt JSON that silently resets all pins.
+fn atomic_write_json(path: &std::path::Path, json: &str) {
+	let tmp = path.with_extension("json.tmp");
+	if std::fs::write(&tmp, json).is_ok() {
+		if let Err(e) = std::fs::rename(&tmp, path) {
+			tracing::warn!("known_peers: rename failed, falling back to direct write: {e}");
+			let _ = std::fs::write(path, json);
+			let _ = std::fs::remove_file(&tmp);
+		}
 	}
 }
 
@@ -197,7 +245,18 @@ pub(crate) async fn connect_target(
 	let sess = node
 		.connect_pinned(id, pinned)
 		.await
-		.map_err(|e| e.to_string())?;
+		.map_err(|e| {
+			// Surface a distinct, actionable message for a pinned-key mismatch so the
+			// UI can show a "identity changed — forget and retry?" prompt rather than
+			// the generic "target unreachable" message. The error string embeds the
+			// sentinel prefix `IDENTITY_CHANGED:` + the grouped id so the frontend
+			// can parse it without knowing about the Rust enum.
+			if matches!(e, pulsar_core::ConnError::IdentityChanged(_)) {
+				format!("IDENTITY_CHANGED:{}", id.grouped())
+			} else {
+				e.to_string()
+			}
+		})?;
 	if let Some(k) = sess.peer_pubkey().await {
 		pin_peer_key(app, &id, &k);
 	}

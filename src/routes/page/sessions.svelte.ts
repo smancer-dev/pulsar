@@ -22,6 +22,8 @@ export type Session = {
 	 * back to `target.name` when unset. */
 	label?: string;
 	mode: 'remote' | 'game';
+	/** For game-mode sessions: the game id passed to startConnect (empty = none). */
+	gameId?: string;
 	conn: 'direct' | 'relay';
 	wsPort: number;
 	audioWsPort?: number;
@@ -119,12 +121,19 @@ export class SessionManager {
 		// Dedupe: a repeated connect to the same peer (e.g. a re-fired reverse-direction
 		// `reverse-request`, or a double-click) must not open a second tab to that device —
 		// that would spin up duplicate viewer ports + a second native renderer and confuse the
-		// tab strip. If a remote session to this id is already connecting/active, focus it
-		// instead. Matched on the despaced id; local host-game tabs (no real peer id) never
-		// collide. A blank target id is treated as unknown and never deduped.
+		// tab strip. If an identical session (same id + same mode + same gameId) is already
+		// connecting/active, focus it instead. Matched on despaced id; local host-game tabs
+		// (no real peer id) never collide. A blank target id is treated as unknown and never
+		// deduped. NOTE: different mode (remote vs game) or different gameId are NOT deduped —
+		// those are legitimately distinct sessions to the same host.
 		const want = target.id.replace(/\s/g, '');
 		if (want) {
-			const existing = this.sessions.find((s) => s.target.id.replace(/\s/g, '') === want);
+			const existing = this.sessions.find(
+				(s) =>
+					s.target.id.replace(/\s/g, '') === want &&
+					s.mode === useMode &&
+					(useMode !== 'game' || (s.gameId ?? '') === (gameId ?? ''))
+			);
 			if (existing) {
 				this.activeTab = existing.tabId;
 				return;
@@ -133,7 +142,7 @@ export class SessionManager {
 		const tabId = this.#nextTab++;
 		this.sessions = [
 			...this.sessions,
-			{ tabId, playId: -1, phase: 'connecting', target, mode: useMode, conn: 'direct', wsPort: 0 }
+			{ tabId, playId: -1, phase: 'connecting', target, mode: useMode, gameId: gameId || undefined, conn: 'direct', wsPort: 0 }
 		];
 		this.activeTab = tabId;
 		// Headless --connect: hold the actual network connect until the launch splash is gone,

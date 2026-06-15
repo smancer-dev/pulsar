@@ -104,6 +104,18 @@ pub(crate) struct AppState {
 	/// Synced from the UI's `ui.tray` setting via `set_tray` (tray_disabled = !ui.tray).
 	/// Default `false` (tray enabled) — preserves the existing behavior on first launch.
 	pub(crate) tray_disabled: AtomicBool,
+	/// Linux-only: the ONE resident `pulsar-render` child kept alive between sessions to
+	/// avoid destroying its EGL context. Destroying the EGL context of an embedded `--wid`
+	/// renderer that shares the Mali display with WebKitGTK corrupts WebKit's shared Mali
+	/// GL on RK3588 — the webview stops processing clicks (hover works, nothing clickable)
+	/// with no in-session recovery short of a reboot. The fix: on session end send `hide\n`
+	/// (renderer unmaps its window but keeps EGL alive), park the child here; on the next
+	/// connect take it back, send `show\n` + `reopen <new-sdp>\n` + new caps lines. The
+	/// GDK container (child GdkWindow) id that owns the renderer's `--wid` is kept so it
+	/// can be re-registered under the new session id without re-creating the X window.
+	/// `None` on every platform except Linux (`#[cfg(…)]` unavailable on struct fields, so
+	/// we use an `Option` that is always `None` on non-Linux builds).
+	pub(crate) resident_render: Mutex<Option<crate::play::ResidentRender>>,
 }
 
 /// Whether an inbound connection is a remote-desktop or a game-streaming session.
@@ -238,6 +250,22 @@ pub(crate) struct PlaySession {
 	/// Stdin-only renderer state (see [`RenderSeed`]) — re-sent after a codec-switch
 	/// respawn, which otherwise resets the fresh renderer to its defaults.
 	pub(crate) render_seed: Arc<Mutex<RenderSeed>>,
+	/// Shared live session id for the `pulsar-render` stdout reader thread (Linux resident
+	/// model). The reader holds a clone of this Arc and uses it to tag `play-vstats` /
+	/// `play-ready` events with the CURRENT session id, so when the renderer is reused for
+	/// a new session its stats are attributed correctly without restarting the reader.
+	/// `None` on non-Linux / mpv-fallback paths (where `start_render_reader` owns the id).
+	#[allow(dead_code)]
+	pub(crate) render_live_id: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+	/// Serializes concurrent renderer respawns (codec/monitor switch) so only one
+	/// respawn executes at a time for this session. Without this, two rapid switches
+	/// (e.g. monitor B then C ~0.5 s apart) both call `respawn_render_for_codec`:
+	/// the second observes `render_child == None` (transiently taken by the first) and
+	/// returns early — yet the host has already restreamed to the second target, leaving
+	/// the live renderer decoding the wrong SPS/resolution indefinitely. Acquiring this
+	/// lock BEFORE taking `render_child` ensures the second respawn waits for the first
+	/// to restore `render_child`, then applies the correct params in sequence.
+	pub(crate) respawn_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Host-side stream settings pushed from the UI.

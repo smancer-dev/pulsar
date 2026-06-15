@@ -810,7 +810,16 @@ fn start_audio_and_mute(
 		#[cfg(windows)]
 		let started_audio = {
 			let pinned = REDIRECT_SINK_ID.lock().unwrap().clone();
-			acfg.audio_loopback() && spawn_loopback_audio(procs, ffmpeg, &dest, pinned, neg_layout)
+			// When a host-silent sink redirect is armed (pinned is Some), ALWAYS try to capture
+			// via WASAPI loopback pinned to the virtual sink — even if the user configured a
+			// named dshow device (audio_loopback() is false with a named device). The redirect
+			// has already moved program audio to the virtual sink, so a dshow tap on the user's
+			// configured device would capture the wrong endpoint (the one that no longer receives
+			// program audio) and the client would hear silence or the wrong source. Prefer the
+			// loopback-of-redirected-sink path; only if that fails too, fall through to dshow.
+			let pinned_active = pinned.is_some();
+			(pinned_active || acfg.audio_loopback())
+				&& spawn_loopback_audio(procs, ffmpeg, &dest, pinned, neg_layout)
 		};
 		#[cfg(not(windows))]
 		let started_audio = false;
@@ -822,6 +831,10 @@ fn start_audio_and_mute(
 			// device (Linux: the null sink's `.monitor`; macOS: the virtual output device's
 			// AVFoundation input) instead of the user's configured device, so the stream
 			// carries program audio while the speakers are silent.
+			// On Windows, if we reach here while a redirect is armed it means the virtual-sink
+			// loopback failed; fall back to the mute path rather than capturing the now-wrong
+			// dshow device (the endpoint-mute fallback below will silence the speakers, but at
+			// least the dshow device will still carry program audio in that scenario).
 			#[cfg(windows)]
 			let input = acfg.audio_input();
 			#[cfg(not(windows))]
@@ -1065,6 +1078,14 @@ pub(super) fn make_on_stream(
 	// The monitor (`display_idx`) the current stream captures, published for the input path so an
 	// absolute (webview) pointer lands on the streamed screen, not always the primary. Windows-only.
 	#[cfg(windows)] cur_display: Arc<std::sync::atomic::AtomicU32>,
+	// Live-confirmed output Arc from the active CaptureHandle (C4): the input closure reads from
+	// this instead of cur_display on the native path so it sees the monitor the capture thread is
+	// ACTUALLY streaming — not the optimistically-requested value written before the rebuild completes.
+	#[cfg(windows)] native_out_arc: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>>,
+	// Monotonic build-generation Arc from the active CaptureHandle (C8): the input closure
+	// re-resolves display_rect/set_monitor when this advances — catching same-index resolution
+	// changes that shift the virtual-desktop geometry without changing the monitor index.
+	#[cfg(windows)] native_gen_arc: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>>,
 	stats_out: tokio::sync::mpsc::Sender<DataMsg>,
 	app_h: AppHandle,
 	peer: String,
@@ -1409,6 +1430,14 @@ pub(super) fn make_on_stream(
 		#[cfg(windows)]
 		if let Some(h) = native_slot.lock().unwrap().take() {
 			h.stop();
+		}
+		// Clear the live-confirmed output Arc so on_input falls back to cur_display while
+		// no native handle is active (ffmpeg path or between teardown and a new handle). (C4)
+		// Also clear the build-generation Arc (C8) for the same reason.
+		#[cfg(windows)]
+		{
+			*native_out_arc.lock().unwrap() = None;
+			*native_gen_arc.lock().unwrap() = None;
 		}
 		// Client-requested size/fps/bitrate win; 0 falls back to the host config.
 		let eff_w = if req.width > 0 { req.width } else { cfg.width };
@@ -1806,6 +1835,15 @@ pub(super) fn make_on_stream(
 					// the confirmed output (the thread writes current_output=req.display_idx on its
 					// first build). Use req.display_idx directly here — we know init succeeded. (C1)
 					cur_display.store(req.display_idx, std::sync::atomic::Ordering::Relaxed);
+					// Expose the handle's current_output Arc to on_input so the input closure can
+					// track the LIVE confirmed output without locking native_slot per event (C4).
+					// The atom is written by the capture thread after every build (including reverts),
+					// so on_input always reads the monitor that is actually being streamed — not the
+					// optimistically-requested value that cur_display carries before a rebuild lands.
+					*native_out_arc.lock().unwrap() = Some(h.current_output_arc());
+					// Expose the build-generation Arc so on_input can detect same-index resolution
+					// changes and re-resolve display_rect/set_monitor even when the index is unchanged (C8).
+					*native_gen_arc.lock().unwrap() = Some(h.build_gen_arc());
 					*native_slot.lock().unwrap() = Some(h);
 					true
 				}
@@ -2080,7 +2118,10 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 	/// Idle transfers older than this are swept from the map on the next FileBegin.
 	const XFER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 	/// Maximum concurrent in-flight transfers. If a new FileBegin would push us over
-	/// this limit, the oldest (by last_activity) entry is evicted first.
+	/// this limit we first try to evict a headless entry (`expected == None` — its
+	/// FileBegin was lost, so it can't complete anyway) and only fall back to the
+	/// oldest-by-last_activity among active entries to avoid silently killing a
+	/// slow-but-legitimate transfer.
 	const MAX_CONCURRENT_XFERS: usize = 8;
 	struct Reasm {
 		/// Set by FileBegin. `None` means chunks arrived before FileBegin (UDP
@@ -2110,15 +2151,19 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 			// session over a lossy link can't accumulate unbounded dead reassemblers.
 			let now = std::time::Instant::now();
 			xfers.retain(|_, r| now.duration_since(r.last_activity) < XFER_IDLE_TIMEOUT);
-			// Hard cap: if still at the concurrent limit, drop the oldest entry —
-			// but only if it is not the lazy placeholder for THIS id (early chunks).
+			// Hard cap: if still at the concurrent limit, evict the least-harmful
+			// entry — but only if it is not the lazy placeholder for THIS id.
+			// Priority: prefer headless entries (expected == None; their FileBegin
+			// was lost so they can never complete) over active ones; among peers
+			// of the same class pick the oldest by last_activity.
 			if xfers.len() >= MAX_CONCURRENT_XFERS && !xfers.contains_key(&id) {
-				if let Some(oldest_id) = xfers
+				let victim = xfers
 					.iter()
-					.min_by_key(|(_, r)| r.last_activity)
-					.map(|(k, _)| *k)
-				{
-					xfers.remove(&oldest_id);
+					// headless orphans first (0), then active (1), tie-break oldest
+					.min_by_key(|(_, r)| (r.expected.is_some() as u8, r.last_activity))
+					.map(|(k, _)| *k);
+				if let Some(vid) = victim {
+					xfers.remove(&vid);
 				}
 			}
 			// If early FileChunks created a lazy entry (UDP reorder), merge the
@@ -2128,6 +2173,19 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 				r.name = sanitize_filename(&n);
 				r.expected = Some(n_chunks);
 				r.last_activity = now;
+				// Prune any pre-buffered chunks whose index is now >= n_chunks.
+				// They arrived before FileBegin (expected was None) so the
+				// in_range guard passed them all through; now that we know the
+				// count, out-of-range indices must be removed so they cannot
+				// substitute for a genuinely lost in-range chunk.
+				r.chunks.retain(|&idx, data| {
+					if idx < n_chunks {
+						true
+					} else {
+						r.received = r.received.saturating_sub(data.len() as u64);
+						false
+					}
+				});
 			} else {
 				xfers.insert(
 					id,
@@ -2147,6 +2205,21 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 			// dropped. FileBegin will fill in `name` and `expected` when it
 			// arrives, keeping the already-stored chunks intact.
 			if !xfers.contains_key(&id) {
+				// Mirror the FileBegin guard: sweep idle entries and enforce the
+				// concurrent-transfer cap before inserting a new headless entry.
+				// Without this a chunk-only flood (FileBegin never arrives) bypasses
+				// both the retain() and the cap, allowing unbounded HashMap growth.
+				let now = std::time::Instant::now();
+				xfers.retain(|_, r| now.duration_since(r.last_activity) < XFER_IDLE_TIMEOUT);
+				if xfers.len() >= MAX_CONCURRENT_XFERS {
+					let victim = xfers
+						.iter()
+						.min_by_key(|(_, r)| (r.expected.is_some() as u8, r.last_activity))
+						.map(|(k, _)| *k);
+					if let Some(vid) = victim {
+						xfers.remove(&vid);
+					}
+				}
 				xfers.insert(
 					id,
 					Reasm {
@@ -2154,7 +2227,7 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 						expected: None,
 						chunks: std::collections::BTreeMap::new(),
 						received: 0,
-						last_activity: std::time::Instant::now(),
+						last_activity: now,
 					},
 				);
 			}
@@ -2195,11 +2268,17 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 			let Some(r) = xfers.remove(&id) else {
 				return;
 			};
-			// Complete iff FileBegin was seen (expected is Some) and every expected
-			// chunk arrived. `Some(0)` is a legitimate empty file. If `expected` is
-			// still `None`, FileBegin never arrived (lost or extremely delayed);
-			// treat that as a failed transfer.
-			let complete = r.expected.map_or(false, |e| r.chunks.len() == e as usize);
+			// Complete iff FileBegin was seen (expected is Some) and every index
+			// 0..expected is present in the BTreeMap. A bare cardinality check
+			// (len == e) would pass even when an out-of-range chunk substituted
+			// for a lost in-range one — the contiguous check catches that gap.
+			// `Some(0)` is a legitimate empty file. If `expected` is still `None`,
+			// FileBegin never arrived; treat that as a failed transfer.
+			let complete = r.expected.map_or(false, |e| {
+				r.chunks.len() == e as usize
+					&& (e == 0 || r.chunks.contains_key(&0) && r.chunks.contains_key(&(e - 1)))
+					&& (0..e).all(|i| r.chunks.contains_key(&i))
+			});
 			// Write chunks directly to disk (in index order via BTreeMap) without
 			// building a second contiguous Vec — avoids ~2x peak memory at the
 			// MAX_XFER_BYTES ceiling (C24 fix).

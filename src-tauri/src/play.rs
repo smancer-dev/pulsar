@@ -24,6 +24,25 @@ use crate::viewer;
 
 mod hold;
 
+/// Linux-only: the ONE resident `pulsar-render` child kept alive across session boundaries
+/// to avoid EGL context destruction on the shared RK3588 Mali display (see
+/// `AppState::resident_render`).
+pub(crate) struct ResidentRender {
+	/// The live renderer process (kept alive; stdin/stdout already taken).
+	pub(crate) child: Child,
+	/// The renderer's stdin (shared Arc so callers can write lines without holding the lock).
+	pub(crate) stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+	/// The GDK container (child GdkWindow) session id under which this renderer lives.
+	/// On next connect we re-register it under the new session id so
+	/// `create_native_container` is skipped and the existing X window is reused.
+	pub(crate) container_id: u64,
+	/// Shared session id for the renderer's stdout reader thread (see `start_render_reader`).
+	/// The reader uses this to tag `play-vstats`/`play-ready` events with the CURRENT session
+	/// id — so when the renderer is reused for a new session, updating this Arc redirects all
+	/// events to the new session without restarting the reader thread.
+	pub(crate) live_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// Whether this client advertises the cursor side-channel ([`StreamReq::cursor_external`]):
 /// it tells the host the client can draw the host pointer itself, so the host may use the
 /// cursorless KMS zero-copy capture and stream the pointer out-of-band. Opt-in behind
@@ -279,6 +298,10 @@ pub(crate) async fn start_remote_play(
 	// which feeds live `stat …` lines). Spawned alongside the vidsink on the Linux native path.
 	#[allow(unused_mut, unused_assignments)]
 	let mut render_child: Option<Child> = None;
+	// Shared live session id for the resident renderer's stdout reader (Linux only; None on
+	// other platforms where the reader uses a fixed id for the renderer's single lifetime).
+	#[allow(unused_mut, unused_assignments)]
+	let mut render_live_id: Option<std::sync::Arc<std::sync::atomic::AtomicU64>> = None;
 	let overlay_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> = Arc::new(Mutex::new(None));
 	let caps_line: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 	// Stdin-only renderer state remembered for a codec-switch respawn re-push.
@@ -338,7 +361,7 @@ pub(crate) async fn start_remote_play(
 						};
 						if let Some(c) = rc.as_mut() {
 							if let Some(out) = c.stdout.take() {
-								crate::render_stats::start_render_reader(&app, id, out);
+								crate::render_stats::start_render_reader(&app, id, out, None);
 							}
 							if let Some(si) = c.stdin.take() {
 								*overlay_stdin.lock().unwrap() = Some(si);
@@ -414,6 +437,30 @@ pub(crate) async fn start_remote_play(
 							single_surface = true;
 							video_port = vport;
 						} else {
+							// Resident renderer: if a previous session's `pulsar-render` is parked
+							// (hidden but EGL-context alive), reuse it instead of spawning a new
+							// child. Spawning a new one would destroy-and-recreate the EGL context
+							// (the old child's eglDestroyContext fires when the process exits), which
+							// on RK3588 corrupts WebKitGTK's shared Mali GL (wedges click input).
+							// Reuse: take the child from AppState, re-register its GDK container
+							// under the new session id, send `show` + `reopen <new-sdp>` + new caps.
+							let resident = state.resident_render.lock().unwrap().take();
+							// Shared session id for the reader thread: when reusing the resident,
+							// update this Arc so the existing reader tags events with the new id;
+							// when spawning fresh, pass it to start_render_reader so the new reader
+							// uses it (allowing future reuse on the NEXT reconnect).
+							let cur_live_id = {
+								use std::sync::atomic::AtomicU64;
+								resident
+									.as_ref()
+									.map(|r| {
+										// Update in-place so the RUNNING reader picks up the new id.
+										r.live_id.store(id, std::sync::atomic::Ordering::Relaxed);
+										r.live_id.clone()
+									})
+									.unwrap_or_else(|| std::sync::Arc::new(AtomicU64::new(id)))
+							};
+							render_live_id = Some(cur_live_id.clone());
 							let toplevel = crate::render::window_xid(&app).await;
 							// In-app container: a pass-through child GdkWindow the renderer embeds
 							// into. The frontend positions it over the session tab's content area
@@ -421,11 +468,29 @@ pub(crate) async fn start_remote_play(
 							// chrome stay visible/clickable — instead of covering the whole window.
 							// Falls back to the toplevel XID (old full-window embed) and then to a
 							// standalone renderer window if there's no XID at all.
-							let container = match toplevel {
-								Some(_) => crate::render::create_native_container(&app, id).await,
-								None => None,
+							// When reusing the resident, the existing container (kept alive at session
+							// end) is re-registered under the new id — no new X window is created.
+							let wid: Option<u64> = if let Some(ref res) = resident {
+								// Re-register the kept container under the new session id.
+								crate::render::rename_native_container(
+									&app,
+									res.container_id,
+									id,
+								);
+								// The renderer is still embedded in that container (it has been
+								// idle-looping with the window unmapped). The wid for reconnect
+								// re-use is whatever the container's X11 XID already is — the
+								// renderer's `--wid` arg was set at spawn and doesn't change; we
+								// just need `mpv_wid` bookkeeping for any future codec-switch respawn.
+								// Re-read it so codec-switch respawn uses the correct XID.
+								crate::render::container_xid(&app, id).await
+							} else {
+								let container = match toplevel {
+									Some(_) => crate::render::create_native_container(&app, id).await,
+									None => None,
+								};
+								container.or(toplevel)
 							};
-							let wid = container.or(toplevel);
 							// DEFAULT Linux renderer: `pulsar-render` — a SINGLE-SURFACE native
 							// renderer doing rkmpp video + the egui overlay in ONE child window of the
 							// app (`--wid`). The overlay is a child of the app window, so it moves/
@@ -439,7 +504,23 @@ pub(crate) async fn start_remote_play(
 							let pace_default = std::env::var("PULSAR_PACE")
 								.map(|v| v == "1" || v == "on" || v == "true")
 								.unwrap_or(true);
-							let mut rc = if std::env::var_os("PULSAR_USE_MPV").is_some() {
+							// Try the resident renderer first; fall back to a fresh spawn.
+							let mut rc = if let Some(res) = resident {
+								use std::io::Write as _;
+								// Activate the resident: show the window + switch to the new SDP.
+								if let Some(si) = res.stdin.lock().unwrap().as_mut() {
+									let _ = writeln!(si, "reopen {}", sdp.display());
+									let _ = writeln!(si, "show");
+									let _ = si.flush();
+								}
+								tracing::info!(pid = res.child.id(), "reusing resident pulsar-render for reconnect");
+								// Reconstitute as a Child for the session bookkeeping path below.
+								// The stdin was already taken into render_stdin at the previous spawn;
+								// here we restore the shared Arc so the session's stat/pace writers
+								// find it in the same Arc they already hold.
+								*overlay_stdin.lock().unwrap() = res.stdin.lock().unwrap().take();
+								Some(res.child)
+							} else if std::env::var_os("PULSAR_USE_MPV").is_some() {
 								None
 							} else {
 								native_view::spawn_render(
@@ -452,13 +533,27 @@ pub(crate) async fn start_remote_play(
 								)
 							};
 							if let Some(c) = rc.as_mut() {
-								if let Some(out) = c.stdout.take() {
-									crate::render_stats::start_render_reader(&app, id, out);
+								// Only take stdout/stdin for a freshly-spawned renderer
+								// (resident had them taken at the original spawn).
+								if c.stdout.is_some() {
+									if let Some(out) = c.stdout.take() {
+										// Pass the live_id Arc so the reader can have its id
+										// updated on the next reconnect (resident model).
+										crate::render_stats::start_render_reader(
+											&app,
+											id,
+											out,
+											Some(cur_live_id.clone()),
+										);
+									}
 								}
 								// Capture the renderer's stdin so set_frame_pacing (and the HUD
 								// stat writer) can push `pace 0|1` / `stat …` lines to it live.
-								if let Some(si) = c.stdin.take() {
-									*overlay_stdin.lock().unwrap() = Some(si);
+								// (Resident path: stdin was already placed in overlay_stdin above.)
+								if c.stdin.is_some() {
+									if let Some(si) = c.stdin.take() {
+										*overlay_stdin.lock().unwrap() = Some(si);
+									}
 								}
 							}
 							if let Some(c) = rc {
@@ -583,7 +678,7 @@ pub(crate) async fn start_remote_play(
 								// emits no `vidsink-fps` video stats). start_render_reader matches an
 								// overlay-only process and tolerates the missing stats.
 								if let Some(out) = c.stdout.take() {
-									crate::render_stats::start_render_reader(&app, id, out);
+									crate::render_stats::start_render_reader(&app, id, out, None);
 								}
 								// Capture its stdin into the SHARED render_stdin slot the other
 								// platforms use, so set_overlay (`open`/`close`), the HUD `stat …`
@@ -915,6 +1010,8 @@ pub(crate) async fn start_remote_play(
 			game_mode,
 			caps_line,
 			render_seed,
+			render_live_id,
+			respawn_lock: Arc::new(tokio::sync::Mutex::new(())),
 		},
 	);
 	Ok(PlayInfo {
@@ -967,6 +1064,17 @@ pub(crate) fn stop_render_child(child: &mut std::process::Child) {
 	let _ = child.wait();
 }
 
+/// Async wrapper: runs `stop_render_child` on a blocking thread so the SIGTERM-grace
+/// poll (up to ~600 ms on unix) never occupies a tokio worker thread.  Takes ownership
+/// of the `Child` so the closure is `'static`.  Callers that must wait for the port to
+/// be released (e.g. respawn_render_for_codec) should `.await` the returned handle;
+/// callers that are fire-and-forget (e.g. session teardown) may drop it.
+pub(crate) fn stop_render_child_blocking(
+	mut child: std::process::Child,
+) -> tokio::task::JoinHandle<()> {
+	tokio::task::spawn_blocking(move || stop_render_child(&mut child))
+}
+
 /// Stop one remote-play session (tab): closes its control session (the host sees a
 /// disconnect) and tears down its video relay.
 #[tauri::command]
@@ -991,6 +1099,10 @@ pub(crate) async fn stop_stream(
 			crate::kbdhook::overlay_suspend(!set.is_empty());
 		}
 	}
+	// Set to true when the Linux `pulsar-render` child is parked as a resident (kept alive)
+	// rather than killed — in that case the GDK container must NOT be destroyed here.
+	#[allow(unused_mut, unused_assignments, unused_variables)]
+	let mut resident_container_kept = false;
 	if let Some(mut play) = play {
 		play.running.store(false, Ordering::SeqCst);
 		play.viewer.stop();
@@ -998,25 +1110,62 @@ pub(crate) async fn stop_stream(
 			let _ = mic.kill();
 			let _ = mic.wait(); // reap — kill alone leaves a unix zombie until app exit
 		}
-		// Close the native renderer's fullscreen/embedded `--wid` window, if any. GRACEFUL
-		// (SIGTERM-first, see stop_render_child) so the GL/EGL teardown runs and WebKit's input
-		// doesn't wedge after the session ends.
-		if let Some(mut child) = play.ffplay.take() {
-			stop_render_child(&mut child);
+		// Close the ffplay fallback renderer (Windows/Linux mpv-fallback), if any. GRACEFUL
+		// (SIGTERM-first, see stop_render_child) — kills a separate window process cleanly.
+		// The pulsar-render child is handled separately below (Linux: kept resident).
+		// Fire-and-forget: teardown does not need to complete before stop_stream returns.
+		if let Some(child) = play.ffplay.take() {
+			stop_render_child_blocking(child);
 		}
-		// Stop the native renderer (`pulsar-render`) cleanly on disconnect. We do NOT keep it
-		// resident: the in-app video container that owns its `--wid` parent window is destroyed a
-		// few lines below (destroy_native_container), and no code path ever reactivates a hidden
-		// renderer (every reconnect uses a fresh, never-reused play id → a brand-new spawn). The
-		// old `hide`+drop-resident model therefore left one orphaned, idle-looping renderer per
-		// reconnect drawing into a dead window tree until the whole app exited (PR_SET_PDEATHSIG
-		// only reaps on app EXIT, not on a normal disconnect) — the exact multi-renderer pile-up
-		// that causes the Pi stutter / "host stale after reconnects". `stop_render_child` sends
-		// SIGTERM first (Linux) with a grace window, so the renderer runs its clean EGL/X teardown
-		// (release the context, XDestroyWindow, XCloseDisplay) — this is what protects WebKitGTK's
-		// shared Mali GL on RK3588; only a hard SIGKILL mid-EGL-bind would wedge it.
-		if let Some(mut child) = play.render_child.take() {
-			stop_render_child(&mut child);
+		// Linux `pulsar-render` (embedded `--wid` renderer): keep it RESIDENT between sessions
+		// to avoid destroying its EGL context. On RK3588 destroying the EGL context of an
+		// embedded renderer that shares the Mali display with WebKitGTK corrupts WebKit's shared
+		// Mali GL state — the webview stops processing clicks (hover works, nothing is clickable)
+		// with no in-session recovery short of a reboot. A clean SIGTERM teardown runs the same
+		// EGL context destruction (XDestroyWindow + eglDestroyContext + XCloseDisplay) as a
+		// SIGKILL, so it carries the same risk. The safe model: send `hide\n` (the renderer
+		// unmaps its window, revealing the WebKitGTK webview underneath, but keeps its EGL
+		// context alive and idle-loops), park the child in AppState::resident_render, and on the
+		// next connect reuse it by sending `show\n` + `reopen <new-sdp>\n` + new caps lines.
+		// The GDK container (child GdkWindow) is ALSO kept alive (skipping destroy_native_container
+		// below) so the renderer's `--wid` X parent window remains valid; the container is
+		// re-registered under the new session id on reconnect.
+		// Non-Linux / mpv-fallback: fall through to stop_render_child as before (Windows/macOS
+		// have no shared-Mali-GL issue).
+		#[cfg(all(unix, not(target_os = "macos")))]
+		if let Some(child) = play.render_child.take() {
+			use std::io::Write as _;
+			// Signal the renderer to hide (unmap video window, idle-loop, keep EGL alive).
+			if let Some(si) = play.render_stdin.lock().unwrap().as_mut() {
+				let _ = writeln!(si, "hide");
+				let _ = si.flush();
+			}
+			// Park in AppState. Any previously parked resident (shouldn't exist — only one
+			// session at a time — but if somehow present) is killed now via stop_render_child
+			// to avoid a double-park.
+			if let Some(old) = state.resident_render.lock().unwrap().take() {
+				tracing::warn!(pid = old.child.id(), "evicting stale resident renderer before parking new one");
+				stop_render_child_blocking(old.child);
+			}
+			// Take the live_id Arc from the session so the reader can be updated on reconnect.
+			let live_id = play
+				.render_live_id
+				.clone()
+				.unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id)));
+			*state.resident_render.lock().unwrap() = Some(ResidentRender {
+				child,
+				stdin: play.render_stdin.clone(),
+				container_id: id,
+				live_id,
+			});
+			resident_container_kept = true; // container must NOT be destroyed — kept for next session
+		}
+		// Non-Linux (Windows/macOS) or mpv/ffplay fallback on Linux (render_child is None
+		// there; the ffplay child is handled via play.ffplay above):
+		// Fire-and-forget: teardown does not need to complete before stop_stream returns.
+		#[cfg(not(all(unix, not(target_os = "macos"))))]
+		if let Some(child) = play.render_child.take() {
+			stop_render_child_blocking(child);
 		}
 		// Stop the Linux native audio player (ffmpeg→PulseAudio), if any.
 		if let Some(mut child) = play.audio_native.take() {
@@ -1039,9 +1188,12 @@ pub(crate) async fn stop_stream(
 	// Tear down the Linux single-surface renderer (libmpv→GLArea), if this session used it.
 	#[cfg(all(unix, not(target_os = "macos")))]
 	crate::render::teardown_single_surface(&app, id).await;
-	// Drop the in-app video container (the renderer child inside it is already dead).
+	// Drop the in-app video container — UNLESS the renderer was kept resident (the container
+	// is still the renderer's valid `--wid` parent and will be re-registered on reconnect).
 	#[cfg(all(unix, not(target_os = "macos")))]
-	crate::render::destroy_native_container(&app, id);
+	if !resident_container_kept {
+		crate::render::destroy_native_container(&app, id);
+	}
 	let _ = &app; // used by teardown on Linux; silence unused elsewhere
 	Ok(())
 }

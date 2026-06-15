@@ -79,6 +79,11 @@ pub struct CaptureHandle {
 	/// (input-mapping) and `last_native_req.display_idx` (fast-path baseline) in sync with
 	/// reality so input lands on the right monitor and a switch retry is not a silent no-op.
 	current_output: std::sync::Arc<std::sync::atomic::AtomicU32>,
+	/// Monotonic build counter: incremented by the capture thread after EVERY successful build
+	/// (including same-index resolution-change rebuilds). The host's input path tracks this to
+	/// detect a host-side resolution change and re-resolve the monitor geometry via
+	/// `display_rect()` / `set_monitor()` even when the monitor INDEX is unchanged (C8).
+	build_gen: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl CaptureHandle {
@@ -107,6 +112,26 @@ impl CaptureHandle {
 	pub fn current_output(&self) -> u32 {
 		self.current_output
 			.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
+	/// A clone of the Arc<AtomicU32> the capture thread writes after every confirmed build
+	/// (including reverts). Callers that need to track the live confirmed output across a
+	/// switch — in particular the input-mapping path — can clone this Arc once and then
+	/// poll it directly without locking the CaptureHandle or the native_slot mutex. The
+	/// atom's value is always the monitor the thread is ACTUALLY streaming, never the
+	/// optimistically-requested one, so reading it from on_input gives the correct rect for
+	/// absolute-pointer injection even during a mid-session monitor switch.
+	pub fn current_output_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+		self.current_output.clone()
+	}
+
+	/// A clone of the build-generation Arc. The capture thread increments this after every
+	/// successful build — including same-index resolution-change rebuilds (C8). The host's
+	/// input closure tracks this alongside the output index: when the generation advances the
+	/// closure re-calls `display_rect(idx)` / `set_monitor()` to pick up the new monitor
+	/// geometry even though the monitor INDEX has not changed.
+	pub fn build_gen_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+		self.build_gen.clone()
 	}
 
 	/// Signal the thread, join it (releases the NVENC session + DXGI duplication), return.
@@ -207,6 +232,10 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 	// input-mapping and fast-path baseline after a failed switch revert.
 	let current_output = Arc::new(AtomicU32::new(cfg.output_idx));
 	let cur_out_t = current_output.clone();
+	// Monotonic build counter: incremented after every successful build (including same-index
+	// resolution-change rebuilds so the host input path can detect geometry changes — C8).
+	let build_gen = Arc::new(AtomicU32::new(0));
+	let build_gen_t = build_gen.clone();
 
 	let thread = std::thread::Builder::new()
 		.name("pulsar-capture".into())
@@ -315,6 +344,9 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 				// Publish the confirmed output so the host can read current_output() and
 				// reconcile cur_display / last_native_req after a failed switch revert.
 				cur_out_t.store(output_idx, Ordering::SeqCst);
+				// Bump the build generation so the host input path re-resolves monitor geometry
+				// even when the index is unchanged (same-index resolution-change rebuild — C8).
+				build_gen_t.fetch_add(1, Ordering::SeqCst);
 				cap_log(&format!(
 					"build #{build_no} STREAMING output={output_idx} {w}x{h} kbps={last_kbps} rebuilt_in={}ms",
 					build_t0.elapsed().as_millis(),
@@ -404,6 +436,7 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 			requested_kbps,
 			requested_output,
 			current_output,
+			build_gen,
 		}),
 		Ok(Err(msg)) => {
 			// Thread reported an init error and is returning; join to reap it.

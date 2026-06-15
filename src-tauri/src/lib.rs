@@ -53,9 +53,9 @@ pub(crate) use process::no_window;
 use auth::{disconnect_peer, respond_request, submit_password};
 use avatar::{device_user_name, self_avatar};
 use commands::{
-	auto_connect_target, available_encoders, connect, controllers, get_config, lan_devices,
-	launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password, node_port,
-	publish_games,
+	auto_connect_target, available_encoders, connect, controllers, forget_peer, get_config,
+	lan_devices, launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password,
+	node_port, publish_games,
 	relaunch_to_home, run_command, scan_folder, self_update_possible, session_password, set_config,
 	set_language, set_stream_settings, set_tray,
 	steam_path,
@@ -516,7 +516,8 @@ pub fn run() {
 			fs_get,
 			local_ls,
 			mic_start,
-			mic_stop
+			mic_stop,
+			forget_peer
 		])
 		.run(tauri::generate_context!())
 		.expect("error while running Pulsar");

@@ -187,13 +187,34 @@ async fn respawn_render_for_codec(
 	id: u64,
 	codec: &str,
 ) {
+	// Serialize concurrent respawns (codec switch + monitor switch can overlap): clone
+	// the per-session lock Arc under a brief std-Mutex hold, then await it OUTSIDE the
+	// std lock so the SIGTERM-grace poll (~600 ms) never stalls other callers of
+	// state.plays (input forward(), the setters). Without this, a second respawn for
+	// the same id that arrives while render_child is transiently None (taken by the
+	// first respawn) fires the old_child.is_none() early-return below — even though the
+	// host has already restreamed to the new target — leaving the live renderer decoding
+	// the wrong SPS/resolution until the user triggers yet another switch.
+	let lock = {
+		let plays = state.plays.lock().unwrap();
+		let Some(p) = plays.get(&id) else { return };
+		p.respawn_lock.clone()
+	};
+	// Wait for any in-flight respawn to complete before proceeding. Holding this guard
+	// for the entirety of the respawn means the second respawn finds render_child = Some
+	// (the freshly-spawned child from the first) instead of the transient None, and
+	// applies its own codec/monitor params correctly in sequence.
+	let _guard = lock.lock().await;
 	let (vport, wid, game_mode, old_child) = {
 		let mut plays = state.plays.lock().unwrap();
 		let Some(p) = plays.get_mut(&id) else { return };
 		(p.video_port, p.mpv_wid, p.game_mode, p.render_child.take())
 	};
 	if old_child.is_none() {
-		return; // mpv/ffplay fallback paths keep their old behavior
+		// render_child is None and we hold the exclusive respawn lock, so no other
+		// respawn transiently cleared it — this session genuinely uses the mpv/ffplay
+		// fallback path (render_child is always None there). Keep old behavior.
+		return;
 	}
 	// Write the new SDP BEFORE killing the old renderer: a transient write failure
 	// used to leave the session with render_child = None and no video for the rest
@@ -216,10 +237,11 @@ async fn respawn_render_for_codec(
 	// renderer while the old one still holds the port causes EADDRINUSE → recv_loop
 	// (Windows rtp.rs) or avformat_open_input (Linux video.rs) fails immediately,
 	// leaving the new renderer permanently deaf and the video permanently black.
-	// stop_render_child waits up to ~600 ms for a clean SIGTERM exit (or SIGKILL +
-	// wait on timeout) before returning, so the port IS released when we spawn below.
-	if let Some(mut c) = old_child {
-		crate::play::stop_render_child(&mut c);
+	// stop_render_child_blocking offloads the SIGTERM-grace poll (~600 ms) to a
+	// dedicated blocking thread so this async fn does not occupy a tokio worker
+	// during the wait. We await the handle so the port IS released before spawn.
+	if let Some(c) = old_child {
+		let _ = crate::play::stop_render_child_blocking(c).await;
 	}
 	let pace_default = std::env::var("PULSAR_PACE")
 		.map(|v| v == "1" || v == "on" || v == "true")
@@ -263,7 +285,7 @@ async fn respawn_render_for_codec(
 		#[cfg(all(unix, not(target_os = "macos")))]
 		let new_pid = c.id();
 		if let Some(out) = c.stdout.take() {
-			crate::render_stats::start_render_reader(app, id, out);
+			crate::render_stats::start_render_reader(app, id, out, None);
 		}
 		let si = c.stdin.take();
 		// Pull the per-id Arcs out under the lock, install the fresh stdin + mpv_sdp, then
@@ -385,8 +407,9 @@ async fn respawn_render_for_codec(
 		// renderer has no owner, and dropping a Child does NOT kill the process — reap
 		// it here or it holds its UDP port + GL context until app exit (the documented
 		// orphan-pile-up class, see native_view/spawn.rs).
-		if let Some(mut c) = rc {
-			crate::play::stop_render_child(&mut c);
+		// Fire-and-forget: we're about to return, so no need to await.
+		if let Some(c) = rc {
+			crate::play::stop_render_child_blocking(c);
 		}
 		return;
 	}
@@ -570,15 +593,30 @@ pub(crate) async fn set_play_monitor(
 	let wait = MON_COOLDOWN_MS - now.saturating_sub(last);
 	tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
 	let p = {
-		let mut map = MON_STATE.lock().unwrap();
-		let st = map.get_or_insert_with(Default::default).entry(id).or_default();
+		let mut guard = MON_STATE.lock().unwrap();
+		// Use get_mut — do NOT use or_default() here.  If forget_monitor_debounce already
+		// removed this id (session torn down while we slept), we must not re-insert a stale
+		// entry; just bail silently so the coalescing task leaves no orphan in the map.
+		let Some(map) = guard.as_mut() else {
+			return Ok(());
+		};
+		let Some(st) = map.get_mut(&id) else {
+			return Ok(());
+		};
 		if st.gen != g {
+			// A newer coalesced call is the designated winner — clean up this entry if no
+			// further switch is in flight (gen will have advanced beyond g, meaning another
+			// task owns the trailing edge; leave the entry for that task to remove).
 			return Ok(());
 		}
 		let p = std::mem::replace(&mut st.pending, u32::MAX);
 		if p != u32::MAX {
 			st.last_ms = mon_now_ms();
 		}
+		// This coalesced call is the winner.  Remove the entry so the map doesn't accumulate
+		// stale entries after the trailing switch fires — forget_monitor_debounce won't see
+		// this id again (the session is still alive here), so we must self-clean.
+		map.remove(&id);
 		p
 	};
 	if p != u32::MAX {

@@ -9,6 +9,7 @@ use tauri::{AppHandle, State};
 
 use crate::audio_io::spawn_mic_recorder;
 use crate::kbdhook;
+use crate::process::ffmpeg_bin;
 use crate::state::AppState;
 use crate::util::{data_sender, forward};
 
@@ -129,7 +130,11 @@ pub(crate) async fn send_file_path(
 
 /// Client: start streaming the microphone to the host (raw PCM over the session).
 #[tauri::command]
-pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(), String> {
+pub(crate) async fn mic_start(
+	app: tauri::AppHandle,
+	state: State<'_, AppState>,
+	id: u64,
+) -> Result<(), String> {
 	let (tx, mic_slot, render_seed) = {
 		let plays = state.plays.lock().unwrap();
 		let p = plays.get(&id).ok_or(crate::i18n::t("err.session"))?;
@@ -144,8 +149,9 @@ pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(),
 	if slot.is_some() {
 		return Ok(()); // already on
 	}
+	let ffmpeg = ffmpeg_bin(&app);
 	let mut child =
-		spawn_mic_recorder().ok_or(crate::i18n::t("err.micRecorder"))?;
+		spawn_mic_recorder(&ffmpeg).ok_or(crate::i18n::t("err.micRecorder"))?;
 	let stdout = child.stdout.take().ok_or(crate::i18n::t("err.micOutput"))?;
 	*slot = Some(child);
 	drop(slot);

@@ -139,13 +139,19 @@ pub(crate) mod throttle {
 		}
 	}
 
-	/// Successful auth clears the slate.
+	/// Successful auth clears the per-peer slate.
+	///
+	/// NOTE: we intentionally do NOT reset [`GLOBAL_FAILURES`] here. That counter
+	/// is source-independent (it accumulates wrong guesses from ANY peer) and exists
+	/// to cap sustained brute-forcing by an attacker who cycles relay ids to defeat
+	/// the per-peer lockout. Resetting it on every successful auth — including a
+	/// passwordless operator Allow or a connect-password login — would let an attacker
+	/// interleave their id-cycling batches with normal legitimate traffic and keep
+	/// the counter at zero indefinitely, completely disarming the OTP-rotation guard.
+	/// The only intended reset is the 600 s WINDOW elapsed check inside
+	/// [`note_global_failure`]: after that quiet period the counter expires naturally.
 	pub(crate) fn clear(peer: &str) {
 		ATTEMPTS.lock().unwrap().remove(&key(peer));
-		// A correct password resets the global counter too: it only exists to cap
-		// SUSTAINED failed guessing against a static code, not to punish a few
-		// fat-fingered attempts that eventually succeed.
-		*GLOBAL_FAILURES.lock().unwrap() = (0, Instant::now());
 	}
 }
 
@@ -368,6 +374,59 @@ pub(crate) async fn client_authenticate(
 				HostAuth::Other => {}
 			},
 		}
+	}
+}
+
+/// Unit tests for the throttle module.
+#[cfg(test)]
+mod tests {
+	use super::throttle;
+
+	/// Interleaving `clear()` calls (which happen on every approved connection,
+	/// including passwordless Allow and connect_password logins) must NOT reset the
+	/// source-independent global counter — otherwise an attacker who cycles relay ids
+	/// and waits for any legitimate login between batches would permanently prevent
+	/// the global threshold from being crossed and the OTP would never rotate.
+	#[test]
+	fn global_counter_not_reset_by_clear() {
+		// Record GLOBAL_MAX_FAILURES - 1 wrong guesses from different "peers"
+		// (simulating relay-id cycling), interleaved with successful auths from
+		// unrelated peers via clear().  The counter must NOT revert to zero.
+		// GLOBAL_MAX_FAILURES = 20; we drive it to 19 with interspersed clears.
+		let mut rotated = false;
+		for i in 0..19u32 {
+			// Simulate a legitimate user getting approved between every two guesses.
+			if i % 2 == 0 {
+				throttle::clear(&format!("legit-peer-{i}"));
+			}
+			// Wrong guess from an attacker cycling ids.
+			if throttle::note_global_failure() {
+				rotated = true;
+				break;
+			}
+		}
+		// After 19 failures (none of which were reset by the clear() calls) the
+		// counter should be at 19, not zero.  One more failure must cross the
+		// threshold and signal rotation.
+		assert!(!rotated, "OTP rotated too early (expected exactly 20 failures)");
+		let triggered = throttle::note_global_failure(); // 20th failure
+		assert!(triggered, "global OTP-rotation guard did not fire after 20 total failures interleaved with successful auths");
+	}
+
+	/// A clear() from an approved peer must still reset THAT peer's per-peer
+	/// attempt counter (this is the intended behaviour — not a regression).
+	#[test]
+	fn clear_resets_per_peer_counter() {
+		let peer = "per-peer-clear-test";
+		// Record some failures for the peer.
+		throttle::record_failure(peer);
+		throttle::record_failure(peer);
+		// Should not be locked out yet (threshold is 5).
+		assert!(throttle::locked_out(peer).is_none());
+		// Clearing removes the entry.
+		throttle::clear(peer);
+		// After clear, locked_out returns None (no entry).
+		assert!(throttle::locked_out(peer).is_none());
 	}
 }
 

@@ -58,6 +58,16 @@ fn media_features() -> Vec<String> {
 /// normal teardown) is safe.
 struct SessionCleanupGuard {
 	procs: Arc<Mutex<Vec<Child>>>,
+	/// The RTP forwarder tasks for this session's current stream (vh/ah).  Each holds
+	/// a strong `Arc<Node>` clone (via `SessionSender`), so without an abort here
+	/// a `JoinHandle::abort()` of the *session* task cancels the session future but
+	/// leaves the forwarders running indefinitely — they block in `vsock/asock.recv()`
+	/// and never observe the session going away, so the old `Node` (and its bound UDP
+	/// socket) is never dropped.  We abort + do NOT await (same rationale as `procs`
+	/// kill: blocking Drop stalls the executor thread running `abort()`; the async
+	/// runtime will poll each aborted task to completion and release the `Arc<Node>`
+	/// shortly after this Drop returns).
+	fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 	#[cfg(target_os = "linux")]
 	cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
 	sid: u64,
@@ -74,6 +84,17 @@ impl Drop for SessionCleanupGuard {
 			// skip wait() — non-blocking; the OS reaps the zombie when we exit or the
 			// Tokio runtime's thread cleans up. Blocking here in Drop would stall the
 			// executor thread that's running abort().
+		}
+		// Abort the RTP media-forwarder tasks (vh/ah).  Each holds a strong
+		// `Arc<Node>` clone (via `SessionSender`) and blocks in `vsock/asock.recv()`;
+		// without this abort they keep the old `Node` alive after the session task is
+		// cancelled, pinning its UDP socket and relay heartbeat indefinitely.
+		// We do NOT await here (same reasoning as the `procs` kill above: Drop must
+		// not block the executor thread).  The runtime will poll each aborted task to
+		// completion shortly after this Drop returns, releasing the `Arc<Node>`.
+		// After draining, the normal teardown block finds the vec empty — safe no-op.
+		for h in self.fwd_slot.lock().unwrap().drain(..) {
+			h.abort();
 		}
 		// Linux: close the XDG ScreenCast portal session so the compositor's
 		// "your screen is being shared" indicator disappears.
@@ -151,6 +172,17 @@ pub(crate) async fn go_online(
 	// we ignore that error. This is the only deterministic way to guarantee the
 	// socket is free when cfg.node_port is pinned.
 	for h in teardown_handles {
+		let _ = h.await;
+	}
+	// Second drain — close the teardown-accept race (C20): after serve_task has
+	// been awaited its final synchronous iteration (accept→spawn→push) has
+	// completed, so any session handle pushed after the first drain is now
+	// visible.  Abort + await those too so no orphan Arc<Node> (and its UDP
+	// socket) escapes teardown.  Collect into a local Vec first so the
+	// MutexGuard is dropped before the await points (the guard is !Send).
+	let late_handles: Vec<_> = state.session_tasks.lock().unwrap().drain(..).collect();
+	for h in late_handles {
+		h.abort();
 		let _ = h.await;
 	}
 	let _ = state.node.lock().unwrap().take();
@@ -341,6 +373,34 @@ pub(crate) async fn go_online(
 				// one-time password; wrong attempts are rate-limited per peer, and a
 				// locked-out peer is rejected up front WITHOUT an Allow/Deny popup
 				// (otherwise repeated connects could spam attention-grabbing windows).
+				//
+				// Read unattended_access LIVE from the current config so a toggle in
+				// Settings → Güvenlik takes effect immediately — without needing a
+				// go_offline/go_online cycle.  go_online only set require_auth once at
+				// startup; if the user disabled unattended access while online the
+				// captured bool would be stale and new connections would still bypass
+				// auth.  Symmetrically, enabling unattended access while online would
+				// still demand a password until a reconnect.
+				let require_auth = !app_h
+					.state::<AppState>()
+					.config
+					.lock()
+					.unwrap()
+					.unattended_access;
+				// If auth just became required but no OTP exists yet (because
+				// unattended_access was ON when go_online ran, so we set the password
+				// to ""), lazily generate one now and emit it so the Home screen can
+				// display it.  This is idempotent: if another connection already
+				// generated it, we find it non-empty and skip.
+				if require_auth {
+					let mut pw_guard = password_store.lock().unwrap();
+					if pw_guard.is_empty() {
+						let fresh = pulsar_core::service::gen_password();
+						*pw_guard = fresh.clone();
+						drop(pw_guard);
+						let _ = app_h.emit("session-password", fresh);
+					}
+				}
 				let approved = if require_auth {
 					if let Some(rem) = crate::auth::throttle::locked_out(&peer) {
 						tracing::warn!(%peer, secs = rem.as_secs(), "auth throttled: rejecting without prompt");
@@ -590,6 +650,26 @@ pub(crate) async fn go_online(
 				#[cfg(windows)]
 				let cur_display: Arc<std::sync::atomic::AtomicU32> =
 					Arc::new(std::sync::atomic::AtomicU32::new(0));
+				// On the native (DXGI+NVENC) path the input closure reads the capture thread's OWN
+				// current_output Arc instead of cur_display. cur_display is set synchronously at
+				// switch-request time (before the thread rebuilds), so it reflects the OLD monitor
+				// for the entire rebuild window — causing absolute pointer events to land on the
+				// wrong screen after a one-shot monitor switch (C4). The capture thread writes its
+				// current_output atom only AFTER each successful build (including reverts), so
+				// reading from it gives the monitor the thread is ACTUALLY streaming, never the
+				// optimistically-requested one. native_out_arc is Some while a CaptureHandle is
+				// active and None otherwise (ffmpeg path / session teardown). Windows-only.
+				#[cfg(windows)]
+				let native_out_arc: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>> =
+					Arc::new(Mutex::new(None));
+				// Monotonic build-generation counter from the CaptureHandle (C8): the capture
+				// thread bumps this after EVERY successful build, including same-index resolution-
+				// change rebuilds. The input closure re-resolves display_rect()/set_monitor()
+				// whenever this advances — catching host resolution changes that leave the monitor
+				// index unchanged but shift the virtual-desktop geometry. Windows-only.
+				#[cfg(windows)]
+				let native_gen_arc: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>> =
+					Arc::new(Mutex::new(None));
 
 				let provider = {
 					let games = games.clone();
@@ -651,6 +731,10 @@ pub(crate) async fn go_online(
 					native_slot.clone(),
 					#[cfg(windows)]
 					cur_display.clone(),
+					#[cfg(windows)]
+					native_out_arc.clone(),
+					#[cfg(windows)]
+					native_gen_arc.clone(),
 					stats_out.clone(),
 					app_h.clone(),
 					peer.clone(),
@@ -678,7 +762,17 @@ pub(crate) async fn go_online(
 					#[cfg(windows)]
 					let cur_display = cur_display.clone();
 					#[cfg(windows)]
+					let native_out_arc = native_out_arc.clone();
+					#[cfg(windows)]
+					let native_gen_arc = native_gen_arc.clone();
+					#[cfg(windows)]
 					let mut applied_display: u32 = u32::MAX;
+					// Last build-generation we resolved geometry for. Starts at u32::MAX so
+					// the first event always resolves. On a same-index resolution change the
+					// capture thread bumps the generation without changing the index — this
+					// sentinel ensures we detect that and re-call display_rect/set_monitor (C8).
+					#[cfg(windows)]
+					let mut applied_gen: u32 = u32::MAX;
 					// "Sadece izleme" gate: read per-event (cheap map lookup) so the
 					// Connections-window toggle takes effect mid-session, sid-guarded
 					// against a same-peer reconnection's newer entry.
@@ -741,11 +835,40 @@ pub(crate) async fn go_online(
 											// ABSOLUTE move would otherwise always land on the PRIMARY display.
 											#[cfg(windows)]
 											{
-												let idx = cur_display.load(std::sync::atomic::Ordering::Relaxed);
-												if idx != applied_display {
-													applied_display = idx;
-													d.set_monitor(pulsar_capture::display_rect(idx).map(|r| {
-														pulsar_core::input::MonitorRect {
+												// On the native (DXGI+NVENC) path, prefer the capture thread's own
+												// current_output Arc over cur_display. cur_display is written at
+												// switch-request time (before the thread rebuilds), so it reflects the OLD
+												// monitor for the entire rebuild window — causing pointer events to land on
+												// the wrong screen after a one-shot menu switch (C4). The thread writes
+												// its current_output atom only AFTER each confirmed build (including
+												// reverts), so reading it gives the monitor actually being streamed. When
+												// no native handle is active (ffmpeg path), fall back to cur_display. (C4)
+												let (idx, gen) = {
+													let out_guard = native_out_arc.lock().unwrap();
+													let gen_guard = native_gen_arc.lock().unwrap();
+													let idx = match out_guard.as_ref() {
+														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
+														None => cur_display.load(std::sync::atomic::Ordering::Relaxed),
+													};
+													let gen = match gen_guard.as_ref() {
+														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
+														None => 0,
+													};
+													(idx, gen)
+												};
+												// Re-resolve the monitor geometry when the index changes (different
+												// monitor selected) OR when the build generation advances (same-index
+												// resolution change — the virtual-desktop layout shifts and the old
+												// mon_width/virt_* are stale → offset clicks on multi-monitor — C8).
+												// applied_display/applied_gen are only advanced when display_rect()
+												// returns Some — a transient None (DXGI enumeration momentarily failing
+												// during a TDR/hotplug/mode-switch) is retried on the next pointer event
+												// instead of latching the primary-only fallback permanently (C23).
+												if idx != applied_display || gen != applied_gen {
+													if let Some(r) = pulsar_capture::display_rect(idx) {
+														applied_display = idx;
+														applied_gen = gen;
+														d.set_monitor(Some(pulsar_core::input::MonitorRect {
 															mon_left: r.mon_left,
 															mon_top: r.mon_top,
 															mon_width: r.mon_width,
@@ -754,8 +877,10 @@ pub(crate) async fn go_online(
 															virt_top: r.virt_top,
 															virt_width: r.virt_width,
 															virt_height: r.virt_height,
-														}
-													}));
+														}));
+													}
+													// If display_rect returned None, we leave applied_display/applied_gen
+													// unchanged so the next PointerMotion retries the resolve.
 												}
 											}
 											d.pointer(x, y)
@@ -1074,6 +1199,7 @@ pub(crate) async fn go_online(
 				// release_mute/redirect are no-ops when already removed).
 				let _cleanup_guard = SessionCleanupGuard {
 					procs: procs.clone(),
+					fwd_slot: fwd_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_slot: cap_slot.clone(),
 					sid,

@@ -247,19 +247,13 @@ pub fn start_decode(sdp_path: &str) {
 			};
 			// A switch was still in progress when this pass ended without a pending reopen —
 			// i.e. the reopen's open/decoder validation failed (`break 'decode`) before any
-			// keyframe. Don't let the decode thread die with the spinner stuck on: clear the
-			// veil and retry THIS sdp so the switch can recover instead of killing video for
-			// the rest of the session (the renderer process must survive on RK3588).
+			// keyframe. Clear the spinner and fall through to the park loop below so the
+			// thread stays alive waiting for the next `request_reopen` (e.g. the user
+			// switches back to H.264/H.265 after an AV1 failure). The renderer process MUST
+			// survive on RK3588 — killing it corrupts the shared Mali GL state.
 			if next.is_none() && SWITCHING.load(Ordering::Relaxed) {
 				SWITCHING.store(false, Ordering::Relaxed);
 				SWITCH_DEADLINE_MS.store(0, Ordering::Relaxed);
-				if let Ok(s) = sdp.to_str() {
-					// `break 'decode` (open/validation failure) can return immediately, so
-					// back off before re-running the same sdp to avoid a hot reopen loop while
-					// the host is still bringing the new stream up.
-					std::thread::sleep(std::time::Duration::from_millis(500));
-					next = Some(s.to_string());
-				}
 			}
 			match next {
 				Some(p) => {
@@ -274,7 +268,37 @@ pub fn start_decode(sdp_path: &str) {
 						Err(_) => return,
 					}
 				}
-				None => return,
+				None => {
+					// No pending SDP and not a reopen — this was a plain EOF or a fatal open
+					// error on a non-switch path. Return and let the caller decide (STOP
+					// → process exit; otherwise the session is over).
+					// Exception: if STOP is NOT set, we may be on RK3588 where the process
+					// must persist. Park here waiting for the next request_reopen() instead
+					// of exiting, so a subsequent codec/monitor switch can revive video
+					// without a full disconnect/reconnect.
+					loop {
+						if STOP.load(Ordering::Relaxed) {
+							return;
+						}
+						std::thread::sleep(std::time::Duration::from_millis(200));
+						let mut pending = REOPEN_SDP.lock().unwrap();
+						if pending.is_some() {
+							// A new reopen arrived while we were parked — take it and
+							// re-enter the decode loop, exactly as the normal reopen path.
+							let p = pending.take().unwrap();
+							REOPEN.store(false, Ordering::Relaxed);
+							drop(pending);
+							eprintln!("pulsar-render: decode thread revived by new reopen request");
+							match CString::new(p) {
+								Ok(c) => {
+									sdp = c;
+									break; // back to the outer `loop { decode_once … }`
+								}
+								Err(_) => return,
+							}
+						}
+					}
+				}
 			}
 		}
 	});

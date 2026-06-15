@@ -123,7 +123,14 @@ export class SessionControls {
 	setMonitor = (idx: number) => {
 		this.streamDisplay = idx;
 		const playId = this.#in.playId();
-		if (playId >= 0) api.setPlayMonitor(playId, idx).catch(() => {});
+		if (playId < 0) return;
+		// A monitor switch forces the host to stop capture, rebuild the DXGI/VAAPI
+		// pipeline on the new output (possibly at a different resolution), and respawn
+		// the native renderer on the client — the same depth of rebuild as setRes.
+		// Without the switch window the stall detector trips after ~3 s of zero fps,
+		// flashing a false "stream stopped" error on a healthy session.
+		this.#beginSwitch(4000);
+		api.setPlayMonitor(playId, idx).catch(() => {});
 	};
 	setFramePacing = (on: boolean) => {
 		this.framePacing = on;

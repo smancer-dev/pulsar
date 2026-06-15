@@ -6,7 +6,7 @@
 	"err.message": "couldn't send the message",
 	"err.file": "couldn't send the file",
 	"err.session": "session not found",
-	"err.micRecorder": "no microphone recorder found (parecord/pw-record/arecord)",
+	"err.micRecorder": "no microphone recorder found",
 	"err.micOutput": "couldn't open the microphone output",
 	"err.videoRecv": "couldn't start the video receiver",
 	"err.spawn": "failed to start",
@@ -22,5 +22,6 @@
 	"err.relayResolve": "Could not resolve the relay server",
 	"err.badTarget": "Invalid ID or IP",
 	"host.gstFailed": "(gst failed to start)",
-	"host.ffmpegFailed": "(ffmpeg failed to start)"
+	"host.ffmpegFailed": "(ffmpeg failed to start)",
+	"err.identityChanged": "The identity behind this device has changed. Accept the new identity and reconnect?"
 }

@@ -49,4 +49,9 @@ pub(super) struct Inner {
 	/// in-band key exchange with its own key can't silently substitute itself. Absent
 	/// for the typed-IP-with-no-known-key path (in-band/TOFU). Removed once consumed.
 	pub(super) expected_pubkey: HashMap<SessionId, PublicKey>,
+	/// Set by the `PeerFound` / `HelloAck` handlers when the answering key differs from
+	/// the pin stored in `expected_pubkey` (TOFU mismatch). `connect_pinned` reads this
+	/// after its rendezvous timeout so it can return `IdentityChanged` instead of the
+	/// generic `TargetUnreachable` when the peer DID answer but with a rotated key.
+	pub(super) identity_mismatch: HashMap<SessionId, Arc<std::sync::atomic::AtomicBool>>,
 }

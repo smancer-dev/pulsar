@@ -143,7 +143,9 @@ pub(super) async fn hold_session(
 	/// Idle transfers older than this are swept from the map on the next FileBegin.
 	const F_XFER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 	/// Maximum concurrent in-flight transfers. If a new FileBegin would push us over
-	/// this limit, the oldest (by last_activity) entry is evicted first.
+	/// this limit we first evict a headless entry (`expected == None` — FileBegin was
+	/// lost, can never complete) and only fall back to oldest-by-last_activity among
+	/// active entries, to avoid silently killing a slow-but-legitimate transfer.
 	const F_MAX_CONCURRENT_XFERS: usize = 8;
 	struct FileReasm {
 		/// Set by FileBegin. `None` means chunks arrived before FileBegin (UDP
@@ -356,16 +358,19 @@ pub(super) async fn hold_session(
 								// dead reassemblers.
 								let now = std::time::Instant::now();
 								f_xfers.retain(|_, r| now.duration_since(r.last_activity) < F_XFER_IDLE_TIMEOUT);
-								// Hard cap: if still at the concurrent limit, drop the oldest
-								// entry — but only if it has no pre-buffered chunks for THIS id
-								// (don't evict the lazy entry we're about to complete).
+								// Hard cap: if still at the concurrent limit, evict the
+								// least-harmful entry — but not the lazy placeholder for THIS
+								// id (don't evict the entry we're about to complete).
+								// Prefer headless entries (expected == None; their FileBegin
+								// was lost so they can never complete) over active ones;
+								// tie-break by oldest last_activity.
 								if f_xfers.len() >= F_MAX_CONCURRENT_XFERS && !f_xfers.contains_key(&xfer) {
-									if let Some(oldest) = f_xfers
+									let victim = f_xfers
 										.iter()
-										.min_by_key(|(_, r)| r.last_activity)
-										.map(|(k, _)| *k)
-									{
-										f_xfers.remove(&oldest);
+										.min_by_key(|(_, r)| (r.expected.is_some() as u8, r.last_activity))
+										.map(|(k, _)| *k);
+									if let Some(vid) = victim {
+										f_xfers.remove(&vid);
 									}
 								}
 								// If early FileChunks created a lazy entry (UDP reorder), merge
@@ -375,6 +380,19 @@ pub(super) async fn hold_session(
 									r.name = crate::files::sanitize_filename(&name);
 									r.expected = Some(chunks);
 									r.last_activity = now;
+									// Prune any pre-buffered chunks whose index is now >= chunks.
+									// They arrived before FileBegin (expected was None) so the
+									// in_range guard passed them all through; now that we know the
+									// count, out-of-range indices must be removed so they cannot
+									// substitute for a genuinely lost in-range chunk.
+									r.chunks.retain(|&idx, data| {
+										if idx < chunks {
+											true
+										} else {
+											r.received = r.received.saturating_sub(data.len() as u64);
+											false
+										}
+									});
 								} else {
 									f_xfers.insert(xfer, FileReasm {
 										name: crate::files::sanitize_filename(&name),
@@ -391,12 +409,27 @@ pub(super) async fn hold_session(
 								// dropped. FileBegin will fill in `name` and `expected` when it
 								// arrives, keeping the already-stored chunks intact.
 								if !f_xfers.contains_key(&xfer) {
+									// Mirror the FileBegin guard: sweep idle entries and enforce
+									// the concurrent cap before inserting a new headless entry.
+									// Without this a chunk-only flood bypasses both the retain()
+									// and the cap, allowing unbounded HashMap growth.
+									let now = std::time::Instant::now();
+									f_xfers.retain(|_, r| now.duration_since(r.last_activity) < F_XFER_IDLE_TIMEOUT);
+									if f_xfers.len() >= F_MAX_CONCURRENT_XFERS {
+										let victim = f_xfers
+											.iter()
+											.min_by_key(|(_, r)| (r.expected.is_some() as u8, r.last_activity))
+											.map(|(k, _)| *k);
+										if let Some(vid) = victim {
+											f_xfers.remove(&vid);
+										}
+									}
 									f_xfers.insert(xfer, FileReasm {
 										name: String::new(),
 										expected: None,
 										chunks: std::collections::BTreeMap::new(),
 										received: 0,
-										last_activity: std::time::Instant::now(),
+										last_activity: now,
 									});
 								}
 								// Ignore an index past the announced count (bogus); a re-sent
@@ -441,7 +474,14 @@ pub(super) async fn hold_session(
 								// `expected == Some(0)` is a legitimate empty file. If
 								// `expected` is still `None`, FileBegin never arrived (lost
 								// or extremely delayed); treat that as failed.
-								let complete = r.expected.map_or(false, |e| r.chunks.len() == e as usize);
+								// Contiguous check: len == e is not sufficient — an
+								// out-of-range pre-Begin chunk (now pruned on FileBegin)
+								// could otherwise substitute for a lost in-range chunk.
+								let complete = r.expected.map_or(false, |e| {
+									r.chunks.len() == e as usize
+										&& (e == 0 || r.chunks.contains_key(&0) && r.chunks.contains_key(&(e - 1)))
+										&& (0..e).all(|i| r.chunks.contains_key(&i))
+								});
 								// Write chunks directly to disk without building a contiguous
 								// intermediate Vec — avoids ~2x peak memory at the MAX_XFER_BYTES
 								// ceiling (C24 fix).

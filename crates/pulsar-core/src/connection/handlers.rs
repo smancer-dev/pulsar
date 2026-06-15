@@ -136,6 +136,11 @@ impl Node {
 							session,
 							"PeerFound pubkey != expected (pinned) key — dropping (relay/MITM identity mismatch)"
 						);
+						// Signal the mismatch flag so `connect_pinned` can return
+						// `IdentityChanged` instead of the generic `TargetUnreachable`.
+						if let Some(flag) = g.identity_mismatch.get(&session) {
+							flag.store(true, std::sync::atomic::Ordering::Release);
+						}
 						return;
 					}
 				}
@@ -498,6 +503,11 @@ impl Node {
 								session,
 								"HelloAck pubkey != expected (pinned) key — dropping (possible MITM)"
 							);
+							// Signal the mismatch flag so the caller can return
+							// `IdentityChanged` instead of the generic `P2pFailed`.
+							if let Some(flag) = g.identity_mismatch.get(&session) {
+								flag.store(true, std::sync::atomic::Ordering::Release);
+							}
 							return;
 						}
 					}

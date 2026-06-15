@@ -6,7 +6,7 @@
 	"err.message": "mesaj gönderilemedi",
 	"err.file": "dosya gönderilemedi",
 	"err.session": "oturum bulunamadı",
-	"err.micRecorder": "mikrofon kaydedici bulunamadı (parecord/pw-record/arecord)",
+	"err.micRecorder": "mikrofon kaydedici bulunamadı",
 	"err.micOutput": "mikrofon çıkışı alınamadı",
 	"err.videoRecv": "video alıcı başlatılamadı",
 	"err.spawn": "başlatılamadı",
@@ -22,5 +22,6 @@
 	"err.relayResolve": "Relay sunucusu çözümlenemedi",
 	"err.badTarget": "Geçersiz kimlik veya IP",
 	"host.gstFailed": "(gst başlamadı)",
-	"host.ffmpegFailed": "(ffmpeg başlamadı)"
+	"host.ffmpegFailed": "(ffmpeg başlamadı)",
+	"err.identityChanged": "Bu cihazın kimliği değişti. Yeni kimliği kabul edip yeniden bağlanmak ister misiniz?"
 }

@@ -1155,11 +1155,14 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 				out
 			};
 			let hint_text = hint;
-			if state.stats_hud || state.overlay_btn || hint_text.is_some() || cursor_draw.is_some()
+			let switching = video::SWITCHING.load(Ordering::Relaxed);
+			if state.stats_hud || state.overlay_btn || hint_text.is_some() || cursor_draw.is_some() || switching
 			{
 				// Closed-state chrome: the mini stats HUD, the Parsec-style open button
 				// and/or the helper tooltip. Display-only on Linux (the container is input
 				// pass-through — the matching CLICK hotspot lives in the webview).
+				// Also paints the "Switching screen…" spinner when a monitor/codec switch
+				// is in progress, regardless of whether any other chrome is active.
 				let raw_input = egui::RawInput {
 					screen_rect: Some(egui::Rect::from_min_size(
 						egui::pos2(0.0, 0.0),
@@ -1169,6 +1172,9 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 					..Default::default()
 				};
 				let full = egui_ctx.run(raw_input, |ctx| {
+					if switching {
+						overlay::draw_switching(ctx);
+					}
 					if state.stats_hud {
 						overlay::draw_hud(ctx, &state);
 					}

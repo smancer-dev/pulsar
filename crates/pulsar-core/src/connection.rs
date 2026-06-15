@@ -58,6 +58,13 @@ pub enum ConnError {
 	TargetUnreachable(DeviceId),
 	#[error("direct P2P connection failed and relay fallback is disabled")]
 	P2pFailed,
+	/// The peer behind this id answered with a PUBLIC KEY that differs from the
+	/// previously-pinned one (TOFU known-peers.json). This is a recoverable condition
+	/// when the identity legitimately rotated (relay restarted + re-minted the id to a
+	/// different device/key); the caller should surface a prompt and, if the user
+	/// accepts, call `forget_peer` to clear the pin and retry.
+	#[error("identity behind {0} changed — the pinned key no longer matches")]
+	IdentityChanged(DeviceId),
 	#[error(transparent)]
 	Io(#[from] std::io::Error),
 }

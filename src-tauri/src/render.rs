@@ -177,6 +177,41 @@ pub(crate) fn destroy_native_container(app: &AppHandle, id: u64) {
 	});
 }
 
+/// Re-register a kept-alive container from `old_id` under `new_id` (resident-renderer reconnect:
+/// the container is kept alive at session end so the renderer's `--wid` parent X window stays
+/// valid; the new session's id takes ownership without creating a new GdkWindow).
+pub(crate) fn rename_native_container(app: &AppHandle, old_id: u64, new_id: u64) {
+	let _ = app.run_on_main_thread(move || {
+		NATIVE_CONTAINERS.with(|m| {
+			let win = m.borrow_mut().remove(&old_id);
+			if let Some(win) = win {
+				m.borrow_mut().insert(new_id, win);
+			}
+		});
+	});
+}
+
+/// Return the X11 XID of an existing container for `id` (so a reconnect with the resident
+/// renderer can discover the XID it was spawned with without creating a new GdkWindow).
+pub(crate) async fn container_xid(app: &AppHandle, id: u64) -> Option<u64> {
+	use gtk::glib::Cast;
+	let (tx, rx) = tokio::sync::oneshot::channel::<Option<u64>>();
+	let posted = app.run_on_main_thread(move || {
+		NATIVE_CONTAINERS.with(|m| {
+			let xid = m
+				.borrow()
+				.get(&id)
+				.and_then(|w| w.clone().downcast::<gdkx11::X11Window>().ok())
+				.map(|x| x.xid() as u64);
+			let _ = tx.send(xid);
+		});
+	});
+	if posted.is_err() {
+		return None;
+	}
+	rx.await.ok().flatten()
+}
+
 /// Build the moonlight-style single surface (Linux/X11): reparent the WebKitGTK webview on
 /// top of a `GtkGLArea` via a `GtkOverlay`, drive the GLArea with libmpv's render API
 /// (rkmpp), and make the webview transparent so the video shows through. MUST run on the

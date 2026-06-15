@@ -9,6 +9,7 @@
 //! APIs (`ChildStdout` + `Emitter`), so they compile on every platform.
 #![cfg(any(unix, target_os = "windows"))]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::AppHandle;
@@ -67,18 +68,35 @@ pub(crate) fn start_vidsink_stats(
 /// Read the single-surface `pulsar-render`'s stdout: BOTH the perf-HUD stats (`vidsink-fps <fps>
 /// <wxh> <mbit> <ms>`) → `play-vstats`, AND the overlay interactions (`ov set/end/close`) →
 /// frontend events. One process, one stdout, both line kinds.
-pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process::ChildStdout) {
+///
+/// `live_id`: when `Some`, the reader uses it to look up the CURRENT session id on every line —
+/// so a resident renderer (kept alive across reconnects) can have its stats attributed to the new
+/// session by storing the new id into the Arc before the next session starts. When `None`, `id`
+/// is fixed for the lifetime of the reader (freshly-spawned, single-session renderer).
+pub(crate) fn start_render_reader(
+	app: &AppHandle,
+	id: u64,
+	stdout: std::process::ChildStdout,
+	live_id: Option<Arc<AtomicU64>>,
+) {
 	use std::io::BufRead;
 	use tauri::Emitter;
 	let app = app.clone();
 	std::thread::spawn(move || {
 		let reader = std::io::BufReader::new(stdout);
 		// First REAL frames (fps/bitrate > 0) ⇒ the stream is actually up — the UI keeps
-		// its Connecting screen until this fires (one-shot per renderer process).
-		let mut ready_sent = false;
+		// its Connecting screen until this fires (one-shot per renderer process / session).
+		// Reset on each reconnect (live_id path): the resident renderer starts streaming fresh
+		// data, so play-ready must fire again for the new session id.
+		let mut ready_sent_for: Option<u64> = None;
 		let mut first_line_logged = false;
 		for line in reader.lines() {
 			let Ok(line) = line else { break };
+			// Resolve the current session id: either live (resident reconnect) or fixed.
+			let cur_id = live_id
+				.as_ref()
+				.map(|a| a.load(Ordering::Relaxed))
+				.unwrap_or(id);
 			if !first_line_logged {
 				first_line_logged = true;
 				tracing::info!(%line, "renderer first stdout line");
@@ -93,23 +111,24 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 				let _ = app.emit(
 					"play-vstats",
 					PlayVStats {
-						id,
+						id: cur_id,
 						fps,
 						drops: 0,
 						mbps,
 						decode_ms: ms,
 					},
 				);
-				if !ready_sent && (fps > 0.0 || mbps > 0.0) {
-					ready_sent = true;
-					let _ = app.emit("play-ready", id);
+				// Emit play-ready once per session id (reset when cur_id changes).
+				if ready_sent_for != Some(cur_id) && (fps > 0.0 || mbps > 0.0) {
+					ready_sent_for = Some(cur_id);
+					let _ = app.emit("play-ready", cur_id);
 				}
 			} else if let Some(rest) = line.strip_prefix("vidsink-dims ") {
 				// The STREAM's pixel size ("<w>x<h>", first frame / live res switch) — the
 				// frontend sizes the windowed session to the host's aspect ratio from this.
 				if let Some((w, h)) = rest.trim().split_once('x') {
 					if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
-						let _ = app.emit("play-dims", (id, w, h));
+						let _ = app.emit("play-dims", (cur_id, w, h));
 					}
 				}
 			} else if let Some(rest) = line.strip_prefix("vidsink-dec ") {
@@ -118,7 +137,7 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 				let mut it = rest.split_whitespace();
 				if let Some(name) = it.next() {
 					let hw = it.next().unwrap_or("na").to_string();
-					let _ = app.emit("play-decoder", (id, name.to_string(), hw));
+					let _ = app.emit("play-decoder", (cur_id, name.to_string(), hw));
 				}
 			} else {
 				let mut it = line.split_whitespace();
@@ -127,14 +146,14 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 						if let (Some(field), Some(val)) = (it.next(), it.next()) {
 							tracing::info!(field, val, "overlay-cmd from renderer");
 							let _ =
-								app.emit("overlay-cmd", (id, field.to_string(), val.to_string()));
+								app.emit("overlay-cmd", (cur_id, field.to_string(), val.to_string()));
 						}
 					}
 					(Some("ov"), Some("end")) => {
-						let _ = app.emit("overlay-end", id);
+						let _ = app.emit("overlay-end", cur_id);
 					}
 					(Some("ov"), Some("close")) => {
-						let _ = app.emit("overlay-close", id);
+						let _ = app.emit("overlay-close", cur_id);
 					}
 					// The renderer's own overlay-open button was clicked (platforms where
 					// the closed-state renderer receives pointer events).
@@ -147,20 +166,20 @@ pub(crate) fn start_render_reader(app: &AppHandle, id: u64, stdout: std::process
 					(Some("ov"), Some("chat")) => {
 						let text = line.splitn(3, ' ').nth(2).unwrap_or("").trim();
 						if !text.is_empty() {
-							let _ = app.emit("overlay-chat", (id, text.to_string()));
+							let _ = app.emit("overlay-chat", (cur_id, text.to_string()));
 						}
 					}
 					// The overlay's Files box: open the per-session file-manager window
 					// (the frontend supplies the peer label and invokes the command).
 					(Some("ov"), Some("files")) => {
-						let _ = app.emit("overlay-files", id);
+						let _ = app.emit("overlay-files", cur_id);
 					}
 					// Native Files (remote pane): list / download / upload requests.
 					(Some("ov"), Some(op @ ("fsls" | "fsget" | "fssend"))) => {
 						let path = line.splitn(3, ' ').nth(2).unwrap_or("").trim();
 						// fsls "" = the host's HOME — an empty path is valid there.
 						if op == "fsls" || !path.is_empty() {
-							let _ = app.emit("overlay-fs", (id, op.to_string(), path.to_string()));
+							let _ = app.emit("overlay-fs", (cur_id, op.to_string(), path.to_string()));
 						}
 					}
 					// Standalone render window (no --wid embed, e.g. Wayland client): it is a

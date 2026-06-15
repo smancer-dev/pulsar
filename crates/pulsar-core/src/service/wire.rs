@@ -218,16 +218,30 @@ pub struct FsEntry {
 // from every method except unit_variant().  So we cannot use the standard
 // EnumAccess / VariantAccess visitor approach to handle both forms in one
 // visitor -- the unit and struct paths are driven by serde_json before we can
-// inspect them.  Instead we deserialize into a serde_json::Value first (cheap
-// for these small control messages), detect the FileEnd shape, patch it to the
-// struct form, then deserialize the DataMsgWire from the Value.  All other
-// variants are handled by the derived Deserialize on DataMsgWire which is
-// identical to DataMsg for those arms.
+// inspect them.  Instead the DataMsg::Deserialize impl captures the raw JSON
+// token cheaply via serde_json::value::RawValue, checks whether it is the
+// bare string "FileEnd", and short-circuits that to DataMsg::FileEnd{id:0}
+// directly.  For every other variant it forwards to DataMsgWire which is
+// deserialized in a single pass (no intermediate Value, no per-byte allocation
+// for Vec<u8> fields — critical for the hot mic-Audio path at ~50 fps).
 
 /// Internal shadow used only for deserialization.  Identical to `DataMsg`
 /// except `FileEnd` is also a struct variant with `id` defaulting to 0
-/// (no special compat needed here -- compat is handled at the Value level
+/// (no special compat needed here -- compat is handled in DataMsg::Deserialize
 /// before the shadow enum is deserialized).
+///
+/// # IMPORTANT — keep in sync with [`DataMsg`]
+///
+/// This enum and the [`From`]`<DataMsgWire> for DataMsg` impl below are the
+/// ONLY place that governs which variants are actually decodable at runtime.
+/// They are NOT checked by the compiler against [`DataMsg`]: adding a new
+/// [`DataMsg`] variant without mirroring it here compiles cleanly but
+/// silently drops that variant on every receiver (the `serde_json::from_str`
+/// below returns an error which `dec()` swallows as `None`).
+///
+/// After adding a variant here, also add a case to the
+/// `data_msg_all_variants_roundtrip` test in `wire.rs` so CI catches any
+/// future drift.
 #[derive(Deserialize)]
 enum DataMsgWire {
 	Clipboard(String),
@@ -302,28 +316,11 @@ impl From<DataMsgWire> for DataMsg {
 	}
 }
 
-/// Normalize the JSON representation of a `DataMsg` so that the legacy unit
-/// `"FileEnd"` form and the new struct `{"FileEnd":{"id":N}}` form both
-/// deserialize correctly.
-///
-/// serde_json's `UnitVariantAccess` (bare-string variant) returns an error from
-/// every `VariantAccess` method except `unit_variant()`.  That means a custom
-/// visitor cannot transparently handle both the unit and struct shapes for the
-/// same variant name — the access type is determined by serde_json before the
-/// visitor sees it.
-///
-/// We therefore normalize at the `Value` level: if the incoming Value is the
-/// string `"FileEnd"`, we replace it with `{"FileEnd":{}}` so the derived
-/// `DataMsgWire` deserializer always sees the struct form and the `#[serde(default)]`
-/// on `id` fills in 0.
-fn normalize_file_end(v: serde_json::Value) -> serde_json::Value {
-	if v == serde_json::Value::String("FileEnd".to_owned()) {
-		// Legacy unit form: patch to struct form with id=0 so DataMsgWire's
-		// derived Deserialize can decode it.
-		serde_json::json!({"FileEnd": {}})
-	} else {
-		v
-	}
+/// Return true if the raw JSON token is the bare string `"FileEnd"` — the
+/// legacy unit-variant form emitted by pre-patch peers.  Checked on the raw
+/// JSON bytes so no allocation is needed.
+fn is_legacy_file_end(raw: &str) -> bool {
+	raw == "\"FileEnd\""
 }
 
 /// A bidirectional data-channel message exchanged over a live session for the
@@ -334,10 +331,21 @@ fn normalize_file_end(v: serde_json::Value) -> serde_json::Value {
 /// silently corrupting.
 ///
 /// `Serialize` is derived normally (produces the struct-variant form for
-/// `FileEnd`).  `Deserialize` is implemented manually: it first deserializes
-/// into a `serde_json::Value`, normalizes the legacy unit-variant `"FileEnd"`
-/// to the struct form `{"FileEnd":{}}`, then forwards to the `DataMsgWire`
-/// derived impl which handles everything uniformly.
+/// `FileEnd`).  `Deserialize` is implemented manually: it captures the raw JSON
+/// token via `serde_json::value::RawValue` (zero allocation), detects the legacy
+/// bare-string `"FileEnd"` unit-variant form, and for all other variants forwards
+/// directly to the derived `DataMsgWire` deserializer (one parse pass, no
+/// `Value` intermediate and no per-byte allocation for `Vec<u8>` fields).
+///
+/// # IMPORTANT — shadow enum must stay in sync
+///
+/// Deserialization goes through the **private [`DataMsgWire`] shadow enum**
+/// (defined just above in `wire.rs`) plus a hand-written
+/// [`From`]`<DataMsgWire>` conversion.  Adding a new variant here WITHOUT also
+/// adding it to `DataMsgWire` + its `From` impl compiles cleanly but **silently
+/// drops** that variant at runtime (the receiver's `dec()` returns `None`).
+/// Guard against this by adding the new variant to the
+/// `data_msg_all_variants_roundtrip` test — CI will then catch any future drift.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum DataMsg {
 	/// Clipboard text pushed to the peer (peer sets its system clipboard).
@@ -445,14 +453,27 @@ pub enum DataMsg {
 
 impl<'de> Deserialize<'de> for DataMsg {
 	fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-		// Deserialize to a generic Value first so we can normalize the legacy
-		// `"FileEnd"` unit-variant form before the typed DataMsgWire deserializer
-		// sees it.  For all other variants this is a trivial pass-through with
-		// negligible overhead (DataMsg packets are tiny control messages).
-		let v = serde_json::Value::deserialize(de)
+		// Capture the raw JSON token without materialising a serde_json::Value
+		// tree.  This avoids the hot-path overhead of the previous approach, which
+		// decoded every DataMsg through Value::deserialize — for byte-array
+		// variants (Audio, Avatar, FileChunk.data, CursorShape.rgba_png) that
+		// allocates one Value::Number per byte (~3 840 boxed numbers per 20 ms mic
+		// frame at 50 fps, megabytes/sec of transient allocation on the host's
+		// single session-driving task).
+		//
+		// We only need the Value round-trip to handle the ONE legacy compat case:
+		// a pre-patch peer that sent `"FileEnd"` as a bare unit-variant string
+		// (serde_json cannot decode a bare string into a struct variant).  We
+		// detect that case cheaply by comparing the raw token, short-circuit it,
+		// and for every other variant forward directly to the derived DataMsgWire
+		// deserializer which parses Vec<u8> in one pass (no intermediate Value).
+		let raw = Box::<serde_json::value::RawValue>::deserialize(de)
 			.map_err(serde::de::Error::custom)?;
-		let v = normalize_file_end(v);
-		serde_json::from_value::<DataMsgWire>(v)
+		if is_legacy_file_end(raw.get()) {
+			// Legacy unit form `"FileEnd"` from a pre-patch peer: treat as id=0.
+			return Ok(DataMsg::FileEnd { id: 0 });
+		}
+		serde_json::from_str::<DataMsgWire>(raw.get())
 			.map(DataMsg::from)
 			.map_err(serde::de::Error::custom)
 	}
@@ -713,5 +734,64 @@ mod tests {
 			QualityPref::Balanced
 		);
 		assert_eq!(QualityPref::default(), QualityPref::Balanced);
+	}
+
+	/// Guard against the DataMsgWire shadow-enum drift trap (bug C21).
+	///
+	/// Every `DataMsg` variant must survive a serialize→deserialize roundtrip
+	/// through the custom `Deserialize` impl (which delegates to `DataMsgWire`).
+	/// If a variant is present in `DataMsg` but missing from `DataMsgWire` / its
+	/// `From` impl, the `from_str` inside `DataMsg::deserialize` returns an error
+	/// and the assertion here panics — catching the omission in CI before it
+	/// silently drops messages at runtime.
+	///
+	/// When you add a new `DataMsg` variant you MUST add a corresponding entry to
+	/// this test (and mirror the variant in `DataMsgWire` + its `From` impl).
+	#[test]
+	fn data_msg_all_variants_roundtrip() {
+		let cases: &[DataMsg] = &[
+			DataMsg::Clipboard("hello".into()),
+			DataMsg::Chat("world".into()),
+			DataMsg::FileBegin { id: 1, name: "foo.bin".into(), size: 1024, chunks: 4 },
+			DataMsg::FileChunk { id: 1, index: 2, data: vec![0xDE, 0xAD, 0xBE, 0xEF] },
+			DataMsg::FileEnd { id: 1 },
+			DataMsg::Audio(vec![0x01, 0x02, 0x03]),
+			DataMsg::AudioEnd,
+			DataMsg::Stats("NVENC · 1080p · 60fps".into()),
+			DataMsg::ReverseRequest("123456789".into()),
+			DataMsg::DisplayRotation(180),
+			DataMsg::MediaNack(vec![1, 2, 65535]),
+			DataMsg::Avatar(vec![0x89, b'P', b'N', b'G']),
+			DataMsg::FsList { path: "Belgeler".into() },
+			DataMsg::FsEntries {
+				path: "Belgeler".into(),
+				entries: vec![FsEntry { name: "a.txt".into(), dir: false, size: 42 }],
+			},
+			DataMsg::FsGet { path: "Belgeler/a.txt".into() },
+			DataMsg::PeerName("Ahmet".into()),
+			DataMsg::CursorPos { x: 0.5, y: 0.25 },
+			DataMsg::CursorShape {
+				w: 32,
+				h: 32,
+				hot_x: 1,
+				hot_y: 1,
+				rgba_png: vec![0x89, b'P', b'N', b'G'],
+			},
+			DataMsg::CursorHidden,
+		];
+
+		for msg in cases {
+			let json = serde_json::to_string(msg)
+				.unwrap_or_else(|e| panic!("DataMsg::{msg:?} failed to serialize: {e}"));
+			let back: DataMsg = serde_json::from_str(&json).unwrap_or_else(|e| {
+				panic!(
+					"DataMsg::{msg:?} failed to deserialize (missing from DataMsgWire?): {e}\n  json={json}"
+				)
+			});
+			assert_eq!(
+				&back, msg,
+				"DataMsg::{msg:?} roundtrip mismatch (From<DataMsgWire> bug?)"
+			);
+		}
 	}
 }

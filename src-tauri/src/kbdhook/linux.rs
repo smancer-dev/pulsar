@@ -133,18 +133,20 @@ fn build_xkb_state() -> Option<xkb::State> {
 
 /// Forward one input event to the session.
 ///
-/// The 256-slot input channel is drained one-await-per-event by the hold loop, so a
-/// congested link can fill it. A bare `try_send` would then DROP the just-arrived
-/// event — fatal if it's a button/key UP (a stuck key/button on the host that never
-/// recovers mid-session). So coalescible motion may drop, but press/release EDGES
-/// `blocking_send` to wait for a slot. This runs on the plain evdev capture thread
-/// (`std::thread::spawn`), never a tokio worker, so blocking here is safe.
+/// Always uses `try_send` — NEVER `blocking_send`. This function is called from
+/// the evdev capture thread while the devices may be EVIOCGRAB-held. A
+/// `blocking_send` on a full channel would stall the capture thread while it holds
+/// the grab, making the local keyboard+mouse appear dead until the channel drains
+/// (the C5 bug). The teardown path already uses the same best-effort approach with
+/// the explicit note that the host's `DesktopInput` Drop flushes held state on its
+/// side, making a dropped UP safe: the host never stays stuck. Motion was already
+/// try_send (coalescible), and key/button edges are equally safe to drop here
+/// because every disengage edge sends a kernel-sourced flush (flush_held via
+/// EVIOCGKEY) that covers the real held state, and the host releases everything on
+/// its own teardown. Blocking the grab for an UP that the host will release anyway
+/// is strictly worse than a dropped try_send.
 fn fwd(tx: &Sender<InputEvent>, ev: InputEvent) {
-	if crate::util::is_coalescible_input(&ev) {
-		let _ = tx.try_send(ev);
-	} else {
-		let _ = tx.blocking_send(ev);
-	}
+	let _ = tx.try_send(ev);
 }
 
 // evdev keycodes for the leave combo + the modifiers it needs.
@@ -500,12 +502,24 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 				|| !was_engaged;
 			if want_suspend != applied_suspend {
 				if want_suspend {
+					// Mirror the teardown fix (C25): ungrab the devices FIRST, THEN flush.
+					// Flushing before ungrab meant flush_held→fwd→try_send could theoretically
+					// stall (if it were blocking_send) while the grab was still held — the C5
+					// bug. With fwd() now always try_send the order matters less for correctness,
+					// but ungrabbing first is the right safety model: the local OS regains input
+					// the instant we release, before any channel send. EVIOCGKEY (get_key_state)
+					// works on open fds regardless of grab state, so flush_held can still read the
+					// kernel's authoritative held-key set after ungrab.
+					for d in grabbed.iter_mut() {
+						let _ = d.ungrab();
+					}
 					// Release EVERYTHING the host still holds for this disengage edge — kernel-sourced
 					// (flush_held: EVIOCGKEY) so it covers modifiers (incl. Win), Char-forwarded keys
 					// AND any held letter, not just a fixed modifier list. The old hand-written list
 					// omitted Win(125/126) + letters, so an overlay/focus-loss/auto-suspend while one
-					// was held latched it on the host for the rest of the session. Runs BEFORE the
-					// ungrab below (fds still grabbed -> get_key_state valid); also drains held_buttons.
+					// was held latched it on the host for the rest of the session. Also drains
+					// held_buttons. get_key_state is valid on ungrabbed-but-open fds (same fds,
+					// just without EVIOCGRAB) — verified by the chord_mods comment above.
 					flush_held(&tx, &grabbed, &mut held_buttons);
 					// And any GENUINELY-held mouse button (a disengage mid-drag otherwise left the
 					// host's uinput holding BTN_LEFT — a stuck drag). Only the buttons actually down,
@@ -528,9 +542,6 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 					shift = false;
 					lalt = false;
 					char_keys.clear();
-					for d in grabbed.iter_mut() {
-						let _ = d.ungrab();
-					}
 				} else {
 					for d in grabbed.iter_mut() {
 						let _ = d.grab();
