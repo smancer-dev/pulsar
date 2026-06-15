@@ -85,6 +85,21 @@ impl Session {
 			.get(&self.id)
 			.map(|s| s.peer_addr)
 	}
+
+	/// The peer's static X25519 public key that this session's E2E key was derived
+	/// against. The caller can pin it to the requested id on first connect (TOFU)
+	/// and pass it back as `connect_pinned`'s `expected` on later connects so a
+	/// malicious relay can't silently substitute a different peer behind a known
+	/// id. `None` only if the session state was already torn down.
+	pub async fn peer_pubkey(&self) -> Option<PublicKey> {
+		self.node
+			.inner
+			.lock()
+			.await
+			.sessions
+			.get(&self.id)
+			.map(|s| s.peer_pubkey)
+	}
 }
 
 /// A cloneable, send-only handle to an established session (see [`Session::sender`]).

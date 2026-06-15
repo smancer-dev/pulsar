@@ -132,8 +132,19 @@ fn build_xkb_state() -> Option<xkb::State> {
 }
 
 /// Forward one input event to the session.
+///
+/// The 256-slot input channel is drained one-await-per-event by the hold loop, so a
+/// congested link can fill it. A bare `try_send` would then DROP the just-arrived
+/// event — fatal if it's a button/key UP (a stuck key/button on the host that never
+/// recovers mid-session). So coalescible motion may drop, but press/release EDGES
+/// `blocking_send` to wait for a slot. This runs on the plain evdev capture thread
+/// (`std::thread::spawn`), never a tokio worker, so blocking here is safe.
 fn fwd(tx: &Sender<InputEvent>, ev: InputEvent) {
-	let _ = tx.try_send(ev);
+	if crate::util::is_coalescible_input(&ev) {
+		let _ = tx.try_send(ev);
+	} else {
+		let _ = tx.blocking_send(ev);
+	}
 }
 
 // evdev keycodes for the leave combo + the modifiers it needs.
@@ -233,13 +244,13 @@ fn flush_held(
 				// 272..=274 = BTN_LEFT/RIGHT/MIDDLE — released via held_buttons below, never here
 				// (querying them would re-introduce the phantom right/middle-click).
 				if !(272..=274).contains(&code) && released.insert(code) {
-					let _ = tx.try_send(InputEvent::Key { code: code as u32, down: false });
+					fwd(tx, InputEvent::Key { code: code as u32, down: false });
 				}
 			}
 		}
 	}
 	for button in held_buttons.drain() {
-		let _ = tx.try_send(InputEvent::PointerButton { button, down: false });
+		fwd(tx, InputEvent::PointerButton { button, down: false });
 	}
 }
 
@@ -500,10 +511,13 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 					// host's uinput holding BTN_LEFT — a stuck drag). Only the buttons actually down,
 					// NOT a blind 0..3 (which released RIGHT+MIDDLE → a phantom context-menu click).
 					for button in held_buttons.drain() {
-						let _ = tx.try_send(InputEvent::PointerButton {
-							button,
-							down: false,
-						});
+						fwd(
+							&tx,
+							InputEvent::PointerButton {
+								button,
+								down: false,
+							},
+						);
 					}
 					// Drop the tracked modifier state too: after the ungrab the physical key-UPs go to
 					// the LOCAL OS, never to fetch_events, so a held modifier would stay latched here.
@@ -726,7 +740,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										} else {
 											held_buttons.remove(&button);
 										}
-										let _ = tx.try_send(InputEvent::PointerButton { button, down });
+										fwd(&tx, InputEvent::PointerButton { button, down });
 									}
 								}
 								_ if !down => {
@@ -812,17 +826,22 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 				}
 			}
 		}
-		// Thread exit (GEN bump / disable — session end, host disconnect, tab close). Before
-		// dropping the grabs, RELEASE anything still held so the HOST doesn't end up with a
-		// stuck key/button (a session that ends abnormally — not via the leave combo, which
-		// already flushes through the want_suspend path — otherwise left modifiers/letters or
-		// a mid-drag BTN_LEFT pressed on the host forever). Windows disable() flushes via
-		// flush_held(); this matches that guarantee on Linux. We were only forwarding while
-		// engaged + not suspended, so only flush then — otherwise nothing was sent down.
+		// Thread exit (GEN bump / disable — session end, host disconnect, tab close).
+		// Priority order:
+		//   1. Snapshot any still-held keys from the kernel (needs fds open for EVIOCGKEY).
+		//   2. Drop `grabbed` IMMEDIATELY so every EVIOCGRAB is released — the local
+		//      keyboard/mouse is returned to the OS before any channel send.  If we flushed
+		//      first with blocking_send (via fwd) and the hold_session consumer was stalled,
+		//      we'd hold the grab for as long as the send blocked — the user's local input
+		//      would appear dead after a disconnect (the C25 bug).
+		//   3. Best-effort try_send the collected UPs to the host.  The host also releases
+		//      everything on its own DesktopInput Drop, so it's safe to drop these events
+		//      rather than block the grab release.
+		// We were only forwarding while engaged + not suspended, so only flush then —
+		// otherwise nothing was sent down.
 		if was_engaged && !applied_suspend {
-			// Query the kernel for every key currently down on each grabbed device (same
-			// authoritative EVIOCGKEY path chord_mods uses) and send a key-UP for each — this
-			// catches modifiers AND letters regardless of whether we tracked their press.
+			// Step 1 — collect held keys while fds are still valid.
+			let mut pending_keys: Vec<InputEvent> = Vec::new();
 			let mut released: std::collections::HashSet<u16> = std::collections::HashSet::new();
 			for d in grabbed.iter() {
 				if let Ok(st) = d.get_key_state() {
@@ -831,24 +850,28 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 						// Mouse buttons (272..=274) are flushed explicitly below as
 						// PointerButton; everything else is a keyboard key.
 						if !(272..=274).contains(&code) && released.insert(code) {
-							let _ = tx.try_send(InputEvent::Key {
-								code: code as u32,
-								down: false,
-							});
+							pending_keys.push(InputEvent::Key { code: code as u32, down: false });
 						}
 					}
 				}
 			}
-			// And any held mouse buttons (a disengage mid-drag otherwise left the host's
-			// uinput holding BTN_LEFT) — same set the suspend path releases.
-			for button in 0..3u8 {
-				let _ = tx.try_send(InputEvent::PointerButton {
-					button,
-					down: false,
-				});
+			// Drain held_buttons now too — the Vec owns the data independently of `grabbed`.
+			let pending_buttons: Vec<u8> = held_buttons.drain().collect();
+
+			// Step 2 — release the grab so the local OS regains input NOW.
+			drop(grabbed);
+
+			// Step 3 — best-effort flush to the host (non-blocking; a stalled consumer
+			// may drop some events, but the host's own teardown handles it).
+			for ev in pending_keys {
+				let _ = tx.try_send(ev);
+			}
+			for button in pending_buttons {
+				let _ = tx.try_send(InputEvent::PointerButton { button, down: false });
 			}
 		}
-		// `grabbed` drops here → fds close → every EVIOCGRAB is released.
+		// `grabbed` already dropped above (or drops here on the non-flush path) →
+		// fds close → every EVIOCGRAB is released.
 	});
 }
 

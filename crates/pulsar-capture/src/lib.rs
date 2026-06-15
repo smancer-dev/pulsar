@@ -66,6 +66,19 @@ pub struct CaptureHandle {
 	/// Stage-3 adaptive bitrate: the host controller writes the target kbps here; the capture
 	/// thread reads it each tick and applies it live via `Encoder::reconfigure_bitrate` on change.
 	requested_kbps: std::sync::Arc<std::sync::atomic::AtomicU32>,
+	/// Live MONITOR switch: the host writes the desired output index here; the capture thread
+	/// polls it each tick and, on change, rebuilds capture+encode on the new monitor in THIS
+	/// thread (the new monitor may be on a different GPU — see start_capture_encode), instead of
+	/// the host tearing the whole pipeline + audio down and re-spawning a fresh process-side
+	/// thread. `u32::MAX` = no pending request (the sentinel).
+	requested_output: std::sync::Arc<std::sync::atomic::AtomicU32>,
+	/// The output index the capture thread is ACTUALLY streaming right now, written by the thread
+	/// after each successful build (including reverts). The host reads this to know the confirmed
+	/// capture output, which may differ from the REQUESTED output when a switch-build failed and
+	/// the thread reverted to `prev_good_output`. Used by the host to keep `cur_display`
+	/// (input-mapping) and `last_native_req.display_idx` (fast-path baseline) in sync with
+	/// reality so input lands on the right monitor and a switch retry is not a silent no-op.
+	current_output: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl CaptureHandle {
@@ -74,6 +87,26 @@ impl CaptureHandle {
 	pub fn set_bitrate(&self, kbps: u32) {
 		self.requested_kbps
 			.store(kbps.max(1), std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// Switch which host monitor is captured, live (session-menu picker). Lock-free: stores the
+	/// output index the capture thread picks up next tick and rebuilds capture+encode on it in
+	/// the SAME thread (correct across GPUs — see the field doc) — no new OS thread, no init-
+	/// handshake wait, and the host leaves audio + forwarders running. No-op if it equals the
+	/// current output.
+	pub fn switch_output(&self, idx: u32) {
+		self.requested_output
+			.store(idx, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// The output index the capture thread is ACTUALLY streaming right now (written by the thread
+	/// after every confirmed build, including reverts). May lag the last `switch_output` request
+	/// by one build cycle while the thread is rebuilding. The host uses this to keep its
+	/// input-mapping (`cur_display`) and fast-path baseline (`last_native_req.display_idx`) in
+	/// sync with the actual streamed monitor rather than the optimistically-requested one.
+	pub fn current_output(&self) -> u32 {
+		self.current_output
+			.load(std::sync::atomic::Ordering::SeqCst)
 	}
 
 	/// Signal the thread, join it (releases the NVENC session + DXGI duplication), return.
@@ -139,6 +172,10 @@ mod frame {
 		/// `false` on the timeout-reuse path (the desktop was static — we still re-encode the
 		/// last surface so the client sees a steady fps and NVENC emits a tiny P-frame).
 		pub is_new: bool,
+		/// Set on the first frame after a SAME-resolution duplication reinit (host Hz change /
+		/// transient ACCESS_LOST). The encoder forces an IDR (+ SPS/PPS) for this frame so a
+		/// client mid-GOP re-syncs immediately instead of freezing until the next safety GOP.
+		pub force_idr: bool,
 	}
 }
 
@@ -161,6 +198,15 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 	// capture thread polls each tick, applying changes live via Encoder::reconfigure_bitrate.
 	let requested_kbps = Arc::new(AtomicU32::new(cfg.bitrate_kbps.max(1)));
 	let req_kbps_t = requested_kbps.clone();
+	// Live monitor switch: u32::MAX = no pending request. The host writes a new output index
+	// via CaptureHandle::switch_output; the capture thread re-points DXGI in place (see run).
+	let requested_output = Arc::new(AtomicU32::new(u32::MAX));
+	let req_out_t = requested_output.clone();
+	// Actual output the thread is streaming — written after each confirmed build (including
+	// reverts). The host reads this via CaptureHandle::current_output() to reconcile its
+	// input-mapping and fast-path baseline after a failed switch revert.
+	let current_output = Arc::new(AtomicU32::new(cfg.output_idx));
+	let cur_out_t = current_output.clone();
 
 	let thread = std::thread::Builder::new()
 		.name("pulsar-capture".into())
@@ -171,82 +217,183 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 			let _prio = ThreadPriorityGuard::time_critical();
 			let _wake = DisplayKeepAlive::engage();
 
-			// 2. Build capture (DXGI). May fail: no display owner / E_ACCESSDENIED on a
-			//    locked or secure desktop / session-0. On failure we report and bail so the
-			//    host falls back to ffmpeg.
-			let mut cap = match dxgi::CaptureDevice::create(cfg.output_idx) {
-				Ok(c) => c,
-				Err(e) => {
-					let _ = init_tx.send(Err(format!("dxgi init: {e:?}")));
-					return;
-				}
-			};
-			let (w, h) = cap.target_size(cfg.width, cfg.height);
-			// Native (full) capture size — the encoder sizes the cross-adapter bridge +
-			// VideoProcessor input to this, scaling native→encode in the Blt when they differ.
-			let (cap_w, cap_h) = cap.native_size();
-			let rotation = cap.rotation_deg();
-
-			// 3. Build the encoder on the SAME device + immediate context as capture
-			//    (Strategy A: the NVENC session is opened on this D3D11 device; the
-			//    driver does any cross-adapter copy internally on hybrid GPUs).
-			let mut enc = match encode::Encoder::new(
-				&cap.device,
-				&cap.context,
-				&encode::EncParams {
-					width: w,
-					height: h,
-					capture_width: cap_w,
-					capture_height: cap_h,
-					fps: cfg.fps.max(1),
-					bitrate_kbps: cfg.bitrate_kbps,
-					dest: cfg.dest.clone(),
-					codec: cfg.codec,
-					low_latency: cfg.low_latency,
-					rotation,
-				},
-			) {
-				Ok(e) => e,
-				Err(e) => {
-					let _ = init_tx.send(Err(format!("nvenc init: {e}")));
-					return;
-				}
-			};
-
-			// 4. Init OK — unblock the caller. From here, failures only reinit (handled in
-			//    dxgi::run) or exit the thread cleanly; the next StreamReq re-runs the branch.
-			let _ = init_tx.send(Ok(()));
-
-			// 5. Pacing loop (Sunshine technique). `on_frame` is invoked once per paced client
-			//    tick with the CURRENT pool texture (fresh capture OR reused last frame). The
-			//    closure converts BGRA→NV12, encodes via NVENC, and HANDS the Annex-B access
-			//    unit to the RTP sender thread (`RtpEgress`) — the network send no longer runs
-			//    inline here, so capture/encode never blocks on the socket.
+			// Live MONITOR switch is handled by REBUILDING capture+encode on the new output in
+			// THIS thread (the outer loop below), NOT by mutating the live device in place. A
+			// monitor can sit on a DIFFERENT GPU (MUX laptops: each panel on the iGPU or the
+			// dGPU), and a D3D11 device can only DuplicateOutput a monitor on its OWN adapter —
+			// so `CaptureDevice::create` must re-pick the adapter per output. Rebuilding here
+			// still skips everything the host-side full restart pays (new OS thread, the init
+			// handshake wait, the audio-pipeline restart, the ffmpeg encoder re-probe), so a
+			// switch is much faster than a fresh `start_capture_encode` and works across GPUs.
+			let mut output_idx = cfg.output_idx;
+			let mut announced = false;
+			// pts is monotonic across switches (the rebuilt encoder forces an IDR on its first
+			// frame, so the client re-syncs regardless); last_kbps is re-seeded per build.
 			let mut pts: i64 = 0;
-			let mut last_kbps = cfg.bitrate_kbps.max(1);
-			cap.run(cfg.fps.max(1), cfg.draw_mouse, &stop_t, |frame: &Frame| {
-				// Stage-3 adaptive bitrate: apply any pending target BEFORE encoding this
-				// tick — a cheap live nvEncReconfigureEncoder (no re-init). Lock-free poll;
-				// on a reconfigure error keep the old bitrate so the stream never stalls.
-				let want = req_kbps_t.load(Ordering::Relaxed);
-				if want != last_kbps {
-					match enc.reconfigure_bitrate(want) {
-						Ok(()) => last_kbps = want,
-						Err(e) => dbg_capture(&format!("reconfigure {want} kbps: {e}")),
+			let mut build_no: u32 = 0;
+			// The last output index that successfully built+streamed — a failed SWITCH build
+			// reverts here so the stream survives (instead of the thread dying → packet drought).
+			let mut prev_good_output = cfg.output_idx;
+			loop {
+				build_no += 1;
+				let build_t0 = std::time::Instant::now();
+				cap_log(&format!("=== build #{build_no} output={output_idx} ==="));
+				// 2. Build capture (DXGI) on the CURRENT output. `create` enumerates the adapter
+				//    that owns this monitor and makes the D3D11 device there — so a cross-GPU
+				//    switch lands on the right adapter. May fail (no display owner / locked
+				//    desktop / session-0). On the FIRST build a failure is reported so the host
+				//    falls back to ffmpeg; on a later (switch) build it tears the stream down (the
+				//    host can re-request).
+				// `announced` is the "already streaming" flag — true ⇒ this is an in-session SWITCH
+				// (or revert) build, so use the SHORT transient-retry budget: a switch to a
+				// fullscreen monitor must not freeze video for ~5 s (and the revert would pay it
+				// again). The initial build (announced=false) keeps the long budget. (B30)
+				let mut cap = match dxgi::CaptureDevice::create(output_idx, stop_t.clone(), announced) {
+					Ok(c) => c,
+					Err(e) => {
+						if !announced {
+							cap_log(&format!("BUILD #{build_no} cap FAILED output={output_idx}: {e:?} — initial, fall to ffmpeg"));
+							let _ = init_tx.send(Err(format!("dxgi init: {e:?}")));
+							return;
+						}
+						// A SWITCH-build failed (e.g. target monitor mid-fullscreen, DuplicateOutput
+						// still unavailable after the long retry). DON'T kill the stream — revert to
+						// the last good monitor so video keeps flowing; the user can retry the switch.
+						if output_idx != prev_good_output {
+							cap_log(&format!("BUILD #{build_no} cap FAILED output={output_idx}: {e:?} — REVERT to {prev_good_output}"));
+							output_idx = prev_good_output;
+							continue;
+						}
+						cap_log(&format!("BUILD #{build_no} cap FAILED output={output_idx} (last-good too): {e:?} — THREAD DYING"));
+						return;
 					}
-				}
-				if let Err(e) = enc.submit(frame, pts) {
-					dbg_capture(&format!("encode: {e}"));
-				}
-				pts += 1;
-			});
+				};
+				let (w, h) = cap.target_size(cfg.width, cfg.height);
+				// Native (full) capture size — the encoder sizes the cross-adapter bridge +
+				// VideoProcessor input to this, scaling native→encode in the Blt when they differ.
+				let (cap_w, cap_h) = cap.native_size();
+				let rotation = cap.rotation_deg();
 
-			// 6. Tear down NVENC (no drain needed — SYNC, no B-frames) and release the
-			//    AddRef'd D3D11 device LAST. Dropping the Encoder also drops its `RtpEgress`,
-			//    which closes the mailbox + joins the `pulsar-rtp-send` thread (≤ the socket
-			//    write timeout, so a wedged socket can't hang teardown); raw RTP has no muxer,
-			//    so there is no trailer to write.
-			enc.flush_and_close();
+				// 3. Build the encoder on the SAME device + immediate context as capture
+				//    (Strategy A: the NVENC session is opened on this D3D11 device; the
+				//    driver does any cross-adapter copy internally on hybrid GPUs). Seed the
+				//    bitrate from the LIVE target so a switch preserves any adaptive-bitrate step.
+				let mut last_kbps = req_kbps_t.load(Ordering::Relaxed).max(1);
+				let mut enc = match encode::Encoder::new(
+					&cap.device,
+					&cap.context,
+					&encode::EncParams {
+						width: w,
+						height: h,
+						capture_width: cap_w,
+						capture_height: cap_h,
+						fps: cfg.fps.max(1),
+						bitrate_kbps: last_kbps,
+						dest: cfg.dest.clone(),
+						codec: cfg.codec,
+						low_latency: cfg.low_latency,
+						rotation,
+					},
+				) {
+					Ok(e) => e,
+					Err(e) => {
+						if !announced {
+							cap_log(&format!("BUILD #{build_no} enc FAILED output={output_idx}: {e} — initial, fall to ffmpeg"));
+							let _ = init_tx.send(Err(format!("nvenc init: {e}")));
+							return;
+						}
+						if output_idx != prev_good_output {
+							cap_log(&format!("BUILD #{build_no} enc FAILED output={output_idx}: {e} — REVERT to {prev_good_output}"));
+							output_idx = prev_good_output;
+							continue;
+						}
+						cap_log(&format!("BUILD #{build_no} enc FAILED output={output_idx} (last-good too): {e} — THREAD DYING"));
+						return;
+					}
+				};
+				prev_good_output = output_idx;
+				// Publish the confirmed output so the host can read current_output() and
+				// reconcile cur_display / last_native_req after a failed switch revert.
+				cur_out_t.store(output_idx, Ordering::SeqCst);
+				cap_log(&format!(
+					"build #{build_no} STREAMING output={output_idx} {w}x{h} kbps={last_kbps} rebuilt_in={}ms",
+					build_t0.elapsed().as_millis(),
+				));
+
+				// 4. First build OK — unblock the caller (Ok ⇒ streaming started). Later (switch)
+				//    builds skip this; the handshake is a one-shot.
+				if !announced {
+					let _ = init_tx.send(Ok(()));
+					announced = true;
+				}
+
+				// 4b. Drain a switch requested DURING this rebuild's blind window (between the prior
+				//     run() exit and now) — `run` won't poll the atom until its first tick, so a
+				//     rapid second click would otherwise wait a whole rebuild+GOP. Rebuild straight
+				//     onto it. A request for the monitor we just built is consumed (no-op).
+				let pending = req_out_t.swap(u32::MAX, Ordering::AcqRel);
+				if pending != u32::MAX && pending != output_idx {
+					enc.flush_and_close();
+					drop(enc);
+					drop(cap);
+					output_idx = pending;
+					continue;
+				}
+
+				// 5. Pacing loop (Sunshine technique). `on_frame` converts BGRA→NV12, encodes via
+				//    NVENC, and hands the Annex-B AU to the RTP sender thread. `run` returns either
+				//    Stop (teardown) or Switch(idx) when the host asked for a new monitor.
+				let mut submit_errs: u64 = 0;
+				let mut frames_sent: u64 = 0;
+				let exit = cap.run(
+					cfg.fps.max(1),
+					cfg.draw_mouse,
+					&req_out_t,
+					&stop_t,
+					|frame: &Frame| {
+						// Stage-3 adaptive bitrate: apply any pending target BEFORE encoding this
+						// tick — a cheap live nvEncReconfigureEncoder (no re-init). Lock-free poll;
+						// on a reconfigure error keep the old bitrate so the stream never stalls.
+						let want = req_kbps_t.load(Ordering::Relaxed);
+						if want != last_kbps {
+							match enc.reconfigure_bitrate(want) {
+								Ok(()) => last_kbps = want,
+								Err(e) => dbg_capture(&format!("reconfigure {want} kbps: {e}")),
+							}
+						}
+						// First frame after a same-res reinit (Hz change / transient ACCESS_LOST):
+						// force a keyframe so the client re-syncs instead of waiting a safety GOP.
+						if frame.force_idr {
+							enc.request_idr();
+						}
+						if let Err(e) = enc.submit(frame, pts) {
+							submit_errs += 1;
+							if submit_errs <= 3 || submit_errs % 240 == 0 {
+								cap_log(&format!("build #{build_no} submit err #{submit_errs}: {e}"));
+							}
+						} else {
+							frames_sent += 1;
+						}
+						pts += 1;
+					},
+				);
+				cap_log(&format!(
+					"build #{build_no} run exited ({}) frames_sent={frames_sent} submit_errs={submit_errs}",
+					match exit { dxgi::RunExit::Stop => "stop".to_string(), dxgi::RunExit::Switch(i) => format!("switch->{i}") },
+				));
+
+				// 6. Tear down NVENC (no drain — SYNC, no B-frames) + release the AddRef'd device
+				//    LAST. Dropping the Encoder drops its RtpEgress (closes the socket, joins the
+				//    sender thread). Then drop `cap` (releases the DXGI duplication + device).
+				enc.flush_and_close();
+				drop(enc);
+				drop(cap);
+				match exit {
+					dxgi::RunExit::Stop => break,
+					// Rebuild on the requested monitor (its adapter may differ — see above).
+					dxgi::RunExit::Switch(idx) => output_idx = idx,
+				}
+			}
 		})?;
 
 	// Block on the init handshake (bounded). If the thread died before sending, treat as Err.
@@ -255,6 +402,8 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 			stop,
 			thread: Some(thread),
 			requested_kbps,
+			requested_output,
+			current_output,
 		}),
 		Ok(Err(msg)) => {
 			// Thread reported an init error and is returning; join to reap it.
@@ -296,6 +445,37 @@ pub fn list_displays() -> Vec<DisplayDesc> {
 	Vec::new()
 }
 
+/// Geometry needed to map a normalized (0..1) pointer onto the captured monitor's
+/// place in the Windows virtual desktop: the chosen monitor's rect and the bounding
+/// box of ALL attached monitors (== `SM_*VIRTUALSCREEN`). All in virtual-desktop
+/// pixels. `mon_*` is the output at `output_idx` (DXGI order, same as `list_displays`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayRect {
+	pub mon_left: i32,
+	pub mon_top: i32,
+	pub mon_width: i32,
+	pub mon_height: i32,
+	pub virt_left: i32,
+	pub virt_top: i32,
+	pub virt_width: i32,
+	pub virt_height: i32,
+}
+
+/// Resolve the virtual-desktop geometry of the captured output (`output_idx`, DXGI
+/// order) plus the full virtual-screen extent, so absolute-pointer injection can target
+/// the streamed (possibly non-primary) monitor. `None` if enumeration fails or the index
+/// is out of range. Windows-only (the native multi-monitor capture path).
+#[cfg(windows)]
+pub fn display_rect(output_idx: u32) -> Option<DisplayRect> {
+	unsafe { dxgi::CaptureDevice::output_rect(output_idx) }
+}
+
+/// Non-Windows stub (see [`display_rect`]).
+#[cfg(not(windows))]
+pub fn display_rect(_output_idx: u32) -> Option<DisplayRect> {
+	None
+}
+
 /// Non-Windows stub: the native path is Windows-only, so callers `cfg`-gate the call site and
 /// this exists purely to keep the symbol present for a clean cross-platform `cargo check`.
 #[cfg(not(windows))]
@@ -310,8 +490,29 @@ pub fn start_capture_encode(_cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 // Windows helpers (thread priority, display keep-alive, debug logging)
 // ===========================================================================
 
-/// Lightweight debug print for the capture thread's encode errors. Writes to stderr only in
-/// debug builds (no-op in release); this crate has no dependency on the host binary.
+/// Capture-thread rebuild lifecycle log. Debug-builds only (no-op in release).
+/// Previously wrote to `C:\Users\Public\pulsar-capture-dbg.txt` unconditionally;
+/// that was temporary instrumentation for the "switch works N times then stuck"
+/// diagnosis and must not ship to release (world-readable fixed path, unbounded
+/// growth, file I/O on the pacing-critical path).
+#[cfg(windows)]
+#[inline]
+fn cap_log(msg: &str) {
+	#[cfg(debug_assertions)]
+	{
+		use std::io::Write;
+		if let Ok(mut f) = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open("C:\\Users\\Public\\pulsar-capture-dbg.txt")
+		{
+			let _ = writeln!(f, "[lib] {msg}");
+		}
+	}
+	#[cfg(not(debug_assertions))]
+	let _ = msg;
+}
+
 #[cfg(windows)]
 #[inline]
 fn dbg_capture(msg: &str) {

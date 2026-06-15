@@ -145,9 +145,12 @@ pub struct StreamReq {
 	/// Request **4:4:4** chroma (no subsampling; sharper text for remote desktop).
 	#[serde(default)]
 	pub yuv444: bool,
-	/// Codecs this CLIENT can decode (startup-probe result, best-first). The host
-	/// clamps its codec fallback to this set so it never streams something the client
-	/// can't show. `#[serde(default)]` (empty = unknown/old client → no clamping).
+	/// Codecs this CLIENT can decode (startup-probe result, best-first), already
+	/// PRUNED of any codec whose decoder is incompatible with an encoder family the
+	/// host actually has (e.g. rkmpp-HEVC × native-NVENC). The host clamps its codec
+	/// fallback to this set so it never streams something the client can't show — its
+	/// auto-degradation can't land on a codec the client deliberately excluded.
+	/// `#[serde(default)]` (empty = unknown/old client → no clamping).
 	#[serde(default)]
 	pub decode_codecs: Vec<String>,
 	/// Carry the RTP media INSIDE this session (single external socket) instead of
@@ -195,28 +198,180 @@ pub struct FsEntry {
 	pub size: u64,
 }
 
+// ---------------------------------------------------------------------------
+// FileEnd cross-version compatibility helper
+// ---------------------------------------------------------------------------
+// `FileEnd` was originally a UNIT variant (`"FileEnd"` on the wire).  The
+// round-1 multi-transfer patch promoted it to a STRUCT variant
+// (`{"FileEnd":{"id":0}}`).  serde_json cannot decode the bare-string form
+// into a struct variant and vice-versa, so a new peer receiving an old
+// `"FileEnd"` silently drops it (dec() → None) and the transfer never
+// completes.
+//
+// Fix: keep the struct variant for Serialize (so new→new transfers carry the
+// id), but implement a custom Deserialize on DataMsg (via the shadow enum
+// DataMsgWire + From conversion) that handles the FileEnd variant to accept
+// BOTH the legacy unit form ("FileEnd") and the new struct form
+// ({"FileEnd":{"id":N}}).
+//
+// serde_json's UnitVariantAccess (for bare-string variants) returns an error
+// from every method except unit_variant().  So we cannot use the standard
+// EnumAccess / VariantAccess visitor approach to handle both forms in one
+// visitor -- the unit and struct paths are driven by serde_json before we can
+// inspect them.  Instead we deserialize into a serde_json::Value first (cheap
+// for these small control messages), detect the FileEnd shape, patch it to the
+// struct form, then deserialize the DataMsgWire from the Value.  All other
+// variants are handled by the derived Deserialize on DataMsgWire which is
+// identical to DataMsg for those arms.
+
+/// Internal shadow used only for deserialization.  Identical to `DataMsg`
+/// except `FileEnd` is also a struct variant with `id` defaulting to 0
+/// (no special compat needed here -- compat is handled at the Value level
+/// before the shadow enum is deserialized).
+#[derive(Deserialize)]
+enum DataMsgWire {
+	Clipboard(String),
+	Chat(String),
+	FileBegin {
+		#[serde(default)]
+		id: u32,
+		name: String,
+		size: u64,
+		chunks: u32,
+	},
+	FileChunk {
+		#[serde(default)]
+		id: u32,
+		index: u32,
+		data: Vec<u8>,
+	},
+	/// Carries the resolved id (0 when the legacy unit form was decoded).
+	FileEnd {
+		#[serde(default)]
+		id: u32,
+	},
+	Audio(Vec<u8>),
+	AudioEnd,
+	Stats(String),
+	ReverseRequest(String),
+	DisplayRotation(u32),
+	MediaNack(Vec<u16>),
+	Avatar(Vec<u8>),
+	FsList { path: String },
+	FsEntries { path: String, entries: Vec<FsEntry> },
+	FsGet { path: String },
+	PeerName(String),
+	CursorPos { x: f32, y: f32 },
+	CursorShape {
+		w: u32,
+		h: u32,
+		hot_x: u32,
+		hot_y: u32,
+		rgba_png: Vec<u8>,
+	},
+	CursorHidden,
+}
+
+impl From<DataMsgWire> for DataMsg {
+	fn from(w: DataMsgWire) -> Self {
+		match w {
+			DataMsgWire::Clipboard(s) => DataMsg::Clipboard(s),
+			DataMsgWire::Chat(s) => DataMsg::Chat(s),
+			DataMsgWire::FileBegin { id, name, size, chunks } => {
+				DataMsg::FileBegin { id, name, size, chunks }
+			}
+			DataMsgWire::FileChunk { id, index, data } => DataMsg::FileChunk { id, index, data },
+			DataMsgWire::FileEnd { id } => DataMsg::FileEnd { id },
+			DataMsgWire::Audio(v) => DataMsg::Audio(v),
+			DataMsgWire::AudioEnd => DataMsg::AudioEnd,
+			DataMsgWire::Stats(s) => DataMsg::Stats(s),
+			DataMsgWire::ReverseRequest(s) => DataMsg::ReverseRequest(s),
+			DataMsgWire::DisplayRotation(n) => DataMsg::DisplayRotation(n),
+			DataMsgWire::MediaNack(v) => DataMsg::MediaNack(v),
+			DataMsgWire::Avatar(v) => DataMsg::Avatar(v),
+			DataMsgWire::FsList { path } => DataMsg::FsList { path },
+			DataMsgWire::FsEntries { path, entries } => DataMsg::FsEntries { path, entries },
+			DataMsgWire::FsGet { path } => DataMsg::FsGet { path },
+			DataMsgWire::PeerName(s) => DataMsg::PeerName(s),
+			DataMsgWire::CursorPos { x, y } => DataMsg::CursorPos { x, y },
+			DataMsgWire::CursorShape { w, h, hot_x, hot_y, rgba_png } => {
+				DataMsg::CursorShape { w, h, hot_x, hot_y, rgba_png }
+			}
+			DataMsgWire::CursorHidden => DataMsg::CursorHidden,
+		}
+	}
+}
+
+/// Normalize the JSON representation of a `DataMsg` so that the legacy unit
+/// `"FileEnd"` form and the new struct `{"FileEnd":{"id":N}}` form both
+/// deserialize correctly.
+///
+/// serde_json's `UnitVariantAccess` (bare-string variant) returns an error from
+/// every `VariantAccess` method except `unit_variant()`.  That means a custom
+/// visitor cannot transparently handle both the unit and struct shapes for the
+/// same variant name — the access type is determined by serde_json before the
+/// visitor sees it.
+///
+/// We therefore normalize at the `Value` level: if the incoming Value is the
+/// string `"FileEnd"`, we replace it with `{"FileEnd":{}}` so the derived
+/// `DataMsgWire` deserializer always sees the struct form and the `#[serde(default)]`
+/// on `id` fills in 0.
+fn normalize_file_end(v: serde_json::Value) -> serde_json::Value {
+	if v == serde_json::Value::String("FileEnd".to_owned()) {
+		// Legacy unit form: patch to struct form with id=0 so DataMsgWire's
+		// derived Deserialize can decode it.
+		serde_json::json!({"FileEnd": {}})
+	} else {
+		v
+	}
+}
+
 /// A bidirectional data-channel message exchanged over a live session for the
 /// session "side channels": clipboard sync, text chat, file transfer, and mic
 /// audio. Either peer can send any of these. NOTE: the session transport is UDP
 /// (unordered, lossy) — fine on LAN/loopback; file transfer tags chunks so the
 /// receiver can detect a gap and report an incomplete transfer rather than
 /// silently corrupting.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// `Serialize` is derived normally (produces the struct-variant form for
+/// `FileEnd`).  `Deserialize` is implemented manually: it first deserializes
+/// into a `serde_json::Value`, normalizes the legacy unit-variant `"FileEnd"`
+/// to the struct form `{"FileEnd":{}}`, then forwards to the `DataMsgWire`
+/// derived impl which handles everything uniformly.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum DataMsg {
 	/// Clipboard text pushed to the peer (peer sets its system clipboard).
 	Clipboard(String),
 	/// A chat line.
 	Chat(String),
-	/// Start of a file: name + total byte length + number of chunks to expect.
+	/// Start of a file: a per-transfer `id` (lets concurrent transfers on the same
+	/// session interleave on the wire without their reassembly state colliding),
+	/// name + total byte length + number of chunks to expect. `id` defaults to 0 so
+	/// an old peer that omits it still decodes (its single-transfer behavior).
 	FileBegin {
+		#[serde(default)]
+		id: u32,
 		name: String,
 		size: u64,
 		chunks: u32,
 	},
-	/// One file chunk with its 0-based index (for gap detection).
-	FileChunk { index: u32, data: Vec<u8> },
-	/// All chunks for the current file have been sent.
-	FileEnd,
+	/// One file chunk: the transfer `id` it belongs to + its 0-based index (for gap
+	/// detection / index-keyed reassembly).
+	FileChunk {
+		#[serde(default)]
+		id: u32,
+		index: u32,
+		data: Vec<u8>,
+	},
+	/// All chunks for the transfer `id` have been sent.  Serializes as the new
+	/// struct-variant form `{"FileEnd":{"id":N}}`.  Deserialized via
+	/// [`DataMsgWire`] which also accepts the legacy unit-variant form `"FileEnd"`
+	/// (id defaults to 0) so new ↔ old peer file transfers still complete even
+	/// when PROTOCOL_VERSION was not bumped.
+	FileEnd {
+		#[serde(default)]
+		id: u32,
+	},
 	/// One frame of raw PCM mic audio (s16le, 48kHz mono).
 	Audio(Vec<u8>),
 	/// The mic stream stopped.
@@ -286,6 +441,21 @@ pub enum DataMsg {
 	/// hid it, or it left the captured screen). The client stops drawing the
 	/// side-channel cursor until the next [`DataMsg::CursorPos`]. Appended for wire compat.
 	CursorHidden,
+}
+
+impl<'de> Deserialize<'de> for DataMsg {
+	fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+		// Deserialize to a generic Value first so we can normalize the legacy
+		// `"FileEnd"` unit-variant form before the typed DataMsgWire deserializer
+		// sees it.  For all other variants this is a trivial pass-through with
+		// negligible overhead (DataMsg packets are tiny control messages).
+		let v = serde_json::Value::deserialize(de)
+			.map_err(serde::de::Error::custom)?;
+		let v = normalize_file_end(v);
+		serde_json::from_value::<DataMsgWire>(v)
+			.map(DataMsg::from)
+			.map_err(serde::de::Error::custom)
+	}
 }
 
 #[cfg(test)]
@@ -466,6 +636,65 @@ mod tests {
 			!req.cursor_external,
 			"missing cursor_external defaults to false (embedded cursor)"
 		);
+	}
+
+	/// Regression test for C2: `FileEnd` unit→struct variant shape change breaks
+	/// cross-version file transfer.  Decodes the LITERAL old-form bytes produced
+	/// by a pre-patch peer (bare string `"FileEnd"` wrapped in a `DataMsg`
+	/// envelope), NOT just a fresh roundtrip — a same-build roundtrip can never
+	/// catch a unit↔struct mismatch.
+	#[test]
+	fn file_end_legacy_unit_form_decodes() {
+		// Old peers wrap the DataMsg in a Msg::Data envelope; the service layer
+		// calls dec(bytes) which runs serde_json::from_slice.  The relevant inner
+		// JSON for a bare FileEnd as emitted by an old build is:
+		//   {"Data":"FileEnd"}
+		// But what we test here is the DataMsg layer in isolation:
+		let old_form = r#""FileEnd""#;
+		let got: DataMsg = serde_json::from_str(old_form)
+			.expect("legacy unit-form \"FileEnd\" must decode (C2 regression)");
+		assert_eq!(
+			got,
+			DataMsg::FileEnd { id: 0 },
+			"legacy FileEnd must decode with id=0"
+		);
+	}
+
+	#[test]
+	fn file_end_new_struct_form_roundtrips() {
+		// New peers produce {"FileEnd":{"id":N}}; must survive roundtrip AND
+		// decode from a hardcoded literal (guards against a future regression
+		// where we accidentally re-emit the old unit form).
+		let m = DataMsg::FileEnd { id: 7 };
+		let json = serde_json::to_string(&m).unwrap();
+		// Verify the serialized form is the new struct shape, not the legacy
+		// bare string.  An old peer (unit form) would produce `"FileEnd"`;
+		// if we see that here the Serialize impl regressed.
+		assert!(
+			json.contains(r#"{"FileEnd":"#),
+			"FileEnd must serialize as struct variant {{\"FileEnd\":...}}, got: {json}"
+		);
+		let back: DataMsg = serde_json::from_str(&json)
+			.expect("new struct-form FileEnd must decode");
+		assert_eq!(back, m, "FileEnd id=7 must roundtrip");
+	}
+
+	#[test]
+	fn file_end_new_struct_form_literal_decodes() {
+		// Literal bytes a new peer produces — ensures new↔new still works.
+		let new_form = r#"{"FileEnd":{"id":3}}"#;
+		let got: DataMsg = serde_json::from_str(new_form)
+			.expect("new struct-form FileEnd literal must decode");
+		assert_eq!(got, DataMsg::FileEnd { id: 3 });
+	}
+
+	#[test]
+	fn file_end_new_struct_form_missing_id_defaults_zero() {
+		// New peer omits id (e.g. a single-transfer build that doesn't set it).
+		let new_form_no_id = r#"{"FileEnd":{}}"#;
+		let got: DataMsg = serde_json::from_str(new_form_no_id)
+			.expect("FileEnd with empty map must decode with id=0");
+		assert_eq!(got, DataMsg::FileEnd { id: 0 });
 	}
 
 	#[test]

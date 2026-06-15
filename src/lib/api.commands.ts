@@ -118,6 +118,11 @@ export const api = {
 	 * Linux only (the native renderer leaves WebKitGTK unable to process clicks once it tears
 	 * down on the headless path); a new process is the reliable fix. Skips auto-connect. */
 	relaunchToHome: () => invoke<void>('relaunch_to_home'),
+	/** Whether an in-app self-update can actually replace the running binary on this platform.
+	 * False on Linux when launched without FUSE (no $APPIMAGE: extract-and-run / raw dev binary),
+	 * where the updater would silently rewrite a throwaway temp file instead of the deployed
+	 * AppImage. Used to skip the update with a clear warning rather than no-op'ing. */
+	selfUpdatePossible: () => invoke<boolean>('self_update_possible'),
 	/** Change an active session's stream resolution live (0×0 = host default). */
 	setPlayResolution: (id: number, width: number, height: number) =>
 		invoke<void>('set_play_resolution', { id, width, height }),
@@ -182,6 +187,10 @@ export const api = {
 	/** Control: keyboard evdev keycode press/release. */
 	inputKey: (id: number, code: number, down: boolean) =>
 		invoke<void>('input_key', { id, code, down }),
+	/** Control: type a resolved Unicode character verbatim (layout-independent). Sent for
+	 * printable keys with no shortcut modifier so non-US layouts + AltGr symbols land
+	 * correctly on the host regardless of ITS active layout. */
+	inputChar: (id: number, ch: string) => invoke<void>('input_char', { id, ch }),
 	/** Control (Windows): arm the low-level keyboard hook so OS-reserved keys
 	 * (Win, Alt+Tab, Ctrl+Esc, media) go to the remote and are suppressed locally.
 	 * No-op on non-Windows. */
@@ -220,5 +229,8 @@ export const api = {
 	/** Client: start streaming the microphone to the host. */
 	micStart: (id: number) => invoke<void>('mic_start', { id }),
 	/** Client: stop streaming the microphone. */
-	micStop: (id: number) => invoke<void>('mic_stop', { id })
+	micStop: (id: number) => invoke<void>('mic_stop', { id }),
+	/** Sync the "run in system tray" preference to the backend so the CloseRequested
+	 * handler knows whether to hide-to-tray (enabled=true) or quit (enabled=false). */
+	setTray: (enabled: boolean) => invoke<void>('set_tray', { enabled })
 };

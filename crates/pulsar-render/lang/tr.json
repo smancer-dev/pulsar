@@ -26,6 +26,7 @@
 	"on": "Açık",
 	"off": "Kapalı",
 	"muted": "Sessiz",
+	"switching": "Ekran değiştiriliyor…",
 	"monitor.title": "Ekran",
 	"monitor.primary": "ana",
 	"fit.title": "Ekran sığdırma",

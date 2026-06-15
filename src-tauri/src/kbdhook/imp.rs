@@ -39,6 +39,12 @@ struct Globals {
 	/// like Ctrl+Shift+M leaves Ctrl+Shift stuck on the host (their up-strokes arrive
 	/// after the gate closed and are never forwarded).
 	held: std::collections::HashSet<u32>,
+	/// Every mouse BUTTON currently held DOWN on the host (0=left/1=right/2=middle).
+	/// Same guarantee as `held` for buttons: a press-and-hold (drag) followed by a
+	/// disengage edge (click-outside implicit release, 3×RightCtrl, Ctrl+Alt+Z,
+	/// focus-loss, disable) would otherwise leave the button stuck DOWN on the host —
+	/// the up-stroke never gets forwarded because the gate has already closed.
+	held_buttons: std::collections::HashSet<u8>,
 }
 
 static GLOBALS: OnceLock<Mutex<Globals>> = OnceLock::new();
@@ -84,8 +90,25 @@ fn globals() -> &'static Mutex<Globals> {
 			shift_down: false,
 			rctrl_presses: Vec::new(),
 			held: std::collections::HashSet::new(),
+			held_buttons: std::collections::HashSet::new(),
 		})
 	})
+}
+
+/// Forward one input event to the session.
+///
+/// The 256-slot input channel is drained one-await-per-event by the hold loop, so a
+/// congested link can fill it. A bare `try_send` would then DROP the just-arrived
+/// event — fatal if it's a button/key UP (a stuck key/button on the host that never
+/// recovers mid-session). So coalescible motion may drop, but press/release EDGES
+/// `blocking_send` to wait for a slot. The hook + Interception capture run on plain
+/// `std::thread::spawn` threads (never a tokio worker), so blocking here is safe.
+fn fwd(tx: &Sender<InputEvent>, ev: InputEvent) {
+	if crate::util::is_coalescible_input(&ev) {
+		let _ = tx.try_send(ev);
+	} else {
+		let _ = tx.blocking_send(ev);
+	}
 }
 
 /// Send up-strokes for every key still held on the host and clear the set — called
@@ -93,11 +116,30 @@ fn globals() -> &'static Mutex<Globals> {
 fn flush_held(g: &mut Globals) {
 	if let Some(tx) = &g.tx {
 		for code in g.held.drain() {
-			let _ = tx.try_send(InputEvent::Key { code, down: false });
+			fwd(tx, InputEvent::Key { code, down: false });
+		}
+		// Same for held mouse buttons (drag-and-hold left/right/middle): release each
+		// before the gate closes so a click-outside / leave-combo can't leave the host
+		// with a stuck button (runaway drag-select). Mirrors the Linux flush_held.
+		for button in g.held_buttons.drain() {
+			fwd(tx, InputEvent::PointerButton { button, down: false });
 		}
 	} else {
 		g.held.clear();
+		g.held_buttons.clear();
 	}
+	// Drop the LOCAL chord-modifier tracking too. The combos (Ctrl+Shift+M / Q / F12)
+	// and the Ctrl+Alt+Z / 3×RightCtrl release gate on these booleans, and unlike Linux
+	// (which re-queries the kernel via `chord_mods` at the trigger moment) Windows trusts
+	// them — so a modifier whose UP-stroke is never observed after a disengage edge (the
+	// physical key was released while the hook was bypassed, suppressed, or the event was
+	// injected) would stay latched true and let a BARE later key mis-fire a combo while
+	// merely app-focused. flush_held runs on EVERY disengage/teardown edge, so resetting
+	// here keeps the combo gate from ever acting on a stale modifier after control drops.
+	g.ctrl_down = false;
+	g.alt_down = false;
+	g.shift_down = false;
+	g.rctrl_presses.clear();
 }
 
 /// Arm kiosk auto-engage: the next `enable()` engages immediately (CLI `--connect`).
@@ -455,19 +497,29 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 		}
 		return true; // never leak the Z locally
 	}
-	if g.tx.is_some() {
-		// Key repeat re-fires down=true; forward each (the host de-dupes).
-		let _ = g
-			.tx
-			.as_ref()
-			.unwrap()
-			.try_send(InputEvent::Key { code: evdev, down });
-		// Track held-on-host keys for the disengage flush.
+	// Clone the sender and build the event BEFORE releasing the lock so the
+	// held-set update is atomic with the send decision.  Then drop the lock and
+	// call fwd() outside it.
+	//
+	// This matters on the WH_KEYBOARD_LL path: ll_keyboard_proc runs on the
+	// hook callback thread, where ANY blocking is forbidden — it stalls the OS
+	// input queue and trips LowLevelHooksTimeout (~300 ms).  fwd() calls
+	// blocking_send for non-coalescible edges, so holding the globals() Mutex
+	// while blocking also prevents disable()/flush_held()/set_focused() from
+	// acquiring the lock (they need it for teardown/recovery).  Drop the guard
+	// first so the lock is always free before any potentially-blocking send.
+	if let Some(tx) = g.tx.clone() {
+		// Track held-on-host keys for the disengage flush (under the lock).
 		if down {
 			g.held.insert(evdev);
 		} else {
 			g.held.remove(&evdev);
 		}
+		// Release the globals lock BEFORE any send — on the WH path this must
+		// not block while the OS input queue is held (LL hook callback thread).
+		drop(g);
+		// Key repeat re-fires down=true; forward each (the host de-dupes).
+		fwd(&tx, InputEvent::Key { code: evdev, down });
 		return true;
 	}
 	false
@@ -546,7 +598,7 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 				// Diagnostic: every locally-SUPPRESSED physical click while engaged.
 				tracing::info!(button, "physical click suppressed (engaged) → forwarded to host");
 			}
-			let _ = tx.try_send(InputEvent::PointerButton { button, down });
+			fwd(tx, InputEvent::PointerButton { button, down });
 		}
 	}
 	// Wheel: state carries the WHEEL bit (0x400), rolling is the signed delta.
@@ -555,6 +607,26 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 			dx: 0.0,
 			dy: -(rolling as f64),
 		});
+	}
+	// Track held buttons for the disengage flush (mirror `g.held` for keys). Done after
+	// the `tx` borrow above so the disjoint `g.held_buttons` field can be mutated. A
+	// press-and-hold (drag) leaves the button in the set until its up-stroke arrives;
+	// if a disengage edge fires first, flush_held() releases it on the host.
+	for (bit, button, down) in [
+		(0x001u16, 0u8, true),
+		(0x002, 0, false),
+		(0x004, 1, true),
+		(0x008, 1, false),
+		(0x010, 2, true),
+		(0x020, 2, false),
+	] {
+		if state & bit != 0 {
+			if down {
+				g.held_buttons.insert(button);
+			} else {
+				g.held_buttons.remove(&button);
+			}
+		}
 	}
 	true
 }
@@ -721,7 +793,8 @@ fn hook_thread() {
 			THREAD_STARTED.store(false, Ordering::SeqCst);
 			return;
 		}
-		globals().lock().unwrap().hook_thread_id = GetCurrentThreadId();
+		let my_tid = GetCurrentThreadId();
+		globals().lock().unwrap().hook_thread_id = my_tid;
 		// Required: LL hooks deliver via this thread's message queue.
 		let mut msg: MSG = std::mem::zeroed();
 		// GetMessageW returns 0 on WM_QUIT, -1 on error.
@@ -730,7 +803,15 @@ fn hook_thread() {
 			DispatchMessageW(&msg);
 		}
 		UnhookWindowsHookEx(hook);
-		globals().lock().unwrap().hook_thread_id = 0;
+		// Compare-and-clear: a fast disable()→enable() churn can spawn a NEW hook
+		// thread before this (old) one drains WM_QUIT. The new thread has already
+		// stored its own id; blindly zeroing here would clobber the LIVE thread's id,
+		// so a later disable() would PostThreadMessageW(0,…) (a no-op) and leak the
+		// live thread with the keyboard still hooked. Only clear if it's still ours.
+		let mut g = globals().lock().unwrap();
+		if g.hook_thread_id == my_tid {
+			g.hook_thread_id = 0;
+		}
 	}
 }
 

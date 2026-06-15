@@ -23,11 +23,9 @@ export interface UiSettings {
 	/** Host-side hardware encoder. */
 	encoder: Encoder;
 	hdr: boolean;
-	bwlimit: boolean;
 	unattended: boolean;
 	twofa: boolean;
 	record: boolean;
-	startup: boolean;
 	tray: boolean;
 	/** Show the verbose host activity log under "connected devices". */
 	debug: boolean;
@@ -89,11 +87,9 @@ const DEFAULTS: UiSettings = {
 	codec: 'auto',
 	encoder: 'auto',
 	hdr: false,
-	bwlimit: false,
 	unattended: true,
 	twofa: true,
 	record: false,
-	startup: true,
 	tray: true,
 	debug: false,
 	keepVisible: true,

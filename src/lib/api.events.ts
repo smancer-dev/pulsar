@@ -40,6 +40,15 @@ export const onLocalCaps = (cb: (caps: LocalCaps) => void) => listenTo<LocalCaps
 /** The node (re)bound its UDP socket on `go_online` — the ACTUAL port for direct
  * `ip:port` connects (Home shows it next to the local IP). */
 export const onNodePort = (cb: (port: number) => void) => listenTo<number>('node-port', cb);
+/** The relay reissued a DIFFERENT 9-digit device ID (a relay restart that lost its
+ * pubkey→id map): the displayed ID + LAN beacon rotated. Payload is the new grouped
+ * ID — the Home screen must adopt it, else it keeps showing the now-unreachable old one. */
+export const onNodeId = (cb: (id: string) => void) => listenTo<string>('node-id', cb);
+/** Host: the relay rejected a re-registration from an already-online node because of
+ * an incompatible protocol version (relay redeployed with a newer build). The node is
+ * stranded and has been taken offline — the UI should set online=false and show the
+ * "update required" error so the user knows to update. */
+export const onNodeVersionError = (cb: () => void) => listenTo<null>('node-version-error', () => cb());
 /** Host: the one-time connect password was rotated (after a successful auth) — the
  * Home SelfCard updates instantly instead of waiting for the next poll. */
 export const onSessionPassword = (cb: (pw: string) => void) =>

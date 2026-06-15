@@ -31,12 +31,20 @@ pub struct DataHandlers {
 	/// `FileBegin`/`FileChunk`/`FileEnd`). Default no-op — a host without the
 	/// file manager just never answers.
 	pub on_fs: Box<dyn FnMut(DataMsg) + Send>,
+	/// Host-initiated re-stream injection. When the host detects its OWN display mode changed
+	/// mid-session (resolution / refresh rate), a watcher re-sends the last [`StreamReq`] here so
+	/// the capture restarts at the new geometry — the ffmpeg (x11grab/gdigrab/avfoundation) and
+	/// Wayland paths have no DXGI `ACCESS_LOST` signal like the Windows native path, so without
+	/// this they keep capturing the old size and the stream freezes until reconnect. `None`
+	/// (default, and on Windows — the native path self-heals in `pulsar-capture`) → inert.
+	pub restream: Option<mpsc::Receiver<StreamReq>>,
 }
 
 impl Default for DataHandlers {
 	fn default() -> Self {
 		Self {
 			outbound: None,
+			restream: None,
 			on_clipboard: Box::new(|_| {}),
 			on_chat: Box::new(|_| {}),
 			on_file: Box::new(|_| {}),
@@ -95,6 +103,8 @@ pub async fn serve_with(
 	enum Ev {
 		In(Result<Option<Vec<u8>>, tokio::time::error::Elapsed>),
 		Out(Option<DataMsg>),
+		/// A host-side display-mode watcher asked to restart capture (re-issue this `StreamReq`).
+		Restream(Option<StreamReq>),
 	}
 	let mut last_inbound = tokio::time::Instant::now();
 	loop {
@@ -108,12 +118,24 @@ pub async fn serve_with(
 		if budget.is_zero() {
 			break; // peer silent too long while we were busy sending
 		}
-		let ev = match data.outbound.as_mut() {
-			Some(rx) => tokio::select! {
+		// Wait on the next inbound frame, an outbound side-channel message, OR a host-initiated
+		// re-stream from the display-mode watcher — whichever lands first (only the chosen branch
+		// then touches `session`). Both side channels are optional, so four select shapes.
+		let ev = match (data.outbound.as_mut(), data.restream.as_mut()) {
+			(Some(rx), Some(rs)) => tokio::select! {
+				r = timeout(budget, session.recv()) => Ev::In(r),
+				o = rx.recv() => Ev::Out(o),
+				q = rs.recv() => Ev::Restream(q),
+			},
+			(Some(rx), None) => tokio::select! {
 				r = timeout(budget, session.recv()) => Ev::In(r),
 				o = rx.recv() => Ev::Out(o),
 			},
-			None => Ev::In(timeout(budget, session.recv()).await),
+			(None, Some(rs)) => tokio::select! {
+				r = timeout(budget, session.recv()) => Ev::In(r),
+				q = rs.recv() => Ev::Restream(q),
+			},
+			(None, None) => Ev::In(timeout(budget, session.recv()).await),
 		};
 		let bytes = match ev {
 			Ev::In(Ok(Some(b))) => {
@@ -128,6 +150,21 @@ pub async fn serve_with(
 			// Outbound queue dropped: stop selecting on it (avoid a busy loop).
 			Ev::Out(None) => {
 				data.outbound = None;
+				continue;
+			}
+			// Host display mode changed → restart capture at the new geometry. Re-run on_stream
+			// with the peer addr exactly as a client re-request would (reuses the full restart
+			// path: kill old ffmpeg/native, re-clamp dims to the new display size, respawn).
+			Ev::Restream(Some(req)) => {
+				tracing::info!(display_idx = req.display_idx, "host re-streaming after display-mode change");
+				if let Some(addr) = session.peer_addr().await {
+					on_stream(req, addr);
+				}
+				continue;
+			}
+			// Watcher channel dropped (session ending / no watcher): stop selecting on it.
+			Ev::Restream(None) => {
+				data.restream = None;
 				continue;
 			}
 		};
@@ -161,9 +198,9 @@ pub async fn serve_with(
 			Some(Msg::Data(d)) => match d {
 				DataMsg::Clipboard(s) => (data.on_clipboard)(s),
 				DataMsg::Chat(s) => (data.on_chat)(s),
-				m @ (DataMsg::FileBegin { .. } | DataMsg::FileChunk { .. } | DataMsg::FileEnd) => {
-					(data.on_file)(m)
-				}
+				m @ (DataMsg::FileBegin { .. }
+				| DataMsg::FileChunk { .. }
+				| DataMsg::FileEnd { .. }) => (data.on_file)(m),
 				m @ (DataMsg::Audio(_) | DataMsg::AudioEnd) => (data.on_audio)(m),
 				DataMsg::Stats(_) => {} // host→client only; ignore if echoed back
 				DataMsg::DisplayRotation(_) => {} // host→client only; ignore if echoed back

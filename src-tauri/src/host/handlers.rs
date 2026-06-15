@@ -27,6 +27,7 @@ pub(super) fn spawn_loopback_audio(
 	pinned_default: Option<String>,
 	req_layout: pulsar_core::audio::ChannelLayout,
 ) -> bool {
+	use pulsar_core::audio::LoopbackFormat;
 	use std::process::Stdio;
 	// Read the format of the SAME endpoint the capture will tap: the pinned virtual sink
 	// (host-silent) when set, else the OS default. Matching them keeps ffmpeg's -f/-ar/-ac
@@ -38,74 +39,133 @@ pub(super) fn spawn_loopback_audio(
 			return false;
 		}
 	};
-	let mut args: Vec<String> = vec![
-		"-hide_banner".into(),
-		"-loglevel".into(),
-		"error".into(),
-		// Read the raw PCM pipe with NO input buffering / NO startup probe: ffmpeg would
-		// otherwise read + hold a chunk to "analyze" the stream (plus whatever burst the
-		// WASAPI loopback delivers at open) before emitting the first packet, baking a
-		// fixed audio delay behind the ultra-low-latency video for the whole session.
-		"-fflags".into(),
-		"nobuffer".into(),
-		"-probesize".into(),
-		"32".into(),
-		"-analyzeduration".into(),
-		"0".into(),
-		"-f".into(),
-		fmt.ffmpeg_sample_fmt().into(),
-		"-ar".into(),
-		fmt.rate.to_string(),
-		"-ac".into(),
-		fmt.channels.to_string(),
-		"-i".into(),
-		"pipe:0".into(),
-	];
-	// Encode at the layout the loopback endpoint actually delivers: the WASAPI mix
-	// format's channel count (`fmt.channels`) is authoritative — a 5.1/7.1 endpoint
-	// streams 6/8 real channels, a stereo one 2 — so derive the Opus layout from it
-	// rather than blindly trusting the request, which would make ffmpeg up/down-mix
-	// silently (e.g. -ac 6 over a 2-channel capture = 4 silent surround channels).
-	let endpoint_layout = match fmt.channels {
-		6 => pulsar_core::audio::ChannelLayout::Surround51,
-		8 => pulsar_core::audio::ChannelLayout::Surround71,
-		_ => pulsar_core::audio::ChannelLayout::Stereo,
+	// Build + spawn the encoder ffmpeg for a given loopback format. Returned so the capture
+	// thread can RESPAWN it when the default render endpoint changes to one with a different
+	// mix format (sample rate / channels / bit depth) mid-session: ffmpeg's -f/-ar/-ac are
+	// fixed for its lifetime, so the re-opened device's PCM would otherwise be parsed wrong
+	// (garbled / wrong-pitch audio for the rest of the session). On respawn the encode layout
+	// is re-derived from the new channel count too.
+	let ffmpeg_owned = ffmpeg.to_string();
+	let dest_owned = dest.to_string();
+	let spawn_encoder = move |fmt: LoopbackFormat| -> Option<(Child, std::process::ChildStdin)> {
+		let mut args: Vec<String> = vec![
+			"-hide_banner".into(),
+			"-loglevel".into(),
+			"error".into(),
+			// Read the raw PCM pipe with NO input buffering / NO startup probe: ffmpeg would
+			// otherwise read + hold a chunk to "analyze" the stream (plus whatever burst the
+			// WASAPI loopback delivers at open) before emitting the first packet, baking a
+			// fixed audio delay behind the ultra-low-latency video for the whole session.
+			"-fflags".into(),
+			"nobuffer".into(),
+			"-probesize".into(),
+			"32".into(),
+			"-analyzeduration".into(),
+			"0".into(),
+			"-f".into(),
+			fmt.ffmpeg_sample_fmt().into(),
+			"-ar".into(),
+			fmt.rate.to_string(),
+			"-ac".into(),
+			fmt.channels.to_string(),
+			"-i".into(),
+			"pipe:0".into(),
+		];
+		// Encode at the layout the loopback endpoint actually delivers: the WASAPI mix
+		// format's channel count (`fmt.channels`) is authoritative — a 5.1/7.1 endpoint
+		// streams 6/8 real channels, a stereo one 2 — so derive the Opus layout from it
+		// rather than blindly trusting the request, which would make ffmpeg up/down-mix
+		// silently (e.g. -ac 6 over a 2-channel capture = 4 silent surround channels).
+		let endpoint_layout = match fmt.channels {
+			6 => pulsar_core::audio::ChannelLayout::Surround51,
+			8 => pulsar_core::audio::ChannelLayout::Surround71,
+			_ => pulsar_core::audio::ChannelLayout::Stereo,
+		};
+		// Clamp to the negotiated request: never encode MORE channels than the client asked
+		// for (a stereo client must get stereo even off a 5.1 endpoint), but never claim more
+		// than the endpoint actually delivers either. The redirect already set the virtual
+		// sink's format to `req_layout`, so on the host-silent path these usually agree.
+		let cap_layout = if (req_layout.channels()) < endpoint_layout.channels() {
+			req_layout
+		} else {
+			endpoint_layout
+		};
+		args.extend(pulsar_core::audio::opus_rtp_output_layout(&dest_owned, cap_layout));
+		let mut cmd = std::process::Command::new(&ffmpeg_owned);
+		cmd.args(&args).stdin(Stdio::piped());
+		no_window(&mut cmd);
+		let mut child = cmd.spawn().ok()?;
+		let stdin = match child.stdin.take() {
+			Some(s) => s,
+			None => {
+				let _ = child.kill();
+				return None;
+			}
+		};
+		crate::job::assign(&child); // tie ffmpeg to Pulsar's lifetime (job.rs), like spawn_tracked
+		Some((child, stdin))
 	};
-	// Clamp to the negotiated request: never encode MORE channels than the client asked
-	// for (a stereo client must get stereo even off a 5.1 endpoint), but never claim more
-	// than the endpoint actually delivers either. The redirect already set the virtual
-	// sink's format to `req_layout`, so on the host-silent path these usually agree.
-	let cap_layout = if (req_layout.channels()) < endpoint_layout.channels() {
-		req_layout
-	} else {
-		endpoint_layout
+	let (child, stdin) = match spawn_encoder(fmt) {
+		Some(v) => v,
+		None => return false,
 	};
-	args.extend(pulsar_core::audio::opus_rtp_output_layout(dest, cap_layout));
-	let mut cmd = std::process::Command::new(ffmpeg);
-	cmd.args(&args).stdin(Stdio::piped());
-	no_window(&mut cmd);
-	let mut child = match cmd.spawn() {
-		Ok(c) => c,
-		Err(_) => {
-			return false;
-		}
-	};
-	let stdin = match child.stdin.take() {
-		Some(s) => s,
-		None => {
-			let _ = child.kill();
-			return false;
-		}
-	};
-	crate::job::assign(&child); // tie ffmpeg to Pulsar's lifetime (job.rs), like spawn_tracked
+	let mut cur_pid = child.id();
 	procs.lock().unwrap().push(child);
+	let procs = procs.clone();
 	std::thread::spawn(move || {
 		// Runs until the pipe breaks (ffmpeg killed on teardown) or WASAPI errors — both expected.
 		// When host-silent is active, `pinned_default` is the virtual sink's id: the capture
 		// re-asserts it as the OS default before every (re)open, so a default-endpoint flip
 		// mid-stream can't make us tap the host's real speakers (review HIGH-2). `None` =
 		// the plain capture (identical to the old behavior).
-		let _ = pulsar_core::audio::run_loopback_capture_pinned(stdin, pinned_default);
+		//
+		// The capture is FORMAT-TRACKING (`fmt` = what the current ffmpeg was spawned with):
+		// when a mid-session default-endpoint change re-opens an endpoint with a different mix
+		// format, it stops (before any mismatched bytes are written) and hands the new format
+		// back so we kill + respawn ffmpeg around it and resume — otherwise ffmpeg's fixed
+		// -f/-ar/-ac would parse the new device's PCM wrong for the rest of the session.
+		let mut stdin = stdin;
+		let mut cur_fmt = fmt;
+		loop {
+			match pulsar_core::audio::run_loopback_capture_tracking(
+				stdin,
+				pinned_default.clone(),
+				cur_fmt,
+			) {
+				Ok(Some(new_fmt)) => {
+					// The default endpoint changed format. Spawn a new ffmpeg with the new
+					// -f/-ar/-ac, then swap it into `procs` for the OLD one (matched by pid, so
+					// we never touch the video/other tracked children) and kill the stale one.
+					let (new_child, new_stdin) = match spawn_encoder(new_fmt) {
+						Some(v) => v,
+						None => return, // can't respawn (e.g. ffmpeg gone) → give up on audio
+					};
+					let new_pid = new_child.id();
+					{
+						// Under the same lock teardown/(re)stream drain `procs`: if our old
+						// child is already gone the session moved on, so don't track the new
+						// one (it would be an untracked orphan) — kill it and stop.
+						let mut g = procs.lock().unwrap();
+						let Some(idx) = g.iter().position(|c| c.id() == cur_pid) else {
+							drop(g);
+							let mut new_child = new_child;
+							let _ = new_child.kill();
+							return;
+						};
+						let mut old = g.remove(idx);
+						let _ = old.kill();
+						let _ = old.wait();
+						g.push(new_child);
+					}
+					stdin = new_stdin;
+					cur_fmt = new_fmt;
+					cur_pid = new_pid;
+					// loop: resume capture against the new endpoint/format
+				}
+				// Clean stop (pipe broke / ffmpeg gone) or a fatal WASAPI error — done.
+				Ok(None) | Err(_) => return,
+			}
+		}
 	});
 	true
 }
@@ -257,16 +317,24 @@ static REDIRECT_SINK_ID: std::sync::LazyLock<Mutex<Option<String>>> =
 /// device format to that channel count (`set_render_device_format`), so the loopback
 /// capture opens at the right width (a stereo-only sink would otherwise cap a 5.1/7.1
 /// stream). A format failure is non-fatal (warn + keep the sink's existing format).
-/// If the virtual sink can't be found (driver missing), fall back to the endpoint
-/// mute toggle — but only for an explicit request and only here in the per-stream
-/// path, where capture is already live (muting an already-open loopback is safe;
-/// opening into a mute is not).
+/// If the virtual sink can't be found (driver missing), signal the caller (via the
+/// returned bool) to fall back to the endpoint mute toggle — applied by the caller
+/// AFTER capture is live, never here (muting an already-open loopback is safe; opening
+/// into a mute is not).
 ///
 /// On the empty→non-empty transition the located virtual sink's device-id is stashed
 /// in `REDIRECT_SINK_ID` so `start_audio_and_mute` can pin the loopback capture to it
 /// (review HIGH-2 re-assert). Cleared on the non-empty→empty (restore) transition.
+///
+/// Returns `true` when no redirect could be set up and an endpoint-mute fallback is
+/// WANTED — the caller (`start_audio_and_mute`) must then apply `mute_fallback(true)`
+/// AFTER the loopback capture is spawned, never here: muting at capture-open latches
+/// silence into the WASAPI loopback on post-mute codecs (the bug fixed 2026-06-13). The
+/// `false`/restore transition undoes any prior mute fallback inline (unmuting an
+/// already-open or closed capture is always safe).
 #[cfg(windows)]
-fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::ChannelLayout) {
+#[must_use = "returns true when a post-capture mute fallback must be applied by the caller"]
+fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::ChannelLayout) -> bool {
 	let mut owners = REDIRECT_OWNERS.lock().unwrap();
 	let was = !owners.is_empty();
 	if want {
@@ -276,7 +344,7 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 	}
 	let now = !owners.is_empty();
 	if was == now {
-		return;
+		return false;
 	}
 	tracing::info!(sid, want, ?layout, owners = ?owners, "host-silent (sink-redirect) request");
 	drop(owners);
@@ -297,23 +365,24 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 						// Pin the loopback to this exact device-id (re-asserted as the OS
 						// default on every reinit — review HIGH-2).
 						*REDIRECT_SINK_ID.lock().unwrap() = Some(dev.id.clone());
+						false
 					}
 					Err(e) => {
-						tracing::warn!("sink redirect failed: {e} — falling back to endpoint mute");
-						mute_fallback(true);
+						tracing::warn!("sink redirect failed: {e} — falling back to endpoint mute (deferred to post-capture)");
+						true
 					}
 				}
 			}
 			Ok(None) => {
 				tracing::warn!(
 					candidates = ?VIRTUAL_SINK_CANDIDATES,
-					"no virtual sink present (Steam Streaming Speakers / cable / our driver) — falling back to endpoint mute"
+					"no virtual sink present (Steam Streaming Speakers / cable / our driver) — falling back to endpoint mute (deferred to post-capture)"
 				);
-				mute_fallback(true);
+				true
 			}
 			Err(e) => {
-				tracing::warn!("enumerating render endpoints failed: {e} — falling back to endpoint mute");
-				mute_fallback(true);
+				tracing::warn!("enumerating render endpoints failed: {e} — falling back to endpoint mute (deferred to post-capture)");
+				true
 			}
 		}
 	} else {
@@ -322,6 +391,7 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 		*REDIRECT_GUARD.lock().unwrap() = None;
 		*REDIRECT_SINK_ID.lock().unwrap() = None;
 		mute_fallback(false);
+		false
 	}
 }
 
@@ -381,6 +451,17 @@ static UNIX_SILENT_GUARD: std::sync::LazyLock<
 static UNIX_SILENT_SOURCE: std::sync::LazyLock<Mutex<Option<String>>> =
 	std::sync::LazyLock::new(|| Mutex::new(None));
 
+/// The pre-resolved AVFoundation `AudioInput` for the redirected virtual output device
+/// on macOS. Populated once at arm-time (inside `set_unix_silent_request`) by running
+/// `avfoundation_input_index` so the result is **cached** for the lifetime of the
+/// redirect and every re-stream can look it up without spawning another blocking ffmpeg
+/// process. `None` while the redirect is not armed or the index could not be resolved.
+/// Cleared on disarm alongside `UNIX_SILENT_SOURCE`.
+#[cfg(all(not(windows), not(target_os = "linux")))]
+static UNIX_SILENT_AUDIO_INPUT: std::sync::LazyLock<
+	Mutex<Option<pulsar_core::audio::AudioInput>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
 /// When no sinkless device could be set up (no `pactl`/null-sink on Linux, no virtual
 /// output on macOS) we fall back to the historic `set_host_muted` toggle for an
 /// EXPLICIT host-silent request — but only applied from the per-stream path AFTER
@@ -392,35 +473,116 @@ static UNIX_SILENT_MUTE_FALLBACK: std::sync::atomic::AtomicBool =
 
 /// The capture source to record from for host audio: the redirected monitor while
 /// host-silent is armed (Linux/macOS), else the user's configured input. The Linux
-/// monitor source is wrapped as `AudioInput::Pulse(...)`; macOS keeps the configured
-/// input (the virtual-device→AVFoundation index mapping is left to the user's config —
-/// the redirect still routes program audio off the speakers).
+/// monitor source is wrapped as `AudioInput::Pulse(...)`; on macOS the host-silent
+/// redirect switched the default OUTPUT to a virtual device (e.g. BlackHole), so the
+/// program audio now leaves the speakers there — we must CAPTURE that same device,
+/// not the user's configured mic, or the client would hear the mic while the program
+/// audio is lost. The virtual device's AVFoundation **input** index was resolved once
+/// at arm-time (via `avfoundation_input_index`) and cached in `UNIX_SILENT_AUDIO_INPUT`
+/// by `set_unix_silent_request`; this function is a pure cache lookup on re-streams
+/// with no subprocess invocation.
 #[cfg(not(windows))]
-fn effective_audio_input(configured: pulsar_core::audio::AudioInput) -> pulsar_core::audio::AudioInput {
-	match UNIX_SILENT_SOURCE.lock().unwrap().clone() {
-		// Linux: the null sink's monitor is a PulseAudio source — capture it directly.
-		#[cfg(target_os = "linux")]
-		Some(src) => pulsar_core::audio::AudioInput::Pulse(src),
-		// macOS: the redirect already routed output to the virtual device; capturing it
-		// by name needs an AVFoundation index we can't derive here, so keep the user's
-		// configured input. The speakers are silent regardless (output was switched).
-		#[cfg(not(target_os = "linux"))]
-		Some(_) => configured,
-		None => configured,
+fn effective_audio_input(
+	configured: pulsar_core::audio::AudioInput,
+) -> pulsar_core::audio::AudioInput {
+	// Linux: the null sink's monitor is a PulseAudio source — capture it directly.
+	#[cfg(target_os = "linux")]
+	{
+		match UNIX_SILENT_SOURCE.lock().unwrap().clone() {
+			Some(src) => pulsar_core::audio::AudioInput::Pulse(src),
+			None => configured,
+		}
 	}
+	// macOS: read the pre-resolved AVFoundation input from the arm-time cache
+	// (UNIX_SILENT_AUDIO_INPUT). No subprocess is run here — the blocking
+	// `avfoundation_input_index` probe was executed once in `set_unix_silent_request`
+	// when the redirect was first armed, so re-streams do a pure lock+clone lookup.
+	#[cfg(not(target_os = "linux"))]
+	{
+		let armed = UNIX_SILENT_SOURCE.lock().unwrap().is_some();
+		if !armed {
+			return configured;
+		}
+		match UNIX_SILENT_AUDIO_INPUT.lock().unwrap().clone() {
+			Some(input) => input,
+			None => {
+				// The arm-time probe couldn't resolve the index (warn already emitted
+				// at arm-time in set_unix_silent_request). Fall back to the configured
+				// input; the host's PROGRAM AUDIO is NOT being captured in this case.
+				configured
+			}
+		}
+	}
+}
+
+/// Resolve the AVFoundation **input** (audio capture) index for a device by name.
+/// `ffmpeg -f avfoundation -list_devices true -i ""` prints the device list to STDERR
+/// under an `AVFoundation audio devices:` header, one line per device as `[idx] Name`.
+/// Returns the index of the first audio device whose name matches `target`
+/// (case-insensitive substring, the same loose matching the redirect used to find the
+/// virtual output), or `None` if ffmpeg fails or no audio device matches.
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn avfoundation_input_index(ffmpeg: &str, target: &str) -> Option<u32> {
+	let out = std::process::Command::new(ffmpeg)
+		.args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
+		.output()
+		.ok()?;
+	let text = String::from_utf8_lossy(&out.stderr);
+	let target_lc = target.to_lowercase();
+	let mut in_audio = false;
+	for line in text.lines() {
+		let lower = line.to_ascii_lowercase();
+		if lower.contains("avfoundation") && lower.contains("audio") && lower.contains("devices") {
+			in_audio = true;
+			continue;
+		}
+		if lower.contains("avfoundation") && lower.contains("video") && lower.contains("devices") {
+			in_audio = false;
+			continue;
+		}
+		if !in_audio {
+			continue;
+		}
+		// A device line carries `[<idx>] <name>` (after ffmpeg's log prefix). Find the
+		// LAST `[idx]` bracket pair on the line so we skip the `[AVFoundation indev @ …]`
+		// log prefix and read the device index that immediately precedes the name.
+		let Some(open) = line.rfind('[') else { continue };
+		let rest = &line[open + 1..];
+		let Some(close) = rest.find(']') else { continue };
+		let idx: u32 = match rest[..close].trim().parse() {
+			Ok(i) => i,
+			Err(_) => continue,
+		};
+		let name = rest[close + 1..].trim();
+		if !name.is_empty() && name.to_lowercase().contains(&target_lc) {
+			return Some(idx);
+		}
+	}
+	None
 }
 
 /// Record `sid`'s host-silent wish and arm/disarm the Linux/macOS capture-source
 /// redirect when the owner set flips between empty and non-empty. Sunshine model:
 /// route program audio to a sinkless device (null sink / virtual output) and capture
 /// its monitor — never mute (muting silences the monitor too). If no sinkless device
-/// is available, fall back to the `set_host_muted` toggle, but ONLY here in the
-/// per-stream path where capture is already live.
+/// is available, signal the caller (via the returned bool) to fall back to the
+/// `set_host_muted` toggle, applied AFTER capture is live — never here.
 ///
 /// On the empty→non-empty transition the redirect's capture source is stashed in
 /// `UNIX_SILENT_SOURCE` so `start_audio_and_mute` taps it; cleared on restore.
+///
+/// Returns `true` when no sinkless device could be armed and an endpoint-mute fallback
+/// is WANTED — the caller (`start_audio_and_mute`) must then apply `unix_mute_fallback(true)`
+/// AFTER the capture is spawned, never here: a muted `@DEFAULT_SINK@` silences its
+/// `.monitor` too (verified −91 dB), so opening the capture into the mute latches
+/// silence. The `false`/restore transition undoes any prior mute fallback inline.
 #[cfg(not(windows))]
-fn set_unix_silent_request(sid: u64, want: bool) {
+#[must_use = "returns true when a post-capture mute fallback must be applied by the caller"]
+fn set_unix_silent_request(
+	sid: u64,
+	want: bool,
+	#[cfg_attr(target_os = "linux", allow(unused_variables))] ffmpeg: &str,
+) -> bool {
 	let mut owners = UNIX_SILENT_OWNERS.lock().unwrap();
 	let was = !owners.is_empty();
 	if want {
@@ -430,7 +592,7 @@ fn set_unix_silent_request(sid: u64, want: bool) {
 	}
 	let now = !owners.is_empty();
 	if was == now {
-		return;
+		return false;
 	}
 	tracing::info!(sid, want, owners = ?owners, "host-silent (unix sink-redirect) request");
 	drop(owners);
@@ -439,18 +601,48 @@ fn set_unix_silent_request(sid: u64, want: bool) {
 		match pulsar_core::audio::arm_host_silent() {
 			Ok(Some(hs)) => {
 				tracing::info!(source = %hs.source, "armed host-silent capture redirect (unix)");
+				// macOS: resolve the AVFoundation input index for the virtual output device
+				// NOW (at arm-time, once per redirect lifetime) and cache it in
+				// UNIX_SILENT_AUDIO_INPUT. This avoids re-running the blocking
+				// `ffmpeg -list_devices` probe on every re-stream inside the async session
+				// loop — the cache is a pure lookup for all subsequent calls to
+				// `effective_audio_input` until the redirect is disarmed.
+				#[cfg(not(target_os = "linux"))]
+				{
+					let cached_input = match avfoundation_input_index(ffmpeg, &hs.source) {
+						Some(idx) => {
+							tracing::info!(
+								device = %hs.source,
+								idx,
+								"host-silent (macOS): resolved AVFoundation input index (cached for redirect lifetime)"
+							);
+							Some(pulsar_core::audio::AudioInput::AvFoundation(idx))
+						}
+						None => {
+							tracing::warn!(
+								device = %hs.source,
+								"host-silent (macOS): output redirected to virtual device but its \
+								 AVFoundation input index could not be resolved at arm-time — \
+								 will capture the configured input instead"
+							);
+							None
+						}
+					};
+					*UNIX_SILENT_AUDIO_INPUT.lock().unwrap() = cached_input;
+				}
 				*UNIX_SILENT_SOURCE.lock().unwrap() = Some(hs.source);
 				*UNIX_SILENT_GUARD.lock().unwrap() = Some(hs.guard);
+				false
 			}
 			Ok(None) => {
 				tracing::warn!(
-					"no sinkless device for host-silent (pactl null-sink / macOS virtual output) — falling back to mute"
+					"no sinkless device for host-silent (pactl null-sink / macOS virtual output) — falling back to mute (deferred to post-capture)"
 				);
-				unix_mute_fallback(true);
+				true
 			}
 			Err(e) => {
-				tracing::warn!("arming host-silent redirect failed: {e} — falling back to mute");
-				unix_mute_fallback(true);
+				tracing::warn!("arming host-silent redirect failed: {e} — falling back to mute (deferred to post-capture)");
+				true
 			}
 		}
 	} else {
@@ -458,7 +650,12 @@ fn set_unix_silent_request(sid: u64, want: bool) {
 		// device + unloads the null sink), clear the source, and undo any mute fallback.
 		*UNIX_SILENT_GUARD.lock().unwrap() = None;
 		*UNIX_SILENT_SOURCE.lock().unwrap() = None;
+		#[cfg(not(target_os = "linux"))]
+		{
+			*UNIX_SILENT_AUDIO_INPUT.lock().unwrap() = None;
+		}
 		unix_mute_fallback(false);
+		false
 	}
 }
 
@@ -487,14 +684,17 @@ fn unix_mute_fallback(mute: bool) {
 #[cfg(windows)]
 pub(super) fn release_redirect(sid: u64) {
 	// Layout is irrelevant on the release path (no format set, no redirect) — pass the
-	// default; the owner-set transition only restores the saved default.
-	set_redirect_request(sid, false, pulsar_core::audio::ChannelLayout::Stereo);
+	// default; the owner-set transition only restores the saved default. The `false`
+	// (release) transition never requests a mute fallback, so the return is moot here.
+	let _ = set_redirect_request(sid, false, pulsar_core::audio::ChannelLayout::Stereo);
 }
 #[cfg(not(windows))]
 pub(super) fn release_redirect(sid: u64) {
 	// Drop this session's host-silent request; restores the host (default sink + null
-	// sink teardown / output switch-back) when it was the last owner.
-	set_unix_silent_request(sid, false);
+	// sink teardown / output switch-back) when it was the last owner. The `false`
+	// (release) transition never requests a mute fallback, so the return is moot here.
+	// ffmpeg is not used on the disarm (want=false) path — pass "" as a placeholder.
+	let _ = set_unix_silent_request(sid, false, "");
 }
 
 /// go_online re-run hook: a fresh serve loop has no live sessions, so clear any
@@ -521,6 +721,10 @@ pub(super) fn reset_redirect_all() {
 		// output back), clear the source, and undo any mute fallback.
 		*UNIX_SILENT_GUARD.lock().unwrap() = None;
 		*UNIX_SILENT_SOURCE.lock().unwrap() = None;
+		#[cfg(not(target_os = "linux"))]
+		{
+			*UNIX_SILENT_AUDIO_INPUT.lock().unwrap() = None;
+		}
 		unix_mute_fallback(false);
 	}
 }
@@ -578,17 +782,22 @@ fn start_audio_and_mute(
 	// loopback capture below, so the capture taps the (never-muted) virtual sink at the
 	// right width and the client gets real audio while the host stays silent. The
 	// owner-set guard restores the original default when the last session releases it.
+	// If no virtual sink is present it returns `true` to request the endpoint-mute
+	// fallback — which we DEFER until after the loopback capture is spawned (muting at
+	// capture-open latches silence into the WASAPI loopback on post-mute codecs).
 	#[cfg(windows)]
-	set_redirect_request(sid, req.mute_host, neg_layout);
+	let want_mute_fallback = set_redirect_request(sid, req.mute_host, neg_layout);
 	// Host-silent (Linux/macOS): arm the capture-source redirect BEFORE building the
 	// capture command below, so the audio ffmpeg taps the redirected monitor (a null
 	// sink on Linux) instead of the real default — the client gets audio while the
 	// host's speakers stay silent, WITHOUT muting (muting silences the monitor too).
 	// Re-evaluated every (re-)stream so a live toggle takes effect; the owner-set guard
 	// restores the host when the last session releases it. If no sinkless device is
-	// available it falls back to `set_host_muted` internally (post-capture, safe).
+	// available it returns `true` to request the `set_host_muted` fallback — DEFERRED
+	// to after the capture is spawned (a muted `@DEFAULT_SINK@` silences its `.monitor`
+	// too, so opening the capture into the mute would latch silence).
 	#[cfg(not(windows))]
-	set_unix_silent_request(sid, req.mute_host);
+	let want_mute_fallback = set_unix_silent_request(sid, req.mute_host, ffmpeg);
 	if req.transmit_audio && audio_dest.port() > 0 {
 		let dest = format!("rtp://{audio_dest}");
 		// Windows: prefer WASAPI loopback — it taps whatever is playing on the
@@ -609,9 +818,10 @@ fn start_audio_and_mute(
 			// Direct-capture (dshow / pulse `.monitor` / avfoundation) fallback. Honor the
 			// NEGOTIATED channel layout so a 5.1/7.1 source is encoded as multistream Opus
 			// (the loopback path above derives the layout from the live endpoint instead).
-			// On Linux/macOS, when host-silent armed a redirect, capture its monitor source
-			// (the null sink's `.monitor`) instead of the user's configured device, so the
-			// stream carries program audio while the speakers are silent.
+			// On Linux/macOS, when host-silent armed a redirect, capture the redirected
+			// device (Linux: the null sink's `.monitor`; macOS: the virtual output device's
+			// AVFoundation input) instead of the user's configured device, so the stream
+			// carries program audio while the speakers are silent.
 			#[cfg(windows)]
 			let input = acfg.audio_input();
 			#[cfg(not(windows))]
@@ -620,6 +830,18 @@ fn start_audio_and_mute(
 				pulsar_core::audio::audio_command_layout(&input, &dest, neg_layout);
 			let _ = spawn_tracked(procs, ffmpeg, &aargs);
 		}
+	}
+	// Apply the DEFERRED endpoint-mute fallback (no virtual sink / null sink present),
+	// now that the loopback/monitor capture above has been spawned. Muting only here —
+	// never at capture-open — keeps a muted endpoint from latching silence into an
+	// already-opened WASAPI loopback (Windows) or a muted `@DEFAULT_SINK@` from
+	// silencing the `.monitor` the capture taps (Linux). The matching unmute runs on
+	// the owner-set release transition (`mute_fallback(false)`/`unix_mute_fallback(false)`).
+	if want_mute_fallback {
+		#[cfg(windows)]
+		mute_fallback(true);
+		#[cfg(not(windows))]
+		unix_mute_fallback(true);
 	}
 }
 
@@ -740,8 +962,23 @@ fn spawn_media_forwarders(
 				}
 				q = nack_rx.recv() => {
 					let Some(seqs) = q else { break };
+					// The peer controls `seqs` length and content (a relayed session
+					// datagram can carry thousands of u16s), so DON'T do a linear ring
+					// scan per requested seq (O(seqs*ring) CPU amplification). De-dup the
+					// request into a set capped at the ring depth (honoring more is
+					// pointless — the ring holds at most `NACK_RING` packets), then scan
+					// the ring ONCE and re-send the matches. This bounds the work per NACK
+					// datagram to O(ring + seqs) regardless of how big `seqs` is.
+					let mut want: std::collections::HashSet<u16> =
+						std::collections::HashSet::with_capacity(NACK_RING);
 					for seq in seqs {
-						if let Some((_, pkt)) = ring.iter().find(|(s, _)| *s == seq) {
+						if want.len() >= NACK_RING {
+							break;
+						}
+						want.insert(seq);
+					}
+					for (s, pkt) in ring.iter() {
+						if want.contains(s) {
 							let _ = vtx.send(&media::frame(media::TAG_VIDEO, pkt)).await;
 						}
 					}
@@ -766,6 +1003,45 @@ fn spawn_media_forwarders(
 	Some((vport, aport))
 }
 
+/// If `req` differs from the previous native request ONLY in fields the LIVE `CaptureHandle` can
+/// absorb without a full capture+encode+audio rebuild — the monitor (`display_idx`) and/or the
+/// target bitrate (`bitrate_kbps`, to a concrete >0 value) — return `(display_changed,
+/// bitrate_changed)`. Otherwise `None` (codec/encoder/res/fps/audio/etc. changed → full rebuild).
+///
+/// This is what keeps a session-menu MONITOR switch AND the client's adaptive-bitrate steps off
+/// the slow path: a monitor change is an in-thread re-capture (`switch_output`), a bitrate change
+/// is a live `nvEncReconfigureEncoder` (`set_bitrate`) — neither spawns a second encoder. Before
+/// this, an adaptive bitrate step landing during a switch made the restream "not display-only" →
+/// a full rebuild that STACKED with the switch (two encoders → the host's encode load doubled,
+/// and the switch time went erratic 1-8 s). Comparing via the derived `PartialEq` (with both live
+/// fields normalized) means any field added to `StreamReq` later defaults to the safe full path.
+#[cfg(windows)]
+fn live_change(prev: &StreamReq, req: &StreamReq) -> Option<(bool, bool)> {
+	let display_changed = prev.display_idx != req.display_idx;
+	let bitrate_changed = prev.bitrate_kbps != req.bitrate_kbps;
+	if !display_changed && !bitrate_changed {
+		return None;
+	}
+	// A STANDALONE bitrate change to "0" (auto → host default) must take the full path so the
+	// host re-resolves the default. But a MONITOR switch must NEVER be demoted to a full restart
+	// just because a bitrate step (incl. →0) coincided with it — that full restart is what
+	// stacked a 2nd encoder + caused the erratic/stuck switches. When the display also changed we
+	// handle the switch live and simply keep the current live bitrate (ignore the →0).
+	if bitrate_changed && req.bitrate_kbps == 0 && !display_changed {
+		return None;
+	}
+	let mut probe = prev.clone();
+	probe.display_idx = req.display_idx;
+	probe.bitrate_kbps = req.bitrate_kbps;
+	if probe == *req {
+		// Only signal a live bitrate apply for a concrete >0 target (set_bitrate(0) is meaningless);
+		// a coincident →0 is dropped here and the rebuilt encoder keeps the current live bitrate.
+		Some((display_changed, bitrate_changed && req.bitrate_kbps > 0))
+	} else {
+		None
+	}
+}
+
 /// Build the per-session `on_stream` handler. A (re-)stream request restarts
 /// capture: it kills any ffmpeg/native capture already running for this session,
 /// then spawns the new encode (native DXGI+NVENC on Windows, else ffmpeg), pushes
@@ -786,6 +1062,9 @@ pub(super) fn make_on_stream(
 	sid: u64,
 	self_name: String,
 	#[cfg(windows)] native_slot: Arc<Mutex<Option<pulsar_capture::CaptureHandle>>>,
+	// The monitor (`display_idx`) the current stream captures, published for the input path so an
+	// absolute (webview) pointer lands on the streamed screen, not always the primary. Windows-only.
+	#[cfg(windows)] cur_display: Arc<std::sync::atomic::AtomicU32>,
 	stats_out: tokio::sync::mpsc::Sender<DataMsg>,
 	app_h: AppHandle,
 	peer: String,
@@ -795,6 +1074,9 @@ pub(super) fn make_on_stream(
 	#[cfg(target_os = "linux")] restore_token: Arc<Mutex<Option<String>>>,
 	#[cfg(target_os = "linux")] cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
 	#[cfg(target_os = "linux")] cap_gen: Arc<std::sync::atomic::AtomicU64>,
+	// Records the latest StreamReq so the host-side display-mode watcher (non-Windows) can
+	// re-issue it to restart capture at the new geometry. Windows self-heals in pulsar-capture.
+	#[cfg(not(windows))] last_req_store: Arc<Mutex<Option<StreamReq>>>,
 ) -> impl FnMut(StreamReq, SocketAddr) + Send + 'static {
 	let mut announced = false;
 	let mut stop_tx = Some(stop_tx);
@@ -803,7 +1085,69 @@ pub(super) fn make_on_stream(
 	// pollers when a session re-requests while still on the cursorless KMS capture.
 	#[cfg(target_os = "linux")]
 	let mut cursor_alive: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+	// The previous request that started a LIVE native (DXGI+NVENC) capture, kept so a re-stream
+	// that only changed `display_idx` can switch the monitor IN PLACE (CaptureHandle::switch_output)
+	// instead of tearing the whole pipeline down. `None` whenever the current stream isn't native
+	// (ffmpeg fallback) — then a monitor change falls through to the normal restart.
+	#[cfg(windows)]
+	let mut last_native_req: Option<StreamReq> = None;
 	move |req: StreamReq, addr: SocketAddr| {
+		// Remember the latest request so the host-side display-mode watcher can re-issue it to
+		// restart capture at the new geometry when the host's resolution/refresh changes.
+		#[cfg(not(windows))]
+		{
+			*last_req_store.lock().unwrap() = Some(req.clone());
+		}
+		// FAST PATH — a live, in-session restream the running native capture can absorb without a
+		// full rebuild: a MONITOR switch (`switch_output` → in-thread re-capture on the new GPU)
+		// and/or an adaptive BITRATE step (`set_bitrate` → live nvEncReconfigureEncoder). Crucially
+		// this keeps a bitrate step from forcing a full restart that STACKS a second encoder onto a
+		// concurrent switch (the doubled encode load + erratic switch time). Audio, the media
+		// forwarders, the ffmpeg probe, and the announce state are all left untouched.
+		#[cfg(windows)]
+		if let Some((disp, bitrate)) =
+			last_native_req.as_ref().and_then(|prev| live_change(prev, &req))
+		{
+			let handled = {
+				let slot = native_slot.lock().unwrap();
+				match slot.as_ref() {
+					Some(h) => {
+						// Bitrate FIRST: an accompanying switch_output rebuilds the encoder, which
+						// seeds itself from the live target — so the new target must be set before it.
+						if bitrate && req.bitrate_kbps > 0 {
+							h.set_bitrate(req.bitrate_kbps);
+						}
+						if disp {
+							h.switch_output(req.display_idx);
+						}
+						// Publish the ACTUALLY-confirmed output for the input path (not the
+						// optimistically-requested one). The capture thread writes current_output()
+						// after each successful build including reverts, so this reflects the real
+						// streaming monitor. Using req.display_idx here would point input at monitor
+						// B even when the thread reverted to A after a failed switch-build (C1).
+						let actual = h.current_output();
+						cur_display.store(actual, std::sync::atomic::Ordering::Relaxed);
+						// Keep last_native_req.display_idx pinned to the CONFIRMED output, not the
+						// requested one. This means a retry of the same monitor B (after a revert
+						// to A) still sees live_change(A, B) → display_changed=true → issues
+						// switch_output(B) again, rather than being a silent live_change(B,B)=None
+						// that falls to the slow path. Once the thread lands on B, current_output()
+						// returns B and subsequent fast-path calls advance the baseline to B. (C1)
+						let mut confirmed_req = req.clone();
+						confirmed_req.display_idx = actual;
+						last_native_req = Some(confirmed_req);
+						true
+					}
+					None => false,
+				}
+			};
+			if handled {
+				tracing::info!(display_idx = req.display_idx, disp, bitrate, "native live restream (fast path)");
+				return;
+			}
+			// The native handle is gone (a prior restream fell back to ffmpeg) — fall through to
+			// the normal restart below.
+		}
 		let cfg = stream_cfg.lock().unwrap().clone();
 		// A (re-)stream supersedes any prior cursor poller; the (maybe) new KMS branch below
 		// starts a fresh one. Stopping here keeps it at most one per session.
@@ -1031,6 +1375,9 @@ pub(super) fn make_on_stream(
 						);
 					}
 					Err(e) => {
+						// LOG it (not just the UI event): a headless/CLI host has no webview for the
+						// toast, so a Wayland capture failure (portal/pipewire/gst) was otherwise invisible.
+						tracing::error!(err = %e, "wayland capture::start failed");
 						let _ = app_h_task.emit(
 							"session",
 							SessionEvent {
@@ -1156,11 +1503,19 @@ pub(super) fn make_on_stream(
 		);
 		// Clamp to what the CLIENT can decode (its startup probe travels in the
 		// request): never stream a codec the other side can't show. H.264 software
-		// decode exists everywhere, so it is the universal meeting point.
+		// decode exists almost everywhere, so it is the usual meeting point — but the
+		// client occasionally prunes h264 out of its set entirely (e.g. only HEVC
+		// validated), so prefer h264 only when it is actually listed, otherwise fall
+		// back to the FIRST codec the client really advertised rather than blindly
+		// streaming a codec it can't show.
 		let codec = if !req.decode_codecs.is_empty()
 			&& !req.decode_codecs.iter().any(|c| codec_from_str(c) == codec)
 		{
-			pipeline::VCodec::H264
+			if req.decode_codecs.iter().any(|c| codec_from_str(c) == pipeline::VCodec::H264) {
+				pipeline::VCodec::H264
+			} else {
+				codec_from_str(&req.decode_codecs[0])
+			}
 		} else {
 			codec
 		};
@@ -1446,6 +1801,11 @@ pub(super) fn make_on_stream(
 				draw_mouse: true,
 			}) {
 				Ok(h) => {
+					// Publish the confirmed capture monitor for the input path. In the slow path
+					// start_capture_encode initialises the thread on req.display_idx, so this is
+					// the confirmed output (the thread writes current_output=req.display_idx on its
+					// first build). Use req.display_idx directly here — we know init succeeded. (C1)
+					cur_display.store(req.display_idx, std::sync::atomic::Ordering::Relaxed);
 					*native_slot.lock().unwrap() = Some(h);
 					true
 				}
@@ -1456,6 +1816,14 @@ pub(super) fn make_on_stream(
 		};
 		#[cfg(not(windows))]
 		let native_started = false;
+
+		// Remember this request for the in-place monitor-switch fast path — but ONLY when the
+		// native capture actually started. If we fell back to ffmpeg there's no CaptureHandle to
+		// switch_output on, so a later monitor change must take the full restart path.
+		#[cfg(windows)]
+		{
+			last_native_req = if native_started { Some(req.clone()) } else { None };
+		}
 
 		// Encode summary (codec · encoder · res · fps · bitrate target) — the base the
 		// client's stats panel shows; the ffmpeg path appends a live "… ms kodlama"
@@ -1698,49 +2066,156 @@ fn spawn_gst_tracked(procs: &Arc<Mutex<Vec<Child>>>, pipeline: &str) -> Result<(
 /// (Begin → buffer, Chunk → append + detect gaps, End → save) and surface the
 /// result to the host UI.
 pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg) + Send + 'static {
-	// Reassemble: Begin → buffer, Chunk → append (detect gaps), End → save.
-	let mut name = String::new();
-	let mut buf: Vec<u8> = Vec::new();
-	let mut next = 0u32;
-	let mut expected = 0u32;
-	let mut gap = false;
+	// Reassemble: Begin → state, Chunk → store BY INDEX, End → save.
+	// The session transport is unordered UDP, so chunks can arrive out of order
+	// or duplicated; keying by index (instead of appending in arrival order) lets
+	// reorders and duplicates self-heal — only a genuinely lost chunk fails the
+	// transfer. The transfer is complete iff every index `0..expected` arrived.
+	//
+	// Each transfer carries a per-stream `id` (FileBegin/Chunk/End), so concurrent
+	// transfers (two uploads, an upload racing a download reply) keep SEPARATE
+	// reassembly state keyed by that id — interleaved messages no longer clobber
+	// each other. An old peer sends id 0 for everything → it falls back to a single
+	// keyed-by-0 transfer, exactly the previous single-stream behavior.
+	/// Idle transfers older than this are swept from the map on the next FileBegin.
+	const XFER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+	/// Maximum concurrent in-flight transfers. If a new FileBegin would push us over
+	/// this limit, the oldest (by last_activity) entry is evicted first.
+	const MAX_CONCURRENT_XFERS: usize = 8;
+	struct Reasm {
+		/// Set by FileBegin. `None` means chunks arrived before FileBegin (UDP
+		/// reorder); the entry was lazily created to buffer them. A FileEnd with
+		/// `expected == None` is treated as incomplete (Begin never arrived).
+		name: String,
+		expected: Option<u32>,
+		chunks: std::collections::BTreeMap<u32, Vec<u8>>,
+		// Running total of buffered bytes (sum of every stored chunk's len, dup-safe).
+		// Capped against MAX_XFER_BYTES so a peer can't OOM us by announcing a huge
+		// chunk count and streaming distinct-index chunks without ever sending FileEnd.
+		received: u64,
+		/// Updated on FileBegin and every FileChunk; entries idle beyond
+		/// XFER_IDLE_TIMEOUT are swept on the next FileBegin so a lost FileEnd
+		/// (UDP, no retransmit) can't leak buffered bytes for the session lifetime.
+		last_activity: std::time::Instant,
+	}
+	let mut xfers: std::collections::HashMap<u32, Reasm> = std::collections::HashMap::new();
 	move |m: DataMsg| match m {
 		DataMsg::FileBegin {
+			id,
 			name: n,
-			size,
-			chunks,
+			size: _,
+			chunks: n_chunks,
 		} => {
-			name = sanitize_filename(&n);
-			// `size` is peer-controlled: clamp the PRE-allocation (an absurd value
-			// would panic with "capacity overflow", a merely huge one reserves GBs
-			// up front) — extend_from_slice still grows past the clamp if a
-			// legitimately larger file actually arrives.
-			buf = Vec::with_capacity(size.min(64 * 1024 * 1024) as usize);
-			next = 0;
-			expected = chunks;
-			gap = false;
-		}
-		DataMsg::FileChunk { index, data } => {
-			if index != next {
-				gap = true;
+			// Evict stale entries (lost FileEnd / lost middle chunk) so a long-lived
+			// session over a lossy link can't accumulate unbounded dead reassemblers.
+			let now = std::time::Instant::now();
+			xfers.retain(|_, r| now.duration_since(r.last_activity) < XFER_IDLE_TIMEOUT);
+			// Hard cap: if still at the concurrent limit, drop the oldest entry —
+			// but only if it is not the lazy placeholder for THIS id (early chunks).
+			if xfers.len() >= MAX_CONCURRENT_XFERS && !xfers.contains_key(&id) {
+				if let Some(oldest_id) = xfers
+					.iter()
+					.min_by_key(|(_, r)| r.last_activity)
+					.map(|(k, _)| *k)
+				{
+					xfers.remove(&oldest_id);
+				}
 			}
-			next = index.wrapping_add(1);
-			buf.extend_from_slice(&data);
+			// If early FileChunks created a lazy entry (UDP reorder), merge the
+			// name + expected into it to preserve buffered chunks.
+			// Otherwise insert a fresh entry.
+			if let Some(r) = xfers.get_mut(&id) {
+				r.name = sanitize_filename(&n);
+				r.expected = Some(n_chunks);
+				r.last_activity = now;
+			} else {
+				xfers.insert(
+					id,
+					Reasm {
+						name: sanitize_filename(&n),
+						expected: Some(n_chunks),
+						chunks: std::collections::BTreeMap::new(),
+						received: 0,
+						last_activity: now,
+					},
+				);
+			}
 		}
-		DataMsg::FileEnd => {
-			let complete = !gap && next == expected;
+		DataMsg::FileChunk { id, index, data } => {
+			// If no entry exists yet (FileBegin hasn't arrived — UDP reorder),
+			// create a lazy placeholder so the chunk is buffered rather than
+			// dropped. FileBegin will fill in `name` and `expected` when it
+			// arrives, keeping the already-stored chunks intact.
+			if !xfers.contains_key(&id) {
+				xfers.insert(
+					id,
+					Reasm {
+						name: String::new(),
+						expected: None,
+						chunks: std::collections::BTreeMap::new(),
+						received: 0,
+						last_activity: std::time::Instant::now(),
+					},
+				);
+			}
+			// Ignore an index past the announced count (bogus/duplicate-after-resize);
+			// a re-sent index simply overwrites with the identical bytes. Before
+			// FileBegin (expected == None) buffer all indices — the overflow check
+			// runs once expected is known.
+			let overflow = if let Some(r) = xfers.get_mut(&id) {
+				r.last_activity = std::time::Instant::now();
+				let in_range = r.expected.map_or(true, |e| index < e);
+				if in_range {
+					let prev_len = r.chunks.get(&index).map(|p| p.len() as u64).unwrap_or(0);
+					let projected = r.received - prev_len + data.len() as u64;
+					if projected > crate::files::MAX_XFER_BYTES {
+						true
+					} else {
+						r.chunks.insert(index, data);
+						r.received = projected;
+						false
+					}
+				} else {
+					false
+				}
+			} else {
+				false
+			};
+			if overflow {
+				// Peer is overshooting the sane transfer ceiling — drop the whole
+				// transfer (further chunks for this id find no entry → ignored, a
+				// later FileEnd is a no-op) so the buffer can't grow unbounded.
+				xfers.remove(&id);
+			}
+		}
+		DataMsg::FileEnd { id } => {
+			// End the transfer: a repeated/stray FileEnd (no matching Begin) must not
+			// re-save — `remove` drops the state so a second End for the same id is a
+			// no-op.
+			let Some(r) = xfers.remove(&id) else {
+				return;
+			};
+			// Complete iff FileBegin was seen (expected is Some) and every expected
+			// chunk arrived. `Some(0)` is a legitimate empty file. If `expected` is
+			// still `None`, FileBegin never arrived (lost or extremely delayed);
+			// treat that as a failed transfer.
+			let complete = r.expected.map_or(false, |e| r.chunks.len() == e as usize);
+			// Write chunks directly to disk (in index order via BTreeMap) without
+			// building a second contiguous Vec — avoids ~2x peak memory at the
+			// MAX_XFER_BYTES ceiling (C24 fix).
 			let saved = if complete {
-				save_received_file(&name, &buf)
+				save_received_file_chunks(&r.name, r.chunks.values(), r.received)
 			} else {
 				None
 			};
 			let ok = saved.is_some();
+			let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
 			let _ = app_h.emit(
 				"file-recv",
 				FilePayload {
 					peer: peer.clone(),
-					name: name.clone(),
-					bytes: buf.len() as u64,
+					name: r.name.clone(),
+					bytes: written,
 					ok,
 				},
 			);
@@ -1750,11 +2225,10 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 					SessionEvent {
 						kind: "file".into(),
 						peer: peer.clone(),
-						detail: format!("{} · {} B", name, buf.len()),
+						detail: format!("{} · {} B", r.name, written),
 					},
 				);
 			}
-			buf = Vec::new();
 		}
 		_ => {}
 	}

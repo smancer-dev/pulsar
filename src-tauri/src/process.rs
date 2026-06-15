@@ -725,6 +725,60 @@ pub fn render_bin(app: &AppHandle) -> String {
 	bundled_bin(app, "pulsar-render")
 }
 
+/// Make a `pulsar-render` child resolve the HOST's system ffmpeg instead of the one
+/// bundled in the AppImage, when the bundle's ffmpeg lacks the SoC hardware decoder
+/// the system has. Apply to EVERY `pulsar-render` invocation on Linux — the real
+/// renderer AND the `--probe` (so capability negotiation + the overlay HUD report the
+/// decoder that will actually run).
+///
+/// Why: the Linux AppImage bundles a GENERIC ffmpeg (no `h264_rkmpp`/`hevc_rkmpp`) and
+/// `AppRun` puts its libs first on `LD_LIBRARY_PATH`, shadowing the Pi's Rockchip
+/// ffmpeg. `pulsar-render`'s tiered decoder selection then finds NO DRM_PRIME hardware
+/// decoder among the bundled libs and falls to Tier-2 software decode — the RK3588
+/// appliance silently software-decodes H.265 (high CPU, capped fps). Prepending the
+/// host's multiarch lib dir makes the loader resolve the system `libav*` (which pull in
+/// `librockchip_mpp`/`librga`) ahead of the bundled set, restoring zero-copy `rkmpp`.
+///
+/// Gated so it can only ever help: auto-on only when running inside an AppImage
+/// (`APPDIR` set) AND a Rockchip decode device (`/dev/mpp_service`) is present AND the
+/// host actually ships a matching `libavcodec.so.58`. `PULSAR_PREFER_SYSTEM_FFMPEG=1`
+/// forces it on (other SoCs); `=0` forces it off. No-op on non-Linux and on x86
+/// desktops without the device, so behaviour is unchanged everywhere else.
+pub fn apply_render_lib_env(cmd: &mut std::process::Command) {
+	#[cfg(target_os = "linux")]
+	{
+		let on = match std::env::var("PULSAR_PREFER_SYSTEM_FFMPEG").as_deref() {
+			Ok("0") | Ok("off") | Ok("false") => return,
+			Ok("1") | Ok("on") | Ok("true") => true,
+			// Auto: the documented RK3588 appliance case — inside an AppImage, on a
+			// Rockchip SoC, where the bundled ffmpeg is the rkmpp-less generic build.
+			_ => {
+				std::env::var_os("APPDIR").is_some()
+					&& std::path::Path::new("/dev/mpp_service").exists()
+			}
+		};
+		if !on {
+			return;
+		}
+		// Debian/Ubuntu multiarch layout. The soname (`.58`) must match the ffmpeg major
+		// `pulsar-render` is linked against (ffmpeg-sys-next); if the host has a different
+		// major the guard fails and this stays a safe no-op (bundled libs are kept).
+		let sysdir = format!("/usr/lib/{}-linux-gnu", std::env::consts::ARCH);
+		if !std::path::Path::new(&format!("{sysdir}/libavcodec.so.58")).exists() {
+			return;
+		}
+		let new_val = match std::env::var("LD_LIBRARY_PATH") {
+			Ok(cur) if !cur.is_empty() => format!("{sysdir}:{cur}"),
+			_ => sysdir,
+		};
+		cmd.env("LD_LIBRARY_PATH", new_val);
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = cmd;
+	}
+}
+
 /// The main Tauri window's native HWND (Windows) as a u64, so `pulsar-render` can create its
 /// D3D11 child window under it via `--wid` (the Win32 analogue of Linux's `render::window_xid`).
 /// None before the window exists.

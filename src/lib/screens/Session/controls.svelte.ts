@@ -91,6 +91,10 @@ export class SessionControls {
 		this.streamRes = v;
 		const playId = this.#in.playId();
 		if (playId < 0) return;
+		// The host kills its current encoder and rebuilds capture at the new geometry
+		// (set_play_resolution in session_cmds.rs). A 4K NVENC/DXGI rebuild can easily
+		// exceed 3 s, so suppress the stall detector for 4 s.
+		this.#beginSwitch(4000);
 		const [w, h] =
 			v === '4K' ? [3840, 2160] : v === '1440p' ? [2560, 1440] : v === '1080p' ? [1920, 1080] : [0, 0];
 		api.setPlayResolution(playId, w, h).catch(() => {});
@@ -98,7 +102,11 @@ export class SessionControls {
 	setFps = (v: 'auto' | '30' | '60' | '120') => {
 		this.streamFps = v;
 		const playId = this.#in.playId();
-		if (playId >= 0) api.setPlayFps(playId, v === 'auto' ? 0 : Number(v)).catch(() => {});
+		if (playId < 0) return;
+		// The host restarts ffmpeg with the new frame rate (same pipeline rebuild as a
+		// codec switch); suppress the stall detector for the same window.
+		this.#beginSwitch(2800);
+		api.setPlayFps(playId, v === 'auto' ? 0 : Number(v)).catch(() => {});
 	};
 	setBitrate = (v: number) => {
 		this.streamBitrate = v;

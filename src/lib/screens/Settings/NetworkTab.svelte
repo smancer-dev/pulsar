@@ -2,7 +2,6 @@
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import type { Config, NetworkMode } from '$lib/types';
-	import { ui, saveUi } from '$lib/settings.svelte';
 	import { api, onNodePort } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
@@ -94,10 +93,6 @@
 			/>
 		{/if}
 	</div>
-</div>
-<div class="srow">
-	<div class="st"><b>{t('settings.bwlimit')}</b><span>{t('settings.bwlimitDesc')}</span></div>
-	<button class="toggle" aria-label={t('settings.bwlimit')} class:on={ui.bwlimit} aria-pressed={ui.bwlimit} onclick={() => { ui.bwlimit = !ui.bwlimit; saveUi(); }}><span class="knob"></span></button>
 </div>
 
 <style>

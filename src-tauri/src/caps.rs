@@ -168,10 +168,12 @@ fn probe_decoders(app: &AppHandle, platform: &str) -> Vec<DecoderCap> {
 	#[cfg(not(target_os = "macos"))]
 	{
 		let render = crate::process::render_bin(app);
-		let out = std::process::Command::new(&render)
-			.arg("--probe")
-			.stderr(std::process::Stdio::null())
-			.output();
+		let mut cmd = std::process::Command::new(&render);
+		cmd.arg("--probe").stderr(std::process::Stdio::null());
+		// Probe with the SAME lib resolution the real renderer uses, so the reported
+		// decoder/tier match what will actually run (rkmpp HW on RK3588, not software).
+		crate::process::apply_render_lib_env(&mut cmd);
+		let out = cmd.output();
 		let Ok(out) = out else {
 			// Renderer missing: software ffmpeg decode still exists inside it when present;
 			// report nothing rather than guessing.

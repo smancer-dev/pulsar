@@ -46,18 +46,61 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// the decode loop tears the old demuxer+decoder down and reopens in place.
 static REOPEN: AtomicBool = AtomicBool::new(false);
 static REOPEN_SDP: Mutex<Option<String>> = Mutex::new(None);
+/// True from the moment a reopen is requested (monitor/codec switch) until the new
+/// stream's first keyframe decodes — the overlay draws a "switching…" indicator over
+/// the held last frame so the user sees the change is in progress, not a hang. Only set
+/// on a REOPEN (not the initial connect, which has its own connecting screen).
+pub static SWITCHING: AtomicBool = AtomicBool::new(false);
+/// Monotonic-millis deadline by which the switch (reopen) must produce its first keyframe,
+/// or 0 = no switch in progress. If a monitor/codec switch fails silently (the host can't
+/// capture the new output, or its restarted encoder never sends a keyframe on the same UDP
+/// port), nothing else would ever clear SWITCHING or unblock `av_read_frame` — the overlay
+/// would spin forever over the held frame. Past the deadline the interrupt callback aborts
+/// the blocked read and the decode loop retries the open, so a silent switch self-recovers.
+static SWITCH_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+/// How long a switch may take to produce its first keyframe before we give up waiting on the
+/// (possibly silent) new stream, clear the spinner and retry the reopen. Covers the host's
+/// restream gap + a couple of GOPs of slack.
+const SWITCH_TIMEOUT_MS: u64 = 6_000;
+
+/// Monotonic milliseconds since first use (for the switch deadline; no wall-clock jumps).
+fn mono_ms() -> u64 {
+	use std::sync::OnceLock;
+	use std::time::Instant;
+	static E: OnceLock<Instant> = OnceLock::new();
+	E.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// True once a switch (reopen) has been waiting past `SWITCH_TIMEOUT_MS` without a keyframe.
+fn switch_timed_out() -> bool {
+	let d = SWITCH_DEADLINE_MS.load(Ordering::Relaxed);
+	d != 0 && mono_ms() >= d
+}
 
 /// Queue a live reopen on `sdp_path` (called from the stdin reader on a `reopen` line).
 pub fn request_reopen(sdp_path: &str) {
-	*REOPEN_SDP.lock().unwrap() = Some(sdp_path.to_string());
-	REOPEN.store(true, Ordering::Relaxed);
+	// Set REOPEN_SDP and REOPEN under the SAME lock the decode loop uses to take()+clear them,
+	// so a second reopen arriving between the loop's take() and store(false) can't be clobbered
+	// back to REOPEN=false (a TOCTOU that dropped the second switch — the new SDP would sit in
+	// REOPEN_SDP with REOPEN=false until the next EOF). With both atomics flipped inside the
+	// mutex, the decode loop either sees the new SDP on its take() or re-breaks immediately on
+	// the still-set REOPEN flag and picks it up on the next pass.
+	{
+		let mut sdp = REOPEN_SDP.lock().unwrap();
+		*sdp = Some(sdp_path.to_string());
+		REOPEN.store(true, Ordering::Relaxed);
+	}
+	SWITCHING.store(true, Ordering::Relaxed);
+	// Arm the switch deadline so a silent new stream can't hang the spinner forever.
+	SWITCH_DEADLINE_MS.store(mono_ms() + SWITCH_TIMEOUT_MS, Ordering::Relaxed);
 }
 
-/// libav interrupt callback: abort a blocked demuxer read on stop/reopen so the decode
-/// loop can't hang waiting for packets that will never come (e.g. the host already
-/// switched codecs and the old RTP flow went quiet).
+/// libav interrupt callback: abort a blocked demuxer read on stop/reopen, or once a switch
+/// has waited past its deadline, so the decode loop can't hang waiting for packets that will
+/// never come (e.g. the host already switched codecs / monitors and the new RTP flow stayed
+/// silent on the same port).
 unsafe extern "C" fn intr_cb(_: *mut c_void) -> c_int {
-	(STOP.load(Ordering::Relaxed) || REOPEN.load(Ordering::Relaxed)) as c_int
+	(STOP.load(Ordering::Relaxed) || REOPEN.load(Ordering::Relaxed) || switch_timed_out()) as c_int
 }
 /// Frame pacing toggle. false = newest-wins (drain all-but-newest each present); true =
 /// Moonlight per-vblank metering (present exactly ONE oldest frame per draw/vblank, hold the
@@ -88,6 +131,13 @@ pub static DEC_LABEL: Mutex<String> = Mutex::new(String::new());
 /// letterboxed/cropped, so the cursor must follow the SAME rect the frame is drawn into. `w==0`
 /// means "no frame presented yet" (don't draw the cursor).
 pub static VIDEO_RECT: Mutex<[i32; 4]> = Mutex::new([0; 4]);
+
+/// The source frame dimensions in HOST pixels — `[w, h]`, updated every `draw()`. The cursor
+/// side-channel overlay (linux.rs) divides the displayed rect (`VIDEO_RECT`) by this to get the
+/// host-pixel → displayed-pixel scale, so the cursor bitmap/hotspot (which arrive in raw host
+/// pixels) are drawn at the right size and the tip stays aligned when the video isn't shown 1:1.
+/// `[0, 0]` means "no frame presented yet".
+pub static VIDEO_SRC: Mutex<[i32; 2]> = Mutex::new([0; 2]);
 
 /// View-fit mode for presenting the video in the window (AnyDesk-style): 0 = FIT
 /// (letterbox, keep aspect — default), 1 = STRETCH (fill the window, may distort),
@@ -186,8 +236,31 @@ pub fn start_decode(sdp_path: &str) {
 			// A pending reopen (live codec switch): drop the stale old-codec frames and
 			// run another decode pass on the rewritten SDP. No pending path → the demuxer
 			// hit EOF / a fatal open error: keep the old end-of-thread behavior.
-			let next = REOPEN_SDP.lock().unwrap().take();
-			REOPEN.store(false, Ordering::Relaxed);
+			// Take the pending SDP and clear REOPEN under the SAME lock request_reopen sets
+			// them under, so a concurrent reopen can't land between take() and store(false)
+			// and have its REOPEN=true clobbered to false (the dropped-second-switch TOCTOU).
+			let mut next = {
+				let mut sdp = REOPEN_SDP.lock().unwrap();
+				let n = sdp.take();
+				REOPEN.store(false, Ordering::Relaxed);
+				n
+			};
+			// A switch was still in progress when this pass ended without a pending reopen —
+			// i.e. the reopen's open/decoder validation failed (`break 'decode`) before any
+			// keyframe. Don't let the decode thread die with the spinner stuck on: clear the
+			// veil and retry THIS sdp so the switch can recover instead of killing video for
+			// the rest of the session (the renderer process must survive on RK3588).
+			if next.is_none() && SWITCHING.load(Ordering::Relaxed) {
+				SWITCHING.store(false, Ordering::Relaxed);
+				SWITCH_DEADLINE_MS.store(0, Ordering::Relaxed);
+				if let Ok(s) = sdp.to_str() {
+					// `break 'decode` (open/validation failure) can return immediately, so
+					// back off before re-running the same sdp to avoid a hot reopen loop while
+					// the host is still bringing the new stream up.
+					std::thread::sleep(std::time::Duration::from_millis(500));
+					next = Some(s.to_string());
+				}
+			}
 			match next {
 				Some(p) => {
 					let mut q = MBX.lock().unwrap();
@@ -259,17 +332,106 @@ unsafe fn decode_once(sdp: &CString) {
 			.and_then(|v| v.parse::<u64>().ok())
 			.unwrap_or(40_000);
 		set(&mut opts, "max_delay", &maxdelay.to_string());
+		// Make avformat_find_stream_info (below) return ASAP instead of sitting in libav's
+		// default ~5 s analyze window. The codec is ALREADY known from the SDP (the m=video
+		// rtpmap sets codec_id) and SPS/PPS arrive in-band on every IDR (host repeatSPSPPS),
+		// so there is nothing to probe — without this, every monitor/codec-switch REOPEN
+		// blocked here for ~5 s on top of the host's restream gap (the "switch takes 5-8 s"
+		// even though the host already resumed). analyzeduration=0 + fpsprobesize=0 (don't
+		// burn frames measuring an fps we don't use — the renderer is untimed) collapses the
+		// probe; a tiny probesize bounds the byte budget. (envs override for diagnosis.)
+		let analyzedur = std::env::var("PULSAR_ANALYZEDUR")
+			.ok()
+			.and_then(|v| v.parse::<u64>().ok())
+			.unwrap_or(0);
+		set(&mut opts, "analyzeduration", &analyzedur.to_string());
+		let probesize = std::env::var("PULSAR_PROBESIZE")
+			.ok()
+			.and_then(|v| v.parse::<u64>().ok())
+			.unwrap_or(100_000);
+		set(&mut opts, "probesize", &probesize.to_string());
+		set(&mut opts, "fpsprobesize", "0");
 		// Pre-allocate the context to install the interrupt callback (a blocked RTP read
 		// must abort on stop/reopen). avformat_open_input frees it on failure as usual.
-		fmt = ff::avformat_alloc_context();
-		(*fmt).interrupt_callback.callback = Some(intr_cb);
-		(*fmt).interrupt_callback.opaque = ptr::null_mut();
-		let opened =
-			ff::avformat_open_input(&mut fmt, sdp.as_ptr(), ptr::null_mut(), &mut opts) >= 0;
-		// Consumed entries were removed from the dict by the demuxer; free whatever remains.
-		ff::av_dict_free(&mut opts);
+		//
+		// Retry on open failure for up to ~800 ms: on a codec/monitor switch the spawner
+		// (respawn_render_for_codec) kills the old renderer via stop_render_child (SIGTERM
+		// + up to 600 ms wait, then SIGKILL+wait) before launching this new process, so
+		// the UDP port should already be free. But there can be a brief kernel delay
+		// between the child's death and the bound UDP socket being released. Retrying
+		// here turns that transient race into a non-event instead of a permanent black
+		// screen for the rest of the session.
+		let opened = {
+			let mut ok = false;
+			for attempt in 0..8u32 {
+				if attempt > 0 {
+					std::thread::sleep(std::time::Duration::from_millis(100));
+				}
+				if STOP.load(Ordering::Relaxed) || REOPEN.load(Ordering::Relaxed) {
+					break; // stop/reopen requested — exit the retry loop and let decode_once return
+				}
+				// avformat_alloc_context returns a context we own; avformat_open_input frees
+				// it on failure, so we re-allocate on every retry.
+				fmt = ff::avformat_alloc_context();
+				(*fmt).interrupt_callback.callback = Some(intr_cb);
+				(*fmt).interrupt_callback.opaque = ptr::null_mut();
+				// Re-build the dict for each attempt: avformat_open_input consumes and
+				// frees consumed entries; calling it again on the same dict after a failure
+				// would re-use already-freed memory.
+				let mut retry_opts: *mut ff::AVDictionary = ptr::null_mut();
+				let set2 = |o: &mut *mut ff::AVDictionary, k: &str, v: &str| {
+					let k = CString::new(k).unwrap();
+					let v = CString::new(v).unwrap();
+					ff::av_dict_set(o, k.as_ptr(), v.as_ptr(), 0);
+				};
+				set2(&mut retry_opts, "protocol_whitelist", "file,rtp,udp");
+				set2(&mut retry_opts, "fflags", "nobuffer+discardcorrupt");
+				let reorder2 = std::env::var("PULSAR_REORDER")
+					.ok()
+					.and_then(|v| v.parse::<u64>().ok())
+					.unwrap_or(64);
+				set2(&mut retry_opts, "reorder_queue_size", &reorder2.to_string());
+				let bufsz2 = std::env::var("PULSAR_BUFSZ")
+					.ok()
+					.and_then(|v| v.parse::<u64>().ok())
+					.unwrap_or(4_194_304);
+				set2(&mut retry_opts, "buffer_size", &bufsz2.to_string());
+				let maxdelay2 = std::env::var("PULSAR_MAXDELAY")
+					.ok()
+					.and_then(|v| v.parse::<u64>().ok())
+					.unwrap_or(40_000);
+				set2(&mut retry_opts, "max_delay", &maxdelay2.to_string());
+				let analyzedur2 = std::env::var("PULSAR_ANALYZEDUR")
+					.ok()
+					.and_then(|v| v.parse::<u64>().ok())
+					.unwrap_or(0);
+				set2(&mut retry_opts, "analyzeduration", &analyzedur2.to_string());
+				let probesize2 = std::env::var("PULSAR_PROBESIZE")
+					.ok()
+					.and_then(|v| v.parse::<u64>().ok())
+					.unwrap_or(100_000);
+				set2(&mut retry_opts, "probesize", &probesize2.to_string());
+				set2(&mut retry_opts, "fpsprobesize", "0");
+				let r =
+					ff::avformat_open_input(&mut fmt, sdp.as_ptr(), ptr::null_mut(), &mut retry_opts);
+				ff::av_dict_free(&mut retry_opts);
+				if r >= 0 {
+					ok = true;
+					break;
+				}
+				if attempt > 0 {
+					eprintln!(
+						"pulsar-render: avformat_open_input failed (attempt {attempt}), retrying…"
+					);
+				}
+			}
+			// The original opts dict was already consumed/freed via set() above; free it
+			// now in case we break out early (STOP/REOPEN) before reaching avformat_open_input.
+			ff::av_dict_free(&mut opts);
+			ok
+		};
 		if !opened {
-			eprintln!("pulsar-render: avformat_open_input failed");
+			eprintln!("pulsar-render: avformat_open_input failed after retries");
 			return;
 		}
 		// Every exit from here on funnels through the cleanup tail below the labeled block
@@ -373,6 +535,21 @@ unsafe fn decode_once(sdp: &CString) {
 			let mut seen_key = false;
 			while !STOP.load(Ordering::Relaxed) && !REOPEN.load(Ordering::Relaxed) {
 				let r = ff::av_read_frame(fmt, pkt);
+				// A switch that never produced its first keyframe within SWITCH_TIMEOUT_MS:
+				// intr_cb has aborted the (otherwise indefinite) read. Stop spinning, clear the
+				// "switching…" veil and requeue THIS sdp so start_decode's loop reopens it from
+				// scratch instead of letting the decode thread die — a silent host that later
+				// resumes is then picked up on the retry. (When the host is gone for good this
+				// just retries every ~SWITCH_TIMEOUT_MS, which is recoverable, not a hard hang.)
+				if r < 0 && !seen_key && switch_timed_out() {
+					ff::av_packet_unref(pkt);
+					SWITCHING.store(false, Ordering::Relaxed);
+					SWITCH_DEADLINE_MS.store(0, Ordering::Relaxed);
+					if let Ok(s) = sdp.to_str() {
+						*REOPEN_SDP.lock().unwrap() = Some(s.to_string());
+					}
+					break;
+				}
 				if r == ff::AVERROR_EOF {
 					break;
 				}
@@ -384,6 +561,8 @@ unsafe fn decode_once(sdp: &CString) {
 				if (*pkt).stream_index == vs && !seen_key {
 					if (*pkt).flags & ff::AV_PKT_FLAG_KEY != 0 {
 						seen_key = true;
+						SWITCHING.store(false, Ordering::Relaxed); // new stream live
+						SWITCH_DEADLINE_MS.store(0, Ordering::Relaxed); // switch completed
 					} else {
 						ff::av_packet_unref(pkt);
 						continue;
@@ -999,6 +1178,9 @@ impl Presenter {
 		// into the SAME rect the frame fills. Note the GL viewport origin is BOTTOM-left; the
 		// overlay (egui) is TOP-left, so it flips Y itself from `[x, y_bottom, w, h]`.
 		*VIDEO_RECT.lock().unwrap() = [vx, vy, rw, rh];
+		// Source (host-pixel) dims alongside the rect — the cursor overlay needs both to derive
+		// the host→displayed scale for sizing the side-channel pointer (see VIDEO_SRC).
+		*VIDEO_SRC.lock().unwrap() = [vw, vh];
 		gl.viewport(vx, vy, rw, rh);
 		let quad: [f32; 24] = [
 			-1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0,

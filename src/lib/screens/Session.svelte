@@ -99,7 +99,11 @@
 			wsPort: () => wsPort,
 			audioWsPort: () => audioWsPort,
 			native: () => native,
-			embedded: () => embedded
+			embedded: () => embedded,
+			// `controls` is declared just below; this getter is only read later from the 1 s
+			// stall timer (after init), so the lazy reference is safe and lets the stall
+			// detector suppress itself while a codec/encoder/resolution switch is in flight.
+			switching: () => controls.switching
 		},
 		() => canvas
 	);
@@ -405,7 +409,8 @@
 	const input = new SessionInput({
 		playId: () => playId,
 		wsPort: () => wsPort,
-		canvas: () => canvas
+		canvas: () => canvas,
+		mode: () => mode
 	});
 	function stopControl() {
 		input.stopControl();

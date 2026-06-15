@@ -12,6 +12,8 @@
 		onLocalCaps,
 		onPeerAvatar,
 		onPeerName,
+		onNodeId,
+		onNodeVersionError,
 		onSessionPassword
 	} from '$lib/api';
 	import { setPeerIdentity } from '$lib/peers.svelte';
@@ -119,17 +121,27 @@
 		pwChecking = false;
 		pwCheckingReq = null;
 	}
+	// Does a prompt's reported peer identify the same host as this connect target? The
+	// prompt's peer may carry a resolved `ip:port` while the target was typed as a bare ip
+	// (or vice-versa), so a bare host bridges to an `ip:port` ONLY when the host segment is
+	// EXACTLY equal — NOT a `startsWith` prefix. A prefix test collides distinct hosts
+	// (`192.168.1.5` would match `192.168.1.50:…`, and `192.168.1.5` vs `192.168.1.5:9001`
+	// could dismiss the wrong concurrent tab); requiring full-segment equality avoids that.
+	function peerMatchesTarget(peer: string, targetId: string): boolean {
+		const p = peer.replace(/\s/g, '');
+		const want = targetId.replace(/\s/g, '');
+		if (p === want) return true;
+		// Strip the trailing `:port` (the LAST colon — keeps bracketed IPv6 hosts intact)
+		// from whichever side carries it, then compare the bare hosts exactly.
+		const host = (s: string) => (s.includes(':') ? s.slice(0, s.lastIndexOf(':')) : null);
+		return host(p) === want || host(want) === p;
+	}
 	// A finished connect dismisses only ITS OWN queued prompt: with concurrent tabs,
 	// dequeuing the head would remove the prompt the user is typing into whenever an
 	// UNRELATED connect settles first — that prompt's req would never be answered and
-	// its tab would hang on Connecting. Matched on the despaced id; the prompt's peer
-	// may carry a resolved `ip:port` while the target was typed as a bare ip.
+	// its tab would hang on Connecting. Matched per-host via `peerMatchesTarget`.
 	function closePwFor(targetId: string) {
-		const want = targetId.replace(/\s/g, '');
-		const i = pwQueue.findIndex((q) => {
-			const p = q.peer.replace(/\s/g, '');
-			return p === want || p.startsWith(want + ':') || want.startsWith(p + ':');
-		});
+		const i = pwQueue.findIndex((q) => peerMatchesTarget(q.peer, targetId));
 		if (i < 0) return;
 		pwQueue = pwQueue.filter((_, j) => j !== i);
 		// The visible head was removed → re-arm the inputs for the next prompt (if any).
@@ -140,15 +152,11 @@
 			pwCheckingReq = null;
 		}
 	}
-	// Does a queued password prompt belong to this connect target? Same despaced
-	// id/ip:port matching as closePwFor — used to show "awaiting approval" only on the
-	// tab whose connect actually has a pending prompt (not every concurrent Connecting).
+	// Does a queued password prompt belong to this connect target? Same per-host matching
+	// as closePwFor — used to show "awaiting approval" only on the tab whose connect
+	// actually has a pending prompt (not every concurrent Connecting).
 	function hasPendingPromptFor(targetId: string): boolean {
-		const want = targetId.replace(/\s/g, '');
-		return pwQueue.some((q) => {
-			const p = q.peer.replace(/\s/g, '');
-			return p === want || p.startsWith(want + ':') || want.startsWith(p + ':');
-		});
+		return pwQueue.some((q) => peerMatchesTarget(q.peer, targetId));
 	}
 
 	// Host-side activity: who's connected + a recent event log.
@@ -242,8 +250,11 @@
 			})
 			.catch(() => {});
 	});
-	// CLI --connect auto-connect: password to auto-submit if the host asks for one.
-	let autoPw = '';
+	// CLI --connect auto-connect: a one-shot, target-scoped password to auto-submit if
+	// the kiosk host asks for one. Keyed by the auto-connect target id so it can NEVER
+	// answer a later/unrelated host's prompt, and cleared after the first submit so a
+	// wrong-password re-fire (or a second connect) falls through to the normal modal.
+	let autoPw: { id: string; pw: string } | null = null;
 	const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 	const nextPaint = () =>
 		new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
@@ -289,7 +300,27 @@
 		onSessionPassword((pw) => {
 			if (!config?.unattended_access) selfPw = pw;
 		});
+		// The relay restarted and reissued a DIFFERENT 9-digit ID (it lost its
+		// pubkey→id map). goOnline() reads the ID once, so without this the Home
+		// screen would keep showing the dead old one. Adopt the rotated ID live.
+		onNodeId((id) => {
+			if (online) selfId = id;
+		});
+		// The relay was redeployed with a newer protocol version while we were
+		// already online. The Rust backend has taken the node offline; mirror that
+		// in the UI so the user sees the "update required" message instead of a
+		// stale (unreachable) ID. Auto-retry is intentionally NOT triggered here
+		// (every re-register would be refused too) — the user must update first.
+		onNodeVersionError(() => {
+			online = false;
+			selfId = '—';
+			selfPw = '';
+			connError = t('connErr.incompatibleVersion');
+		});
 		await goOnline();
+		// Sync the persisted tray preference into the Rust backend on startup so
+		// CloseRequested knows whether to hide-to-tray or quit from the first launch.
+		api.setTray(ui.tray).catch(() => {});
 		// Surface incoming connections on the host UI.
 		await onSessionEvent((e) => {
 			if (e.kind === 'request') {
@@ -331,10 +362,19 @@
 		// A host is asking us for a password — show the prompt (a re-fire means the
 		// previous password was wrong).
 		await onAuthPrompt((e) => {
-			// Auto-connect: answer the host's password prompt without UI.
+			// Auto-connect: answer the kiosk host's FIRST password prompt without UI, but
+			// only for the CLI target itself (same despaced id/ip:port matching as closePwFor)
+			// and only ONCE — clear it so a wrong-password re-fire, a reverse-direction connect,
+			// or a manual connect to a different host falls through to the interactive modal.
 			if (autoPw) {
-				api.submitPassword(e.req, autoPw).catch(() => {});
-				return;
+				const want = autoPw.id.replace(/\s/g, '');
+				const p = e.peer.replace(/\s/g, '');
+				if (p === want || p.startsWith(want + ':') || want.startsWith(p + ':')) {
+					const pw = autoPw.pw;
+					autoPw = null;
+					api.submitPassword(e.req, pw).catch(() => {});
+					return;
+				}
 			}
 			// A re-fire for the connection currently being checked (same peer, fresh req) means
 			// the previous password was wrong — replace the head's req in place and flag the error.
@@ -365,11 +405,20 @@
 		if (ac && ac.id) {
 			// Appliance/kiosk (CLI --connect): update on BOOT, before connecting. If an
 			// update installs, the app relaunches and never reaches startConnect below;
-			// otherwise we continue into the session. A short timeout keeps boot moving
-			// when the update endpoint is unreachable. Mid-session is never interrupted
+			// otherwise we continue into the session. `timeoutMs` keeps the manifest
+			// fetch quick when the endpoint is unreachable; `overallTimeoutMs` bounds the
+			// whole flow so a stalled download (flaky Wi-Fi, throttling, half-open TCP)
+			// can't hang the boot path before connect. Mid-session is never interrupted
 			// (this is the launch path only).
-			await silentUpdateCheck({ timeoutMs: 8000 });
-			autoPw = ac.pw ?? '';
+			await silentUpdateCheck({
+				timeoutMs: 8000,
+				overallTimeoutMs: 60000,
+				// startConnect runs only after this resolves, but a peer can connect to
+				// this host (incoming control) during the manifest fetch — abort the
+				// install so we never tear down a session that began in the gap.
+				isBusy: () => sm.sessions.length > 0 || hostSessions.length > 0
+			});
+			if (ac.pw) autoPw = { id: ac.id, pw: ac.pw };
 			const m = ac.mode === 'game' ? 'game' : 'remote';
 			const gameId = m === 'game' ? (ac.app || '') : '';
 			// Headless --connect: show the splash, THEN the Connecting screen. The session is
@@ -388,7 +437,15 @@
 		// seconds so it never delays first paint / the splash. Self-swallows all errors.
 		if (!(ac && ac.id)) {
 			setTimeout(() => {
-				void silentUpdateCheck();
+				// Re-check session state at fire time: the user may have connected (client
+				// session) or a peer may have connected to control this host within the 3s
+				// window. The updater must never tear down a live session.
+				if (sm.sessions.length === 0 && hostSessions.length === 0)
+					// Re-check at fire time (above) AND inside silentUpdateCheck after the
+					// slow manifest fetch: a session can begin during the check→install gap.
+					void silentUpdateCheck({
+						isBusy: () => sm.sessions.length > 0 || hostSessions.length > 0
+					});
 			}, 3000);
 		}
 	});

@@ -52,6 +52,8 @@ pub enum ConnError {
 	NotRegistered,
 	#[error("relay did not respond (is it reachable?)")]
 	RelayTimeout,
+	#[error("incompatible protocol version — update both ends to the same release")]
+	IncompatibleVersion,
 	#[error("target {0} could not be reached via the relay")]
 	TargetUnreachable(DeviceId),
 	#[error("direct P2P connection failed and relay fallback is disabled")]

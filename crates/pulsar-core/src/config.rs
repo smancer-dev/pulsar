@@ -129,13 +129,37 @@ impl Config {
 	}
 
 	/// Persist to a JSON file (creating parent dirs).
+	///
+	/// The write is **atomic**: the JSON is written to a sibling temp file and
+	/// then renamed over the target. A crash/power-loss mid-write therefore
+	/// leaves the previous config intact instead of a truncated file that
+	/// [`Config::load`] would silently discard (resetting every setting).
 	pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
 		let path = path.as_ref();
 		if let Some(parent) = path.parent() {
 			std::fs::create_dir_all(parent)?;
 		}
 		let json = serde_json::to_string_pretty(self).expect("config serializes");
-		std::fs::write(path, json)
+		// Write to a sibling temp file (same dir → same filesystem, so the rename
+		// is atomic on Windows/macOS/Linux), then rename over the target. The pid
+		// keeps concurrent writers (e.g. separate ASTER seats) from clobbering one
+		// another's temp file.
+		let tmp = match path.file_name() {
+			Some(name) => {
+				let mut fname = name.to_os_string();
+				fname.push(format!(".{}.tmp", std::process::id()));
+				path.with_file_name(fname)
+			}
+			None => path.with_extension("tmp"),
+		};
+		std::fs::write(&tmp, json)?;
+		match std::fs::rename(&tmp, path) {
+			Ok(()) => Ok(()),
+			Err(e) => {
+				let _ = std::fs::remove_file(&tmp);
+				Err(e)
+			}
+		}
 	}
 
 	/// The audio toggles as an [`crate::audio::AudioSettings`] for policy resolution.

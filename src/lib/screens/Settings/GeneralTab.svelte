@@ -66,12 +66,8 @@
 	</div>
 </div>
 <div class="srow">
-	<div class="st"><b>{t('settings.startup')}</b><span>{t('settings.startupDesc')}</span></div>
-	<button class="toggle" aria-label={t('settings.startup')} class:on={ui.startup} aria-pressed={ui.startup} onclick={() => { ui.startup = !ui.startup; saveUi(); }}><span class="knob"></span></button>
-</div>
-<div class="srow">
 	<div class="st"><b>{t('settings.tray')}</b><span>{t('settings.trayDesc')}</span></div>
-	<button class="toggle" aria-label={t('settings.tray')} class:on={ui.tray} aria-pressed={ui.tray} onclick={() => { ui.tray = !ui.tray; saveUi(); }}><span class="knob"></span></button>
+	<button class="toggle" aria-label={t('settings.tray')} class:on={ui.tray} aria-pressed={ui.tray} onclick={() => { ui.tray = !ui.tray; saveUi(); api.setTray(ui.tray).catch(() => {}); }}><span class="knob"></span></button>
 </div>
 <div class="srow">
 	<div class="st"><b>{t('settings.debug')}</b><span>{t('settings.debugDesc')}</span></div>

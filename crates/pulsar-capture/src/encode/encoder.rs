@@ -94,6 +94,12 @@ pub struct Encoder {
 	/// Frame counter for periodic FORCED IDR + SPS/PPS (gopLength config alone proved
 	/// ineffective → infinite GOP → late-joining RTP clients never get an IDR).
 	pub(super) frame_idx: u64,
+	/// One-shot forced-IDR request (set by `request_idr`, consumed in `submit`). Set by the
+	/// capture loop after a SAME-resolution duplication reinit (host refresh-rate change /
+	/// transient ACCESS_LOST) so the client gets a keyframe at once instead of freezing until
+	/// the next multi-second safety GOP. A true RESOLUTION change rebuilds the whole encoder
+	/// (capture loop) instead, since the NV12/VideoProcessor are sized to the old dimensions.
+	pub(super) force_idr_once: bool,
 }
 
 // The encoder lives entirely on the capture thread; the raw NVENC/COM pointers are
@@ -106,6 +112,13 @@ impl Encoder {
 	/// forces an IDR so the client recovers cleanly, and pushes the new bitrate into the RtpEgress
 	/// pacing atom so packet pacing tracks it. Returns Err on a bad reconfigure (caller logs; the
 	/// old bitrate stays in effect).
+	/// Request that the NEXT submitted frame be a forced IDR (+ in-band SPS/PPS). One-shot,
+	/// consumed in `submit`. Cheap (a flag) — the capture loop calls it after a same-resolution
+	/// reinit so a client mid-GOP re-syncs immediately rather than waiting the safety interval.
+	pub fn request_idr(&mut self) {
+		self.force_idr_once = true;
+	}
+
 	pub unsafe fn reconfigure_bitrate(&mut self, kbps: u32) -> Result<(), String> {
 		if self.closed {
 			return Err("reconfigure after close".into());

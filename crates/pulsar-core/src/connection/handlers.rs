@@ -82,11 +82,23 @@ impl Node {
 		match msg {
 			RelayMsg::Registered { id, token } => {
 				let mut g = self.inner.lock().await;
+				// A re-register (NotRegistered → register_msg) after a relay restart
+				// that lost `by_pubkey` mints a DIFFERENT id. Detect that rotation so
+				// the app can re-advertise it; the UI/LAN beacon snapshot the id once
+				// and would otherwise keep broadcasting the dead old one forever.
+				let rotated = matches!(g.self_id, Some(prev) if prev != id);
 				g.self_id = Some(id);
 				g.token = Some(token);
+				// Clear any stale register error: we're registered now.
+				g.register_error = None;
 				drop(g);
 				self.registered.notify_waiters();
 				self.registered.notify_one();
+				if rotated {
+					// notify_one stores a permit, so a rotation that lands while the
+					// watcher is mid-processing (not parked in `notified()`) isn't lost.
+					self.id_changed.notify_one();
+				}
 			}
 			RelayMsg::HeartbeatAck => {}
 			RelayMsg::Incoming {
@@ -109,11 +121,32 @@ impl Node {
 				};
 				let peer_lan = parse_lan_candidate(&answer);
 				let mut g = self.inner.lock().await;
+				// If the caller pinned the expected identity for this id (TOFU /
+				// known-host), DROP a PeerFound whose key differs: the relay only
+				// proves it enforced `target == id`, NOT which pubkey owns that id, so
+				// a malicious/compromised relay (the stated threat model) or an
+				// attacker that won the pubkey→id registration race could otherwise
+				// answer in the target's place and terminate the E2E with its own key.
+				// Leave the waiter/salt untouched so a legitimate retransmitted
+				// PeerFound can still complete within the connect timeout; if none
+				// arrives the connect fails `TargetUnreachable` (mirrors `HelloAck`).
+				if let Some(&expected) = g.expected_pubkey.get(&session) {
+					if key != expected {
+						tracing::warn!(
+							session,
+							"PeerFound pubkey != expected (pinned) key — dropping (relay/MITM identity mismatch)"
+						);
+						return;
+					}
+				}
 				// Pair the peer's salt with the one we minted in `connect`.
 				let Some(our_salt) = g.pending_salt.remove(&session) else {
 					tracing::warn!(session, "PeerFound for an unknown/expired connect");
 					return;
 				};
+				// The key is accepted (matched the pin, or none was set) — the pin has
+				// served its purpose for this session.
+				g.expected_pubkey.remove(&session);
 				let crypto =
 					self.identity
 						.session(key, Role::Initiator, session, our_salt, peer_salt);
@@ -123,6 +156,7 @@ impl Node {
 						peer_addr: target_addr,
 						peer_lan,
 						crypto,
+						peer_pubkey: key,
 						transport: Transport::Relay,
 						send_seq: 0,
 						direct_ok: false,
@@ -142,12 +176,38 @@ impl Node {
 			}
 			RelayMsg::Error { code, message } => {
 				tracing::warn!(?code, message, "relay error");
+				// A relay refusal that arrives while we're still UNREGISTERED (initial
+				// `register()` in flight, no id yet) is fatal for registration — most
+				// notably `IncompatibleVersion`. Record it and wake the `register()`
+				// waiter so it fails with a specific `ConnError` (e.g. a clear "update
+				// required" message) instead of waiting out the full `REGISTER_TIMEOUT`
+				// and reporting a generic `RelayTimeout`.
+				{
+					let mut g = self.inner.lock().await;
+					if g.self_id.is_none() {
+						g.register_error = Some(code);
+						drop(g);
+						self.registered.notify_waiters();
+						self.registered.notify_one();
+					} else if code == ErrCode::IncompatibleVersion {
+						// Already registered but the relay now rejects us (relay was
+						// redeployed with a newer PROTOCOL_VERSION). The heartbeat will
+						// keep bouncing; every future Register attempt will be refused too.
+						// Signal the version-error watcher so the app can surface an
+						// "update required" message and go offline — instead of silently
+						// advertising a dead id forever.
+						drop(g);
+						self.version_error.notify_one();
+					}
+				}
 				// The relay evicted us (>TTL outage / relay restart): our id+token
 				// are stale, every heartbeat keeps bouncing, and this device is
-				// unreachable by ID until re-registered. Re-send Register — the
-				// relay maps pubkey → id so the same 9-digit ID is reissued, and
-				// the `Registered` arm above refreshes self_id/token in place.
-				// Bounded by the heartbeat cadence: at most one retry per bounce.
+				// unreachable by ID until re-registered. Re-send Register — if the
+				// relay still has our pubkey → id mapping it reissues the SAME
+				// 9-digit ID; but a full relay restart loses `by_pubkey` and mints
+				// a DIFFERENT id, so the `Registered` arm signals `id_changed` and
+				// the app re-advertises the new id. Bounded by the heartbeat
+				// cadence: at most one retry per bounce.
 				if code == ErrCode::NotRegistered {
 					let _ = self
 						.sock
@@ -218,6 +278,7 @@ impl Node {
 					peer_addr: from_addr,
 					peer_lan,
 					crypto,
+					peer_pubkey: key,
 					transport: Transport::Relay,
 					send_seq: 0,
 					direct_ok: false,
@@ -384,6 +445,7 @@ impl Node {
 						peer_addr: from,
 						peer_lan: None, // direct-IP: the typed address IS the path
 						crypto,
+						peer_pubkey: pubkey,
 						transport: Transport::Direct,
 						send_seq: 0,
 						direct_ok: false,
@@ -424,11 +486,29 @@ impl Node {
 			} => {
 				let mut g = self.inner.lock().await;
 				if !g.sessions.contains_key(&session) {
+					// If the caller pinned the peer's key (beacon/known-host path),
+					// DROP an ack carrying any other key: an attacker that answers our
+					// Hello in the peer's place would otherwise terminate the E2E with
+					// its own key (silent MITM). We don't notify the waiter or consume
+					// our salt, so a legitimate retransmitted ack can still complete
+					// within the connect timeout; if none arrives it fails P2pFailed.
+					if let Some(&expected) = g.expected_pubkey.get(&session) {
+						if pubkey != expected {
+							tracing::warn!(
+								session,
+								"HelloAck pubkey != expected (pinned) key — dropping (possible MITM)"
+							);
+							return;
+						}
+					}
 					// Pair the peer's salt with the one we minted in `connect_direct`.
 					let Some(our_salt) = g.pending_salt.remove(&session) else {
 						tracing::warn!(session, "HelloAck for an unknown/expired direct connect");
 						return;
 					};
+					// The key is accepted (matched the pin, or none was set) — the
+					// pin has served its purpose for this session.
+					g.expected_pubkey.remove(&session);
 					let crypto = self.identity.session(
 						pubkey,
 						Role::Initiator,
@@ -442,6 +522,7 @@ impl Node {
 							peer_addr: from,
 							peer_lan: None, // direct-IP: the typed address IS the path
 							crypto,
+							peer_pubkey: pubkey,
 							transport: Transport::Direct,
 							send_seq: 0,
 							direct_ok: false,

@@ -39,11 +39,22 @@ export type Session = {
 
 const STREAM_PORT = 9000;
 
+// A connect attempt that neither resolves nor rejects (e.g. the host accepted the
+// transport but never answers the auth/caps step, or the link dropped mid-handshake
+// after the await began) would otherwise leave the Connecting screen spinning forever
+// — the core's auth recv loop has no timeout. Fail the attempt after this deadline so
+// the user lands back on Home with a friendly error instead of an endless spinner.
+const CONNECT_TIMEOUT_MS = 45_000;
+
+/** Marker thrown when the connect attempt blows past `CONNECT_TIMEOUT_MS`. */
+const CONNECT_TIMEOUT = 'connect-timed-out';
+
 // Known core connect errors arrive as raw English Rust strings (ConnError) — map them
 // to friendly copy IN THE ACTIVE UI LANGUAGE for the connect flash (substring match
 // so wrapped/formatted variants still hit). Unknown messages fall through verbatim.
 function friendlyConnectError(raw: string): string {
 	const m = raw.toLowerCase();
+	if (m.includes(CONNECT_TIMEOUT)) return t('connErr.timeout');
 	if (m.includes('relay did not respond')) return t('connErr.relayDown');
 	if (m.includes('could not be reached via the relay')) return t('connErr.peerUnreachable');
 	if (m.includes('not registered with a relay yet')) return t('connErr.notOnline');
@@ -105,6 +116,20 @@ export class SessionManager {
 	) => {
 		const useMode = m ?? this.#deps.getMode();
 		this.connectErr = '';
+		// Dedupe: a repeated connect to the same peer (e.g. a re-fired reverse-direction
+		// `reverse-request`, or a double-click) must not open a second tab to that device —
+		// that would spin up duplicate viewer ports + a second native renderer and confuse the
+		// tab strip. If a remote session to this id is already connecting/active, focus it
+		// instead. Matched on the despaced id; local host-game tabs (no real peer id) never
+		// collide. A blank target id is treated as unknown and never deduped.
+		const want = target.id.replace(/\s/g, '');
+		if (want) {
+			const existing = this.sessions.find((s) => s.target.id.replace(/\s/g, '') === want);
+			if (existing) {
+				this.activeTab = existing.tabId;
+				return;
+			}
+		}
 		const tabId = this.#nextTab++;
 		this.sessions = [
 			...this.sessions,
@@ -122,7 +147,12 @@ export class SessionManager {
 		// Auth (password prompt + host Allow/Deny) happens during this call, driven
 		// by events — no password is passed up front.
 		try {
-			const info = await api.startRemotePlay(
+			// Guard the connect with a deadline: if it neither resolves nor rejects in
+			// time, abort with a timeout error (routed through friendlyConnectError) so
+			// the Connecting screen can't spin forever. Keep the underlying promise so a
+			// late resolution (after the timeout fired) can still be torn down rather than
+			// leaking its viewer ports + native renderer + the held host session.
+			const play = api.startRemotePlay(
 				target.id,
 				gameId,
 				STREAM_PORT,
@@ -131,6 +161,24 @@ export class SessionManager {
 				useMode === 'game',
 				useMode === 'game'
 			);
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let timedOut = false;
+			const timeout = new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					timedOut = true;
+					reject(new Error(CONNECT_TIMEOUT));
+				}, CONNECT_TIMEOUT_MS);
+			});
+			// If the connect wins the race, stop the timeout from later rejecting (and
+			// leaking the timer). If the timeout wins, a late-resolving connect must still
+			// stop its stream so we don't strand a half-open host session.
+			play.then(
+				(info) => {
+					if (timedOut) api.stopStream(info.id).catch(() => {});
+				},
+				() => {}
+			);
+			const info = await Promise.race([play, timeout]).finally(() => clearTimeout(timer));
 			// The user may have cancelled (closed the connecting tab) while the auth/connect
 			// was in flight. If so the tab is gone, so #patch would be a no-op and the UI would
 			// never learn the play id → tear down the session we just created instead of leaking

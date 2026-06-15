@@ -64,20 +64,27 @@ pub(crate) async fn set_language(
 /// Available hardware encoders detected via ffmpeg (kebab-case values).
 #[tauri::command]
 pub(crate) async fn available_encoders(app: AppHandle) -> Vec<String> {
-	let mut ids: Vec<String> = detect_encoders(&ffmpeg_bin(&app))
-		.into_iter()
-		.map(|e| crate::process::encoder_wire_id(e).to_string())
-		.collect();
-	// Families served by the GStreamer backend (e.g. Rockchip MPP encode on RK3588,
-	// where ffmpeg has no rkmpp encoders) count as available too.
-	#[cfg(target_os = "linux")]
-	for (enc, _codecs) in crate::process::validated_gst_encoders() {
-		let id = enc.wire_id().to_string();
-		if !ids.contains(&id) {
-			ids.push(id);
+	// `detect_encoders` shells out to ffmpeg (`-encoders`), which can take a second
+	// or more — run it off the async runtime so it doesn't block a tokio worker.
+	let ffmpeg = ffmpeg_bin(&app);
+	tokio::task::spawn_blocking(move || {
+		let mut ids: Vec<String> = detect_encoders(&ffmpeg)
+			.into_iter()
+			.map(|e| crate::process::encoder_wire_id(e).to_string())
+			.collect();
+		// Families served by the GStreamer backend (e.g. Rockchip MPP encode on RK3588,
+		// where ffmpeg has no rkmpp encoders) count as available too.
+		#[cfg(target_os = "linux")]
+		for (enc, _codecs) in crate::process::validated_gst_encoders() {
+			let id = enc.wire_id().to_string();
+			if !ids.contains(&id) {
+				ids.push(id);
+			}
 		}
-	}
-	ids
+		ids
+	})
+	.await
+	.unwrap_or_default()
 }
 
 /// The audio capture devices this host can record from, for the Settings dropdown.
@@ -87,18 +94,26 @@ pub(crate) async fn available_encoders(app: AppHandle) -> Vec<String> {
 #[tauri::command]
 pub(crate) async fn list_audio_sources(app: AppHandle) -> Vec<String> {
 	let _ = &app;
+	// Device enumeration shells out (ffmpeg `-list_devices` / `pactl`) and can take a
+	// second or more, so run it off the async runtime to avoid blocking a tokio worker.
 	#[cfg(windows)]
-	{
-		audio_sources_dshow(&ffmpeg_bin(&app))
-	}
-	#[cfg(target_os = "linux")]
-	{
-		audio_sources_pactl()
-	}
-	#[cfg(target_os = "macos")]
-	{
-		Vec::new()
-	}
+	let ffmpeg = ffmpeg_bin(&app);
+	tokio::task::spawn_blocking(move || {
+		#[cfg(windows)]
+		{
+			audio_sources_dshow(&ffmpeg)
+		}
+		#[cfg(target_os = "linux")]
+		{
+			audio_sources_pactl()
+		}
+		#[cfg(target_os = "macos")]
+		{
+			Vec::new()
+		}
+	})
+	.await
+	.unwrap_or_default()
 }
 
 /// Windows: enumerate DirectShow audio capture devices via the bundled ffmpeg.
@@ -256,7 +271,7 @@ pub(crate) async fn list_remote_games(
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let disc = state.discovery.lock().unwrap().clone();
 	let net_mode = state.config.lock().unwrap().network_mode;
-	let (mut sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
+	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
 	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
 		.await?
 	{
@@ -282,7 +297,7 @@ pub(crate) async fn launch_remote_game(
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let disc = state.discovery.lock().unwrap().clone();
 	let net_mode = state.config.lock().unwrap().network_mode;
-	let (mut sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
+	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
 	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
 		.await?
 	{
@@ -295,6 +310,7 @@ pub(crate) async fn launch_remote_game(
 
 #[tauri::command]
 pub(crate) async fn connect(
+	app: AppHandle,
 	state: State<'_, AppState>,
 	target: String,
 ) -> Result<ConnInfo, String> {
@@ -306,7 +322,7 @@ pub(crate) async fn connect(
 		.ok_or(crate::i18n::t("err.online"))?;
 	let disc = state.discovery.lock().unwrap().clone();
 	let net_mode = state.config.lock().unwrap().network_mode;
-	let (sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
+	let (sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
 	let transport = match sess.transport() {
 		Transport::Direct => "direct",
 		Transport::Relay => "relay",
@@ -343,8 +359,10 @@ pub(crate) async fn lan_devices(state: State<'_, AppState>) -> Result<Vec<LanDev
 /// empty list when no gamepad subsystem is available.
 #[tauri::command]
 pub(crate) async fn controllers() -> Result<Vec<ControllerInfo>, String> {
-	match ControllerHub::new() {
-		Ok(mut hub) => Ok(hub
+	// gilrs enumeration touches the OS gamepad subsystem and can block briefly; run
+	// it off the async runtime so it doesn't stall a tokio worker.
+	let list = tokio::task::spawn_blocking(|| match ControllerHub::new() {
+		Ok(mut hub) => hub
 			.list()
 			.into_iter()
 			.map(|c| ControllerInfo {
@@ -354,9 +372,12 @@ pub(crate) async fn controllers() -> Result<Vec<ControllerInfo>, String> {
 				label: c.kind.label().to_string(),
 				connected: c.connected,
 			})
-			.collect()),
-		Err(_) => Ok(Vec::new()),
-	}
+			.collect(),
+		Err(_) => Vec::new(),
+	})
+	.await
+	.unwrap_or_default();
+	Ok(list)
 }
 
 /// This machine's primary LAN IPv4 (so a peer can connect to us by IP). Best-effort
@@ -418,30 +439,36 @@ pub(crate) async fn steam_path() -> Result<String, String> {
 /// executable bit.
 #[tauri::command]
 pub(crate) async fn scan_folder(path: String) -> Result<Vec<ScannedApp>, String> {
-	let dir = std::path::PathBuf::from(&path);
-	if !dir.is_dir() {
-		return Err(format!("{}: {path}", crate::i18n::t("err.folder")));
-	}
-	let mut apps = Vec::new();
-	for entry in std::fs::read_dir(&dir)
-		.map_err(|e| e.to_string())?
-		.flatten()
-	{
-		let p = entry.path();
-		if p.is_file() && is_executable(&p) {
-			let name = p
-				.file_stem()
-				.and_then(|s| s.to_str())
-				.unwrap_or("app")
-				.to_string();
-			apps.push(ScannedApp {
-				name,
-				path: p.to_string_lossy().into_owned(),
-			});
+	// `read_dir` + per-entry stat can hit a slow/network filesystem, so run the scan
+	// off the async runtime to avoid blocking a tokio worker.
+	tokio::task::spawn_blocking(move || {
+		let dir = std::path::PathBuf::from(&path);
+		if !dir.is_dir() {
+			return Err(format!("{}: {path}", crate::i18n::t("err.folder")));
 		}
-	}
-	apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-	Ok(apps)
+		let mut apps = Vec::new();
+		for entry in std::fs::read_dir(&dir)
+			.map_err(|e| e.to_string())?
+			.flatten()
+		{
+			let p = entry.path();
+			if p.is_file() && is_executable(&p) {
+				let name = p
+					.file_stem()
+					.and_then(|s| s.to_str())
+					.unwrap_or("app")
+					.to_string();
+				apps.push(ScannedApp {
+					name,
+					path: p.to_string_lossy().into_owned(),
+				});
+			}
+		}
+		apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+		Ok(apps)
+	})
+	.await
+	.map_err(|e| e.to_string())?
 }
 
 /// Run a host-side prep command (e.g. a per-game session start/stop hook).
@@ -489,6 +516,39 @@ pub(crate) fn auto_connect_target(app: AppHandle) -> Option<AutoConnect> {
 		return None;
 	}
 	AUTO_CONNECT.get().cloned().flatten()
+}
+
+/// Whether an in-app self-update can actually replace the *running* binary on this platform.
+///
+/// On Linux the Tauri updater self-replaces the file pointed to by `$APPIMAGE`. When the AppImage
+/// is launched WITHOUT FUSE (e.g. `--appimage-extract-and-run`, or the raw `--no-bundle` dev binary,
+/// or any non-AppImage launch) the runtime never sets `$APPIMAGE`, so the updater falls back to
+/// `current_exe()` — which points at a throwaway extracted temp file. Installing would then rewrite
+/// that temp copy (or error), never the deployed AppImage, so the appliance keeps booting the old
+/// version forever while the updater appears to "run". Detect that here and let the frontend skip
+/// the update with a clear warning instead of silently no-op'ing. Windows/macOS always update the
+/// installed app in place, so they're always capable.
+#[tauri::command]
+pub(crate) fn self_update_possible() -> bool {
+	#[cfg(all(unix, not(target_os = "macos")))]
+	{
+		// Self-update only works from a FUSE-mounted AppImage, which exports $APPIMAGE.
+		std::env::var_os("APPIMAGE").is_some()
+	}
+	#[cfg(not(all(unix, not(target_os = "macos"))))]
+	{
+		true
+	}
+}
+
+/// Sync the "run in system tray" preference from the UI. When `enabled` is true,
+/// closing the main window hides Pulsar to the tray (existing behavior). When false,
+/// closing quits the app. The flag is read by the `CloseRequested` handler in lib.rs.
+#[tauri::command]
+pub(crate) fn set_tray(state: State<'_, AppState>, enabled: bool) {
+	state
+		.tray_disabled
+		.store(!enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Relaunch the app to a fresh home after the user disconnects from a direct-connect (kiosk)

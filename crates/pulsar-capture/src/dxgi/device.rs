@@ -26,6 +26,17 @@ use super::platform::Qpc;
 /// How long (ms) a `Reinit`-triggered rebuild backs off before retrying `create()`.
 pub(super) const REINIT_BACKOFF_MS: u64 = 200;
 
+/// Why the pacing loop (`run`) returned. The capture thread (lib.rs) acts on it: tear the
+/// stream down, or rebuild capture+encode on the newly-requested monitor.
+pub enum RunExit {
+	/// `stop` was set — the session is ending.
+	Stop,
+	/// The host asked to capture a different monitor (session-menu picker). The thread rebuilds
+	/// `CaptureDevice`/`Encoder` on this output index — `create` re-picks the owning adapter, so
+	/// a switch to a monitor on the OTHER GPU (MUX laptop) lands on the right device.
+	Switch(u32),
+}
+
 /// Outcome of an `AcquireNextFrame` attempt, mapped from the raw HRESULT.
 pub(super) enum Capture {
 	/// A fresh desktop frame landed; the pool texture now holds it.
@@ -81,6 +92,11 @@ pub struct CaptureDevice {
 	/// Set once we've ATTEMPTED to build the compositor, so a build failure isn't retried
 	/// every frame (it would just fail again, wasting time on the pacing-critical path).
 	pub(super) compositor_tried: bool,
+	/// Shared session-stop flag (cloned from the capture thread's `stop`). `build_duplication`
+	/// polls it between its transient retry sleeps so an init/switch that hits the long
+	/// `NOT_CURRENTLY_AVAILABLE` retry loop bails immediately when the session is torn down,
+	/// instead of stalling the joining caller for the whole ~5 s budget.
+	pub(super) stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CaptureDevice {
@@ -90,7 +106,14 @@ impl CaptureDevice {
 	///
 	/// On the hybrid laptop the display owner is the iGPU; building the device there is
 	/// what lets NVENC do the cross-adapter copy itself (Strategy A).
-	pub unsafe fn create(output_idx: u32) -> windows::core::Result<Self> {
+	pub unsafe fn create(
+		output_idx: u32,
+		stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+		// `true` for an in-session SWITCH build (short transient-retry budget — see
+		// `build_duplication`); `false` for the initial build (long budget, the monitor must
+		// come up for the session to start).
+		fast_transient: bool,
+	) -> windows::core::Result<Self> {
 		let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
 		let (adapter, output) = Self::find_output(&factory, output_idx)?;
 
@@ -119,8 +142,9 @@ impl CaptureDevice {
 			cursor: CursorState::default(),
 			compositor: None,
 			compositor_tried: false,
+			stop,
 		};
-		me.build_duplication()?;
+		me.build_duplication(fast_transient)?;
 		Ok(me)
 	}
 
@@ -169,6 +193,64 @@ impl CaptureDevice {
 			ai += 1;
 		}
 		Ok(out)
+	}
+
+	/// Virtual-desktop geometry of the attached output at `output_idx` (same DXGI order as
+	/// [`list_outputs`]) plus the bounding box of ALL attached outputs (== the Windows virtual
+	/// screen, `SM_*VIRTUALSCREEN`). Lets the host map a normalized absolute pointer onto the
+	/// streamed monitor's place in the virtual desktop. `None` if enumeration fails or the index
+	/// has no attached output.
+	pub unsafe fn output_rect(output_idx: u32) -> Option<crate::DisplayRect> {
+		let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+		let mut idx: u32 = 0;
+		// Bounding box of every attached output = the virtual desktop extent.
+		let mut vl = i32::MAX;
+		let mut vt = i32::MAX;
+		let mut vr = i32::MIN;
+		let mut vb = i32::MIN;
+		let mut chosen: Option<(i32, i32, i32, i32)> = None;
+		let mut ai = 0u32;
+		loop {
+			let adapter = match factory.EnumAdapters1(ai) {
+				Ok(a) => a,
+				Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+				Err(_) => return None,
+			};
+			let mut oi = 0u32;
+			loop {
+				let o: IDXGIOutput = match adapter.EnumOutputs(oi) {
+					Ok(o) => o,
+					Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+					Err(_) => return None,
+				};
+				let desc = o.GetDesc().ok()?;
+				if desc.AttachedToDesktop.as_bool() {
+					let r = desc.DesktopCoordinates;
+					vl = vl.min(r.left);
+					vt = vt.min(r.top);
+					vr = vr.max(r.right);
+					vb = vb.max(r.bottom);
+					if idx == output_idx {
+						chosen = Some((r.left, r.top, r.right - r.left, r.bottom - r.top));
+					}
+					idx += 1;
+				}
+				oi += 1;
+			}
+			ai += 1;
+		}
+		let (mon_left, mon_top, mon_width, mon_height) = chosen?;
+		// Some outputs were found (chosen is Some ⇒ vl/vt/vr/vb were assigned at least once).
+		Some(crate::DisplayRect {
+			mon_left,
+			mon_top,
+			mon_width,
+			mon_height,
+			virt_left: vl,
+			virt_top: vt,
+			virt_width: vr - vl,
+			virt_height: vb - vt,
+		})
 	}
 
 	/// Walk adapters/outputs, returning the (adapter, output1) pair for `output_idx`,
@@ -266,13 +348,35 @@ impl CaptureDevice {
 
 	/// (Re)build the output duplication and the matching BGRA pool texture. Called from
 	/// `create` and from the Reinit path in `run`.
-	pub(super) unsafe fn build_duplication(&mut self) -> windows::core::Result<()> {
-		// Try DuplicateOutput1 (lets us request the BGRA format explicitly / HDR-aware)
-		// then fall back to DuplicateOutput. Retry twice with a 200 ms gap because right
-		// after a resolution change / fullscreen transition DXGI briefly returns
-		// NOT_CURRENTLY_AVAILABLE.
+	///
+	/// `fast_transient` caps the TRANSIENT-error retry to a short (~600 ms) budget instead of
+	/// the long ~5 s one. It's set for an in-session monitor SWITCH build: during a switch the
+	/// pacing loop isn't running, so every retry second is frozen on-screen video; and a failed
+	/// switch reverts to the previous good output and rebuilds AGAIN, so the long budget would be
+	/// paid twice (~10 s freeze). A short budget lets the switch fall back fast to the still-good
+	/// previous monitor (stream keeps flowing) and the user can retry. The INITIAL build and the
+	/// in-session Reinit recovery keep the long budget (the monitor genuinely needs to come up).
+	pub(super) unsafe fn build_duplication(&mut self, fast_transient: bool) -> windows::core::Result<()> {
+		// Try DuplicateOutput, retrying on the TRANSIENT failures. `NOT_CURRENTLY_AVAILABLE`
+		// and `ACCESS_DENIED` are exactly what DXGI returns while a target monitor is mid
+		// fullscreen/mode transition or a hybrid-GPU output is being reparented — and these can
+		// persist for SECONDS (a fullscreen game on the target panel). The old 3×200 ms (~600 ms)
+		// budget gave up far too early: a switch TO a fullscreen monitor failed → the capture
+		// thread died → the client saw a multi-second packet drought + stuck "switching". So
+		// retry the transient errors for a generous ~5 s with re-enumeration each round; a
+		// NON-transient error (a real failure) still bails fast after a few tries.
+		const TRANSIENT_ATTEMPTS: u32 = 25; // ~5 s at REINIT_BACKOFF_MS (200 ms)
+		// A SWITCH build pays the retry as a visible freeze (no pacing) and re-pays it on revert,
+		// so cap it short and let the caller fall back to the previous good monitor (B30).
+		const SWITCH_TRANSIENT_ATTEMPTS: u32 = 3; // ~600 ms
+		let transient_budget = if fast_transient {
+			SWITCH_TRANSIENT_ATTEMPTS
+		} else {
+			TRANSIENT_ATTEMPTS
+		};
 		let mut last_err: Option<windows::core::Error> = None;
-		for attempt in 0..3 {
+		let mut attempt: u32 = 0;
+		loop {
 			// Prefer the plain DuplicateOutput — DuplicateOutput1 needs an IDXGIOutput5
 			// and a format list; the SDR BGRA path here doesn't benefit from it, and
 			// DuplicateOutput is the most broadly available entry point.
@@ -286,18 +390,29 @@ impl CaptureDevice {
 					return Ok(());
 				}
 				Err(e) => {
-					last_err = Some(e.clone());
-					// NOT_CURRENTLY_AVAILABLE / ACCESS_DENIED are the transient hybrid-GPU
-					// reparenting symptoms — re-enumerate the owning output and retry.
-					if e.code() == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE || e.code() == E_ACCESSDENIED
-					{
+					let transient = e.code() == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+						|| e.code() == E_ACCESSDENIED;
+					last_err = Some(e);
+					// Transient (fullscreen/mode/reparent): re-enumerate the owning output and
+					// keep retrying up to the budget. Non-transient: give up after 3 tries.
+					let max = if transient { transient_budget } else { 3 };
+					if transient {
 						if let Ok((_, out1)) = Self::find_output(&self.factory, self.output_idx) {
 							self.output = out1;
 						}
 					}
-					if attempt < 2 {
-						std::thread::sleep(std::time::Duration::from_millis(REINIT_BACKOFF_MS));
+					attempt += 1;
+					if attempt >= max {
+						break;
 					}
+					// Bail out of the long transient-retry budget the moment the session is torn
+					// down: the capture thread's caller sets `stop` then joins, and without this
+					// check the join would block for the whole remaining ~5 s while we sleep here
+					// on a DuplicateOutput that no longer matters (B29).
+					if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+						break;
+					}
+					std::thread::sleep(std::time::Duration::from_millis(REINIT_BACKOFF_MS));
 				}
 			}
 		}
@@ -414,7 +529,9 @@ impl CaptureDevice {
 		if let Ok((_, out1)) = Self::find_output(&self.factory, self.output_idx) {
 			self.output = out1;
 		}
-		self.build_duplication()
+		// In-session recovery (Hz change / transient ACCESS_LOST): keep the long retry budget —
+		// the stream is already established and the monitor genuinely needs to come back.
+		self.build_duplication(false)
 	}
 }
 

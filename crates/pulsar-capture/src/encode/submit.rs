@@ -97,12 +97,23 @@ impl Encoder {
 			pic.pictureStruct = nvenc::NV_ENC_PIC_STRUCT_FRAME;
 			pic.outputBitstream = self.bitstream;
 			pic.inputTimeStamp = pts as u64;
-			// Force an IDR + in-band SPS/PPS on the FIRST frame (immediate connect) and then only
-			// every `idr_interval` frames (a multi-second safety keyframe, NOT the old fps/4 =
-			// 0.25 s tax that hitched the Pi 4×/s). frame_idx==0 ⇒ 0 % interval == 0 ⇒ first frame
-			// is always a keyframe, so a joining client still decodes immediately.
+			// Keyframe policy. The client DROPS every packet until it decodes a keyframe (its
+			// reopen/join gate), so it must catch one fast. Steady state: a rare safety IDR every
+			// `idr_interval` frames (multi-second — NOT the old fps/4 = 0.25 s tax that hitched the
+			// Pi 4×/s). BUT a fresh encoder (initial connect AND every monitor/codec switch starts
+			// frame_idx at 0) has just ONE frame-0 IDR; if it loses the race against the client's
+			// demuxer reopen or drops a packet over the relay, the client waits a WHOLE safety GOP
+			// (~4 s) for the next keyframe — the "switch takes 5-8 s". So for the first ~1.5 s of a
+			// fresh encoder emit an IDR every ~250 ms (~6 keyframes) so the client reliably catches
+			// one within a quarter second even with a miss; then settle to the rare safety GOP.
 			let interval = self.idr_interval.max(1) as u64;
-			pic.encodePicFlags = if self.frame_idx % interval == 0 {
+			let fast_step = (self.fps / 4).max(1) as u64; // ~every 250 ms (fps-scaled)
+			let fast_window = self.fps as u64; // first ~1 s after (re)start → ~4 keyframes
+			let force_idr = self.force_idr_once
+				|| self.frame_idx % interval == 0
+				|| (self.frame_idx < fast_window && self.frame_idx % fast_step == 0);
+			self.force_idr_once = false; // one-shot — consumed
+			pic.encodePicFlags = if force_idr {
 				nvenc::NV_ENC_PIC_FLAG_FORCEIDR | nvenc::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
 			} else {
 				0

@@ -74,6 +74,13 @@ pub(crate) struct AppState {
 	/// top of each `go_online` so a reconnect/settings change doesn't leak the prior
 	/// node + its serve loop (which keeps an Arc<Node> alive forever).
 	pub(crate) serve_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+	/// The independently-spawned per-session tasks (one per accepted incoming
+	/// connection). Each owns a strong `Arc<Node>` (its `Session` + `SessionSender`),
+	/// so aborting only `serve_task` would leave a live session pinning the old node
+	/// alive — its UDP socket stays bound (a re-bind to a pinned port then fails) and
+	/// its relay heartbeat keeps pinging. `go_online` aborts these before dropping
+	/// `state.node` so the old node reaches strong-count 0 and its loops exit.
+	pub(crate) session_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 	/// Active inbound connections, keyed by the connected peer's id. Drives the
 	/// dedicated "connections" management window (`connections.rs`): the window lists
 	/// these, and the per-connection `mode` decides whether a new connection brings the
@@ -93,6 +100,10 @@ pub(crate) struct AppState {
 	/// (also emitted as the `node-port` event); the Home screen shows it next to the
 	/// local IP so a copy-able direct `ip:port` target is always visible.
 	pub(crate) node_port: std::sync::atomic::AtomicU16,
+	/// When `true` the main window QUITS on close instead of hiding to the tray.
+	/// Synced from the UI's `ui.tray` setting via `set_tray` (tray_disabled = !ui.tray).
+	/// Default `false` (tray enabled) — preserves the existing behavior on first launch.
+	pub(crate) tray_disabled: AtomicBool,
 }
 
 /// Whether an inbound connection is a remote-desktop or a game-streaming session.
@@ -184,6 +195,12 @@ pub(crate) struct PlaySession {
 	/// the stats poller (Faz 4). `None` on Windows (ffplay) and the single-surface path.
 	#[allow(dead_code)]
 	pub(crate) mpv_ipc: Option<std::path::PathBuf>,
+	/// Every SDP temp file this session has written (`write_sdp` for video,
+	/// `spawn_native_audio` for audio). The port-based filenames are essentially unique
+	/// per session (ephemeral ports) and a fresh one is written on every live codec /
+	/// monitor switch, so they would otherwise pile up in `temp_dir` for the life of the
+	/// machine. `stop_stream` `remove_file`s each on teardown.
+	pub(crate) sdp_files: Arc<Mutex<Vec<std::path::PathBuf>>>,
 	/// Faz 3 overlay (Linux `--wid` path): the SDP + window id needed to respawn the mpv
 	/// child after the overlay killed it. Killing mpv on overlay-open destroys its window so
 	/// the webview menu (which mpv otherwise composites over) becomes visible; respawning on

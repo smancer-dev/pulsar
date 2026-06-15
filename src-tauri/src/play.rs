@@ -120,7 +120,7 @@ pub(crate) async fn start_remote_play(
 
 	let disc = state.discovery.lock().unwrap().clone();
 	let net_mode = state.config.lock().unwrap().network_mode;
-	let (mut sess, peer_label) = connect_target(&node, disc, &target, net_mode).await?;
+	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
 	// Real connection phase: the transport is now actually established (direct P2P or
 	// relay). Tell the Connecting screen so it reflects the truth instead of guessing.
 	let transport = match sess.transport() {
@@ -283,6 +283,10 @@ pub(crate) async fn start_remote_play(
 	let caps_line: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 	// Stdin-only renderer state remembered for a codec-switch respawn re-push.
 	let render_seed: Arc<Mutex<RenderSeed>> = Arc::new(Mutex::new(RenderSeed::default()));
+	// Every SDP temp file written for this session — tracked so stop_stream can delete
+	// them (they're never overwritten because the port-based name is effectively unique
+	// per session, and codec/monitor switches write a fresh one each time).
+	let sdp_files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
 	// Linux/X11: the embedded webview (WebKitGTK WebCodecs) can't hardware-decode here — it
 	// would software-decode + glitch AND add a webview hop to the video path. So the native
 	// mpv renderer (rkmpp) is the DEFAULT. We first try the moonlight-style SINGLE SURFACE
@@ -304,6 +308,9 @@ pub(crate) async fn start_remote_play(
 		if let Some(vport) = native_view::free_udp_port() {
 			match native_view::write_sdp(vport, &codec) {
 				Ok(sdp) => {
+					// Track for teardown on every platform (Windows ffplay/render path
+					// below never stores `mpv_sdp`, so this is the only handle to it).
+					sdp_files.lock().unwrap().push(sdp.clone());
 					#[cfg(windows)]
 					{
 						// DEFAULT Windows renderer: `pulsar-render` — Media Foundation HW decode +
@@ -727,7 +734,11 @@ pub(crate) async fn start_remote_play(
 		// degrades if the chosen encoder+codec can't actually do them.
 		hdr: std::env::var_os("PULSAR_HDR").is_some(),
 		yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
-		decode_codecs: client_codecs.clone(),
+		// PRUNED set (host-encoder-aware), not raw `client_codecs`: the host clamps its
+		// auto-degraded codec to this, so it can never land on a codec the client dropped
+		// because its decoder is incompatible with the host's encoder family (e.g. the Pi's
+		// rkmpp can't decode native-NVENC HEVC — HEVC is in `client_codecs` but not `allowed`).
+		decode_codecs: allowed.clone(),
 		media_over_session: mos,
 		// Cursor side-channel: the native renderer can draw the host pointer itself
 		// (so the host may use the cursorless KMS zero-copy capture and stream the
@@ -775,6 +786,12 @@ pub(crate) async fn start_remote_play(
 				// true channel count if the host ever sends multistream surround.
 				match native_view::spawn_native_audio(&ff, lp, pulsar_core::audio::CHANNELS) {
 					Some(c) => {
+						// Track the audio SDP temp file (named by spawn_native_audio after
+						// the loopback port) so stop_stream removes it on teardown.
+						sdp_files
+							.lock()
+							.unwrap()
+							.push(std::env::temp_dir().join(format!("pulsar-audio-{lp}.sdp")));
 						view.forward_audio_to_loopback(lp);
 						Some(c)
 					}
@@ -860,7 +877,10 @@ pub(crate) async fn start_remote_play(
 		encoder_h,
 		codec_h,
 		game_mode,
-		client_codecs.clone(),
+		// PRUNED set: the hold-loop re-requests (adaptive bitrate / menu restream) carry this
+		// as `decode_codecs`, so the host's clamp keeps excluding host-encoder-incompatible
+		// codecs across the whole session, not just the first request (see `allowed` above).
+		allowed.clone(),
 		overlay_stdin.clone(),
 		mos,
 		host_nack,
@@ -884,6 +904,7 @@ pub(crate) async fn start_remote_play(
 			ffplay: native_child,
 			audio_native,
 			mpv_ipc: mpv_ipc_sock,
+			sdp_files,
 			mpv_sdp,
 			mpv_wid,
 			vidsink_bin: vidsink_bin_path,
@@ -958,6 +979,9 @@ pub(crate) async fn stop_stream(
 	// otherwise every other state.plays user (forward() on each mouse-move/keystroke,
 	// the setters, mic/kbd commands) stalls until the closed session's children exit.
 	let play = state.plays.lock().unwrap().remove(&id);
+	// Drop this session's per-id monitor-picker debounce entry so the map doesn't
+	// accumulate stale entries across reconnects.
+	crate::session_cmds::forget_monitor_debounce(id);
 	// A session torn down with its overlay still open must release the global
 	// SUSPENDED latch (see AppState::overlay_open) — otherwise the next session
 	// starts permanently un-engageable.
@@ -980,38 +1004,18 @@ pub(crate) async fn stop_stream(
 		if let Some(mut child) = play.ffplay.take() {
 			stop_render_child(&mut child);
 		}
-		// Keep the native renderer (`pulsar-render`) ALIVE on disconnect — do NOT kill it. Killing
-		// destroys its EGL context, which corrupts the WebKitGTK webview's shared Mali GL on RK3588
-		// and wedges the webview (clicks dead) with no in-session recovery (needs a reboot). Instead
-		// tell it to `hide` (unmap its window → the webview shows through) and idle; its
-		// `PR_SET_PDEATHSIG` reaps it when the app exits. If there's no stdin to send `hide`
-		// (shouldn't happen for pulsar-render), fall back to a kill.
+		// Stop the native renderer (`pulsar-render`) cleanly on disconnect. We do NOT keep it
+		// resident: the in-app video container that owns its `--wid` parent window is destroyed a
+		// few lines below (destroy_native_container), and no code path ever reactivates a hidden
+		// renderer (every reconnect uses a fresh, never-reused play id → a brand-new spawn). The
+		// old `hide`+drop-resident model therefore left one orphaned, idle-looping renderer per
+		// reconnect drawing into a dead window tree until the whole app exited (PR_SET_PDEATHSIG
+		// only reaps on app EXIT, not on a normal disconnect) — the exact multi-renderer pile-up
+		// that causes the Pi stutter / "host stale after reconnects". `stop_render_child` sends
+		// SIGTERM first (Linux) with a grace window, so the renderer runs its clean EGL/X teardown
+		// (release the context, XDestroyWindow, XCloseDisplay) — this is what protects WebKitGTK's
+		// shared Mali GL on RK3588; only a hard SIGKILL mid-EGL-bind would wedge it.
 		if let Some(mut child) = play.render_child.take() {
-			// Linux: hide + keep resident (don't destroy the EGL context → no WebKit GL corruption).
-			#[cfg(all(unix, not(target_os = "macos")))]
-			{
-				let hidden = {
-					use std::io::Write as _;
-					match play.render_stdin.lock().unwrap().as_mut() {
-						Some(si) => writeln!(si, "hide").is_ok(),
-						None => false,
-					}
-				};
-				if hidden {
-					// DROP the handle (don't `forget` it): the renderer's stdin AND stdout
-					// were already moved out at spawn (render_stdin Arc + start_render_reader),
-					// so the Child owns no pipe fds to close — the only reason `forget` was
-					// used. Dropping a Child on Unix neither kills nor waits the process, so the
-					// resident renderer keeps running exactly as intended; `forget` additionally
-					// LEAKED the Child struct (and any fds it still held) on every reconnect.
-					drop(child);
-				} else {
-					stop_render_child(&mut child);
-				}
-			}
-			// Windows/macOS: WebView2/WKWebView don't share GL with the renderer like WebKitGTK does
-			// on Mali, so a normal teardown is fine (and the renderer there doesn't handle `hide`).
-			#[cfg(not(all(unix, not(target_os = "macos"))))]
 			stop_render_child(&mut child);
 		}
 		// Stop the Linux native audio player (ffmpeg→PulseAudio), if any.
@@ -1024,6 +1028,12 @@ pub(crate) async fn stop_stream(
 		#[cfg(unix)]
 		if let Some(sock) = play.mpv_ipc.take() {
 			let _ = std::fs::remove_file(&sock);
+		}
+		// Remove every SDP temp file this session wrote (video + Linux audio, plus one per
+		// codec/monitor switch). Their port-based names are effectively unique per session,
+		// so without this they accumulate in temp_dir for the life of the machine.
+		for sdp in play.sdp_files.lock().unwrap().drain(..) {
+			let _ = std::fs::remove_file(&sdp);
 		}
 	}
 	// Tear down the Linux single-surface renderer (libmpv→GLArea), if this session used it.

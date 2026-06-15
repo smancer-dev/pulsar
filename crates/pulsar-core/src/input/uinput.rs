@@ -116,6 +116,11 @@ pub struct DesktopInput {
 	/// instead accumulate the remainder so successive fine scrolls eventually move.
 	scroll_acc_v: f64,
 	scroll_acc_h: f64,
+	/// Currently-held mouse-button evdev codes and key evdev codes. Tracked so they
+	/// can be released on `flush_held()` (control revoked mid-press → "Sadece izleme")
+	/// and on `Drop` (session teardown) — otherwise a held button/modifier stays stuck.
+	held_buttons: std::collections::HashSet<u16>,
+	held_keys: std::collections::HashSet<u16>,
 }
 
 impl DesktopInput {
@@ -166,6 +171,8 @@ impl DesktopInput {
 			keyboard,
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
+			held_buttons: std::collections::HashSet::new(),
+			held_keys: std::collections::HashSet::new(),
 		})
 	}
 
@@ -210,6 +217,11 @@ impl DesktopInput {
 			2 => Key::BTN_MIDDLE,
 			_ => Key::BTN_LEFT,
 		};
+		if down {
+			self.held_buttons.insert(key.code());
+		} else {
+			self.held_buttons.remove(&key.code());
+		}
 		let _ = self
 			.mouse
 			.emit(&[InputEvent::new(EventType::KEY, key.code(), down as i32)]);
@@ -252,17 +264,176 @@ impl DesktopInput {
 		if code == 0 || code > 248 {
 			return;
 		}
+		let code = code as u16;
+		if down {
+			self.held_keys.insert(code);
+		} else {
+			self.held_keys.remove(&code);
+		}
 		let _ = self
 			.keyboard
-			.emit(&[InputEvent::new(EventType::KEY, code as u16, down as i32)]);
+			.emit(&[InputEvent::new(EventType::KEY, code, down as i32)]);
 	}
 
 	/// Type a resolved Unicode character (layout-independent). uinput is keycode-based with no
-	/// direct Unicode-insert path, so a Linux HOST can't trivially type an arbitrary codepoint;
-	/// no-op for now (Windows hosts use KEYEVENTF_UNICODE). A Linux-host client typically shares
-	/// the same layout, and the `Key` (keycode) path still works. TODO: synthesize via a temporary
-	/// keymap remap if Linux-host non-matching-layout input becomes a requirement.
-	pub fn type_char(&mut self, _c: char) {}
+	/// direct Unicode-insert path, so a Linux HOST can't natively insert an arbitrary codepoint.
+	/// A Linux CLIENT resolves printable keys through xkb and forwards ONLY `Char(c)` (suppressing
+	/// the raw `Key` press/release), so without this the character is silently dropped on a Linux
+	/// host (Windows hosts use KEYEVENTF_UNICODE). We synthesize ASCII codepoints by tapping the
+	/// matching US-layout evdev keycode (+ Shift when needed) on the existing keyboard device —
+	/// reliable for URLs, passwords, chat and filenames. Non-ASCII codepoints have no fixed
+	/// keycode without a temporary keymap remap and remain unhandled.
+	pub fn type_char(&mut self, c: char) {
+		let Some((key, shift)) = us_char_to_key(c) else {
+			return;
+		};
+		let code = key.code();
+		let mut ev = Vec::with_capacity(4);
+		if shift {
+			ev.push(InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 1));
+		}
+		ev.push(InputEvent::new(EventType::KEY, code, 1));
+		ev.push(InputEvent::new(EventType::KEY, code, 0));
+		if shift {
+			ev.push(InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 0));
+		}
+		let _ = self.keyboard.emit(&ev);
+	}
+
+	/// Release every currently-held mouse button and key. Called when control is
+	/// revoked mid-press ("Sadece izleme"): the gate then drops all later events,
+	/// including the matching key-up/button-up, so without this flush a held
+	/// modifier or a held mouse button (drag-select) stays stuck on the host.
+	/// Idempotent — drained sets make repeat calls no-ops.
+	pub fn flush_held(&mut self) {
+		let btn_up: Vec<InputEvent> = self
+			.held_buttons
+			.drain()
+			.map(|code| InputEvent::new(EventType::KEY, code, 0))
+			.collect();
+		if !btn_up.is_empty() {
+			let _ = self.mouse.emit(&btn_up);
+		}
+		let key_up: Vec<InputEvent> = self
+			.held_keys
+			.drain()
+			.map(|code| InputEvent::new(EventType::KEY, code, 0))
+			.collect();
+		if !key_up.is_empty() {
+			let _ = self.keyboard.emit(&key_up);
+		}
+	}
+}
+
+impl Drop for DesktopInput {
+	/// Release anything still held when the session tears down, so a mid-press
+	/// disconnect can't leave the host with a stuck mouse button (→ a runaway
+	/// drag-select) or a stuck Ctrl/Alt/Shift.
+	fn drop(&mut self) {
+		self.flush_held();
+	}
+}
+
+/// Maps an ASCII character to the US-layout evdev key that produces it and whether Shift is held.
+/// The host keyboard device exposes the full evdev keycode range, so emitting these raw codes (the
+/// same codes a Linux client's `Key` path sends) lands the character regardless of the host's own
+/// X/Wayland layout. Returns `None` for non-ASCII (no fixed keycode without a keymap remap).
+fn us_char_to_key(c: char) -> Option<(Key, bool)> {
+	let unshifted = |k: Key| Some((k, false));
+	let shifted = |k: Key| Some((k, true));
+	match c {
+		'a'..='z' => unshifted(Key::new(letter_key_code(c, false))),
+		'A'..='Z' => shifted(Key::new(letter_key_code(c, true))),
+		'0' => unshifted(Key::KEY_0),
+		'1' => unshifted(Key::KEY_1),
+		'2' => unshifted(Key::KEY_2),
+		'3' => unshifted(Key::KEY_3),
+		'4' => unshifted(Key::KEY_4),
+		'5' => unshifted(Key::KEY_5),
+		'6' => unshifted(Key::KEY_6),
+		'7' => unshifted(Key::KEY_7),
+		'8' => unshifted(Key::KEY_8),
+		'9' => unshifted(Key::KEY_9),
+		' ' => unshifted(Key::KEY_SPACE),
+		'\t' => unshifted(Key::KEY_TAB),
+		'\n' | '\r' => unshifted(Key::KEY_ENTER),
+		'-' => unshifted(Key::KEY_MINUS),
+		'=' => unshifted(Key::KEY_EQUAL),
+		'[' => unshifted(Key::KEY_LEFTBRACE),
+		']' => unshifted(Key::KEY_RIGHTBRACE),
+		'\\' => unshifted(Key::KEY_BACKSLASH),
+		';' => unshifted(Key::KEY_SEMICOLON),
+		'\'' => unshifted(Key::KEY_APOSTROPHE),
+		'`' => unshifted(Key::KEY_GRAVE),
+		',' => unshifted(Key::KEY_COMMA),
+		'.' => unshifted(Key::KEY_DOT),
+		'/' => unshifted(Key::KEY_SLASH),
+		'!' => shifted(Key::KEY_1),
+		'@' => shifted(Key::KEY_2),
+		'#' => shifted(Key::KEY_3),
+		'$' => shifted(Key::KEY_4),
+		'%' => shifted(Key::KEY_5),
+		'^' => shifted(Key::KEY_6),
+		'&' => shifted(Key::KEY_7),
+		'*' => shifted(Key::KEY_8),
+		'(' => shifted(Key::KEY_9),
+		')' => shifted(Key::KEY_0),
+		'_' => shifted(Key::KEY_MINUS),
+		'+' => shifted(Key::KEY_EQUAL),
+		'{' => shifted(Key::KEY_LEFTBRACE),
+		'}' => shifted(Key::KEY_RIGHTBRACE),
+		'|' => shifted(Key::KEY_BACKSLASH),
+		':' => shifted(Key::KEY_SEMICOLON),
+		'"' => shifted(Key::KEY_APOSTROPHE),
+		'~' => shifted(Key::KEY_GRAVE),
+		'<' => shifted(Key::KEY_COMMA),
+		'>' => shifted(Key::KEY_DOT),
+		'?' => shifted(Key::KEY_SLASH),
+		_ => None,
+	}
+}
+
+/// evdev keycode for an ASCII letter. The alphabet is NOT contiguous in evdev order, so look it up
+/// in a row-ordered table (q-row, a-row, z-row) keyed by the lowercase letter.
+fn letter_key_code(c: char, upper: bool) -> u16 {
+	let lower = if upper {
+		c.to_ascii_lowercase()
+	} else {
+		c
+	};
+	// evdev key order by physical row: top (Q..P), home (A..L), bottom (Z..M).
+	const ROWS: &[(char, u16)] = &[
+		('q', 16),
+		('w', 17),
+		('e', 18),
+		('r', 19),
+		('t', 20),
+		('y', 21),
+		('u', 22),
+		('i', 23),
+		('o', 24),
+		('p', 25),
+		('a', 30),
+		('s', 31),
+		('d', 32),
+		('f', 33),
+		('g', 34),
+		('h', 35),
+		('j', 36),
+		('k', 37),
+		('l', 38),
+		('z', 44),
+		('x', 45),
+		('c', 46),
+		('v', 47),
+		('b', 48),
+		('n', 49),
+		('m', 50),
+	];
+	ROWS.iter()
+		.find(|(ch, _)| *ch == lower)
+		.map(|(_, code)| *code)
+		.unwrap_or(0)
 }
 
 #[cfg(test)]

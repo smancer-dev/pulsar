@@ -13,6 +13,19 @@ pub struct Node {
 	pub(super) mode: NetworkMode,
 	pub(super) name: String,
 	pub(super) registered: Notify,
+	/// Signalled by the `Registered` handler when a RE-registration returns a
+	/// DIFFERENT id than we already held — e.g. the relay restarted/lost its
+	/// `by_pubkey` map and minted a fresh 9-digit id. Lets the app re-advertise
+	/// the new id (UI + LAN beacon) instead of broadcasting the dead old one.
+	/// `Arc` so a watcher can await it (`id_changed_handle`) without pinning the
+	/// `Node` alive across the await (mirrors `shutdown`).
+	pub(super) id_changed: Arc<Notify>,
+	/// Signalled when the relay rejects a re-registration from an already-online
+	/// node with `IncompatibleVersion` (relay was redeployed with a newer protocol
+	/// version). The heartbeat will keep bouncing; the node is effectively stranded.
+	/// Lets the app surface an "update required" error and go offline cleanly
+	/// instead of silently advertising a dead id forever.
+	pub(super) version_error: Arc<Notify>,
 	pub(super) inner: Mutex<Inner>,
 	pub(super) incoming_tx: mpsc::UnboundedSender<Session>,
 	pub(super) incoming_rx: Mutex<mpsc::UnboundedReceiver<Session>>,
@@ -29,6 +42,11 @@ impl Drop for Node {
 		// notify_one stores a permit, so the wakeup also lands if the loop is
 		// mid-dispatch rather than parked in its select! right now.
 		self.shutdown.notify_one();
+		// Wake any id-rotation watcher (`id_changed_handle`) so it re-checks its
+		// Weak<Node>, sees the node is gone, and exits instead of parking forever.
+		self.id_changed.notify_one();
+		// Wake any version-error watcher so it exits cleanly too.
+		self.version_error.notify_one();
 	}
 }
 
@@ -90,6 +108,8 @@ impl Node {
 			mode,
 			name,
 			registered: Notify::new(),
+			id_changed: Arc::new(Notify::new()),
+			version_error: Arc::new(Notify::new()),
 			inner: Mutex::new(Inner::default()),
 			incoming_tx,
 			incoming_rx: Mutex::new(incoming_rx),
@@ -137,6 +157,27 @@ impl Node {
 		self.inner.lock().await.self_id
 	}
 
+	/// A handle to the id-rotation signal. Its `.notified()` resolves the next
+	/// time our relay-assigned id ROTATES after the initial `register()` — i.e. a
+	/// `NotRegistered` re-register got a brand-new id (a relay restart that lost
+	/// `by_pubkey`). Await it in a loop and read [`self_id`] to re-advertise the
+	/// fresh id to the UI / LAN beacon, otherwise both keep broadcasting the
+	/// now-unreachable old id. Cloning the `Arc` lets a watcher await without
+	/// pinning the `Node` alive across the await.
+	pub fn id_changed_handle(&self) -> Arc<Notify> {
+		self.id_changed.clone()
+	}
+
+	/// A handle to the post-registration version-error signal. Its `.notified()`
+	/// resolves when the relay sends an `IncompatibleVersion` error to an already-
+	/// registered node (relay redeployed with a newer protocol version). The node
+	/// is stranded at this point — heartbeats will keep bouncing — so the app
+	/// should surface an "update required" error and go offline. Cloning the `Arc`
+	/// lets the watcher await without pinning the `Node` alive.
+	pub fn version_error_handle(&self) -> Arc<Notify> {
+		self.version_error.clone()
+	}
+
 	/// The relay registration message. One encoding for both the initial
 	/// `register()` and the `NotRegistered` re-register (relay restart / >TTL
 	/// outage): the relay maps pubkey → id, so re-sending this reissues the
@@ -158,12 +199,21 @@ impl Node {
 		timeout(REGISTER_TIMEOUT, self.registered.notified())
 			.await
 			.map_err(|_| ConnError::RelayTimeout)?;
-		let id = self
-			.inner
-			.lock()
-			.await
-			.self_id
-			.ok_or(ConnError::RelayTimeout)?;
+		let id = {
+			let g = self.inner.lock().await;
+			match g.self_id {
+				Some(id) => id,
+				// The notify fired with no id: the relay refused our registration. A
+				// version mismatch maps to a clear `IncompatibleVersion`; anything else
+				// (or no recorded code) falls back to a timeout-style error.
+				None => {
+					return Err(match g.register_error {
+						Some(ErrCode::IncompatibleVersion) => ConnError::IncompatibleVersion,
+						_ => ConnError::RelayTimeout,
+					})
+				}
+			}
+		};
 		// Keep the registration alive: the relay drops devices that go silent for
 		// `DEVICE_TTL`, after which `connect()` would fail with `BadToken`.
 		tokio::spawn(heartbeat_loop(Arc::downgrade(self)));
@@ -172,6 +222,25 @@ impl Node {
 
 	/// Connect to a peer by id, following the configured [`NetworkMode`].
 	pub async fn connect(self: &Arc<Self>, target: DeviceId) -> Result<Session, ConnError> {
+		self.connect_pinned(target, None).await
+	}
+
+	/// Like [`Self::connect`] but with an optional **expected peer public key** to
+	/// pin the relay-path identity. The relay maps pubkey → id but never proves to
+	/// the requester WHICH pubkey owns the target id — it only enforces `target ==
+	/// id` before emitting `PeerFound`. So a malicious/compromised relay (the
+	/// stated self-hostable, ciphertext-only threat model) or an attacker that won
+	/// the pubkey→id registration race after a TTL eviction could answer in the
+	/// target's place with its OWN key. When `expected` is `Some(pk)` (e.g. the
+	/// caller pinned the key on a prior connect — TOFU), the `PeerFound` handler
+	/// drops any answer carrying a different key, mirroring the direct-path
+	/// `connect_direct(_, Some(pk))` pin. `None` keeps the original TOFU-first
+	/// behavior. Read [`Session::peer_pubkey`] after connecting to record the pin.
+	pub async fn connect_pinned(
+		self: &Arc<Self>,
+		target: DeviceId,
+		expected: Option<PublicKey>,
+	) -> Result<Session, ConnError> {
 		let (id, token) = {
 			let g = self.inner.lock().await;
 			(
@@ -190,6 +259,13 @@ impl Node {
 			let mut g = self.inner.lock().await;
 			g.peer_found.insert(session, pf.clone());
 			g.pending_salt.insert(session, our_salt);
+			// Pin the expected identity for this id (TOFU / known-host): the
+			// `PeerFound` handler drops an answer carrying any other key so the relay
+			// can't substitute a different peer behind the requested id. Absent ⇒
+			// the original accept-any (TOFU-first) behavior.
+			if let Some(pk) = expected {
+				g.expected_pubkey.insert(session, pk);
+			}
 		}
 		// Handshake blob: static pubkey(32) || fresh session salt(32) || optional
 		// LAN candidate (same-NAT peers punch our PRIVATE addr too — see
@@ -220,6 +296,7 @@ impl Node {
 			// already have inserted the session; nothing will ever use it.
 			if rv.is_err() {
 				g.pending_salt.remove(&session);
+				g.expected_pubkey.remove(&session);
 				g.sessions.remove(&session);
 			}
 		}
@@ -276,7 +353,7 @@ impl Node {
 	pub async fn connect_direct(
 		self: &Arc<Self>,
 		peer_addr: SocketAddr,
-		_peer_pubkey: Option<PublicKey>,
+		peer_pubkey: Option<PublicKey>,
 	) -> Result<Session, ConnError> {
 		let session: SessionId = rand::random();
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
@@ -297,6 +374,13 @@ impl Node {
 			let mut g = self.inner.lock().await;
 			g.hello_done.insert(session, hp.clone());
 			g.pending_salt.insert(session, our_salt);
+			// When the caller already knows the peer's key, pin it: the `HelloAck`
+			// handler drops an ack carrying any other key, so an attacker that answers
+			// the Hello in the peer's place can't terminate the E2E with its own key
+			// (silent MITM of the direct path). Absent ⇒ in-band/TOFU as before.
+			if let Some(pk) = peer_pubkey {
+				g.expected_pubkey.insert(session, pk);
+			}
 		}
 		// The caller may race this whole future against its own (shorter) timeout
 		// — the LAN fast path uses 1.5 s vs our 3 s — so if we're DROPPED at an
@@ -319,6 +403,7 @@ impl Node {
 			let mut g = self.inner.lock().await;
 			g.hello_done.remove(&session);
 			g.pending_salt.remove(&session);
+			g.expected_pubkey.remove(&session);
 			g.sessions.remove(&session);
 			guard.armed = false;
 			return Err(ConnError::P2pFailed);
@@ -375,6 +460,7 @@ impl Drop for DirectGuard {
 				let mut g = node.inner.lock().await;
 				g.hello_done.remove(&session);
 				g.pending_salt.remove(&session);
+				g.expected_pubkey.remove(&session);
 				g.punched.remove(&session);
 				g.sessions.remove(&session);
 			});

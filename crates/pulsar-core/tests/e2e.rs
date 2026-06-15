@@ -184,6 +184,45 @@ async fn direct_ip_connect_without_a_relay() {
 	assert_eq!(got, b"ping");
 }
 
+/// Relay-path identity pinning (TOFU): `connect_pinned` with the target's REAL key
+/// succeeds and exposes that key via `peer_pubkey`, while a connect pinned to a
+/// WRONG key is dropped at the `PeerFound` handler and fails (the relay can't
+/// substitute a different peer behind a known id).
+#[tokio::test]
+async fn relay_connect_pins_the_peer_pubkey() {
+	let (relay, _h) = start_relay().await;
+	let host = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::RelayOnly)
+		.await
+		.unwrap();
+	let client = Node::bind(LOCAL.parse().unwrap(), relay, NetworkMode::RelayOnly)
+		.await
+		.unwrap();
+	host.register().await.unwrap();
+	client.register().await.unwrap();
+	let host_id = host.self_id().await.unwrap();
+
+	// Correct pin → connects, and the established session reports the host's key.
+	let sess = client
+		.connect_pinned(host_id, Some(host.public_key()))
+		.await
+		.unwrap();
+	let _h = timeout(Duration::from_secs(2), host.next_incoming())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(sess.peer_pubkey().await, Some(host.public_key()));
+	drop(sess);
+
+	// Wrong pin → the PeerFound answer is dropped, so rendezvous times out and the
+	// connect fails (no silent substitution of the attacker's key).
+	let mut wrong = host.public_key();
+	wrong[0] ^= 0xFF;
+	assert!(
+		client.connect_pinned(host_id, Some(wrong)).await.is_err(),
+		"a pinned key mismatch must fail the connect, not establish a wrong-peer session"
+	);
+}
+
 /// Media-over-session: tagged RTP frames ride the SAME encrypted session as the
 /// JSON control messages — through the RELAY (the single-socket promise must hold
 /// on the worst-case transport), sent from a concurrent `SessionSender` while the

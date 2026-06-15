@@ -109,6 +109,10 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'auto_connect_target':
 			// No CLI auto-connect target in the browser mock (silences the reject log).
 			return Promise.resolve(null as unknown as T);
+		case 'self_update_possible':
+			// The browser mock isn't an AppImage; pretend self-update is possible so the
+			// preview behaves like a normal in-place-updatable build.
+			return Promise.resolve(true as unknown as T);
 		case 'list_connections':
 			return Promise.resolve([] as unknown as T);
 		case 'respond_request':
@@ -134,6 +138,7 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'input_button':
 		case 'input_scroll':
 		case 'input_key':
+		case 'input_char':
 		case 'kbd_capture_start':
 		case 'kbd_capture_stop':
 		case 'kbd_engage':

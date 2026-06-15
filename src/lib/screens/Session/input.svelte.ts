@@ -14,6 +14,7 @@ type Inputs = {
 	playId: () => number;
 	wsPort: () => number;
 	canvas: () => HTMLCanvasElement;
+	mode: () => 'remote' | 'game';
 };
 
 export class SessionInput {
@@ -40,6 +41,11 @@ export class SessionInput {
 	// Win key. The old code excluded Win to avoid a spurious lone Win-up popping Start,
 	// but since we only release keys actually held, releasing Win here is correct.
 	#heldKeys = new Set<number>();
+	// Physical codes (KeyboardEvent.code) we resolved to a Unicode char and forwarded as a
+	// one-shot `Char` (layout-independent). These have NO held key-down on the host, so their
+	// key-up is suppressed (mirrors the Linux native hook's char_keys) and they're never put in
+	// #heldKeys — nothing to release on blur/disengage.
+	#charKeys = new Set<string>();
 
 	constructor(inputs: Inputs) {
 		this.#in = inputs;
@@ -90,6 +96,9 @@ export class SessionInput {
 		api.inputButton(playId, 2, false).catch(() => {});
 	}
 	#releaseHeldKeys() {
+		// Char keys are one-shot (no held VK on the host), so there's nothing to release —
+		// just drop the tracking so a later key-up isn't wrongly suppressed.
+		this.#charKeys.clear();
 		const playId = this.#in.playId();
 		if (playId < 0) {
 			this.#heldKeys.clear();
@@ -169,11 +178,49 @@ export class SessionInput {
 		const code = evdevCode(e.code);
 		if (!code) return;
 		e.preventDefault();
-		// Track held keys so focus loss (the Win key popping Start, Alt+Tab) can release
-		// them on the host — otherwise the key-up never arrives (the webview lost focus)
-		// and the key stays stuck, e.g. Win held → every letter becomes a Win+letter shortcut.
-		if (down) this.#heldKeys.add(code);
-		else this.#heldKeys.delete(code);
-		api.inputKey(this.#in.playId(), code, down).catch(() => {});
+		const playId = this.#in.playId();
+		// WYSIWYG / layout-independent text (mirrors the Linux native hook): a printable key
+		// with no SHORTCUT modifier (Ctrl/Meta/Alt — but AltGr is NOT a shortcut) resolves via
+		// THIS client's keyboard layout to a Unicode codepoint and is sent as `Char`, so the host
+		// inserts that exact character regardless of its own active layout. Without this every key
+		// goes through the positional evdev→VK table, so non-US layouts mistype and AltGr symbols
+		// (@ € { }) become e.g. macOS Option dead-keys. Shortcuts and non-text keys (Enter, arrows,
+		// F-keys, modifiers) still take the `Key` path so VK-level semantics are preserved.
+		const altGraph = e.getModifierState && e.getModifierState('AltGraph');
+		const isShortcut = !altGraph && (e.ctrlKey || e.metaKey || e.altKey);
+		// Game mode must deliver raw scancodes/VK so games can see movement keys (WASD, digits,
+		// space) via DirectInput / RawInput / GetAsyncKeyState — KEYEVENTF_UNICODE and CGEvent
+		// Unicode injection are invisible to those APIs. The Char path is only correct for
+		// remote-desktop mode where layout-independent text entry matters.
+		const printable =
+			this.#in.mode() === 'remote' &&
+			e.key.length === 1 &&
+			e.key.codePointAt(0)! >= 0x20 &&
+			!isShortcut;
+		if (down) {
+			if (printable) {
+				// One-shot char insert (no held VK on the host); remember it so the key-up is
+				// suppressed and so blur/disengage doesn't try to release a key never held.
+				this.#charKeys.add(e.code);
+				api.inputChar(playId, e.key).catch(() => {});
+				return;
+			}
+			// Track held keys so focus loss (the Win key popping Start, Alt+Tab) can release
+			// them on the host — otherwise the key-up never arrives (the webview lost focus)
+			// and the key stays stuck, e.g. Win held → every letter becomes a Win+letter shortcut.
+			// If this physical key was previously tracked as a one-shot Char (e.g. 'a' was held
+			// without a modifier, then Ctrl was pressed mid-hold so the auto-repeat now carries
+			// ctrlKey=true), drop the stale #charKeys entry. Without this the key-UP handler
+			// hits the `#charKeys.delete` branch first and suppresses the matching
+			// inputKey(code, false), leaving the host key stuck.
+			this.#charKeys.delete(e.code);
+			this.#heldKeys.add(code);
+		} else {
+			// Key UP: a char key had no held VK on the host, so suppress its up. Otherwise
+			// release the tracked VK as before.
+			if (this.#charKeys.delete(e.code)) return;
+			this.#heldKeys.delete(code);
+		}
+		api.inputKey(playId, code, down).catch(() => {});
 	}
 }

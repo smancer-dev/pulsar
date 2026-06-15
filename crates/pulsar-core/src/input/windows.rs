@@ -5,8 +5,26 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 	SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
 	KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
 	MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-	MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+	MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+	MOUSEINPUT,
 };
+
+/// Virtual-desktop geometry of the streamed monitor, used to map a normalized (0..1)
+/// absolute pointer onto the correct (possibly non-primary) screen. All in virtual-desktop
+/// pixels: `mon_*` is the captured monitor's rect; `virt_*` is the bounding box of every
+/// monitor (== `SM_*VIRTUALSCREEN`). Without this an absolute move always lands on the
+/// PRIMARY display, since `MOUSEEVENTF_ABSOLUTE` alone maps 0..65535 to the primary only.
+#[derive(Clone, Copy, Debug)]
+pub struct MonitorRect {
+	pub mon_left: i32,
+	pub mon_top: i32,
+	pub mon_width: i32,
+	pub mon_height: i32,
+	pub virt_left: i32,
+	pub virt_top: i32,
+	pub virt_width: i32,
+	pub virt_height: i32,
+}
 
 const WHEEL_DELTA: i32 = 120;
 
@@ -149,6 +167,11 @@ pub struct DesktopInput {
 	/// so successive small scrolls eventually move (and big deltas behave as before).
 	scroll_acc_v: f64,
 	scroll_acc_h: f64,
+	/// Geometry of the streamed monitor within the virtual desktop. `None` ⇒ the primary
+	/// display (single-monitor host / unknown geometry) — keeps the legacy primary-only
+	/// absolute mapping. `Some` ⇒ map the normalized coords onto that monitor's rect across
+	/// the whole virtual screen so a non-primary monitor's clicks land on it.
+	monitor: Option<MonitorRect>,
 }
 
 impl DesktopInput {
@@ -158,15 +181,48 @@ impl DesktopInput {
 			held_keys: std::collections::HashSet::new(),
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
+			monitor: None,
 		})
 	}
 
-	/// Move the pointer to a normalized (0..1) position on the primary display
-	/// (what ddagrab output_idx=0 captures).
+	/// Set (or clear) the streamed monitor's virtual-desktop geometry so absolute pointer
+	/// moves target the captured screen, not always the primary. Called by the host whenever
+	/// the stream's `display_idx` is (re)selected.
+	pub fn set_monitor(&mut self, rect: Option<MonitorRect>) {
+		self.monitor = rect;
+	}
+
+	/// Move the pointer to a normalized (0..1) position on the streamed monitor. When a
+	/// `MonitorRect` is set, the normalized coords are placed inside that monitor's rect and
+	/// remapped across the whole virtual desktop with `MOUSEEVENTF_VIRTUALDESK` — otherwise a
+	/// bare `MOUSEEVENTF_ABSOLUTE` move always lands on the PRIMARY display. With no rect set
+	/// (single-monitor / unknown) it falls back to the primary-only mapping.
 	pub fn pointer(&mut self, x: f64, y: f64) {
-		let dx = (x.clamp(0.0, 1.0) * 65535.0).round() as i32;
-		let dy = (y.clamp(0.0, 1.0) * 65535.0).round() as i32;
-		send_mouse(dx, dy, 0, MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE);
+		let x = x.clamp(0.0, 1.0);
+		let y = y.clamp(0.0, 1.0);
+		match self.monitor {
+			Some(m) if m.virt_width > 0 && m.virt_height > 0 => {
+				// Absolute virtual-desktop pixel of the normalized point on the streamed monitor.
+				let px = m.mon_left as f64 + x * m.mon_width as f64;
+				let py = m.mon_top as f64 + y * m.mon_height as f64;
+				// Normalize across the whole virtual screen (what VIRTUALDESK maps 0..65535 onto).
+				let nx = (px - m.virt_left as f64) / m.virt_width as f64;
+				let ny = (py - m.virt_top as f64) / m.virt_height as f64;
+				let dx = (nx * 65535.0).round() as i32;
+				let dy = (ny * 65535.0).round() as i32;
+				send_mouse(
+					dx,
+					dy,
+					0,
+					MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE,
+				);
+			}
+			_ => {
+				let dx = (x * 65535.0).round() as i32;
+				let dy = (y * 65535.0).round() as i32;
+				send_mouse(dx, dy, 0, MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE);
+			}
+		}
 	}
 
 	/// Move the pointer by a raw relative delta (native renderer / games). No
@@ -249,13 +305,13 @@ impl DesktopInput {
 			}
 		}
 	}
-}
 
-impl Drop for DesktopInput {
-	/// Release anything still held when the session tears down, so a mid-press
-	/// disconnect can't leave the host with a stuck mouse button (→ a runaway
-	/// black drag-select rectangle) or a stuck Ctrl/Alt/Shift.
-	fn drop(&mut self) {
+	/// Release every currently-held mouse button and key. Called when control is
+	/// revoked mid-press ("Sadece izleme"): the gate then drops all later events,
+	/// including the matching key-up/button-up, so without this flush a held
+	/// Shift/Ctrl or a held mouse button (drag-select) stays stuck on the host.
+	/// Idempotent — drained sets make repeat calls no-ops.
+	pub fn flush_held(&mut self) {
 		for b in self.held_buttons.drain() {
 			let flag = match b {
 				1 => MOUSEEVENTF_RIGHTUP,
@@ -267,6 +323,15 @@ impl Drop for DesktopInput {
 		for vk in self.held_keys.drain() {
 			send_key(vk, KEYEVENTF_KEYUP);
 		}
+	}
+}
+
+impl Drop for DesktopInput {
+	/// Release anything still held when the session tears down, so a mid-press
+	/// disconnect can't leave the host with a stuck mouse button (→ a runaway
+	/// black drag-select rectangle) or a stuck Ctrl/Alt/Shift.
+	fn drop(&mut self) {
+		self.flush_held();
 	}
 }
 

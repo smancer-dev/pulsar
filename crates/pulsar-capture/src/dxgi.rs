@@ -19,7 +19,7 @@ mod pacing;
 pub(crate) mod platform;
 
 // Re-export the public API at the original `crate::dxgi::*` paths. `lib.rs` uses
-// `dxgi::CaptureDevice`; the platform helpers (`raise_thread_priority`,
-// `DisplayKeepAlive`) keep their original `pub` reachability here too.
-pub use device::CaptureDevice;
-pub use platform::{raise_thread_priority, DisplayKeepAlive};
+// `dxgi::CaptureDevice`. The display keep-alive + TIME_CRITICAL priority are engaged
+// ONCE for the whole capture thread by `lib.rs`'s thread body (its own guards), so the
+// pacing loop no longer re-engages thread-global SetThreadExecutionState/priority here.
+pub use device::{CaptureDevice, RunExit};

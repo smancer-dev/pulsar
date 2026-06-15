@@ -170,11 +170,20 @@ pub struct DesktopInput {
 	held_keys: HashSet<u16>,
 	/// Current modifier mask, kept in sync as modifier keys go down/up.
 	flags: CGEventFlags,
+	/// Caps-lock toggle state. On macOS a synthetic `kVK_CapsLock` key event does
+	/// NOT flip the hardware lock; toggling requires asserting/clearing the
+	/// `CGEventFlagAlphaShift` flag in the mask. We latch this on each Caps Lock
+	/// key-DOWN and keep it in `flags` so subsequent events stay caps-locked.
+	caps_lock: bool,
 	/// Carried-over fractional scroll (in lines). Fine/precision wheel deltas (< one
 	/// line) used to `round()` to 0 and do nothing; we accumulate the remainder so
 	/// successive small scrolls eventually move (big deltas behave as before).
 	scroll_acc_v: f64,
 	scroll_acc_h: f64,
+	/// Last pointer location we successfully read back from CoreGraphics. A transient
+	/// source/event-creation failure must NOT relocate a click/drag-release to (0,0)
+	/// (the menu-bar corner); we fall back to this last-known position instead.
+	last_point: CGPoint,
 }
 
 /// Translate our button id (0=left, 1=right, 2=middle) to the CGMouseButton plus
@@ -204,8 +213,10 @@ impl DesktopInput {
 			held_buttons: HashSet::new(),
 			held_keys: HashSet::new(),
 			flags: CGEventFlags::empty(),
+			caps_lock: false,
 			scroll_acc_v: 0.0,
 			scroll_acc_h: 0.0,
+			last_point: CGPoint::new(0.0, 0.0),
 		})
 	}
 
@@ -218,12 +229,16 @@ impl DesktopInput {
 
 	/// The current pointer location in global display (pixel) coordinates, read
 	/// back from CoreGraphics. Used to anchor relative moves.
-	fn current_location(&self) -> CGPoint {
+	///
+	/// On a transient source/event-creation failure we return the last location we
+	/// successfully read instead of (0,0): defaulting to the origin would silently
+	/// relocate a click or a teardown button-release to the top-left menu-bar corner.
+	fn current_location(&mut self) -> CGPoint {
 		// A throwaway null event carries the live cursor location.
-		match Self::source().and_then(|s| CGEvent::new(s).ok()) {
-			Some(ev) => ev.location(),
-			None => CGPoint::new(0.0, 0.0),
+		if let Some(ev) = Self::source().and_then(|s| CGEvent::new(s).ok()) {
+			self.last_point = ev.location();
 		}
+		self.last_point
 	}
 
 	/// If a button is held, the matching dragged event so the move counts as a drag.
@@ -325,6 +340,25 @@ impl DesktopInput {
 	/// Press/release a key by evdev keycode. Tracks held modifiers and stamps the
 	/// resulting flag mask onto the event (CoreGraphics won't infer it).
 	pub fn key(&mut self, code: u32, down: bool) {
+		// Caps Lock (evdev 58) is special on macOS: a plain kVK_CapsLock key event
+		// does NOT flip the lock state — only the CGEventFlagAlphaShift mask bit does.
+		// Latch the toggle on the FIRST down edge only (edge-detection via held_keys so
+		// that auto-repeat / evdev value=2 → down=true duplicates are no-ops).  A
+		// physical hold delivers: down (not yet in held_keys → toggle), repeat…repeat
+		// (already in held_keys → skip), up (clears held_keys).  Next physical press
+		// starts with an empty slot again, so the toggle fires exactly once per press.
+		if code == 58 {
+			// kVK_CapsLock = 0x39; held_keys stores VK codes.
+			let caps_vk: u16 = 0x39;
+			if down && !self.held_keys.contains(&caps_vk) {
+				self.caps_lock = !self.caps_lock;
+				if self.caps_lock {
+					self.flags.insert(CGEventFlags::CGEventFlagAlphaShift);
+				} else {
+					self.flags.remove(CGEventFlags::CGEventFlagAlphaShift);
+				}
+			}
+		}
 		// Keep the modifier mask in sync even though the key event itself also
 		// carries the flag — downstream chords (Cmd+C) need the flag asserted.
 		if let Some(flag) = evdev_modifier_flag(code) {
@@ -371,6 +405,39 @@ impl DesktopInput {
 			}
 		}
 	}
+
+	/// Release every currently-held mouse button and key and clear the modifier
+	/// mask. Called when control is revoked mid-press ("Sadece izleme"): the gate
+	/// then drops all later events, including the matching key-up/button-up, so
+	/// without this flush a held Cmd/Ctrl/Shift/Option or a held mouse button
+	/// (drag-select) stays stuck on the host. Idempotent — cleared sets make
+	/// repeat calls no-ops.
+	pub fn flush_held(&mut self) {
+		let point = self.current_location();
+		for b in self.held_buttons.clone() {
+			let (cg_btn, ty) = button_events(b, false);
+			if let Some(ev) =
+				Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
+			{
+				ev.post(CGEventTapLocation::HID);
+			}
+		}
+		self.held_buttons.clear();
+		// Drop modifiers from the mask before releasing keys so the key-up events
+		// don't re-assert a flag we're tearing down. Reset the caps latch too so it
+		// stays consistent with the now-cleared AlphaShift bit (a reused input after
+		// "Sadece izleme" must not toggle from a stale caps state).
+		self.flags = CGEventFlags::empty();
+		self.caps_lock = false;
+		for vk in self.held_keys.clone() {
+			if let Some(ev) =
+				Self::source().and_then(|s| CGEvent::new_keyboard_event(s, vk, false).ok())
+			{
+				ev.post(CGEventTapLocation::HID);
+			}
+		}
+		self.held_keys.clear();
+	}
 }
 
 // Compile-time guarantee: the host serve loop holds DesktopInput across awaits
@@ -386,27 +453,7 @@ impl Drop for DesktopInput {
 	/// disconnect can't leave the host with a stuck mouse button (→ a runaway
 	/// drag-select) or a stuck Cmd/Ctrl/Shift/Option.
 	fn drop(&mut self) {
-		let point = self.current_location();
-		for b in self.held_buttons.clone() {
-			let (cg_btn, ty) = button_events(b, false);
-			if let Some(ev) =
-				Self::source().and_then(|s| CGEvent::new_mouse_event(s, ty, point, cg_btn).ok())
-			{
-				ev.post(CGEventTapLocation::HID);
-			}
-		}
-		self.held_buttons.clear();
-		// Drop modifiers from the mask before releasing keys so the key-up events
-		// don't re-assert a flag we're tearing down.
-		self.flags = CGEventFlags::empty();
-		for vk in self.held_keys.clone() {
-			if let Some(ev) =
-				Self::source().and_then(|s| CGEvent::new_keyboard_event(s, vk, false).ok())
-			{
-				ev.post(CGEventTapLocation::HID);
-			}
-		}
-		self.held_keys.clear();
+		self.flush_held();
 	}
 }
 

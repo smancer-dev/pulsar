@@ -420,6 +420,7 @@ impl Encoder {
 			_kept_amd_context: kept_amd_context,
 			closed: false,
 			frame_idx: 0,
+			force_idr_once: false,
 		})
 	}
 }

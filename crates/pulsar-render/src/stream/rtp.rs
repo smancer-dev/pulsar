@@ -437,18 +437,49 @@ pub fn recv_loop(
 	// BIG receive buffer: the OS default (64 KiB on Windows) overflows on IDR bursts
 	// at high fps — the depacketizer then waits for a keyframe that never arrives
 	// whole. 4 MiB matches the app's node socket (pulsar-core node.rs).
-	let sock = (|| -> std::io::Result<UdpSocket> {
-		let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-		let _ = s.set_recv_buffer_size(4 * 1024 * 1024);
-		s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
-		Ok(s.into())
-	})();
-	let sock = match sock {
-		Ok(s) => s,
-		Err(e) => {
-			eprintln!("pulsar-render(win): rtp bind 0.0.0.0:{port} failed: {e}");
-			return;
+	//
+	// Retry on EADDRINUSE for up to ~800 ms: on a codec/monitor switch the orchestrator
+	// (respawn_render_for_codec) kills the old renderer BEFORE spawning this one
+	// (kill+wait via stop_render_child), so the port should already be free. But there
+	// can be a brief OS-level delay between TerminateProcess returning and the kernel
+	// fully releasing the bound UDP socket, and on some Windows versions a killed-but-
+	// not-yet-reaped child still holds the port for a tick. Retrying here (instead of
+	// returning immediately) turns a transient race into a non-event rather than a
+	// permanent black screen for the rest of the session.
+	let sock = 'bind: {
+		let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+		let mut last_err = None;
+		for attempt in 0..8u32 {
+			if attempt > 0 {
+				std::thread::sleep(Duration::from_millis(100));
+			}
+			if stop.load(Ordering::SeqCst) {
+				return; // session torn down while we were waiting — don't spin longer
+			}
+			match (|| -> std::io::Result<UdpSocket> {
+				let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+				let _ = s.set_recv_buffer_size(4 * 1024 * 1024);
+				s.bind(&addr.into())?;
+				Ok(s.into())
+			})() {
+				Ok(s) => break 'bind s,
+				Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+					eprintln!(
+						"pulsar-render(win): rtp bind 0.0.0.0:{port} EADDRINUSE (attempt {attempt}), retrying…"
+					);
+					last_err = Some(e);
+				}
+				Err(e) => {
+					eprintln!("pulsar-render(win): rtp bind 0.0.0.0:{port} failed: {e}");
+					return;
+				}
+			}
 		}
+		eprintln!(
+			"pulsar-render(win): rtp bind 0.0.0.0:{port} still busy after retries: {}",
+			last_err.unwrap()
+		);
+		return;
 	};
 	// Short read timeout so `stop` is honored promptly between datagrams.
 	let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));

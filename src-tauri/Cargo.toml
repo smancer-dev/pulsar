@@ -47,6 +47,13 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # Peer avatars arrive as raw PNG bytes over the session side channel; the webview
 # renders them from a `data:image/png;base64,…` URL (avatar.rs::data_url).
 base64 = "0.22"
+# Constant-time secret comparison for the connect/one-time password check
+# (auth.rs): a remote peer can flood Auth guesses, and a data-dependent `==` on
+# the secret leaks the shared-prefix length via reject latency. We hash both
+# candidate + stored secret to fixed-length SHA-256 digests and compare those
+# with subtle's constant-time `ct_eq` (digesting also hides the secret length).
+sha2 = { workspace = true }
+subtle = "2"
 
 # Raw Win32 for true taskbar-covering fullscreen (borderless-fullscreen via SetWindowPos).
 [target.'cfg(windows)'.dependencies]

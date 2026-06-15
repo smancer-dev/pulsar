@@ -26,6 +26,7 @@
 	"on": "On",
 	"off": "Off",
 	"muted": "Muted",
+	"switching": "Switching screen…",
 	"monitor.title": "Monitor",
 	"monitor.primary": "primary",
 	"fit.title": "View fit",

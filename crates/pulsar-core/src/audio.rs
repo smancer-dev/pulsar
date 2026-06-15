@@ -43,7 +43,8 @@ pub use command::{
 };
 #[cfg(windows)]
 pub use loopback::{
-	loopback_format, run_loopback_capture, run_loopback_capture_pinned, LoopbackFormat,
+	loopback_format, run_loopback_capture, run_loopback_capture_pinned,
+	run_loopback_capture_tracking, LoopbackFormat,
 };
 pub use mute::set_host_muted;
 pub use settings::{

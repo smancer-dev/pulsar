@@ -117,8 +117,10 @@ pub(super) struct CursorState {
 	hot_x: i32,
 	hot_y: i32,
 
-	/// Logical cursor pixel size (for MONOCHROME the height is already halved). Drives the
-	/// blend viewport — the texture is rendered at exactly this size at (pos_x, pos_y).
+	/// Logical (UNROTATED) cursor pixel size (for MONOCHROME the height is already halved).
+	/// Drives the blend viewport — at 0° the texture is rendered at exactly this size at
+	/// (pos_x, pos_y); under a rotated host the uploaded texture is the pre-rotated bitmap
+	/// (dims swapped for 90/270) and `composite_cursor` derives the scan-out viewport from this.
 	tex_w: u32,
 	tex_h: u32,
 	/// Alpha-blended image (always present for a valid shape).
@@ -233,46 +235,105 @@ unsafe fn make_cursor_srv(
 // CaptureDevice cursor methods (cache refresh + GPU compositing).
 // ---------------------------------------------------------------------------
 
-/// Rotate a tightly-packed BGRA image (row pitch = w*4) by 180° — reverse the pixel
-/// sequence (180° mirrors both axes). Returns a new owned buffer. On a 180°-rotated host
-/// the cursor bitmap is pre-rotated by this before upload, so that after the encoder's 180°
-/// bake (submit.rs `VideoProcessorSetStreamRotation`) the cursor appears UPRIGHT at the true
-/// pointer position. A malformed (too-short) buffer is returned as an unchanged copy (no panic).
-fn rotate180_bgra(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+/// Pre-rotate a tightly-packed BGRA cursor image (row pitch = w*4) by `deg` degrees
+/// **counter-clockwise** so that after the encoder's clockwise bake (submit.rs
+/// `VideoProcessorSetStreamRotation`) the cursor appears UPRIGHT at the true pointer
+/// position. Returns `(rotated_bytes, out_w, out_h)`; for 90/270 the dims are swapped
+/// (`out_w = h`, `out_h = w`). `deg` is the host display rotation (the amount the encoder
+/// will rotate the present surface CW); we apply the inverse here so the two cancel:
+///   - 0   → identity (caller skips this entirely)
+///   - 90  → rotate the bitmap 90° CCW (encoder bakes 90° CW)
+///   - 180 → rotate 180° (its own inverse)
+///   - 270 → rotate 270° CCW = 90° CW (encoder bakes 270° CW)
+/// A malformed (too-short) buffer is returned as an unchanged copy (no panic).
+fn rotate_bgra(src: &[u8], w: usize, h: usize, deg: u32) -> (Vec<u8>, u32, u32) {
 	let n = w.saturating_mul(h);
 	if src.len() < n * 4 {
-		return src.to_vec();
+		return (src.to_vec(), w as u32, h as u32);
 	}
-	let mut out = vec![0u8; n * 4];
-	for i in 0..n {
-		let s = i * 4;
-		let d = (n - 1 - i) * 4;
-		out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+	let px = |x: usize, y: usize| {
+		let s = (y * w + x) * 4;
+		[src[s], src[s + 1], src[s + 2], src[s + 3]]
+	};
+	let (ow, oh) = match deg {
+		90 | 270 => (h, w),
+		_ => (w, h),
+	};
+	let mut out = vec![0u8; ow * oh * 4];
+	let mut put = |ox: usize, oy: usize, p: [u8; 4]| {
+		let d = (oy * ow + ox) * 4;
+		out[d..d + 4].copy_from_slice(&p);
+	};
+	match deg {
+		// 90° CCW: out dims h×w. out(ox,oy) ← in(x = w-1-oy, y = ox).
+		90 => {
+			for y in 0..h {
+				for x in 0..w {
+					put(y, w - 1 - x, px(x, y));
+				}
+			}
+		}
+		// 270° CCW (= 90° CW): out dims h×w. out(ox,oy) ← in(x = oy, y = h-1-ox).
+		270 => {
+			for y in 0..h {
+				for x in 0..w {
+					put(h - 1 - y, x, px(x, y));
+				}
+			}
+		}
+		// 180°: reverse the pixel sequence (mirror both axes); dims unchanged.
+		_ => {
+			for y in 0..h {
+				for x in 0..w {
+					put(w - 1 - x, h - 1 - y, px(x, y));
+				}
+			}
+		}
 	}
-	out
+	(out, ow as u32, oh as u32)
 }
 
 #[cfg(test)]
 mod tests {
-	use super::rotate180_bgra;
+	use super::rotate_bgra;
 
 	#[test]
 	fn rotate180_reverses_pixels() {
 		// 2×1: [A,B] → [B,A].
 		let a = [1u8, 2, 3, 4, 5, 6, 7, 8];
-		assert_eq!(rotate180_bgra(&a, 2, 1), vec![5, 6, 7, 8, 1, 2, 3, 4]);
+		assert_eq!(rotate_bgra(&a, 2, 1, 180), (vec![5, 6, 7, 8, 1, 2, 3, 4], 2, 1));
 		// 1×2 (vertical): top/bottom swap.
 		let b = [9u8, 9, 9, 9, 1, 1, 1, 1];
-		assert_eq!(rotate180_bgra(&b, 1, 2), vec![1, 1, 1, 1, 9, 9, 9, 9]);
+		assert_eq!(rotate_bgra(&b, 1, 2, 180), (vec![1, 1, 1, 1, 9, 9, 9, 9], 1, 2));
 		// 2×2: TL,TR,BL,BR → BR,BL,TR,TL (both axes mirrored).
 		let c = [0u8, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3];
 		assert_eq!(
-			rotate180_bgra(&c, 2, 2),
-			vec![3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0]
+			rotate_bgra(&c, 2, 2, 180),
+			(vec![3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0], 2, 2)
 		);
 		// Malformed (too short for w*h) → unchanged copy, no panic.
 		let d = [1u8, 2, 3];
-		assert_eq!(rotate180_bgra(&d, 2, 2), vec![1, 2, 3]);
+		assert_eq!(rotate_bgra(&d, 2, 2, 180), (vec![1, 2, 3], 2, 2));
+	}
+
+	#[test]
+	fn rotate90_270_swap_dims_and_pixels() {
+		// 2×1 source: TL=A(0), TR=B(1). Pixels labelled by their B channel value.
+		let a = [0u8, 0, 0, 0, 1, 1, 1, 1]; // (0,0)=A, (1,0)=B
+		// 90° CCW: A(0,0)→(0, w-1-0)=(0,1); B(1,0)→(0, w-1-1)=(0,0). out dims 1×2.
+		assert_eq!(
+			rotate_bgra(&a, 2, 1, 90),
+			(vec![1, 1, 1, 1, 0, 0, 0, 0], 1, 2)
+		);
+		// 270° CCW (= 90° CW): A(0,0)→(h-1-0, 0)=(0,0); B(1,0)→(h-1-0,1)=(0,1). out dims 1×2.
+		assert_eq!(
+			rotate_bgra(&a, 2, 1, 270),
+			(vec![0, 0, 0, 0, 1, 1, 1, 1], 1, 2)
+		);
+		// 90° then 270° of the same image returns to the original (inverse rotations).
+		let (r90, w90, h90) = rotate_bgra(&a, 2, 1, 90);
+		let (back, bw, bh) = rotate_bgra(&r90, w90 as usize, h90 as usize, 270);
+		assert_eq!((back, bw, bh), (a.to_vec(), 2, 1));
 	}
 }
 
@@ -290,9 +351,11 @@ impl CaptureDevice {
 		// (a) New SHAPE bytes — only present when PointerShapeBufferSize > 0. Decode the
 		//     raw buffer into up to two BGRA images and upload them as textures.
 		// Host display rotation (deg CW) — read from the SAME DXGI desc the encoder bakes by
-		// (rotation_deg() ← dup_desc.Rotation). For a 180° host the cursor bitmap is pre-rotated
-		// here so it ends UPRIGHT after the encoder's 180° bake; the viewport in `composite_cursor`
-		// is mirrored to match. 0° = identity; 90/270 not yet handled (offset there is a TODO).
+		// (rotation_deg() ← dup_desc.Rotation). For a 90/180/270° host the cursor bitmap is
+		// pre-rotated here (by the INVERSE of the encoder's bake) so it ends UPRIGHT after the
+		// encoder's bake; the viewport in `composite_cursor` is transformed into scan-out space
+		// to match. The UPLOADED texture is the rotated bitmap (dims swapped for 90/270); we keep
+		// the LOGICAL (unrotated) cursor size in `tex_w`/`tex_h` for the position transform. 0° = identity.
 		let rot = self.rotation_deg();
 		if info.PointerShapeBufferSize > 0 {
 			let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
@@ -311,24 +374,26 @@ impl CaptureDevice {
 			self.cursor.tex_w = 0;
 			self.cursor.tex_h = 0;
 			if let Some((alpha, w, h)) = make_cursor_alpha_image(&buf, &shape_info) {
-				let alpha = if rot == 180 {
-					rotate180_bgra(&alpha, w as usize, h as usize)
+				let (alpha, aw, ah) = if rot != 0 {
+					rotate_bgra(&alpha, w as usize, h as usize, rot)
 				} else {
-					alpha
+					(alpha, w, h)
 				};
-				self.cursor.tex_alpha = Some(make_cursor_srv(&self.device, &alpha, w, h)?);
+				self.cursor.tex_alpha = Some(make_cursor_srv(&self.device, &alpha, aw, ah)?);
+				// Store the LOGICAL (unrotated) cursor size — the viewport transform in
+				// `composite_cursor` derives the (possibly swapped) scan-out footprint from it.
 				self.cursor.tex_w = w;
 				self.cursor.tex_h = h;
 				self.cursor.hot_x = shape_info.HotSpot.x as i32;
 				self.cursor.hot_y = shape_info.HotSpot.y as i32;
 				// The xor image (if any) shares the alpha image's logical size.
 				if let Some((xor, xw, xh)) = make_cursor_xor_image(&buf, &shape_info) {
-					let xor = if rot == 180 {
-						rotate180_bgra(&xor, xw as usize, xh as usize)
+					let (xor, rxw, rxh) = if rot != 0 {
+						rotate_bgra(&xor, xw as usize, xh as usize, rot)
 					} else {
-						xor
+						(xor, xw, xh)
 					};
-					self.cursor.tex_xor = Some(make_cursor_srv(&self.device, &xor, xw, xh)?);
+					self.cursor.tex_xor = Some(make_cursor_srv(&self.device, &xor, rxw, rxh)?);
 				}
 			}
 		}
@@ -438,27 +503,30 @@ impl CaptureDevice {
 
 		let ctx = &self.context;
 		// Viewport positions+sizes the cursor: the VS emits a fullscreen triangle with tex
-		// [0,1], so it covers exactly this viewport → the cursor lands at (pos_x,pos_y)
-		// sized tex_w×tex_h.
-		// For a 180° host the cursor is composited on the PRE-bake (scan-out-oriented) surface,
-		// so mirror its viewport into that space; combined with the 180°-rotated cursor bitmap
-		// (update_cursor_cache), the encoder's 180° bake then lands the cursor UPRIGHT at the true
-		// pointer position. 0° = identity. (90/270 offset is a TODO — see update_cursor_cache.)
-		let (vx, vy) = if self.rotation_deg() == 180 {
-			let pw = self.dup_desc.ModeDesc.Width as f32;
-			let ph = self.dup_desc.ModeDesc.Height as f32;
-			(
-				pw - self.cursor.pos_x as f32 - self.cursor.tex_w as f32,
-				ph - self.cursor.pos_y as f32 - self.cursor.tex_h as f32,
-			)
-		} else {
-			(self.cursor.pos_x as f32, self.cursor.pos_y as f32)
+		// [0,1], so it covers exactly this viewport → the (pre-rotated) cursor texture lands at
+		// the right scan-out rect. The cursor is composited on the PRE-bake (scan-out-oriented)
+		// `present` surface, so we transform the LOGICAL pointer rect into scan-out space;
+		// combined with the inverse-pre-rotated cursor bitmap (update_cursor_cache), the encoder's
+		// bake then lands the cursor UPRIGHT at the true pointer position. Mirrors Sunshine's
+		// `gpu_cursor_t::update_viewport`. `pw`/`ph` = scan-out (unrotated) surface dims; for
+		// 90/270 the logical desktop is the transpose. `cw`/`ch` = logical cursor size; the drawn
+		// footprint is swapped (ch×cw) for 90/270. 0° = identity.
+		let pw = self.dup_desc.ModeDesc.Width as f32;
+		let ph = self.dup_desc.ModeDesc.Height as f32;
+		let (px, py) = (self.cursor.pos_x as f32, self.cursor.pos_y as f32);
+		let (cw, ch) = (self.cursor.tex_w as f32, self.cursor.tex_h as f32);
+		let (vx, vy, vw, vh) = match self.rotation_deg() {
+			// Logical desktop is ph(wide)×pw(tall); cursor footprint is ch×cw.
+			90 => (py, ph - cw - px, ch, cw),
+			180 => (pw - cw - px, ph - ch - py, cw, ch),
+			270 => (pw - ch - py, px, ch, cw),
+			_ => (px, py, cw, ch),
 		};
 		let vp = D3D11_VIEWPORT {
 			TopLeftX: vx,
 			TopLeftY: vy,
-			Width: self.cursor.tex_w as f32,
-			Height: self.cursor.tex_h as f32,
+			Width: vw,
+			Height: vh,
 			MinDepth: 0.0,
 			MaxDepth: 1.0,
 		};

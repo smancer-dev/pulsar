@@ -45,7 +45,7 @@ mod desktop_stub;
 pub use uinput::DesktopInput;
 
 #[cfg(windows)]
-pub use windows::DesktopInput;
+pub use windows::{DesktopInput, MonitorRect};
 
 #[cfg(target_os = "macos")]
 pub use macos::DesktopInput;

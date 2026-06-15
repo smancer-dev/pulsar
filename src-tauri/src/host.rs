@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 
 use crate::audio_io::spawn_audio_player;
 use crate::events::{AvatarPayload, DataPayload, FilePayload, ReverseReq, SessionEvent};
-use crate::files::{sanitize_filename, save_received_file};
+use crate::files::{sanitize_filename, save_received_file_chunks};
 use crate::process::{
 	capture_from_str, codec_from_str, encoder_from_str, ffmpeg_bin, launch_host_game, no_window,
 	probe_ddagrab_zerocopy, spawn_tracked,
@@ -39,6 +39,56 @@ use handlers::{make_on_audio, make_on_file, make_on_stream};
 fn media_features() -> Vec<String> {
 	use pulsar_core::service::media::{FEAT_MOS, FEAT_NACK};
 	vec![FEAT_MOS.to_string(), FEAT_NACK.to_string()]
+}
+
+/// RAII guard that ensures per-session resources are released when the session task
+/// ends — either naturally (session disconnect) or forcibly (via `JoinHandle::abort()`
+/// in `go_online`'s drain loop on a reconnect/settings change).
+///
+/// Without this, `abort()` cancels the future at the current `.await` point inside
+/// `serve_with` and skips the post-`tokio::select!` cleanup block, leaving:
+///   - ffmpeg encoder children running orphaned (GPU leak / NVENC 100% failure mode)
+///   - on Linux: the XDG ScreenCast portal session live (compositor keeps showing
+///     "your screen is being shared" even though nothing is captured)
+///   - host audio muted/redirected until the next `go_online` calls `reset_mute_all`
+///
+/// `Drop` performs the critical synchronous parts immediately; the Linux portal
+/// close (async D-Bus call) is fire-and-forget spawned so the runtime cleans it up
+/// in the background. All operations are idempotent so double-calling (guard drop +
+/// normal teardown) is safe.
+struct SessionCleanupGuard {
+	procs: Arc<Mutex<Vec<Child>>>,
+	#[cfg(target_os = "linux")]
+	cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
+	sid: u64,
+}
+
+impl Drop for SessionCleanupGuard {
+	fn drop(&mut self) {
+		// Kill any live ffmpeg encoder children. `std::process::Child::drop` does NOT
+		// kill the OS process, so the orphan-NVENC-100%-GPU failure mode requires an
+		// explicit `kill()`. After draining, the normal teardown block finds the vec
+		// empty and is a no-op (safe double-call).
+		for mut child in self.procs.lock().unwrap().drain(..) {
+			let _ = child.kill();
+			// skip wait() — non-blocking; the OS reaps the zombie when we exit or the
+			// Tokio runtime's thread cleans up. Blocking here in Drop would stall the
+			// executor thread that's running abort().
+		}
+		// Linux: close the XDG ScreenCast portal session so the compositor's
+		// "your screen is being shared" indicator disappears.
+		// `WaylandCapture::stop` is async, so we fire-and-forget a background task.
+		// The runtime is still live when this Drop runs: abort() fires from within the
+		// running Tokio executor, not from its shutdown path.
+		#[cfg(target_os = "linux")]
+		if let Some(cap) = self.cap_slot.lock().unwrap().take() {
+			let _ = tokio::spawn(cap.stop());
+		}
+		// Release per-session mute/redirect ownership; idempotent if already released
+		// by the normal teardown block.
+		handlers::release_mute(self.sid);
+		handlers::release_redirect(self.sid);
+	}
 }
 
 /// Bind the node and register with the configured relay; returns this device's
@@ -70,8 +120,38 @@ pub(crate) async fn go_online(
 	// (its UDP socket, relay heartbeat, serve task, LAN beacon) on every reconnect.
 	// Aborting the serve loop drops its Arc<Node> clone; taking state.node drops ours,
 	// so the old node reaches strong-count 0 and its recv_loop/heartbeat_loop exit.
+	// Collect ALL live task handles before aborting so we can await them below.
+	// Awaiting is necessary when cfg.node_port is pinned: abort() only SCHEDULES
+	// cancellation; each aborted task holds a strong Arc<Node> clone (its Session +
+	// SessionSender keep the node alive), and that Arc — together with its UDP
+	// socket — is not dropped until the runtime actually polls the cancelled future
+	// to completion. If we don't await, the only yield point before rebinding the
+	// pinned port is `resolve_relay().await`, which returns synchronously (no poll
+	// of the reactor) when the relay string is already a SocketAddr (IP literal,
+	// e.g. 192.168.1.5:21116 — the normal LAN-relay case). On a current-thread or
+	// busy executor the aborted tasks may not have run their drop yet, leaving the
+	// old socket bound and the rebind failing with address-in-use.
+	let mut teardown_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 	if let Some(h) = state.serve_task.lock().unwrap().take() {
 		h.abort();
+		teardown_handles.push(h);
+	}
+	// Abort the independently-spawned per-session tasks too: each owns a strong
+	// Arc<Node> (its Session + SessionSender), so without this they'd keep the old
+	// node at strong-count > 0 — its UDP socket stays bound (a re-bind to a pinned
+	// node_port would then fail address-in-use) and its relay heartbeat keeps
+	// pinging the OLD relay.
+	for h in state.session_tasks.lock().unwrap().drain(..) {
+		h.abort();
+		teardown_handles.push(h);
+	}
+	// Await all aborted tasks to completion — this ensures their Arc<Node> clones
+	// (and thus the old UDP socket) are fully dropped BEFORE we rebind the port.
+	// `abort()` + `await` resolves immediately with `Err(JoinError::cancelled())`;
+	// we ignore that error. This is the only deterministic way to guarantee the
+	// socket is free when cfg.node_port is pinned.
+	for h in teardown_handles {
+		let _ = h.await;
 	}
 	let _ = state.node.lock().unwrap().take();
 	// The old node (and its port) is gone: clear the advertised port now, so a
@@ -189,6 +269,9 @@ pub(crate) async fn go_online(
 	let incoming = state.incoming.clone();
 	let host_out = state.host_out.clone();
 	let active = state.active.clone();
+	// Track every per-session task so a later `go_online` can abort them and release
+	// the strong Arc<Node> they each hold (otherwise the old node never drops).
+	let session_tasks = state.session_tasks.clone();
 	#[cfg(target_os = "linux")]
 	let restore_token = state.restore_token.clone();
 	let serve_node = node.clone();
@@ -233,7 +316,7 @@ pub(crate) async fn go_online(
 			// `incoming`/`host_out` entries isn't evicted when THIS (older) session tears
 			// down (both maps are keyed by `peer`, which collides across reconnects).
 			let sid = session.id();
-			tokio::spawn(async move {
+			let session_handle = tokio::spawn(async move {
 				let mut session = session;
 				// The client's first message is its access request (password may be
 				// empty). Auto-allow no-auth hosts or a correct password; otherwise
@@ -282,8 +365,10 @@ pub(crate) async fn go_online(
 						// reusable and is NEVER rotated. `matched_otp` is true only when the
 						// provided secret equals the (non-empty) OTP.
 						let matched_otp =
-							|p: &str| !host_pw.is_empty() && p == host_pw;
-						if !accepted.is_empty() && accepted.iter().any(|a| provided == *a) {
+							|p: &str| !host_pw.is_empty() && crate::auth::secret_eq(p, &host_pw);
+						if !accepted.is_empty()
+							&& accepted.iter().any(|a| crate::auth::secret_eq(&provided, a))
+						{
 							if matched_otp(&provided) {
 								crate::commands::rotate_session_password(&app_h);
 							}
@@ -300,6 +385,13 @@ pub(crate) async fn go_online(
 							// typed code in the race).
 							if !provided.is_empty() {
 								crate::auth::throttle::record_failure(&peer);
+								// Count it against the source-independent global limit
+								// too: a relay attacker who registers many ids gets a
+								// fresh per-peer bucket each time, so rotate the OTP
+								// after enough TOTAL wrong guesses regardless of source.
+								if crate::auth::throttle::note_global_failure() {
+									crate::commands::rotate_session_password(&app_h);
+								}
 							}
 							let _ = need_password(&mut session).await;
 							let outcome = crate::auth::race_host_auth(
@@ -397,6 +489,107 @@ pub(crate) async fn go_online(
 				// of storing it into a dead/superseded session (orphaned portal cast).
 				#[cfg(target_os = "linux")]
 				let cap_gen: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
+				// Records the latest StreamReq so the host-side display-mode watcher (non-Windows)
+				// can re-issue it to restart capture at the new geometry. Windows self-heals in
+				// pulsar-capture, so it's cfg-removed there.
+				#[cfg(not(windows))]
+				let last_req_store: Arc<Mutex<Option<StreamReq>>> = Arc::new(Mutex::new(None));
+				// Producer half of the re-stream channel feeding `serve_with`'s restream branch:
+				// when the HOST's own display mode changes mid-session the watcher re-sends the
+				// last StreamReq so capture restarts at the new geometry (ffmpeg/Wayland have no
+				// DXGI ACCESS_LOST signal). Cfg'd out on Windows — the native path self-heals.
+				#[cfg(not(windows))]
+				let (restream_tx, restream_rx) = tokio::sync::mpsc::channel::<StreamReq>(4);
+				// Poll the host's own display geometry; on a STABLE change to the streamed
+				// display's size, re-issue the stored StreamReq once so capture rebuilds at the
+				// new size. Inert when nothing has streamed yet (no stored req) and on platforms
+				// where `host_displays()` is empty (Wayland w/o Mutter, macOS) — there it just
+				// loops without ever firing. Exits when the channel closes (session teardown).
+				#[cfg(not(windows))]
+				let mode_watcher = {
+					let last_req_store = last_req_store.clone();
+					tokio::spawn(async move {
+						// Baseline size of the currently-streamed display; re-baselined on a monitor
+						// switch. `None` until the first stream request establishes a display_idx.
+						let mut baseline: Option<(u32, (u32, u32))> = None;
+						loop {
+							tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+							// Stop once the consumer (serve_with) dropped its receiver.
+							if restream_tx.is_closed() {
+								break;
+							}
+							let Some(req) = last_req_store.lock().unwrap().clone() else {
+								// Nothing has streamed yet — keep waiting for the first request.
+								continue;
+							};
+							let idx = req.display_idx;
+							// host_displays() may shell out (xrandr / gdbus), so keep it off the runtime.
+							let size = tokio::task::spawn_blocking(move || {
+								crate::process::host_displays()
+									.into_iter()
+									.find(|d| d.idx == idx)
+									.map(|d| (d.width, d.height))
+							})
+							.await
+							.ok()
+							.flatten();
+							let Some(size) = size else {
+								continue; // display not enumerable (empty list / disconnected) — skip
+							};
+							match baseline {
+								// First observation, or the streamed monitor changed: (re-)baseline,
+								// don't fire (a monitor switch already restarts capture on its own).
+								None => baseline = Some((idx, size)),
+								Some((bidx, _)) if bidx != idx => baseline = Some((idx, size)),
+								Some((_, bsize)) if bsize != size => {
+									// Confirm the new size is STABLE across one more poll before acting,
+									// so we don't restart mid-transition (some drivers report an
+									// intermediate mode while applying a change).
+									tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+									let confirm = tokio::task::spawn_blocking(move || {
+										crate::process::host_displays()
+											.into_iter()
+											.find(|d| d.idx == idx)
+											.map(|d| (d.width, d.height))
+									})
+									.await
+									.ok()
+									.flatten();
+									if confirm == Some(size) {
+										tracing::info!(
+											display_idx = idx,
+											w = size.0,
+											h = size.1,
+											"host display mode changed -> restarting capture"
+										);
+											// Channel full (a prior restart still in flight) → skip
+											// this send but keep looping; next poll re-detects delta.
+											// Closed → session torn down; exit the watcher.
+											match restream_tx.try_send(req) {
+												Ok(_) => {
+													baseline = Some((idx, size));
+												}
+												Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+													// Don't update baseline — next poll must still see the delta.
+												}
+												Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+													break;
+												}
+											}
+									}
+								}
+								_ => {}
+							}
+						}
+					})
+				};
+				// The monitor (`display_idx`) the current stream is capturing, so the input path
+				// can map an absolute (webview) pointer onto the streamed screen instead of always
+				// the primary. `on_stream` publishes the selected idx here; `on_input` reads it.
+				// Windows-only (the native multi-monitor absolute-pointer mapping).
+				#[cfg(windows)]
+				let cur_display: Arc<std::sync::atomic::AtomicU32> =
+					Arc::new(std::sync::atomic::AtomicU32::new(0));
 
 				let provider = {
 					let games = games.clone();
@@ -456,6 +649,8 @@ pub(crate) async fn go_online(
 					self_name.clone(),
 					#[cfg(windows)]
 					native_slot.clone(),
+					#[cfg(windows)]
+					cur_display.clone(),
 					stats_out.clone(),
 					app_h.clone(),
 					peer.clone(),
@@ -468,6 +663,8 @@ pub(crate) async fn go_online(
 					cap_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_gen.clone(),
+					#[cfg(not(windows))]
+					last_req_store.clone(),
 				);
 				// Route the client's input: controllers into a virtual gamepad, and
 				// mouse/keyboard into a uinput desktop injector — both created lazily.
@@ -475,11 +672,24 @@ pub(crate) async fn go_online(
 					let mut pad: Option<Box<dyn VirtualGamepad>> = None;
 					let mut desktop: Option<pulsar_core::input::DesktopInput> = None;
 					let mut tried = false;
+					// Which monitor's geometry is currently applied to the desktop injector, so we
+					// only re-resolve the virtual-desktop rect when the streamed monitor changes.
+					// `u32::MAX` = "none applied yet" (forces the first resolve).
+					#[cfg(windows)]
+					let cur_display = cur_display.clone();
+					#[cfg(windows)]
+					let mut applied_display: u32 = u32::MAX;
 					// "Sadece izleme" gate: read per-event (cheap map lookup) so the
 					// Connections-window toggle takes effect mid-session, sid-guarded
 					// against a same-peer reconnection's newer entry.
 					let view_active = active.clone();
 					let view_peer = peer.clone();
+					// Tracks the view-only state we last saw so we can detect the
+					// FALSE->TRUE edge and flush any input held at the instant control was
+					// revoked: the gate below then drops the matching key-up/button-up, so
+					// without this a held Shift/Ctrl or mouse button (drag-select) stays
+					// stuck on the host until teardown.
+					let mut was_view_only = false;
 					// Input is injected WITHOUT any pointer rotation. The host video is always presented
 					// UPRIGHT (the native capture bakes the display rotation into the frame, or a rotated
 					// ffmpeg stream is un-rotated by the client), and Windows SendInput addresses the same
@@ -488,15 +698,28 @@ pub(crate) async fn go_online(
 					move |ev: InputEvent| {
 						// View-only: drop EVERY input event for this session (gamepad too)
 						// while the host user has control revoked.
-						if view_active
+						let view_only = view_active
 							.lock()
 							.unwrap()
 							.get(&view_peer)
 							.map(|ci| ci.sid == sid && ci.view_only)
-							.unwrap_or(false)
-						{
+							.unwrap_or(false);
+						if view_only {
+							// On the FALSE->TRUE edge, release whatever was held at the instant
+							// control was revoked (every later up-event is about to be dropped):
+							// keys/buttons on the desktop injector and the virtual gamepad to neutral.
+							if !was_view_only {
+								was_view_only = true;
+								if let Some(d) = desktop.as_mut() {
+									d.flush_held();
+								}
+								if let Some(p) = pad.as_mut() {
+									p.apply(&pulsar_core::input::GamepadState::default());
+								}
+							}
 							return;
 						}
+						was_view_only = false;
 						match ev {
 							InputEvent::Gamepad(state) => {
 								pad.get_or_insert_with(|| create_virtual_pad(GamepadKind::Xbox))
@@ -513,8 +736,29 @@ pub(crate) async fn go_online(
 								if let Some(d) = desktop.as_mut() {
 									match other {
 										InputEvent::PointerMotion { x, y } => {
-											let (rx, ry) = (x, y);
-											d.pointer(rx, ry)
+											// Absolute (webview) pointer: map onto the streamed monitor's place in the
+											// virtual desktop. Re-resolve only when the captured monitor changed — a bare
+											// ABSOLUTE move would otherwise always land on the PRIMARY display.
+											#[cfg(windows)]
+											{
+												let idx = cur_display.load(std::sync::atomic::Ordering::Relaxed);
+												if idx != applied_display {
+													applied_display = idx;
+													d.set_monitor(pulsar_capture::display_rect(idx).map(|r| {
+														pulsar_core::input::MonitorRect {
+															mon_left: r.mon_left,
+															mon_top: r.mon_top,
+															mon_width: r.mon_width,
+															mon_height: r.mon_height,
+															virt_left: r.virt_left,
+															virt_top: r.virt_top,
+															virt_width: r.virt_width,
+															virt_height: r.virt_height,
+														}
+													}));
+												}
+											}
+											d.pointer(x, y)
 										}
 										InputEvent::PointerRelative { dx, dy } => {
 											let (rdx, rdy) = (dx, dy);
@@ -628,11 +872,23 @@ pub(crate) async fn go_online(
 								usable(e)
 									&& e.id != "software" && e.codecs.iter().any(|c| c == "h265")
 							});
-							let codecs = if hw_h265 {
-								vec!["h265".to_string(), "h264".to_string()]
-							} else {
-								vec!["h264".to_string()]
-							};
+							// AV1 only from a validated HARDWARE encoder (software realtime AV1
+							// isn't viable on the hosts we target — same rule as hw_h265). Mirrors
+							// the inline fallback so the probed and inline paths advertise the same
+							// codecs; without this AV1 is never negotiated even when both ends support it.
+							let hw_av1 = lc.encoders.iter().any(|e| {
+								usable(e)
+									&& e.id != "software" && e.codecs.iter().any(|c| c == "av1")
+							});
+							// Quality-descending, best-first.
+							let mut codecs = Vec::new();
+							if hw_av1 {
+								codecs.push("av1".to_string());
+							}
+							if hw_h265 {
+								codecs.push("h265".to_string());
+							}
+							codecs.push("h264".to_string());
 							return StreamCaps {
 								codecs,
 								encoders,
@@ -802,6 +1058,25 @@ pub(crate) async fn go_online(
 					// File manager: FsList/FsGet from this client, answered through the
 					// same outbound queue (HOME-jailed; see fs_browse).
 					on_fs: Box::new(crate::fs_browse::make_on_fs(fs_out)),
+					// Host-initiated re-stream: fed by the display-mode watcher above (non-Windows).
+					// Windows' native capture self-heals on ACCESS_LOST, so it stays inert there.
+					#[cfg(not(windows))]
+					restream: Some(restream_rx),
+					#[cfg(windows)]
+					restream: None,
+				};
+				// Guard that runs critical cleanup even if this task is cancelled via
+				// `JoinHandle::abort()` (e.g. by `go_online` on a reconnect). Abort
+				// skips the post-`tokio::select!` block below, so we duplicate the
+				// essential teardown inside `Drop` as a safety net. The normal path still
+				// runs the block below; every operation is idempotent so double-execution
+				// is safe (procs drain finds an empty vec, cap_slot.take() returns None,
+				// release_mute/redirect are no-ops when already removed).
+				let _cleanup_guard = SessionCleanupGuard {
+					procs: procs.clone(),
+					#[cfg(target_os = "linux")]
+					cap_slot: cap_slot.clone(),
+					sid,
 				};
 				tokio::select! {
 					_ = serve_with(session, provider, on_launch, on_stream, on_input, handlers) => {}
@@ -811,6 +1086,7 @@ pub(crate) async fn go_online(
 				// so capture/encode stops at once and the GPU is freed. Held mouse
 				// buttons / modifier keys are released by DesktopInput's Drop (the
 				// on_input closure is dropped when serve_with's future ends above).
+				// (SessionCleanupGuard above also covers these for the abort() path.)
 				for mut child in procs.lock().unwrap().drain(..) {
 					let _ = child.kill();
 					let _ = child.wait();
@@ -819,6 +1095,9 @@ pub(crate) async fn go_online(
 				for h in fwd_slot.lock().unwrap().drain(..) {
 					h.abort();
 				}
+				// Stop the host display-mode watcher (its restream receiver is gone with serve_with).
+				#[cfg(not(windows))]
+				mode_watcher.abort();
 				// Stop the native capture thread (releases the NVENC session + DXGI duplication).
 				#[cfg(windows)]
 				if let Some(h) = native_slot.lock().unwrap().take() {
@@ -891,6 +1170,14 @@ pub(crate) async fn go_online(
 					},
 				);
 			});
+			// Track this session task so the next go_online can abort it (releasing the
+			// strong Arc<Node> it holds). Prune already-finished handles first so the
+			// list cannot grow without bound across many short-lived connections.
+			{
+				let mut tasks = session_tasks.lock().unwrap();
+				tasks.retain(|h| !h.is_finished());
+				tasks.push(session_handle);
+			}
 		}
 	});
 
@@ -917,5 +1204,70 @@ pub(crate) async fn go_online(
 	if let Some(d) = &discovery {
 		d.set_id(Some(id)).await;
 	}
+
+	// Watch for an ID ROTATION: a full relay restart loses its pubkey→id map and
+	// re-registration mints a DIFFERENT 9-digit id. Without this the Home screen
+	// and the LAN beacon keep advertising the dead old id forever (connects fail
+	// with TargetOffline) until the user toggles offline/online. Re-advertise the
+	// new id to both. Holds a Weak<Node> + the id-change signal handle so it does
+	// NOT pin the node alive: it exits when go_online tears the node down (the next
+	// call's `state.node.take()` drops the last strong ref → upgrade() fails).
+	{
+		let id_signal = node.id_changed_handle();
+		let weak = std::sync::Arc::downgrade(&node);
+		let watch_app = app.clone();
+		let watch_disc = discovery.clone();
+		tokio::spawn(async move {
+			loop {
+				id_signal.notified().await;
+				let Some(n) = weak.upgrade() else { return };
+				let new_id = n.self_id().await;
+				drop(n);
+				let Some(new_id) = new_id else { continue };
+				tracing::warn!(id = %new_id, "relay reissued a new device ID — re-advertising");
+				if let Some(d) = &watch_disc {
+					d.set_id(Some(new_id)).await;
+				}
+				let _ = watch_app.emit("node-id", new_id.grouped());
+			}
+		});
+	}
+
+	// Watch for a post-registration INCOMPATIBLE VERSION: the relay was redeployed
+	// with a newer protocol version while this node was already online. The node is
+	// stranded (every heartbeat and re-register attempt will be refused). Surface
+	// "update required" to the UI and go offline cleanly so the user sees the error
+	// instead of silently advertising a dead id. Same Weak<Node> pattern: exits when
+	// go_online tears the node down (next call's `state.node.take()` drops it).
+	{
+		let ver_signal = node.version_error_handle();
+		let weak = std::sync::Arc::downgrade(&node);
+		let watch_app = app.clone();
+		let watch_disc = discovery.clone();
+		tokio::spawn(async move {
+			ver_signal.notified().await;
+			// If the node is already gone (normal go_online teardown), nothing to do.
+			if weak.upgrade().is_none() {
+				return;
+			}
+			tracing::warn!("relay rejected re-registration: incompatible protocol version — going offline");
+			// Clear the relay id from the LAN beacon so it stops advertising a dead id.
+			if let Some(d) = &watch_disc {
+				d.set_id(None).await;
+			}
+			// Drop the node (and with it the heartbeat loop's strong ref) so it
+			// exits: access AppState through the AppHandle, which is Clone + 'static.
+			watch_app
+				.state::<AppState>()
+				.node
+				.lock()
+				.unwrap()
+				.take();
+			// Emit the version-error event — the UI sets online=false and shows the
+			// "update required" message (same text as the initial-register path).
+			let _ = watch_app.emit("node-version-error", ());
+		});
+	}
+
 	Ok(id.grouped())
 }

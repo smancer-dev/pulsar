@@ -83,9 +83,12 @@ export function startOpusAudio(
 			src.buffer = buf;
 			src.connect(ac.destination);
 			const now = ac.currentTime;
-			// Keep ~60 ms of lead to absorb network jitter; if we've fallen behind
-			// (underrun), reset the play head rather than scheduling in the past.
-			if (playHead < now + 0.02) playHead = now + 0.06;
+			// Keep ~60 ms of lead to absorb network jitter. Clamp on BOTH sides of the
+			// target lead: if we've fallen behind (underrun), reset rather than schedule
+			// in the past; if a burst has pushed the play head too far ahead (overrun),
+			// reset back to the target lead so accumulated buffering is shed instead of
+			// growing without bound and drifting permanently behind the video.
+			if (playHead < now + 0.02 || playHead > now + 0.2) playHead = now + 0.06;
 			src.start(playHead);
 			playHead += buf.duration;
 		},

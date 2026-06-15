@@ -34,6 +34,14 @@ impl LoopbackFormat {
 		let bytes_per_sample = if self.float { 4 } else { 2 };
 		self.channels as usize * bytes_per_sample
 	}
+
+	/// Whether two formats yield the SAME raw PCM byte stream — i.e. ffmpeg's fixed
+	/// `-f/-ar/-ac` (derived from one) would correctly parse bytes captured at the
+	/// other. All three of rate, channel count and sample width must match; if any
+	/// differs the consuming ffmpeg must be respawned (see `run_loopback_capture_tracking`).
+	pub fn matches(&self, other: &LoopbackFormat) -> bool {
+		self.rate == other.rate && self.channels == other.channels && self.float == other.float
+	}
 }
 
 /// Query the shared mix format of the capture target. Pass the SAME `device_id` the
@@ -87,7 +95,30 @@ pub fn run_loopback_capture_pinned<W: std::io::Write>(
 	sink: W,
 	pinned_default: Option<String>,
 ) -> Result<(), String> {
-	win_loopback::run(sink, pinned_default.as_deref())
+	// `expected = None` → never compare the re-opened device's format, so this path
+	// behaves byte-for-byte as before (the example / standalone capture test use it).
+	win_loopback::run(sink, pinned_default.as_deref(), None).map(|_| ())
+}
+
+/// Like [`run_loopback_capture_pinned`], but tracks the capture format against
+/// `expected` — the [`LoopbackFormat`] the consuming ffmpeg was spawned with (its
+/// fixed `-f/-ar/-ac`).
+///
+/// The re-init loop re-opens whatever the default render endpoint is after a
+/// device-invalidated / default-endpoint change, and that NEW endpoint can have a
+/// different mix format (sample rate / channels / bit depth). The capture then writes
+/// PCM in the new format while ffmpeg still parses it as `expected` → garbled / wrong-
+/// pitch audio for the rest of the session. To let the caller recover, when a re-opened
+/// endpoint's format differs from `expected` this stops the capture and returns
+/// `Ok(Some(new_format))` *before* any mismatched bytes are written, so the caller can
+/// respawn ffmpeg with the new format. A normal end (the pipe broke / ffmpeg exited)
+/// returns `Ok(None)`; a fatal WASAPI error returns `Err`.
+pub fn run_loopback_capture_tracking<W: std::io::Write>(
+	sink: W,
+	pinned_default: Option<String>,
+	expected: LoopbackFormat,
+) -> Result<Option<LoopbackFormat>, String> {
+	win_loopback::run(sink, pinned_default.as_deref(), Some(expected))
 }
 
 /// Windows system-audio capture via **WASAPI loopback** on the default render endpoint
@@ -211,6 +242,11 @@ mod win_loopback {
 		/// is true when a capture cycle actually ran before the failure (vs failing at
 		/// open/setup) — `run` uses it to reset the re-init budget for a live cycle.
 		DeviceInvalidated { productive: bool },
+		/// A re-opened endpoint reports a DIFFERENT mix format than the one ffmpeg was
+		/// spawned with (`expected`). No capture bytes were written in the new format,
+		/// so `run` returns the new format to the caller to respawn ffmpeg around it.
+		/// Only produced when an `expected` format was supplied (the tracking path).
+		FormatChanged(LoopbackFormat),
 		/// Any other WASAPI failure — terminal (surfaced as an error string).
 		Fatal(String),
 	}
@@ -268,7 +304,11 @@ mod win_loopback {
 		true
 	}
 
-	pub fn run<W: Write>(mut sink: W, pinned_default: Option<&str>) -> Result<(), String> {
+	pub fn run<W: Write>(
+		mut sink: W,
+		pinned_default: Option<&str>,
+		expected: Option<LoopbackFormat>,
+	) -> Result<Option<LoopbackFormat>, String> {
 		// Outer re-init loop: a device-invalidated / default-endpoint-change ends the
 		// inner capture but we re-open the new default endpoint and resume, so host
 		// audio survives the user switching outputs mid-session (the old code let the
@@ -278,14 +318,23 @@ mod win_loopback {
 		// all) can't spin forever; a successful capture cycle resets the budget.
 		const MAX_REINIT: u32 = 50; // ~10 s at 200 ms backoff
 		let mut reinit_left = MAX_REINIT;
+		// `false` for the very first open (a failure there is genuine no-audio-hardware →
+		// fail fast / fatal); `true` after a device-invalidated re-open, where a transient
+		// `open()` failure is almost always the just-promoted default endpoint not being
+		// ready yet, so it must consume a retry from the budget instead of killing the
+		// stream (see `run_once`'s open() error handling).
+		let mut reopen = false;
 		loop {
 			// Before each (re)open, re-assert the pinned default render endpoint (the
 			// host-silent virtual sink) if the OS default has drifted off it — see the
 			// `reassert_pinned_default` doc. A no-op when `pinned_default` is None.
 			reassert_pinned_default(pinned_default);
-			match run_once(&mut sink, pinned_default) {
-				CaptureEnd::PipeBroken => return Ok(()),
+			match run_once(&mut sink, pinned_default, expected, reopen) {
+				CaptureEnd::PipeBroken => return Ok(None),
 				CaptureEnd::Fatal(e) => return Err(e),
+				// A re-opened endpoint has a format ffmpeg can't parse — hand the new
+				// format back so the caller respawns ffmpeg around it (the tracking path).
+				CaptureEnd::FormatChanged(new_fmt) => return Ok(Some(new_fmt)),
 				CaptureEnd::DeviceInvalidated { productive } => {
 					// A live cycle that ran then lost its device resets the budget, so
 					// repeated, well-separated device changes each get the full allowance;
@@ -307,6 +356,10 @@ mod win_loopback {
 					// default) doesn't spin; the silence filler already kept the timeline
 					// moving up to the failure, and resumes once we re-open.
 					std::thread::sleep(std::time::Duration::from_millis(200));
+					// The next iteration is a re-open after a real device change: a transient
+					// open() failure (new default not yet Activatable) must be retried within
+					// the budget, not treated as fatal.
+					reopen = true;
 					continue;
 				}
 			}
@@ -317,7 +370,24 @@ mod win_loopback {
 	/// virtual sink when `Some`, else the OS default render endpoint). Returns why it
 	/// ended so `run` can re-init or stop. A WASAPI error during setup is treated as
 	/// device-invalidated when its HRESULT says so (re-init), else fatal.
-	fn run_once<W: Write>(sink: &mut W, device_id: Option<&str>) -> CaptureEnd {
+	///
+	/// `expected` is the format ffmpeg was spawned with (the tracking path). When set
+	/// and the opened endpoint's mix format differs from it, we return
+	/// `FormatChanged(new)` BEFORE writing any mismatched bytes, so the caller can
+	/// respawn ffmpeg; `None` skips the check (identical to the old behavior).
+	///
+	/// `reopen` is `true` when this is a re-open after a device-invalidated / default-
+	/// endpoint change (see `run`): a transient `open()` failure then is almost always
+	/// the just-promoted default not being ready yet, so it is classified as
+	/// `DeviceInvalidated { productive: false }` (consumes a retry from the budget with
+	/// backoff) instead of fatal. On the FIRST open (`false`) an `open()` failure is
+	/// genuine no-audio-hardware and stays fatal so we fail fast.
+	fn run_once<W: Write>(
+		sink: &mut W,
+		device_id: Option<&str>,
+		expected: Option<LoopbackFormat>,
+		reopen: bool,
+	) -> CaptureEnd {
 		unsafe {
 			// Classify a SETUP failure (no capture cycle ran yet → not productive): a
 			// device-invalidated HRESULT means re-init, anything else is fatal.
@@ -330,13 +400,23 @@ mod win_loopback {
 			};
 			let (client, pwfx) = match open(device_id) {
 				Ok(v) => v,
-				// `open` returns a String (HRESULT lost). A failure here on a RE-INIT is
-				// almost always the new default endpoint not yet ready — but to avoid an
-				// infinite spin when there's genuinely no audio hardware, treat it as
-				// fatal (the original behavior). The re-init path only re-opens AFTER a
-				// successful first cycle, so a mid-session device change still recovers
-				// via the in-loop DeviceInvalidated classification below.
-				Err(e) => return CaptureEnd::Fatal(e),
+				// `open` returns a String (HRESULT lost). On a RE-OPEN after a device change
+				// this is almost always the just-promoted default endpoint not being ready
+				// yet (SetDefaultEndpoint propagates asynchronously / hotplug takes time), so
+				// treat it as a non-productive device-invalidation: `run` retries it within
+				// the bounded MAX_REINIT budget with backoff rather than killing the stream.
+				// On the FIRST open (`!reopen`) a failure is genuine no-audio-hardware → stay
+				// fatal so we fail fast instead of spinning the whole budget at session start.
+				Err(e) => {
+					if reopen {
+						tracing::warn!(
+							"WASAPI loopback re-open failed ({e}) — new default endpoint likely \
+							 not ready yet; retrying within the re-init budget"
+						);
+						return CaptureEnd::DeviceInvalidated { productive: false };
+					}
+					return CaptureEnd::Fatal(e);
+				}
 			};
 			let fmt = match read_format(pwfx) {
 				Ok(f) => f,
@@ -345,6 +425,27 @@ mod win_loopback {
 					return CaptureEnd::Fatal(e);
 				}
 			};
+			// Tracking path: ffmpeg's -f/-ar/-ac are fixed for the life of its process, so a
+			// re-opened endpoint with a different mix format would feed it bytes it parses
+			// wrong (garbled / wrong-pitch audio for the rest of the session). Bail BEFORE
+			// initializing/capturing so no mismatched bytes reach the pipe, handing the new
+			// format up so the caller respawns ffmpeg around it.
+			if let Some(expected) = expected {
+				if !fmt.matches(&expected) {
+					CoTaskMemFree(Some(pwfx as *const _));
+					tracing::warn!(
+						"WASAPI loopback re-opened a different mix format \
+						 ({}Hz/{}ch/{} vs spawned {}Hz/{}ch/{}) — respawning ffmpeg to match",
+						fmt.rate,
+						fmt.channels,
+						fmt.ffmpeg_sample_fmt(),
+						expected.rate,
+						expected.channels,
+						expected.ffmpeg_sample_fmt(),
+					);
+					return CaptureEnd::FormatChanged(fmt);
+				}
+			}
 			// Size every copy/silence-fill from the device's real frame stride. We trust
 			// WASAPI's nBlockAlign (== fmt.block_align() for sane PCM/float formats) so
 			// 2/6/8-channel mixes all stride correctly without a stereo assumption.
@@ -517,6 +618,21 @@ mod tests {
 		let period_frames = (surround71_f32.rate / 100) as usize;
 		let silence_len = period_frames * surround71_f32.block_align();
 		assert_eq!(silence_len, 480 * 32);
+	}
+
+	#[test]
+	fn matches_requires_rate_channels_and_width_to_agree() {
+		// `matches` decides whether a re-opened endpoint's PCM is byte-compatible with the
+		// format ffmpeg was spawned with; any differing dimension means ffmpeg must respawn
+		// (otherwise it parses the new device's samples wrong → garbled / wrong-pitch audio).
+		let base = LoopbackFormat { rate: 48000, channels: 2, float: true };
+		assert!(base.matches(&LoopbackFormat { rate: 48000, channels: 2, float: true }));
+		// Different sample rate (48k → 44.1k).
+		assert!(!base.matches(&LoopbackFormat { rate: 44100, channels: 2, float: true }));
+		// Different channel count (stereo → 5.1).
+		assert!(!base.matches(&LoopbackFormat { rate: 48000, channels: 6, float: true }));
+		// Different sample width (f32 → s16).
+		assert!(!base.matches(&LoopbackFormat { rate: 48000, channels: 2, float: false }));
 	}
 
 	#[test]

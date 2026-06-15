@@ -21,6 +21,9 @@ type Inputs = {
 	audioWsPort: () => number;
 	native: () => boolean;
 	embedded: () => boolean;
+	// True while a codec/encoder/resolution switch is in flight: the host restarts
+	// ffmpeg, so frames deliberately stop — the stall detector must not fire then.
+	switching: () => boolean;
 };
 
 export class SessionMedia {
@@ -160,6 +163,16 @@ export class SessionMedia {
 		$effect(() => {
 			const timer = setInterval(() => {
 				this.fpsHistory = [...this.fpsHistory, this.fps].slice(-48);
+				// A codec/encoder/resolution switch deliberately interrupts the frame flow
+				// while the host restarts ffmpeg; don't let that look like a stall (a restart
+				// that runs past the 3 s threshold would otherwise flash the "stream stopped"
+				// error). Reset the counters so the detector re-arms cleanly once frames resume.
+				if (this.#in.switching()) {
+					this.#staleSecs = 0;
+					this.stalled = false;
+					this.#lastVStatsAt = 0;
+					return;
+				}
 				if (this.hasVideo) {
 					const statsSilent =
 						this.#lastVStatsAt > 0 && Date.now() - this.#lastVStatsAt > 3000;

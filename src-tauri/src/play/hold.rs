@@ -82,6 +82,11 @@ pub(super) async fn hold_session(
 	let (mut win_recv, mut win_lost) = (0u32, 0u32);
 	let mut clean_windows = 0u32;
 	let mut last_step = std::time::Instant::now();
+	// When the last menu re-request (esp. a monitor switch) fired. The host rebuilds its encoder
+	// for one → a brief packet-loss gap that is NOT congestion; the adaptive controller must
+	// ignore it for a moment, or it steps the bitrate (a full-path restream that churns + slows
+	// the very switch in progress). Seeded far in the past so startup isn't suppressed.
+	let mut last_switch_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
 	// When the last keepalive Ping was sent, to time the host's Pong (RTT).
 	let mut ping_at: Option<std::time::Instant> = None;
 	// Watchdog: a host-side kick / network drop doesn't always send a clean close over UDP,
@@ -128,13 +133,35 @@ pub(super) async fn hold_session(
 		QualityPref::Quality
 	};
 	// Inbound file reassembly (file-manager downloads — the host streams an FsGet
-	// back as FileBegin/Chunk/End): Begin → buffer, Chunk → append + gap detection,
-	// End → save under "Pulsar Alınanlar". Mirrors the host's make_on_file.
-	let mut f_name = String::new();
-	let mut f_buf: Vec<u8> = Vec::new();
-	let mut f_next = 0u32;
-	let mut f_expected = 0u32;
-	let mut f_gap = false;
+	// back as FileBegin/Chunk/End): Begin → state, Chunk → store BY INDEX,
+	// End → save under "Pulsar Alınanlar". The session transport is unordered UDP,
+	// so chunks can arrive reordered or duplicated; keying by index (not appending
+	// in arrival order) lets reorders/dups self-heal — only a genuinely lost chunk
+	// fails the transfer. Each transfer carries a per-stream `id`, so concurrent
+	// downloads keep separate reassembly state keyed by that id and interleaved
+	// messages no longer clobber each other. Mirrors the host's make_on_file.
+	/// Idle transfers older than this are swept from the map on the next FileBegin.
+	const F_XFER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+	/// Maximum concurrent in-flight transfers. If a new FileBegin would push us over
+	/// this limit, the oldest (by last_activity) entry is evicted first.
+	const F_MAX_CONCURRENT_XFERS: usize = 8;
+	struct FileReasm {
+		/// Set by FileBegin. `None` means chunks arrived before FileBegin (UDP
+		/// reorder); the entry was lazily created to buffer them. A FileEnd with
+		/// `expected == None` is treated as incomplete (Begin never arrived).
+		name: String,
+		expected: Option<u32>,
+		chunks: std::collections::BTreeMap<u32, Vec<u8>>,
+		// Running total of buffered bytes (sum of every stored chunk's len, dup-safe).
+		// Capped against MAX_XFER_BYTES so a peer can't OOM us by announcing a huge
+		// chunk count and streaming distinct-index chunks without ever sending FileEnd.
+		received: u64,
+		/// Updated on FileBegin and every FileChunk; entries idle beyond
+		/// F_XFER_IDLE_TIMEOUT are swept on the next FileBegin so a lost FileEnd
+		/// (UDP, no retransmit) can't leak buffered bytes for the session lifetime.
+		last_activity: std::time::Instant,
+	}
+	let mut f_xfers: std::collections::HashMap<u32, FileReasm> = std::collections::HashMap::new();
 	loop {
 		if !send_flag.load(Ordering::SeqCst) {
 			break;
@@ -182,8 +209,11 @@ pub(super) async fn hold_session(
 									win_lost = win_lost.saturating_sub(1);
 								} else if let Some(last) = last_vseq {
 									let d = media::seq_forward(last, seq);
-									if d > 0 && d < 0x8000 {
-										if d > 1 && d <= 128 {
+									if d == 0 {
+										// Duplicate / retransmit of the last seq — ignore.
+									} else if d < 0x8000 && d <= 128 {
+										// Small forward gap → NACK the missing seqs for retransmit.
+										if d > 1 {
 											let now = std::time::Instant::now();
 											let mut nacks = Vec::with_capacity((d - 1) as usize);
 											for i in 1..d {
@@ -195,11 +225,31 @@ pub(super) async fn hold_session(
 											if host_nack {
 												let _ = send_data(&sess, &DataMsg::MediaNack(nacks)).await;
 											}
-										} else if d > 128 {
-											// Huge jump = encoder restart / long stall: resync.
-											missing.clear();
 										}
 										last_vseq = Some(seq);
+									} else if d < 0x8000 {
+										// Big forward gap (d > 128 but < 0x8000) — encoder restarted
+										// with a fresh RTP sequence base (every monitor/codec switch
+										// rebuilds it). Resync cleanly to the new base.
+										missing.clear();
+										last_vseq = Some(seq);
+									} else {
+										// Backward jump (d >= 0x8000). Compute the backward distance:
+										// how far behind seq is relative to last.
+										let back = 0x10000u32 - d as u32;
+										if back > 128 {
+											// Large backward jump = the host's encoder RESTARTED with a
+											// new sequence base that happens to be numerically lower
+											// (roughly half of random bases land here). The old code
+											// skipped these — last_vseq stayed STUCK, so every later
+											// packet re-tripped the discontinuity and NACK-flooded the
+											// session. Resync cleanly to the new base instead.
+											missing.clear();
+											last_vseq = Some(seq);
+										}
+										// else: small backward distance (≤128 seqs behind) = an
+										// ordinary stale reorder or duplicate that arrived late.
+										// Leave last_vseq unchanged and do NOT NACK or count loss.
 									}
 								} else {
 									last_vseq = Some(seq);
@@ -300,41 +350,117 @@ pub(super) async fn hold_session(
 								// A host directory listing for the file panel's remote pane.
 								let _ = app_ev.emit("fs-entries", FsEntriesPayload { id, path, entries });
 							}
-							DataMsg::FileBegin { name, size, chunks } => {
-								f_name = crate::files::sanitize_filename(&name);
-								// `size` is peer-controlled: clamp the pre-allocation so a
-								// bogus huge value can't reserve gigabytes (or panic with
-								// "capacity overflow" near usize::MAX) and tear the session
-								// down; extend_from_slice grows past this if a legitimately
-								// larger file actually arrives.
-								f_buf = Vec::with_capacity(size.min(64 * 1024 * 1024) as usize);
-								f_next = 0;
-								f_expected = chunks;
-								f_gap = false;
-							}
-							DataMsg::FileChunk { index, data } => {
-								if index != f_next {
-									f_gap = true;
+							DataMsg::FileBegin { id: xfer, name, size: _, chunks } => {
+								// Evict stale entries (lost FileEnd / lost middle chunk) so a
+								// long-lived session over a lossy link can't accumulate unbounded
+								// dead reassemblers.
+								let now = std::time::Instant::now();
+								f_xfers.retain(|_, r| now.duration_since(r.last_activity) < F_XFER_IDLE_TIMEOUT);
+								// Hard cap: if still at the concurrent limit, drop the oldest
+								// entry — but only if it has no pre-buffered chunks for THIS id
+								// (don't evict the lazy entry we're about to complete).
+								if f_xfers.len() >= F_MAX_CONCURRENT_XFERS && !f_xfers.contains_key(&xfer) {
+									if let Some(oldest) = f_xfers
+										.iter()
+										.min_by_key(|(_, r)| r.last_activity)
+										.map(|(k, _)| *k)
+									{
+										f_xfers.remove(&oldest);
+									}
 								}
-								f_next = index.wrapping_add(1);
-								f_buf.extend_from_slice(&data);
+								// If early FileChunks created a lazy entry (UDP reorder), merge
+								// the name + expected into it to preserve buffered chunks.
+								// Otherwise insert a fresh entry.
+								if let Some(r) = f_xfers.get_mut(&xfer) {
+									r.name = crate::files::sanitize_filename(&name);
+									r.expected = Some(chunks);
+									r.last_activity = now;
+								} else {
+									f_xfers.insert(xfer, FileReasm {
+										name: crate::files::sanitize_filename(&name),
+										expected: Some(chunks),
+										chunks: std::collections::BTreeMap::new(),
+										received: 0,
+										last_activity: now,
+									});
+								}
 							}
-							DataMsg::FileEnd => {
-								// Save only complete transfers (UDP transport — a gap means a
-								// lost chunk; report a failed transfer instead of corrupting).
-								let complete = !f_gap && f_next == f_expected;
+							DataMsg::FileChunk { id: xfer, index, data } => {
+								// If no entry exists yet (FileBegin hasn't arrived — UDP reorder),
+								// create a lazy placeholder so the chunk is buffered rather than
+								// dropped. FileBegin will fill in `name` and `expected` when it
+								// arrives, keeping the already-stored chunks intact.
+								if !f_xfers.contains_key(&xfer) {
+									f_xfers.insert(xfer, FileReasm {
+										name: String::new(),
+										expected: None,
+										chunks: std::collections::BTreeMap::new(),
+										received: 0,
+										last_activity: std::time::Instant::now(),
+									});
+								}
+								// Ignore an index past the announced count (bogus); a re-sent
+								// index just overwrites with the identical bytes. Before FileBegin
+								// (expected == None) we buffer all indices — the overflow check
+								// runs once expected is known.
+								let overflow = if let Some(r) = f_xfers.get_mut(&xfer) {
+									r.last_activity = std::time::Instant::now();
+									let in_range = r.expected.map_or(true, |e| index < e);
+									if in_range {
+										let prev_len = r.chunks.get(&index).map(|p| p.len() as u64).unwrap_or(0);
+										let projected = r.received - prev_len + data.len() as u64;
+										if projected > crate::files::MAX_XFER_BYTES {
+											true
+										} else {
+											r.chunks.insert(index, data);
+											r.received = projected;
+											false
+										}
+									} else {
+										false
+									}
+								} else {
+									false
+								};
+								if overflow {
+									// Peer is overshooting the sane transfer ceiling — drop the
+									// whole transfer (further chunks for this id find no entry →
+									// ignored, a later FileEnd is a no-op) so the buffer can't
+									// grow unbounded.
+									f_xfers.remove(&xfer);
+								}
+							}
+							DataMsg::FileEnd { id: xfer } => {
+								// End the transfer: a repeated/stray FileEnd (no matching
+								// Begin) must not re-save — `remove` drops the state so a
+								// second End for the same id is a no-op.
+								let Some(r) = f_xfers.remove(&xfer) else { continue };
+								// Save only complete transfers (unordered UDP — a missing
+								// index means a lost chunk; report a failed transfer instead
+								// of corrupting). Reorders/dups already self-healed above.
+								// `expected == Some(0)` is a legitimate empty file. If
+								// `expected` is still `None`, FileBegin never arrived (lost
+								// or extremely delayed); treat that as failed.
+								let complete = r.expected.map_or(false, |e| r.chunks.len() == e as usize);
+								// Write chunks directly to disk without building a contiguous
+								// intermediate Vec — avoids ~2x peak memory at the MAX_XFER_BYTES
+								// ceiling (C24 fix).
 								let saved = if complete {
-									crate::files::save_received_file(&f_name, &f_buf)
+									crate::files::save_received_file_chunks(
+										&r.name,
+										r.chunks.values(),
+										r.received,
+									)
 								} else {
 									None
 								};
+								let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
 								let _ = app_ev.emit("file-recv", FilePayload {
 									peer: id.to_string(),
-									name: f_name.clone(),
-									bytes: f_buf.len() as u64,
+									name: r.name.clone(),
+									bytes: written,
 									ok: saved.is_some(),
 								});
-								f_buf = Vec::new();
 							}
 							_ => {}
 						}
@@ -355,7 +481,12 @@ pub(super) async fn hold_session(
 				// ---- Adaptive bitrate (auto mode only): step DOWN on sustained loss,
 				// creep back UP after a long clean stretch. Each step re-requests the
 				// stream (the host restarts its encoder — brief, so steps are damped).
-				if adapt_enabled && !manual_bitrate {
+				if last_switch_at.elapsed() < std::time::Duration::from_millis(2500) {
+					// A recent menu switch caused an encoder-rebuild gap — skip the adaptive step so
+					// that loss isn't mistaken for congestion (win_recv/win_lost are zeroed at the
+					// end of this tick anyway); also don't let it count toward a clean-stretch creep.
+					clean_windows = 0;
+				} else if adapt_enabled && !manual_bitrate {
 					let total = win_recv + win_lost;
 					let loss = if total > 0 { win_lost as f32 / total as f32 } else { 0.0 };
 					let mut new_kbps = None;
@@ -412,6 +543,9 @@ pub(super) async fn hold_session(
 				// current state and re-request — the host kills the old ffmpeg and
 				// restarts capture/encode with the new setting.
 				Some(cmd) => {
+					// A menu re-request (esp. a monitor switch) → the host rebuilds its encoder
+					// (a brief gap). Mark it so the adaptive controller ignores that gap's loss.
+					last_switch_at = std::time::Instant::now();
 					match cmd {
 						Restream::Resolution(w, h) => { cur_w = w; cur_h = h; }
 						Restream::Encoder(e) => { cur_encoder = e; }

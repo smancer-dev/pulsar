@@ -56,8 +56,8 @@ use commands::{
 	auto_connect_target, available_encoders, connect, controllers, get_config, lan_devices,
 	launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password, node_port,
 	publish_games,
-	relaunch_to_home, run_command, scan_folder, session_password, set_config, set_language,
-	set_stream_settings,
+	relaunch_to_home, run_command, scan_folder, self_update_possible, session_password, set_config,
+	set_language, set_stream_settings, set_tray,
 	steam_path,
 };
 use connections::{list_connections, set_view_only, show_connections};
@@ -65,7 +65,7 @@ use files_window::open_files_window;
 use fs_browse::local_ls;
 use host::go_online;
 use io_cmds::{
-	chat_log, host_send_chat, input_button, input_key, input_pointer, input_scroll,
+	chat_log, host_send_chat, input_button, input_char, input_key, input_pointer, input_scroll,
 	kbd_capture_start, kbd_capture_stop, kbd_engage, mic_start, mic_stop, native_view_rect,
 	read_clipboard_text, send_chat, send_clipboard, send_file, send_file_path,
 	set_window_fullscreen, write_clipboard_text,
@@ -379,14 +379,24 @@ pub fn run() {
 		})
 		.on_window_event(|window, event| match event {
 			// Closing the window hides Pulsar to the tray rather than quitting, so a
-			// single launch stays resident until the tray's "Çıkış" is chosen.
+			// single launch stays resident until the tray's "Çıkış" is chosen — UNLESS
+			// the user has turned off "Run in system tray" (ui.tray = false), in which
+			// case the window close actually quits.
 			WindowEvent::CloseRequested { api, .. } => {
 				// Only the MAIN window hides-to-tray; secondary windows (approval popup,
 				// connections manager) close NORMALLY so a host-side win.close() works
 				// (prevent_close + hide would otherwise leave them stuck hidden).
 				if window.label() == "main" {
-					api.prevent_close();
-					let _ = window.hide();
+					let tray_off = window
+						.state::<AppState>()
+						.tray_disabled
+						.load(std::sync::atomic::Ordering::Relaxed);
+					if tray_off {
+						// Tray disabled → let the window close normally (quit the app).
+					} else {
+						api.prevent_close();
+						let _ = window.hide();
+					}
 				}
 			}
 			// While fullscreen, stay above the taskbar/other apps ONLY when focused;
@@ -440,6 +450,7 @@ pub fn run() {
 			node_port,
 			auto_connect_target,
 			relaunch_to_home,
+			self_update_possible,
 			steam_path,
 			scan_folder,
 			run_command,
@@ -449,6 +460,7 @@ pub fn run() {
 			available_encoders,
 			list_audio_sources,
 			set_stream_settings,
+			set_tray,
 			start_remote_play,
 			stop_stream,
 			set_play_resolution,
@@ -489,6 +501,7 @@ pub fn run() {
 			input_button,
 			input_scroll,
 			input_key,
+			input_char,
 			kbd_capture_start,
 			kbd_capture_stop,
 			send_clipboard,

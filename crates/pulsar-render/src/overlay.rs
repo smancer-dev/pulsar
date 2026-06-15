@@ -228,6 +228,31 @@ const CYAN: egui::Color32 = egui::Color32::from_rgb(120, 200, 240);
 use crate::i18n::t;
 
 /// Apply the Pulsar dark theme to an egui context (call once at startup).
+/// Centered "switching screen…" indicator (spinner + label) drawn over the held last
+/// frame while a monitor/codec switch waits for the new stream's first keyframe. Keeps
+/// the user informed that the change is loading, not hung.
+pub fn draw_switching(ctx: &egui::Context) {
+	egui::Area::new(egui::Id::new("switching"))
+		.anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+		.show(ctx, |ui| {
+			egui::Frame::none()
+				.fill(egui::Color32::from_rgba_unmultiplied(18, 20, 26, 230))
+				.rounding(12.0)
+				.inner_margin(egui::Margin::symmetric(22.0, 18.0))
+				.show(ui, |ui| {
+					ui.vertical_centered(|ui| {
+						ui.add(egui::Spinner::new().size(28.0));
+						ui.add_space(8.0);
+						ui.label(
+							egui::RichText::new(t("switching"))
+								.size(14.0)
+								.color(egui::Color32::WHITE),
+						);
+					});
+				});
+		});
+}
+
 /// Parse the `caps` line's `displays=idx:name:w:h:primary,…` field into the overlay's
 /// `(idx, label)` monitor list (primary marked). Tolerant: skips malformed entries.
 pub fn parse_displays(s: &str) -> Vec<(u32, String)> {
@@ -384,7 +409,7 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 				match ui_state.view {
 					View::Root => draw_root(ui, st, &mut ui_state.view, &mut cmds),
 					View::Stream => draw_stream(ui, st, &mut cmds),
-					View::Display => draw_display(ui, st, &mut cmds),
+					View::Display => draw_display(ui, st, st.mode, &mut cmds),
 					View::Audio => draw_audio(ui, st, &mut cmds),
 					View::Tools => draw_tools(ui, &mut ui_state.view, &mut cmds),
 					View::Chat => draw_chat(ui, st, &mut ui_state.chat_input, &mut cmds),
@@ -432,7 +457,14 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 
 	// Category boxes, 2 per row (AnyDesk-style hub). Chat + Files are NATIVE views
 	// now — the webview session menu is gone on Linux (it lived under the video).
-	let boxes: [(&str, &str, View); 7] = [
+	// Game mode shows the slim set (Stream + Display view-fit + Gauges only);
+	// Remote mode gets the full seven boxes incl. file transfer, chat, mic, monitor.
+	let game_boxes: &[(&str, &str, View)] = &[
+		("📡", t("view.stream"), View::Stream),
+		("🖥", t("view.display"), View::Display),
+		("📊", t("view.gauges"), View::Gauges),
+	];
+	let remote_boxes: &[(&str, &str, View)] = &[
 		("📡", t("view.stream"), View::Stream),
 		("🖥", t("view.display"), View::Display),
 		("🔊", t("view.audio"), View::Audio),
@@ -441,6 +473,10 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 		("🛠", t("view.tools"), View::Tools),
 		("📊", t("view.gauges"), View::Gauges),
 	];
+	let boxes: &[(&str, &str, View)] = match st.mode {
+		Mode::Game => game_boxes,
+		Mode::Remote => remote_boxes,
+	};
 	egui::Grid::new("ov_boxes")
 		.num_columns(2)
 		.spacing(egui::vec2(8.0, 8.0))
@@ -571,12 +607,12 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 	});
 }
 
-/// Display section: host monitor picker (when the host has >1) + AnyDesk-style
-/// view-fit modes (renderer-local, instant).
-fn draw_display(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
-	// Host monitor picker — only meaningful when the host exposes more than one.
-	// Rendered as selectable TILES (one box per screen), not a dropdown.
-	if st.displays.len() > 1 {
+/// Display section: host monitor picker (when the host has >1, remote mode only) +
+/// AnyDesk-style view-fit modes (renderer-local, instant).
+fn draw_display(ui: &mut egui::Ui, st: &OverlayState, mode: Mode, cmds: &mut Vec<OverlayCmd>) {
+	// Host monitor picker — remote mode only (multi-monitor is irrelevant in-game)
+	// and only meaningful when the host exposes more than one display.
+	if mode == Mode::Remote && st.displays.len() > 1 {
 		ui.label(
 			egui::RichText::new(format!("🖵 {}", t("monitor.title")))
 				.small()

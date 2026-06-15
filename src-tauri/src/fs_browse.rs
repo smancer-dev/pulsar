@@ -21,6 +21,17 @@ use tokio::sync::mpsc::Sender;
 /// dropped (serve_with/hold swallow send errors) → broken transfers.
 const CHUNK: usize = 2048;
 
+/// A process-unique id for one file transfer. Tags every `FileBegin`/`FileChunk`/
+/// `FileEnd` of a single stream so concurrent transfers on the same session (two
+/// downloads, an upload racing a download, …) can interleave on the unordered UDP
+/// wire without their reassembly state colliding on the receiver. Starts at 1 so 0
+/// stays reserved for an old peer's un-tagged (single-transfer) messages.
+pub(crate) fn next_transfer_id() -> u32 {
+	use std::sync::atomic::{AtomicU32, Ordering};
+	static NEXT: AtomicU32 = AtomicU32::new(1);
+	NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The user's HOME directory — the jail root for every file-manager path.
 /// (`USERPROFILE` is the Windows equivalent; `HOME` is checked first so the
 /// behavior matches `files::received_dir`.)
@@ -30,11 +41,16 @@ fn home_dir() -> Option<PathBuf> {
 		.map(PathBuf::from)
 }
 
+/// The canonicalized HOME jail root — the prefix every resolved path must keep.
+fn canonical_home() -> Option<PathBuf> {
+	std::fs::canonicalize(home_dir()?).ok()
+}
+
 /// Resolve a HOME-relative request path to a real filesystem path, refusing
 /// anything that escapes HOME. Returns `None` for absolute/rooted requests,
 /// non-existent paths, or any resolution that lands outside the canonical HOME.
 pub(crate) fn resolve_jailed(rel: &str) -> Option<PathBuf> {
-	let home = std::fs::canonicalize(home_dir()?).ok()?;
+	let home = canonical_home()?;
 	// An absolute/rooted request would *replace* the base in `join` — reject it
 	// outright instead of letting it address arbitrary paths.
 	let p = Path::new(rel);
@@ -55,6 +71,7 @@ pub(crate) fn resolve_jailed(rel: &str) -> Option<PathBuf> {
 /// jailed-out, unreadable, or not-a-directory paths all answer with no entries
 /// so the client always gets a response.
 pub(crate) fn list_dir(rel: &str) -> Vec<FsEntry> {
+	let home = canonical_home();
 	let Some(dir) = resolve_jailed(rel) else {
 		return Vec::new();
 	};
@@ -64,9 +81,31 @@ pub(crate) fn list_dir(rel: &str) -> Vec<FsEntry> {
 	let mut entries: Vec<FsEntry> = rd
 		.filter_map(|e| e.ok())
 		.filter_map(|e| {
-			// Follow symlinks so a linked dir lists as a dir — escapes are still
-			// caught when it's actually opened (resolve_jailed canonicalizes).
-			let md = std::fs::metadata(e.path()).ok()?;
+			// `symlink_metadata` does NOT follow links, so the listing never
+			// reflects a symlink TARGET's attributes by default. For a symlink we
+			// canonicalize + jail-check the target: an in-jail target is followed
+			// (so a linked dir lists as a dir and stays navigable), while an
+			// out-of-jail (or broken) target is reported with neutral attributes —
+			// resolve_jailed would refuse it on open anyway, so we don't disclose
+			// its existence/type/size as a real dir/file.
+			let path = e.path();
+			let lmd = std::fs::symlink_metadata(&path).ok()?;
+			let md = if lmd.file_type().is_symlink() {
+				match (home.as_ref(), std::fs::canonicalize(&path).ok()) {
+					(Some(home), Some(target)) if target.starts_with(home) => {
+						std::fs::metadata(&path).ok()?
+					}
+					_ => {
+						return Some(FsEntry {
+							name: e.file_name().to_string_lossy().into_owned(),
+							dir: false,
+							size: 0,
+						});
+					}
+				}
+			} else {
+				lmd
+			};
 			Some(FsEntry {
 				name: e.file_name().to_string_lossy().into_owned(),
 				dir: md.is_dir(),
@@ -96,9 +135,15 @@ pub(crate) async fn send_file_at(tx: &Sender<DataMsg>, rel: &str) -> Option<()> 
 	let name = real.file_name()?.to_string_lossy().into_owned();
 	let size = md.len();
 	let chunks = size.div_ceil(CHUNK as u64) as u32;
-	tx.send(DataMsg::FileBegin { name, size, chunks })
-		.await
-		.ok()?;
+	let id = next_transfer_id();
+	tx.send(DataMsg::FileBegin {
+		id,
+		name,
+		size,
+		chunks,
+	})
+	.await
+	.ok()?;
 	let mut f = tokio::fs::File::open(&real).await.ok()?;
 	let mut buf = vec![0u8; CHUNK];
 	let mut index = 0u32;
@@ -117,6 +162,7 @@ pub(crate) async fn send_file_at(tx: &Sender<DataMsg>, rel: &str) -> Option<()> 
 			break;
 		}
 		tx.send(DataMsg::FileChunk {
+			id,
 			index,
 			data: buf[..filled].to_vec(),
 		})
@@ -124,7 +170,7 @@ pub(crate) async fn send_file_at(tx: &Sender<DataMsg>, rel: &str) -> Option<()> 
 		.ok()?;
 		index += 1;
 	}
-	tx.send(DataMsg::FileEnd).await.ok()?;
+	tx.send(DataMsg::FileEnd { id }).await.ok()?;
 	Some(())
 }
 

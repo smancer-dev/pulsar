@@ -86,7 +86,11 @@ pub(crate) async fn send_file(
 	const CHUNK: usize = 2048;
 	let tx = data_sender(&state, id)?;
 	let chunks = data.len().div_ceil(CHUNK) as u32;
+	// Tag every message of this transfer so it never collides with a concurrent
+	// transfer's reassembly state on the receiver (see fs_browse::next_transfer_id).
+	let xfer = crate::fs_browse::next_transfer_id();
 	tx.send(DataMsg::FileBegin {
+		id: xfer,
 		name,
 		size: data.len() as u64,
 		chunks,
@@ -95,13 +99,14 @@ pub(crate) async fn send_file(
 	.map_err(|_| crate::i18n::t("err.file").to_string())?;
 	for (i, ch) in data.chunks(CHUNK).enumerate() {
 		tx.send(DataMsg::FileChunk {
+			id: xfer,
 			index: i as u32,
 			data: ch.to_vec(),
 		})
 		.await
 		.map_err(|_| crate::i18n::t("err.file").to_string())?;
 	}
-	tx.send(DataMsg::FileEnd)
+	tx.send(DataMsg::FileEnd { id: xfer })
 		.await
 		.map_err(|_| crate::i18n::t("err.file").to_string())
 }
@@ -125,10 +130,10 @@ pub(crate) async fn send_file_path(
 /// Client: start streaming the microphone to the host (raw PCM over the session).
 #[tauri::command]
 pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(), String> {
-	let (tx, mic_slot) = {
+	let (tx, mic_slot, render_seed) = {
 		let plays = state.plays.lock().unwrap();
 		let p = plays.get(&id).ok_or(crate::i18n::t("err.session"))?;
-		(p.data_tx.clone(), p.mic.clone())
+		(p.data_tx.clone(), p.mic.clone(), p.render_seed.clone())
 	};
 	// Hold the slot lock across check→spawn→insert (spawn_mic_recorder is
 	// synchronous, no await): two concurrent invocations could otherwise both
@@ -144,6 +149,12 @@ pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(),
 	let stdout = child.stdout.take().ok_or(crate::i18n::t("err.micOutput"))?;
 	*slot = Some(child);
 	drop(slot);
+	// Record the mic-on bit in the audio truth so a codec/monitor-switch respawn
+	// re-seeds the fresh renderer's overlay with mic=1 (set_play_audio preserves
+	// this bit but never sets it — the mic state is owned here).
+	if let Some(seed) = render_seed.lock().unwrap().audio.as_mut() {
+		seed.2 = true;
+	}
 	// Blocking read loop on a dedicated thread; killing the child ends it.
 	std::thread::spawn(move || {
 		let mut rdr = stdout;
@@ -165,18 +176,23 @@ pub(crate) async fn mic_start(state: State<'_, AppState>, id: u64) -> Result<(),
 /// Client: stop streaming the microphone.
 #[tauri::command]
 pub(crate) async fn mic_stop(state: State<'_, AppState>, id: u64) -> Result<(), String> {
-	let (tx, mic_slot) = {
+	let (tx, mic_slot, render_seed) = {
 		let plays = state.plays.lock().unwrap();
 		let Some(p) = plays.get(&id) else {
 			return Ok(());
 		};
-		(p.data_tx.clone(), p.mic.clone())
+		(p.data_tx.clone(), p.mic.clone(), p.render_seed.clone())
 	};
 	if let Some(mut c) = mic_slot.lock().unwrap().take() {
 		let _ = c.kill();
 		// Reap immediately — kill() alone leaves the recorder as a zombie until
 		// session teardown (visible as a defunct parecord for the session's life).
 		let _ = c.wait();
+	}
+	// Clear the mic-on bit in the audio truth so a later respawn re-seeds mic=0
+	// (mirrors mic_start; set_play_audio preserves but never sets this bit).
+	if let Some(seed) = render_seed.lock().unwrap().audio.as_mut() {
+		seed.2 = false;
 	}
 	let _ = tx.send(DataMsg::AudioEnd).await;
 	Ok(())
@@ -221,7 +237,7 @@ pub(crate) async fn input_pointer(
 	x: f64,
 	y: f64,
 ) -> Result<(), String> {
-	forward(&state, id, InputEvent::PointerMotion { x, y });
+	forward(&state, id, InputEvent::PointerMotion { x, y }).await;
 	Ok(())
 }
 
@@ -233,7 +249,7 @@ pub(crate) async fn input_button(
 	button: u8,
 	down: bool,
 ) -> Result<(), String> {
-	forward(&state, id, InputEvent::PointerButton { button, down });
+	forward(&state, id, InputEvent::PointerButton { button, down }).await;
 	Ok(())
 }
 
@@ -245,7 +261,7 @@ pub(crate) async fn input_scroll(
 	dx: f64,
 	dy: f64,
 ) -> Result<(), String> {
-	forward(&state, id, InputEvent::Scroll { dx, dy });
+	forward(&state, id, InputEvent::Scroll { dx, dy }).await;
 	Ok(())
 }
 
@@ -257,7 +273,25 @@ pub(crate) async fn input_key(
 	code: u32,
 	down: bool,
 ) -> Result<(), String> {
-	forward(&state, id, InputEvent::Key { code, down });
+	forward(&state, id, InputEvent::Key { code, down }).await;
+	Ok(())
+}
+
+/// Client: forward a resolved Unicode character to type verbatim (layout-independent).
+/// The webview resolves a printable keypress through ITS OWN keyboard layout to this
+/// codepoint, so the host inserts it regardless of the host's active layout (matching the
+/// Linux/Windows native hook's `Char` path). The UI sends a one-char string; an empty or
+/// multi-`char` string (no scalar value) is ignored.
+#[tauri::command]
+pub(crate) async fn input_char(
+	state: State<'_, AppState>,
+	id: u64,
+	ch: String,
+) -> Result<(), String> {
+	let Some(c) = ch.chars().next().filter(|_| ch.chars().count() == 1) else {
+		return Ok(());
+	};
+	forward(&state, id, InputEvent::Char(c)).await;
 	Ok(())
 }
 
@@ -342,8 +376,12 @@ pub(crate) fn native_view_rect(
 			.unwrap_or(1.0);
 		let px = |v: i32| (v as f64 * scale).round() as i32;
 		use std::io::Write as _;
-		if let Some(p) = state.plays.lock().unwrap().get(&id) {
-			if let Some(si) = p.render_stdin.lock().unwrap().as_mut() {
+		// Pull the render_stdin Arc out under the lock, then DROP the plays guard before the
+		// blocking child-stdin write — a full/backed-up pipe must not stall every other
+		// state.plays user (forward() on each input event, the setters). Mirrors render_hint.
+		let stdin = state.plays.lock().unwrap().get(&id).map(|p| p.render_stdin.clone());
+		if let Some(stdin) = stdin {
+			if let Some(si) = stdin.lock().unwrap().as_mut() {
 				let _ = writeln!(si, "viewrect {} {} {} {}", px(x), px(y), px(w), px(h));
 			}
 		}

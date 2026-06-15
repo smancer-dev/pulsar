@@ -5,50 +5,16 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::Power::{
-	SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
-	EXECUTION_STATE,
-};
 use windows::Win32::System::Threading::{
-	CreateWaitableTimerExW, GetCurrentThread, SetThreadPriority, SetWaitableTimer,
-	WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, THREAD_PRIORITY_TIME_CRITICAL,
-	TIMER_ALL_ACCESS,
+	CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+	CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
 
-// ---------------------------------------------------------------------------
-// Thread priority + display keep-alive (called from lib.rs's thread body)
-// ---------------------------------------------------------------------------
-
-/// Pin the capture thread to `TIME_CRITICAL` so the pacing loop isn't preempted mid
-/// frame interval (the documented cause of the "73 fps irregular" symptom). Best-effort;
-/// a failure just means we run at normal priority.
-pub unsafe fn raise_thread_priority() {
-	// GetCurrentThread() returns a pseudo-handle (no need to close it).
-	let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-}
-
-/// RAII guard that asks Windows to keep the display + system awake while streaming, and
-/// clears the request on drop. Mirrors what every screen-share tool does so the host
-/// doesn't blank/sleep mid-session.
-pub struct DisplayKeepAlive;
-
-impl DisplayKeepAlive {
-	pub unsafe fn engage() -> Self {
-		// ES_CONTINUOUS makes the request sticky until the next call; combine with
-		// DISPLAY|SYSTEM so neither the monitor nor the box sleeps.
-		let _ = SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-		DisplayKeepAlive
-	}
-}
-
-impl Drop for DisplayKeepAlive {
-	fn drop(&mut self) {
-		// Drop the keep-awake request — ES_CONTINUOUS alone resets to the default policy.
-		unsafe {
-			let _: EXECUTION_STATE = SetThreadExecutionState(ES_CONTINUOUS);
-		}
-	}
-}
+// NOTE: the display keep-alive (SetThreadExecutionState) and TIME_CRITICAL thread priority
+// are engaged ONCE for the whole capture-thread life by `lib.rs`'s thread body, NOT here.
+// SetThreadExecutionState is thread-global sticky state (not a refcount), so engaging a
+// second guard inside the pacing loop would, on drop (a monitor Switch / Stop), clear the
+// keep-awake request the outer guard still holds — blanking the panel mid-rebuild.
 
 // ---------------------------------------------------------------------------
 // High-resolution waitable timer (the pacing primitive)

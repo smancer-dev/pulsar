@@ -112,6 +112,14 @@ fn decode_cursor_png(b64: &str, w: usize, h: usize) -> Option<Vec<u8>> {
 	let bytes = base64_decode(b64)?;
 	let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
 	let mut reader = decoder.read_info().ok()?;
+	// Reject a PNG whose HEADER dimensions don't match the announced (already ≤256²)
+	// w×h BEFORE allocating — `output_buffer_size()` is derived from the header's own
+	// dimensions, so a tiny PNG declaring e.g. 40000×40000 would otherwise allocate
+	// multiple GB and OOM/crash the renderer.
+	let (hw, hh) = reader.info().size();
+	if hw as usize != w || hh as usize != h {
+		return None;
+	}
 	let mut buf = vec![0u8; reader.output_buffer_size()];
 	let info = reader.next_frame(&mut buf).ok()?;
 	if info.color_type != png::ColorType::Rgba
@@ -1062,12 +1070,22 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			if vw < 1.0 || vh < 1.0 || !have_video {
 				return None;
 			}
+			// Host-pixel → displayed-pixel scale: the side-channel cursor bitmap/hotspot arrive
+			// in raw host pixels, so its drawn size AND hotspot must scale by the same factor the
+			// video is shown at, or the tip mis-aligns / the shape is the wrong size whenever the
+			// stream isn't presented 1:1 (downscale = too big, upscale = too small).
+			let src = *video::VIDEO_SRC.lock().unwrap();
+			let (sw, sh) = (src[0] as f32, src[1] as f32);
+			let (kx, ky) = (vw / sw.max(1.0), vh / sh.max(1.0));
 			// GL bottom-left rect → top-left pixel rect, then px → egui points (÷ ppp).
 			let vy_top = h as f32 - (vyb + vh);
 			let px = vx + nx * vw;
 			let py = vy_top + ny * vh;
-			let pos = egui::pos2((px - cursor_hot.0) / ppp, (py - cursor_hot.1) / ppp);
-			let size = egui::vec2(cursor_dims.0 / ppp, cursor_dims.1 / ppp);
+			let pos = egui::pos2(
+				(px - cursor_hot.0 * kx) / ppp,
+				(py - cursor_hot.1 * ky) / ppp,
+			);
+			let size = egui::vec2(cursor_dims.0 * kx / ppp, cursor_dims.1 * ky / ppp);
 			Some((pos, tex.id(), size))
 		})();
 
@@ -1102,6 +1120,10 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			let mut cmds: Vec<OverlayCmd> = Vec::new();
 			let full = egui_ctx.run(raw_input, |ctx| {
 				cmds = overlay::draw(ctx, &state, &mut ov_ui);
+				// "Switching screen…" indicator over the held last frame during a switch.
+				if video::SWITCHING.load(Ordering::Relaxed) {
+					overlay::draw_switching(ctx);
+				}
 				paint_cursor(ctx);
 			});
 			for c in cmds {

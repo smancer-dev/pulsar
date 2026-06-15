@@ -14,6 +14,22 @@ use tokio::sync::oneshot;
 use crate::events::{AuthPrompt, SessionEvent};
 use crate::state::AppState;
 
+/// Constant-time secret equality for the connect/one-time passwords.
+///
+/// A remote peer can flood `Auth(password)` guesses, so the secret check must not
+/// leak the shared-prefix length through reject latency the way `str`/`String`
+/// `==` does (it short-circuits on the first differing byte). We hash both the
+/// candidate and the stored secret to fixed-length SHA-256 digests and compare
+/// those digests in constant time — digesting also hides the secret's length
+/// (a raw byte-slice compare would short-circuit on a length mismatch first).
+pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
+	use sha2::{Digest, Sha256};
+	use subtle::ConstantTimeEq;
+	let da = Sha256::digest(a.as_bytes());
+	let db = Sha256::digest(b.as_bytes());
+	da.ct_eq(&db).into()
+}
+
 /// Per-peer auth throttle (brute-force / prompt-spam protection). Both passwords
 /// (the rotating one-time pw and the persistent connect password) and the
 /// Allow/Deny popup are remotely triggerable, so a hostile peer could spam
@@ -31,8 +47,22 @@ pub(crate) mod throttle {
 	/// forgetful user shouldn't accumulate into a lockout across hours).
 	const WINDOW: Duration = Duration::from_secs(600);
 
+	/// Total wrong guesses across ALL peers before the host force-rotates the
+	/// one-time password. The per-peer [`MAX_FAILURES`] lockout is keyed by the
+	/// peer label, which for a relay connect is the attacker-chosen 9-digit id —
+	/// an attacker who registers many ids (relay registration is unauthenticated)
+	/// gets a fresh per-peer bucket each time, defeating that lockout. This global
+	/// counter is source-independent: after this many wrong guesses (over the
+	/// window, against a static OTP) the credential being brute-forced is rotated
+	/// out from under the attacker regardless of which ids they cycle through.
+	const GLOBAL_MAX_FAILURES: u32 = 20;
+
 	static ATTEMPTS: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
 		LazyLock::new(|| Mutex::new(HashMap::new()));
+
+	/// Source-independent wrong-guess counter: (count, first-failure instant).
+	static GLOBAL_FAILURES: LazyLock<Mutex<(u32, Instant)>> =
+		LazyLock::new(|| Mutex::new((0, Instant::now())));
 
 	/// Throttle key: a relay id passes through, but a direct peer's label is
 	/// "ip:port" with a NEW EPHEMERAL PORT per connection — keyed verbatim, an
@@ -87,9 +117,35 @@ pub(crate) mod throttle {
 		}
 	}
 
+	/// Count a wrong guess against the source-independent global counter; returns
+	/// true exactly when the global threshold is crossed, meaning the host should
+	/// force-rotate the one-time password (and resets the counter so the next
+	/// rotation needs a fresh batch of failures). This defeats the relay-id
+	/// rotation that sidesteps the per-peer [`record_failure`] lockout: no matter
+	/// how many ids an attacker cycles, the OTP they are guessing changes after
+	/// [`GLOBAL_MAX_FAILURES`] total wrong attempts.
+	pub(crate) fn note_global_failure() -> bool {
+		let mut g = GLOBAL_FAILURES.lock().unwrap();
+		if g.1.elapsed() > WINDOW {
+			*g = (0, Instant::now());
+		}
+		g.0 += 1;
+		if g.0 >= GLOBAL_MAX_FAILURES {
+			tracing::warn!(failures = g.0, "auth throttle: global wrong-guess limit — rotating one-time password");
+			*g = (0, Instant::now());
+			true
+		} else {
+			false
+		}
+	}
+
 	/// Successful auth clears the slate.
 	pub(crate) fn clear(peer: &str) {
 		ATTEMPTS.lock().unwrap().remove(&key(peer));
+		// A correct password resets the global counter too: it only exists to cap
+		// SUSTAINED failed guessing against a static code, not to punish a few
+		// fat-fingered attempts that eventually succeed.
+		*GLOBAL_FAILURES.lock().unwrap() = (0, Instant::now());
 	}
 }
 
@@ -201,15 +257,23 @@ pub(crate) async fn race_host_auth(
 					ClientAuth::Password(pw) => {
 						// Either the rotating one-time password or the persistent
 						// connect password (Settings → Güvenlik) unlocks the session.
-						if accepted_pws.iter().any(|a| !a.is_empty() && pw == *a) {
+						if accepted_pws.iter().any(|a| !a.is_empty() && secret_eq(&pw, a)) {
 							// correct password → accept; flag if it was the OTP so the
 							// caller rotates it (single-use).
-							let otp = !one_time_pw.is_empty() && pw == one_time_pw;
+							let otp = !one_time_pw.is_empty() && secret_eq(&pw, one_time_pw);
 							break (true, otp);
 						}
 						// Wrong: count it. Crossing the throttle threshold ends the
 						// race as a deny (no more retries for this peer for a while).
-						if throttle::record_failure(peer) {
+						let locked = throttle::record_failure(peer);
+						// Also count it against the source-independent global limit:
+						// a relay attacker who cycles ids gets a fresh per-peer bucket
+						// each time, so the per-peer lockout alone can't stop sustained
+						// guessing — rotate the OTP after enough TOTAL wrong guesses.
+						if throttle::note_global_failure() {
+							crate::commands::rotate_session_password(app);
+						}
+						if locked {
 							break (false, false);
 						}
 						let _ = need_password(session).await; // wrong → ask client to retry

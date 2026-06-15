@@ -167,6 +167,8 @@ fn reopen_render_for_codec(state: &State<'_, AppState>, id: u64, codec: &str) {
 	// Re-store mpv_sdp (plain field) under a brief lock — the play may have been torn
 	// down while the pipe write was in flight, in which case there's nothing to update.
 	if let Some(p) = state.plays.lock().unwrap().get_mut(&id) {
+		// Track the freshly-written SDP for teardown (the old one stays tracked too).
+		p.sdp_files.lock().unwrap().push(sdp.clone());
 		p.mpv_sdp = Some(sdp);
 	}
 	tracing::info!(id, codec, sent, "renderer demuxer reopened for codec switch");
@@ -207,6 +209,15 @@ async fn respawn_render_for_codec(
 	};
 	#[cfg(not(windows))]
 	crate::render::set_container_visible(app, id, false);
+	// Kill the old renderer FIRST so it releases its UDP video port before the new
+	// renderer tries to bind the same port. Both processes use the same video_port
+	// (the host re-encodes to the unchanged port on a codec/monitor switch), and the
+	// RTP socket is bound with no SO_REUSEADDR/SO_REUSEPORT — starting the new
+	// renderer while the old one still holds the port causes EADDRINUSE → recv_loop
+	// (Windows rtp.rs) or avformat_open_input (Linux video.rs) fails immediately,
+	// leaving the new renderer permanently deaf and the video permanently black.
+	// stop_render_child waits up to ~600 ms for a clean SIGTERM exit (or SIGKILL +
+	// wait on timeout) before returning, so the port IS released when we spawn below.
 	if let Some(mut c) = old_child {
 		crate::play::stop_render_child(&mut c);
 	}
@@ -237,7 +248,20 @@ async fn respawn_render_for_codec(
 			)
 		})
 	};
+	if rc.is_none() {
+		// Spawn failed: the old renderer was already reaped, so the session is now
+		// without video. Surface the failure via a warning; the session stays alive
+		// (control channel intact) and the user can retry the codec/monitor switch.
+		#[cfg(not(windows))]
+		crate::render::set_container_visible(app, id, true);
+		tracing::warn!(id, codec, "renderer respawn failed after killing old renderer");
+		return;
+	}
 	if let Some(c) = rc.as_mut() {
+		// Fresh renderer's PID — needed to re-assert an open overlay on Linux (SIGUSR1)
+		// below, since the new process starts with OPEN=false (see the re-assert block).
+		#[cfg(all(unix, not(target_os = "macos")))]
+		let new_pid = c.id();
 		if let Some(out) = c.stdout.take() {
 			crate::render_stats::start_render_reader(app, id, out);
 		}
@@ -252,6 +276,8 @@ async fn respawn_render_for_codec(
 			let mut plays = state.plays.lock().unwrap();
 			plays.get_mut(&id).map(|p| {
 				*p.render_stdin.lock().unwrap() = si;
+				// Track the freshly-written SDP for teardown (the old one stays tracked too).
+				p.sdp_files.lock().unwrap().push(sdp.clone());
 				p.mpv_sdp = Some(sdp);
 				(
 					p.render_stdin.clone(),
@@ -314,6 +340,31 @@ async fn respawn_render_for_codec(
 						);
 					}
 					let _ = si.flush();
+				}
+			}
+			// Re-assert the overlay open-state on the fresh renderer. The respawn was
+			// triggered from INSIDE the open overlay (codec switch), so the frontend's
+			// dock.overlayOpen is still true and the keyboard/evdev capture stays SUSPENDED
+			// (state.overlay_open still holds this id). But the new process starts with
+			// OPEN=false, so without this it would never draw the overlay — the user is
+			// "stuck" (no video control, no menu) until they toggle Ctrl+Shift+M twice.
+			// Mirror set_overlay's open path: SIGUSR1 + pass-through off on Linux, an `open`
+			// stdin line elsewhere (Windows / future native macOS).
+			if state.overlay_open.lock().unwrap().contains(&id) {
+				#[cfg(all(unix, not(target_os = "macos")))]
+				{
+					crate::render::set_container_pass_through(app, id, false);
+					unsafe {
+						libc::kill(new_pid as i32, libc::SIGUSR1);
+					}
+				}
+				#[cfg(not(all(unix, not(target_os = "macos"))))]
+				{
+					use std::io::Write as _;
+					if let Some(si) = stdin.lock().unwrap().as_mut() {
+						let _ = writeln!(si, "open");
+						let _ = si.flush();
+					}
 				}
 			}
 		}
@@ -430,9 +481,55 @@ pub(crate) async fn set_play_quality(
 	Ok(())
 }
 
+/// Leading-edge debounce state for the monitor picker, keyed PER play id (a client can stream
+/// from several hosts at once — one tab each — so a single global would let one tab's pending
+/// switch overwrite another's, dropping a switch or applying it to the wrong session). `last_ms`
+/// = when this session's last switch fired; `pending` = its most-recent requested monitor while
+/// coalescing (`u32::MAX` = none); `gen` distinguishes coalesced calls so only the newest one
+/// fires the trailing switch.
+struct MonDebounce {
+	last_ms: u64,
+	pending: u32,
+	gen: u64,
+}
+impl Default for MonDebounce {
+	fn default() -> Self {
+		// `pending == u32::MAX` is the "no pending switch" sentinel (a real display_idx is < MAX).
+		Self {
+			last_ms: 0,
+			pending: u32::MAX,
+			gen: 0,
+		}
+	}
+}
+static MON_STATE: std::sync::Mutex<Option<std::collections::HashMap<u64, MonDebounce>>> =
+	std::sync::Mutex::new(None);
+/// How long after a switch fires that further picks coalesce instead of each spawning their own
+/// reopen. ~A single switch's wall time, so deliberate switches (seconds apart) never coalesce,
+/// but spamming the picker collapses to (first + final) instead of N decoder teardowns.
+const MON_COOLDOWN_MS: u64 = 400;
+
+/// Monotonic milliseconds since first use (for the debounce window).
+fn mon_now_ms() -> u64 {
+	use std::sync::OnceLock;
+	use std::time::Instant;
+	static E: OnceLock<Instant> = OnceLock::new();
+	E.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Drop a session's monitor-picker debounce entry when its play session is torn down
+/// (called from `stop_stream`) so the per-id map doesn't accumulate stale entries.
+pub(crate) fn forget_monitor_debounce(id: u64) {
+	if let Some(map) = MON_STATE.lock().unwrap().as_mut() {
+		map.remove(&id);
+	}
+}
+
 /// Client: switch which HOST monitor is streamed (session menu), as an index into the
 /// host's advertised `StreamCaps::displays` (0 = primary). Re-requests the stream — the
-/// host restarts capture on the selected output.
+/// host restarts capture on the selected output. Debounced per play id (see `MON_STATE`) so
+/// spamming the picker doesn't stack reopens (each tears the decoder down → the "stuck on
+/// switching").
 #[tauri::command]
 pub(crate) async fn set_play_monitor(
 	app: AppHandle,
@@ -441,12 +538,70 @@ pub(crate) async fn set_play_monitor(
 	display_idx: u32,
 ) -> Result<(), String> {
 	tracing::info!(id, display_idx, "set_play_monitor command");
+	let now = mon_now_ms();
+	let last = {
+		let mut map = MON_STATE.lock().unwrap();
+		let st = map.get_or_insert_with(Default::default).entry(id).or_default();
+		st.last_ms
+	};
+	// Leading edge: a switch outside the cooldown fires IMMEDIATELY (no added latency).
+	// `last == 0` means this session has never fired a switch — always treat that as eligible
+	// so the very first monitor pick of a session isn't penalised the full 400 ms cooldown.
+	if last == 0 || now.saturating_sub(last) >= MON_COOLDOWN_MS {
+		MON_STATE
+			.lock()
+			.unwrap()
+			.get_or_insert_with(Default::default)
+			.entry(id)
+			.or_default()
+			.last_ms = now;
+		do_monitor_switch(&app, &state, id, display_idx).await;
+		return Ok(());
+	}
+	// Inside the cooldown: record the latest target FOR THIS SESSION, wait out the remainder, and
+	// only the newest coalesced call (highest generation) for this id fires the trailing switch.
+	let g = {
+		let mut map = MON_STATE.lock().unwrap();
+		let st = map.get_or_insert_with(Default::default).entry(id).or_default();
+		st.pending = display_idx;
+		st.gen += 1;
+		st.gen
+	};
+	let wait = MON_COOLDOWN_MS - now.saturating_sub(last);
+	tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+	let p = {
+		let mut map = MON_STATE.lock().unwrap();
+		let st = map.get_or_insert_with(Default::default).entry(id).or_default();
+		if st.gen != g {
+			return Ok(());
+		}
+		let p = std::mem::replace(&mut st.pending, u32::MAX);
+		if p != u32::MAX {
+			st.last_ms = mon_now_ms();
+		}
+		p
+	};
+	if p != u32::MAX {
+		do_monitor_switch(&app, &state, id, p).await;
+	}
+	Ok(())
+}
+
+/// The actual monitor switch: re-request the stream on the new host output and resync the local
+/// renderer (its demuxer/decoder were fixed at spawn). Split out of `set_play_monitor` so the
+/// debounce can fire it on both the leading edge and the trailing (coalesced) edge.
+async fn do_monitor_switch(
+	app: &AppHandle,
+	state: &State<'_, AppState>,
+	id: u64,
+	display_idx: u32,
+) {
 	// Pull the restream channel + the active codec (from the stored caps line) under one lock.
 	let (tx, codec) = {
 		let plays = state.plays.lock().unwrap();
 		let Some(p) = plays.get(&id) else {
 			tracing::warn!(id, "set_play_monitor: no play session for id");
-			return Ok(());
+			return;
 		};
 		let codec = p
 			.caps_line
@@ -457,9 +612,9 @@ pub(crate) async fn set_play_monitor(
 			.unwrap_or_default();
 		(p.restream_tx.clone(), codec)
 	};
-	tx.send(Restream::Display(display_idx))
-		.await
-		.map_err(|e| e.to_string())?;
+	if tx.send(Restream::Display(display_idx)).await.is_err() {
+		return;
+	}
 	// Monitors can differ in resolution (e.g. 2560×1440 vs 1920×1200), so the host's
 	// restarted capture emits a stream with NEW dimensions/SPS. The renderer's demuxer +
 	// decoder are fixed at spawn, so — exactly like a codec switch — they must resync or
@@ -471,11 +626,10 @@ pub(crate) async fn set_play_monitor(
 			all(unix, not(target_os = "macos"), not(target_arch = "aarch64")),
 			windows
 		))]
-		respawn_render_for_codec(&app, &state, id, &codec).await;
+		respawn_render_for_codec(app, state, id, &codec).await;
 		#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
-		reopen_render_for_codec(&state, id, &codec);
+		reopen_render_for_codec(state, id, &codec);
 	}
-	Ok(())
 }
 
 /// Client (Linux native renderer): toggle Moonlight-style frame pacing live. Writes a
@@ -810,6 +964,22 @@ pub(crate) async fn set_overlay(
 						p.ffplay = Some(c);
 					}
 					crate::render::set_container_visible(&app, id, true);
+				} else {
+					// Respawn failed (mpv vanished mid-session / transient resource
+					// exhaustion). The open branch already killed the previous mpv, so a
+					// silent None would leave the container hidden = video gone for good with
+					// no error. Surface it on the `host-stats` channel the session UI renders
+					// as a status string (mirrors play.rs's mpv-missing notice), so the failure
+					// is visible and the user can retry by re-toggling the overlay.
+					use tauri::Emitter;
+					tracing::error!("mpv fallback respawn failed on overlay close — video unavailable");
+					let _ = app.emit(
+						"host-stats",
+						crate::events::PlayStats {
+							id,
+							label: "Video yok — mpv yeniden başlatılamadı".to_string(),
+						},
+					);
 				}
 			}
 		}

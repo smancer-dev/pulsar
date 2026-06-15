@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pulsar_core::proto::DeviceId;
+use pulsar_core::proto::{DeviceId, PublicKey};
 use pulsar_core::service::{DataMsg, InputEvent};
 use pulsar_core::Node;
 use tauri::{AppHandle, Manager};
@@ -40,6 +40,62 @@ pub(crate) fn identity_path(app: &AppHandle) -> PathBuf {
 		.app_config_dir()
 		.unwrap_or_else(|_| PathBuf::from("."))
 		.join("identity.key")
+}
+
+/// Per-user file pinning each connected device id → the X25519 public key we first
+/// saw behind it (trust-on-first-use). The relay maps pubkey → id but never proves
+/// WHICH pubkey owns an id to the requester — it only enforces `target == id` with
+/// its own token check — so a malicious/compromised relay (the self-hostable,
+/// ciphertext-only threat model) or an attacker that won the pubkey→id registration
+/// race could otherwise answer in a known target's place with its own key and the
+/// client would transparently trust it. Pinning the key here lets `connect_pinned`
+/// hard-fail a later connect whose key changed, instead of silently substituting it.
+fn known_peers_path(app: &AppHandle) -> PathBuf {
+	app.path()
+		.app_config_dir()
+		.unwrap_or_else(|_| PathBuf::from("."))
+		.join("known_peers.json")
+}
+
+/// The pinned public key for a canonical 9-digit relay id, if we've connected to it
+/// before. Keyed by the despaced digits so "641 724 395" and "641724395" are one peer
+/// (mirrors the frontend `peers` store's `normalizeId`).
+fn known_peer_key(app: &AppHandle, id: &DeviceId) -> Option<PublicKey> {
+	let raw = std::fs::read_to_string(known_peers_path(app)).ok()?;
+	let map: std::collections::HashMap<String, String> = serde_json::from_str(&raw).ok()?;
+	let hex = map.get(&id.0.to_string())?;
+	let mut key = [0u8; 32];
+	if hex.len() != 64 {
+		return None;
+	}
+	for (i, b) in key.iter_mut().enumerate() {
+		*b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+	}
+	Some(key)
+}
+
+/// Record the pubkey first seen behind a relay id (TOFU). No-op if already pinned —
+/// a later key change must NOT silently overwrite the pin (that is the very
+/// substitution we guard against), so `connect_pinned` rejects the mismatched
+/// connect upstream and this is never reached for a changed key on a known id.
+fn pin_peer_key(app: &AppHandle, id: &DeviceId, key: &PublicKey) {
+	let path = known_peers_path(app);
+	let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(&path)
+		.ok()
+		.and_then(|raw| serde_json::from_str(&raw).ok())
+		.unwrap_or_default();
+	let entry = id.0.to_string();
+	if map.contains_key(&entry) {
+		return;
+	}
+	let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+	map.insert(entry, hex);
+	if let Some(dir) = path.parent() {
+		let _ = std::fs::create_dir_all(dir);
+	}
+	if let Ok(json) = serde_json::to_string(&map) {
+		let _ = std::fs::write(&path, json);
+	}
 }
 
 /// Resolve a user-entered `host:port` (IP or DNS name) to a socket address.
@@ -82,6 +138,7 @@ pub(crate) fn parse_target_addr(s: &str) -> Option<SocketAddr> {
 /// loss (measured 14.7% on this network) — the LAN path sidesteps the router's
 /// WAN side entirely. Falls back to the relay rendezvous within 1.5 s.
 pub(crate) async fn connect_target(
+	app: &AppHandle,
 	node: &Arc<Node>,
 	discovery: Option<Arc<pulsar_core::discovery::Discovery>>,
 	target: &str,
@@ -90,7 +147,8 @@ pub(crate) async fn connect_target(
 	let s = target.trim();
 	if let Some(addr) = parse_target_addr(s) {
 		// An explicit IP target IS a direct connect by definition — honored even in
-		// relay-only mode (there is no relay route to a raw address).
+		// relay-only mode (there is no relay route to a raw address). No id to pin
+		// against (the address IS the identity here), so no TOFU.
 		let sess = node
 			.connect_direct(addr, None)
 			.await
@@ -98,6 +156,11 @@ pub(crate) async fn connect_target(
 		return Ok((sess, addr.to_string()));
 	}
 	let id = DeviceId::parse(s).ok_or_else(|| crate::i18n::t("err.badTarget").to_string())?;
+	// TOFU: the key we pinned the FIRST time we connected to this id, if any. Passed
+	// to the pinned connect paths so a malicious relay / pubkey-race attacker can't
+	// silently swap a different peer behind a known id — a changed key hard-fails the
+	// connect instead.
+	let pinned = known_peer_key(app, &id);
 	// Relay-only must NOT take the same-LAN direct shortcut — the whole point of
 	// that mode is that traffic goes through the relay (policy/diagnostics).
 	let lan_allowed = !matches!(
@@ -114,12 +177,15 @@ pub(crate) async fn connect_target(
 		if let Some(addr) = lan {
 			match tokio::time::timeout(
 				std::time::Duration::from_millis(1500),
-				node.connect_direct(addr, None),
+				node.connect_direct(addr, pinned),
 			)
 			.await
 			{
 				Ok(Ok(sess)) => {
 					tracing::info!(%addr, id = %id.grouped(), "same-LAN fast path: connected directly (discovery match)");
+					if let Some(k) = sess.peer_pubkey().await {
+						pin_peer_key(app, &id, &k);
+					}
 					return Ok((sess, id.grouped()));
 				}
 				_ => {
@@ -128,7 +194,13 @@ pub(crate) async fn connect_target(
 			}
 		}
 	}
-	let sess = node.connect(id).await.map_err(|e| e.to_string())?;
+	let sess = node
+		.connect_pinned(id, pinned)
+		.await
+		.map_err(|e| e.to_string())?;
+	if let Some(k) = sess.peer_pubkey().await {
+		pin_peer_key(app, &id, &k);
+	}
 	Ok((sess, id.grouped()))
 }
 
@@ -146,10 +218,35 @@ pub(crate) fn data_sender(
 		.ok_or_else(|| crate::i18n::t("err.session").into())
 }
 
+/// True for high-rate, idempotent-ish input that is SAFE to drop under backpressure
+/// (the next sample supersedes it): pointer motion / scroll / gamepad snapshots. Press
+/// and release EDGES (`PointerButton`/`Key`/`Char`) are NOT coalescible — dropping a
+/// release leaves the host with a stuck button or held key (a stuck drag / runaway
+/// key-repeat with no recovery until the session ends), so those must never be dropped.
+pub(crate) fn is_coalescible_input(ev: &InputEvent) -> bool {
+	matches!(
+		ev,
+		InputEvent::PointerMotion { .. }
+			| InputEvent::PointerRelative { .. }
+			| InputEvent::Scroll { .. }
+			| InputEvent::Gamepad(_)
+	)
+}
+
 /// Forward an input event to a specific play session's host.
-pub(crate) fn forward(state: &AppState, id: u64, ev: InputEvent) {
-	if let Some(play) = state.plays.lock().unwrap().get(&id) {
-		let _ = play.input_tx.try_send(ev);
+///
+/// The 256-slot input channel is drained one-await-per-event by the hold loop, so a
+/// congested link (relay under load, a brief stall) can fill it. On a full channel a
+/// `try_send` would DROP the just-arrived event — fatal for press/release semantics if
+/// the dropped one is a button/key UP (stuck input on the host). So we only drop
+/// coalescible motion; edge events `await` a slot, preserving in-order delivery.
+pub(crate) async fn forward(state: &AppState, id: u64, ev: InputEvent) {
+	let tx = state.plays.lock().unwrap().get(&id).map(|p| p.input_tx.clone());
+	let Some(tx) = tx else { return };
+	if is_coalescible_input(&ev) {
+		let _ = tx.try_send(ev);
+	} else {
+		let _ = tx.send(ev).await;
 	}
 }
 

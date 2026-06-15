@@ -74,13 +74,16 @@ enum Msg {
 	StreamCaps(wire::StreamCaps),
 }
 
-/// A short, human-typable one-time password like `7yf2-qk` (no ambiguous chars).
+/// A short, human-typable one-time password like `7yf2-qk9p` (no ambiguous chars).
+/// Eight chars from a 31-symbol alphabet ≈ 39.6 bits — a six-char code (~29.7 bits)
+/// is brute-forceable for a host left online with a static OTP (see the host-side
+/// global-failure rotation in `src-tauri/src/auth.rs`).
 pub fn gen_password() -> String {
 	use rand::Rng;
 	const CS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
 	let mut rng = rand::thread_rng();
-	let mut s = String::with_capacity(7);
-	for i in 0..6 {
+	let mut s = String::with_capacity(9);
+	for i in 0..8 {
 		if i == 4 {
 			s.push('-');
 		}

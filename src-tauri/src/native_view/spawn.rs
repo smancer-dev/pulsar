@@ -154,6 +154,8 @@ pub fn spawn_vidsink(bin: &str, sdp: &Path, wid: Option<u64>, rotate: u32) -> Op
 	}
 	cmd.arg("--stats");
 	cmd.stdout(std::process::Stdio::piped());
+	// Prefer the host's rkmpp ffmpeg over the AppImage's rkmpp-less bundle on RK3588.
+	crate::process::apply_render_lib_env(&mut cmd);
 	die_with_parent(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => Some(child),
@@ -192,6 +194,8 @@ pub fn spawn_render(
 	// from the frontend); without stdin piped, set_frame_pacing can't reach the renderer.
 	cmd.stdin(std::process::Stdio::piped());
 	cmd.stdout(std::process::Stdio::piped());
+	// Prefer the host's rkmpp ffmpeg over the AppImage's rkmpp-less bundle on RK3588.
+	crate::process::apply_render_lib_env(&mut cmd);
 	die_with_parent(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => Some(child),

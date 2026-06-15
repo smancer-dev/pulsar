@@ -129,6 +129,14 @@ fn decode_cursor_png(b64: &str, w: usize, h: usize) -> Option<Vec<u8>> {
 	let bytes = base64_decode(b64)?;
 	let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
 	let mut reader = decoder.read_info().ok()?;
+	// Reject a PNG whose HEADER dimensions don't match the announced (already ≤256²)
+	// w×h BEFORE allocating — `output_buffer_size()` is derived from the header's own
+	// dimensions, so a tiny PNG declaring e.g. 40000×40000 would otherwise allocate
+	// multiple GB and OOM/crash the renderer.
+	let (hw, hh) = reader.info().size();
+	if hw as usize != w || hh as usize != h {
+		return None;
+	}
 	let mut buf = vec![0u8; reader.output_buffer_size()];
 	let info = reader.next_frame(&mut buf).ok()?;
 	if info.color_type != png::ColorType::Rgba
@@ -585,6 +593,12 @@ struct Renderer {
 	// Decoded source size (from the NV12 texture); drives the letterbox + processor rebuild.
 	src_w: u32,
 	src_h: u32,
+	// Last decoded NV12 frame (an owned, single-slice texture from sample_to_texture — NOT a
+	// recycled MFT pool surface, so holding it is safe). Re-blt during a video STALL so the
+	// overlay/HUD/cursor keep painting over the last frame instead of freezing (Linux-parity:
+	// linux.rs re-presents `last` every vsync). Cleared on resolution change so a stale frame
+	// is never re-presented through a mismatched VideoProcessor.
+	last_nv12: Option<ID3D11Texture2D>,
 	// fps counter for the `vidsink-fps` HUD line + self-measured stream metrics
 	// (bytes → mbps, decode wall time → ms) so the overlay shows real numbers
 	// without an app-side echo (the stdin `stat` line never arrives on Windows).
@@ -683,6 +697,7 @@ impl Renderer {
 			codec,
 			src_w: 0,
 			src_h: 0,
+			last_nv12: None,
 			frames: 0,
 			last_fps_at: std::time::Instant::now(),
 			bytes: 0,
@@ -904,15 +919,20 @@ impl Renderer {
 		// through fit/stretch/original (original = a center CROP, so the source
 		// position maps through the visible source window, not the full frame).
 		let ((sx, sy, sw, sh), (dx, dy, dw, dh)) = present::fit_rects(iw, ih, ow, oh);
-		let px = dx + (nx * iw - sx) * (dw / sw.max(1.0));
-		let py = dy + (ny * ih - sy) * (dh / sh.max(1.0));
+		// Host-pixel → displayed-pixel scale (the same factor the position uses). The
+		// side-channel cursor bitmap/hotspot arrive in raw host pixels, so its drawn
+		// size AND hotspot must scale by this too or the tip mis-aligns / shape is the
+		// wrong size whenever the video isn't shown at 1:1 host resolution.
+		let (kx, ky) = (dw / sw.max(1.0), dh / sh.max(1.0));
+		let px = dx + (nx * iw - sx) * kx;
+		let py = dy + (ny * ih - sy) * ky;
 		let pos = egui::pos2(
-			(px - self.cursor_hot.0) / OVERLAY_PPP,
-			(py - self.cursor_hot.1) / OVERLAY_PPP,
+			(px - self.cursor_hot.0 * kx) / OVERLAY_PPP,
+			(py - self.cursor_hot.1 * ky) / OVERLAY_PPP,
 		);
 		let size = egui::vec2(
-			self.cursor_dims.0 / OVERLAY_PPP,
-			self.cursor_dims.1 / OVERLAY_PPP,
+			self.cursor_dims.0 * kx / OVERLAY_PPP,
+			self.cursor_dims.1 * ky / OVERLAY_PPP,
 		);
 		Some((pos, tex.id(), size))
 	}
@@ -1058,7 +1078,10 @@ impl Renderer {
 		};
 		self.dec_ms_acc += dec_t0.elapsed().as_secs_f32() * 1000.0;
 		self.dec_n += 1;
-		if let Some(nv12) = texs.into_iter().last() {
+		// Present EVERY decoded frame in order: a single decode() drain can yield more than one
+		// NV12 texture (multi-frame batch), and dropping all but the last silently loses frames
+		// (micro-stutter). In steady state this is exactly one frame, so the loop is a no-op there.
+		for nv12 in texs {
 			self.show_frame(&nv12);
 		}
 	}
@@ -1070,6 +1093,12 @@ impl Renderer {
 		nv12.GetDesc(&mut td);
 		let (sw, sh) = (td.Width, td.Height);
 		if self.present.is_none() || sw != self.src_w || sh != self.src_h {
+			// Resolution changed (or first frame): the held frame is now stale for the
+			// resized processor — drop it so repaint_idle can't re-Blt a mismatched texture
+			// (it is replaced with this fresh frame at the end of show_frame anyway).
+			if sw != self.src_w || sh != self.src_h {
+				self.last_nv12 = None;
+			}
 			self.src_w = sw;
 			self.src_h = sh;
 			// Report the STREAM pixel size on stdout (first frame + live resolution
@@ -1105,10 +1134,43 @@ impl Renderer {
 			None => false,
 		};
 		if drawn {
+			// Retain this frame so a later video STALL can re-present it under the overlay
+			// instead of freezing (see repaint_idle). Cheap COM refcount bump on an owned
+			// single-slice texture.
+			self.last_nv12 = Some(nv12.clone());
 			self.paint_overlay(); // egui over the video (no-op unless OPEN)
 			let _ = self.swap.Present(0, Default::default());
 			self.tick_fps();
 		}
+	}
+
+	/// Idle repaint during a video STALL (no fresh AU this tick): re-Blt the LAST decoded
+	/// frame onto the back buffer, paint the overlay/HUD/cursor over it, and Present — so the
+	/// egui overlay (and the side-channel cursor / closed-state chrome) stays live and
+	/// responsive while the host video is paused/frozen, instead of being painted only on a
+	/// freshly-decoded frame. Linux-parity: linux.rs re-presents `last` + overlay every vsync.
+	/// The caller rate-caps this (~60 Hz). With FLIP_DISCARD the back buffer is undefined after
+	/// Present, so we MUST re-Blt the last frame (not rely on stale content); if there is no
+	/// last frame yet, dark-clear so the overlay still has a surface.
+	unsafe fn repaint_idle(&mut self) {
+		let back = match self.swap.GetBuffer::<ID3D11Texture2D>(0).ok() {
+			Some(b) => b,
+			None => return,
+		};
+		// Re-present the last frame if we have one + a live processor; otherwise dark-clear so
+		// the overlay still paints (matches clear()'s pre-first-frame background).
+		let drawn = match (self.last_nv12.clone(), self.present.as_ref()) {
+			(Some(nv12), Some(p)) => p.blt(&nv12, &back).is_ok(),
+			_ => false,
+		};
+		if !drawn {
+			if let Some(rtv) = self.rtv.as_ref() {
+				let c = [0.02f32, 0.02, 0.03, 1.0];
+				self.context.ClearRenderTargetView(rtv, &c);
+			}
+		}
+		self.paint_overlay(); // egui over the (re-presented) video — no-op unless OPEN or chrome
+		let _ = self.swap.Present(0, Default::default());
 	}
 
 	/// Emit a `vidsink-fps <fps> <w>x<h>` HUD line once per second (same as the Linux backend).
@@ -1357,9 +1419,13 @@ unsafe fn event_loop(
 				|au| {
 					let mut g = q.lock().unwrap();
 					// Bound the backlog (low latency): keep at most a few AUs; on overflow drop
-					// the oldest non-key so we never play seconds-late video.
+					// the oldest non-key so we never play seconds-late video. Dropping a keyframe
+					// would orphan every P-frame after it (green/mosaic until the next IDR), so
+					// skip keys and only drop the oldest delta; if the backlog is somehow all
+					// keyframes, drop the oldest of those to keep latency bounded.
 					if g.len() >= 8 {
-						g.pop_front();
+						let drop_idx = g.iter().position(|au| !au.key).unwrap_or(0);
+						g.remove(drop_idx);
 					}
 					g.push_back(au);
 				},
@@ -1371,6 +1437,9 @@ unsafe fn event_loop(
 	// Pump Win32 messages + drain decode + present.
 	let mut msg = MSG::default();
 	let mut cursor_hidden = false;
+	// Rate-cap the idle (video-stall) overlay repaint to ~60 Hz so a frozen/paused host
+	// doesn't pin the CPU re-presenting the same frame every 2 ms loop tick.
+	let mut last_idle_paint = std::time::Instant::now();
 	loop {
 		while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
 			let _ = TranslateMessage(&msg);
@@ -1402,6 +1471,22 @@ unsafe fn event_loop(
 		if aus.is_empty() {
 			if r.decoder.is_none() {
 				r.clear(); // nothing decoded yet → dark background
+			} else {
+				// Video has stalled (host paused — e.g. for the overlay — minimized, or a
+				// network/encode hiccup). Keep the overlay/HUD/side-cursor LIVE and
+				// responsive instead of freezing on the last frame: drain the queued wndproc
+				// input and re-present the last frame + overlay, capped at ~60 Hz. Only when
+				// there is actually chrome to draw (overlay open OR any closed-state HUD /
+				// open-button / hint / side-cursor) so a plain frozen frame stays idle.
+				let chrome = OPEN.load(Ordering::SeqCst)
+					|| STATS_HUD.load(Ordering::SeqCst)
+					|| OVERLAY_BTN.load(Ordering::SeqCst)
+					|| HINT.lock().unwrap().is_some()
+					|| CURSOR_POS.lock().unwrap().is_some();
+				if chrome && last_idle_paint.elapsed() >= std::time::Duration::from_millis(16) {
+					r.repaint_idle();
+					last_idle_paint = std::time::Instant::now();
+				}
 			}
 			std::thread::sleep(std::time::Duration::from_millis(2));
 		} else {

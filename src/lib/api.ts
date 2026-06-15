@@ -58,6 +58,8 @@ export {
 	onSessionEvent,
 	onAuthPrompt,
 	onNodePort,
+	onNodeId,
+	onNodeVersionError,
 	onSessionPassword
 } from './api.events';
 
