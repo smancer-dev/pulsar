@@ -276,6 +276,13 @@ Windows — keep this straight:
 - **Rendezvous gotcha:** a host that serves LAN clients must register with the relay using
   its **LAN IP**, not `127.0.0.1` — otherwise the relay hands clients a loopback address and
   P2P/auth never completes (`Config.relay`).
+- **Auto-update → the appliance runs the AppImage, not the raw binary.** Tauri's Linux
+  updater self-replaces the running **AppImage** (`$APPIMAGE`), so the deployed Orange Pi
+  kiosk launches the release's `Pulsar_<ver>_aarch64.AppImage` (FUSE/libfuse2 required), e.g.
+  `setsid env DISPLAY=:0 … ./Pulsar.AppImage --connect <id> --mode game`. A `--connect` kiosk
+  checks for updates **on boot, before connecting** (8 s timeout), so it self-updates between
+  sessions and never mid-session. The raw `--no-bundle` binary is still fine for fast dev test
+  loops, but it CANNOT self-update. See `docs/superpowers/specs/2026-06-14-auto-update-design.md`.
 
 ## What's complete vs. scaffolded
 
