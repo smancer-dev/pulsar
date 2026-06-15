@@ -363,6 +363,12 @@
 		// nothing). Remote mode always carries an empty gameId.
 		const ac = await api.autoConnectTarget().catch(() => null);
 		if (ac && ac.id) {
+			// Appliance/kiosk (CLI --connect): update on BOOT, before connecting. If an
+			// update installs, the app relaunches and never reaches startConnect below;
+			// otherwise we continue into the session. A short timeout keeps boot moving
+			// when the update endpoint is unreachable. Mid-session is never interrupted
+			// (this is the launch path only).
+			await silentUpdateCheck({ timeoutMs: 8000 });
 			autoPw = ac.pw ?? '';
 			const m = ac.mode === 'game' ? 'game' : 'remote';
 			const gameId = m === 'game' ? (ac.app || '') : '';

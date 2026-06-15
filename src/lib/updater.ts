@@ -8,9 +8,9 @@ import { relaunch } from '@tauri-apps/plugin-process';
  * remote control. Any failure (offline, signature, download, no Tauri context)
  * is swallowed so a broken updater can never block launch.
  */
-export async function silentUpdateCheck(): Promise<void> {
+export async function silentUpdateCheck(opts?: { timeoutMs?: number }): Promise<void> {
 	try {
-		const update = await check();
+		const update = await check(opts?.timeoutMs ? { timeout: opts.timeoutMs } : undefined);
 		if (!update) return; // already up to date
 		await update.downloadAndInstall();
 		// Installed; relaunch into the new version.
