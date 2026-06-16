@@ -92,6 +92,10 @@ static CURSOR_POS: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(
 static CURSOR_IMG: std::sync::Mutex<Option<CursorImg>> = std::sync::Mutex::new(None);
 /// Bumped on every new `cursorimg` so the render loop knows to re-upload the egui texture.
 static CURSOR_IMG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Session mode set at spawn via `--mode` and live-updatable via the `mode game|remote` stdin
+/// command. The render loop reads this each frame so a cross-session mode change (game→remote
+/// or vice-versa) takes effect without a renderer restart. `false` = Game, `true` = Remote.
+static MODE_REMOTE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct CursorImg {
@@ -237,6 +241,9 @@ pub fn run() {
 	}
 
 	video::set_pace(pace);
+	// Seed the MODE_REMOTE atomic so the render loop and the live `mode` command see the
+	// correct initial mode parsed from `--mode`.
+	MODE_REMOTE.store(mode == Mode::Remote, Ordering::SeqCst);
 	// Adaptive pacing ceiling by mode: game prizes min latency (buffer ≤2), remote tolerates one
 	// more frame for smoothness (≤3). Within the QCAP hard cap; the pacer trims toward 1 at rest.
 	video::set_pace_ceiling(match mode {
@@ -393,6 +400,17 @@ pub fn run() {
 				Some("rtt") => {
 					if let Some(ms) = it.next().and_then(|v| v.parse::<f32>().ok()) {
 						RTT_DMS.store((ms * 10.0) as u32, Ordering::Relaxed);
+					}
+				}
+				// Live mode switch for cross-session reconnects (game→remote or remote→game).
+				// Updates the MODE_REMOTE atomic; the render loop re-reads it each frame so
+				// OverlayState.mode and the pace ceiling update on the very next frame paint
+				// without a renderer restart.
+				Some("mode") => {
+					if let Some(v) = it.next() {
+						let remote = v == "remote";
+						MODE_REMOTE.store(remote, Ordering::SeqCst);
+						video::set_pace_ceiling(if remote { 3 } else { 2 });
 					}
 				}
 				// Live codec switch: reopen the demuxer+decoder on a rewritten SDP IN PLACE —
@@ -810,6 +828,13 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 				state.host_active = he.clone();
 			}
 		}
+		// Live mode switch: `mode game|remote` on stdin flips MODE_REMOTE; we mirror it
+		// into state.mode each frame so the overlay menu boxes + look update immediately.
+		state.mode = if MODE_REMOTE.load(Ordering::SeqCst) {
+			Mode::Remote
+		} else {
+			Mode::Game
+		};
 		state.stats_hud = STATS_HUD.load(Ordering::SeqCst);
 		state.overlay_btn = OVERLAY_BTN.load(Ordering::SeqCst);
 		state.btn_pos = *OVBTN_POS.lock().unwrap();

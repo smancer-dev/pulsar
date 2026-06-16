@@ -83,6 +83,11 @@
 	let config = $state<Config | null>(null);
 	let connecting = $state(false);
 	let connError = $state('');
+	// Set to true when the relay rejects us with an incompatible protocol version.
+	// Blocks the auto-retry effect so the app stays offline with the "update required"
+	// message instead of hammering the relay it can never join.  Cleared only when
+	// the user explicitly triggers a new connection (config change → goOnline).
+	let versionBlocked = $state(false);
 	// Multiple concurrent host connections (tabs), the active tab, fullscreen, and the
 	// connect/disconnect lifecycle live in the session manager.
 	const sm = new SessionManager({ getMode: () => mode, onAuthDone: (target) => closePwFor(target) });
@@ -166,6 +171,10 @@
 	// Bind + register with the configured relay. Re-runnable: called on startup,
 	// on manual retry, and whenever the relay/network settings change.
 	async function goOnline() {
+		// A user-initiated or config-driven goOnline call clears the version-blocked
+		// guard so the auto-retry effect can resume if the new registration also fails
+		// for a transient reason (not a version mismatch).
+		versionBlocked = false;
 		connecting = true;
 		connError = '';
 		try {
@@ -197,7 +206,18 @@
 	$effect(() => {
 		if (configTick.n === lastConfigTick || isPopup || !isTauri) return;
 		lastConfigTick = configTick.n;
-		api.getConfig().then((c) => (config = c)).catch(() => {});
+		api.getConfig().then((c) => {
+			const wasUnattended = config?.unattended_access ?? true;
+			config = c;
+			// Proactively mint an OTP when unattended access is toggled OFF while
+			// online: the lazy per-connection mint (host.rs) runs AFTER a client
+			// connects, but the client needs the code before it can connect —
+			// chicken-and-egg.  Minting here makes the code visible on the Home
+			// screen the instant the host is re-secured.
+			if (online && wasUnattended && !c.unattended_access && !selfPw) {
+				api.newPassword().then((pw) => { selfPw = pw; }).catch(() => {});
+			}
+		}).catch(() => {});
 	});
 
 	// Unattended hosts must come online without a human: a machine that boots before
@@ -210,6 +230,11 @@
 			if (online) retryDelay = 0; // a real success re-arms the fresh backoff
 			return;
 		}
+		// Do NOT auto-retry when the relay rejected us with an incompatible protocol
+		// version: every attempt would fail the same way and would overwrite the
+		// "update required" message with the generic "will retry" text.  The user must
+		// update the app; goOnline() clears this flag when explicitly called again.
+		if (versionBlocked) return;
 		retryDelay = retryDelay > 0 ? Math.min(12_000, retryDelay * 2) : 3000;
 		const tmr = setTimeout(goOnline, retryDelay);
 		return () => clearTimeout(tmr);
@@ -312,6 +337,7 @@
 		// stale (unreachable) ID. Auto-retry is intentionally NOT triggered here
 		// (every re-register would be refused too) — the user must update first.
 		onNodeVersionError(() => {
+			versionBlocked = true;
 			online = false;
 			selfId = '—';
 			selfPw = '';
@@ -510,7 +536,7 @@
 		api.publishGames($state.snapshot(gameStore.games)).catch(() => {});
 	});
 
-	// Keep the core's host stream settings in sync (resolution/fps/bitrate/encoder).
+	// Keep the core's host stream settings in sync (resolution/fps/bitrate/encoder/hdr).
 	$effect(() => {
 		if (isPopup) return;
 		const res = gameStore.host.resolution;
@@ -521,7 +547,8 @@
 				height,
 				fps: gameStore.host.fps,
 				bitrate_kbps: gameStore.host.bitrate * 1000,
-				encoder: ui.encoder
+				encoder: ui.encoder,
+				hdr: ui.hdr
 			})
 			.catch(() => {});
 	});

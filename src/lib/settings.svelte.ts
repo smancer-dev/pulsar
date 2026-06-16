@@ -29,9 +29,6 @@ export interface UiSettings {
 	tray: boolean;
 	/** Show the verbose host activity log under "connected devices". */
 	debug: boolean;
-	/** Keep the in-session control handle/menu visible at all times (even fullscreen /
-	 * while controlling). Default on; turn off to let it auto-hide while controlling. */
-	keepVisible: boolean;
 	/** Moonlight-style frame pacing on the Linux native renderer: buffer ~1-2 frames and
 	 * present at a steady cadence to smooth network/decode jitter (slightly higher latency).
 	 * Off = present newest immediately (lowest latency). */
@@ -92,7 +89,6 @@ const DEFAULTS: UiSettings = {
 	record: false,
 	tray: true,
 	debug: false,
-	keepVisible: true,
 	framePacing: true,
 	statsHud: false,
 	overlayButton: true,

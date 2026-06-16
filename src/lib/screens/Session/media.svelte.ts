@@ -170,7 +170,13 @@ export class SessionMedia {
 				if (this.#in.switching()) {
 					this.#staleSecs = 0;
 					this.stalled = false;
-					this.#lastVStatsAt = 0;
+					// Reset #rawFps so the stall detector re-arms via the `#rawFps <= 0`
+					// path after the switch window ends — even if the renderer died and
+					// no new vstats arrive. Do NOT zero #lastVStatsAt: if we did, then
+					// after a dead switch both #rawFps and statsSilent would be false
+					// (lastVStatsAt=0 makes statsSilent=false) and the detector would
+					// never trip, permanently disarming it for the rest of the session.
+					this.#rawFps = 0;
 					return;
 				}
 				if (this.hasVideo) {

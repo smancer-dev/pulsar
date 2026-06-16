@@ -346,7 +346,6 @@ export const en: Dict = {
 	'session.secSession': 'Session',
 	'session.audioTransmit': 'Transmit host audio',
 	'session.audioMute': 'Mute host',
-	'session.keepVisible': 'Keep menu visible',
 	'session.av1Native': 'AV1 isn’t supported in the in-app viewer yet — enable the native viewer (settings) or pick H.264/H.265.',
 	'session.controlOffSame':
 		'Control disabled on the same device · use a second device for remote control',

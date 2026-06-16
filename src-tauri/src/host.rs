@@ -616,26 +616,46 @@ pub(crate) async fn go_online(
 									.ok()
 									.flatten();
 									if confirm == Some(size) {
+										// Re-read the freshest StreamReq AFTER the confirm sleep so
+										// we don't clobber a client request that arrived during those
+										// 700 ms (e.g. monitor switch, codec change, resolution pick).
+										let fresh_req =
+											last_req_store.lock().unwrap().clone();
+										let Some(fresh_req) = fresh_req else {
+											// Session was torn down during the sleep — nothing to do.
+											continue;
+										};
+										// If the client switched to a different display during the
+										// confirm window, skip this watcher-triggered restream
+										// entirely: the client's own StartStream already restarted
+										// capture on the new monitor; firing again with the old idx
+										// would override that switch.
+										if fresh_req.display_idx != idx {
+											// Re-baseline to the new display so the next poll starts
+											// fresh for whatever monitor the client is now on.
+											baseline = Some((fresh_req.display_idx, size));
+											continue;
+										}
 										tracing::info!(
 											display_idx = idx,
 											w = size.0,
 											h = size.1,
 											"host display mode changed -> restarting capture"
 										);
-											// Channel full (a prior restart still in flight) → skip
-											// this send but keep looping; next poll re-detects delta.
-											// Closed → session torn down; exit the watcher.
-											match restream_tx.try_send(req) {
-												Ok(_) => {
-													baseline = Some((idx, size));
-												}
-												Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-													// Don't update baseline — next poll must still see the delta.
-												}
-												Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-													break;
-												}
+										// Channel full (a prior restart still in flight) → skip
+										// this send but keep looping; next poll re-detects delta.
+										// Closed → session torn down; exit the watcher.
+										match restream_tx.try_send(fresh_req) {
+											Ok(_) => {
+												baseline = Some((idx, size));
 											}
+											Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+												// Don't update baseline — next poll must still see the delta.
+											}
+											Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+												break;
+											}
+										}
 									}
 								}
 								_ => {}
@@ -1381,14 +1401,33 @@ pub(crate) async fn go_online(
 			if let Some(d) = &watch_disc {
 				d.set_id(None).await;
 			}
-			// Drop the node (and with it the heartbeat loop's strong ref) so it
-			// exits: access AppState through the AppHandle, which is Clone + 'static.
-			watch_app
-				.state::<AppState>()
-				.node
-				.lock()
-				.unwrap()
-				.take();
+			// Perform the same deterministic teardown that go_online does at its top so
+			// the serve task, all per-session tasks, and the node (with its UDP socket +
+			// heartbeat) are actually released — not just the AppState strong reference.
+			// A bare node.take() only drops ONE Arc while serve_handle and every live
+			// session task each hold their own strong clone; those keep the heartbeat
+			// pinging an incompatible relay and the UDP socket bound indefinitely.
+			let state = watch_app.state::<AppState>();
+			let mut teardown_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+			if let Some(h) = state.serve_task.lock().unwrap().take() {
+				h.abort();
+				teardown_handles.push(h);
+			}
+			for h in state.session_tasks.lock().unwrap().drain(..) {
+				h.abort();
+				teardown_handles.push(h);
+			}
+			for h in teardown_handles {
+				let _ = h.await;
+			}
+			// Second drain — close the teardown-accept race: after serve_task has been
+			// awaited its last synchronous accept→spawn may have pushed a new handle.
+			let late_handles: Vec<_> = state.session_tasks.lock().unwrap().drain(..).collect();
+			for h in late_handles {
+				h.abort();
+				let _ = h.await;
+			}
+			let _ = state.node.lock().unwrap().take();
 			// Emit the version-error event — the UI sets online=false and shows the
 			// "update required" message (same text as the initial-register path).
 			let _ = watch_app.emit("node-version-error", ());

@@ -64,12 +64,18 @@ pub(crate) async fn set_language(
 /// Remove the TOFU-pinned key for a peer id from `known_peers.json`. Called when
 /// the user acknowledges an `IdentityChanged` error and wants to accept the peer's
 /// new identity — the next connect will re-pin via TOFU. `id` is the target in any
-/// format `DeviceId::parse` accepts ("641724395" or "641 724 395").
+/// format `DeviceId::parse` accepts ("641724395" or "641 724 395"). The pin is
+/// scoped to the current relay endpoint so that pins on other relays are unaffected.
 #[tauri::command]
-pub(crate) async fn forget_peer(app: AppHandle, id: String) -> Result<(), String> {
+pub(crate) async fn forget_peer(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	id: String,
+) -> Result<(), String> {
 	let device_id =
 		pulsar_core::proto::DeviceId::parse(&id).ok_or_else(|| crate::i18n::t("err.badTarget").to_string())?;
-	forget_peer_key(&app, &device_id);
+	let relay = state.config.lock().unwrap().relay.clone();
+	forget_peer_key(&app, &relay, &device_id);
 	Ok(())
 }
 
@@ -282,8 +288,11 @@ pub(crate) async fn list_remote_games(
 		.ok_or(crate::i18n::t("err.online"))?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let disc = state.discovery.lock().unwrap().clone();
-	let net_mode = state.config.lock().unwrap().network_mode;
-	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
+	let (net_mode, relay) = {
+		let cfg = state.config.lock().unwrap();
+		(cfg.network_mode, cfg.relay.clone())
+	};
+	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
 	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
 		.await?
 	{
@@ -308,8 +317,11 @@ pub(crate) async fn launch_remote_game(
 		.ok_or(crate::i18n::t("err.online"))?;
 	let (pw_pending, next_auth) = (state.pw_pending.clone(), state.next_auth.clone());
 	let disc = state.discovery.lock().unwrap().clone();
-	let net_mode = state.config.lock().unwrap().network_mode;
-	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
+	let (net_mode, relay) = {
+		let cfg = state.config.lock().unwrap();
+		(cfg.network_mode, cfg.relay.clone())
+	};
+	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
 	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
 		.await?
 	{
@@ -333,8 +345,11 @@ pub(crate) async fn connect(
 		.clone()
 		.ok_or(crate::i18n::t("err.online"))?;
 	let disc = state.discovery.lock().unwrap().clone();
-	let net_mode = state.config.lock().unwrap().network_mode;
-	let (sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
+	let (net_mode, relay) = {
+		let cfg = state.config.lock().unwrap();
+		(cfg.network_mode, cfg.relay.clone())
+	};
+	let (sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
 	let transport = match sess.transport() {
 		Transport::Direct => "direct",
 		Transport::Relay => "relay",

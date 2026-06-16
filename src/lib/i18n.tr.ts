@@ -344,8 +344,7 @@ export const tr: Dict = {
 	'session.secVideo': 'Görüntü',
 	'session.secSession': 'Oturum',
 	'session.audioTransmit': 'Hosttan ses aktar',
-	'session.audioMute': 'Host’u sustur',
-	'session.keepVisible': 'Menü hep görünsün',
+	'session.audioMute': "Host'u sustur",
 	'session.av1Native': 'AV1 uygulama içi görüntüleyicide henüz desteklenmiyor — yerel görüntüleyiciyi (ayarlar) aç ya da H.264/H.265 seç.',
 	'session.controlOffSame':
 		'Aynı cihazda kontrol kapalı · uzaktan kontrol için 2. bir cihaz kullan',

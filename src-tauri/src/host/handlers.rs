@@ -141,10 +141,10 @@ pub(super) fn spawn_loopback_audio(
 						None => return, // can't respawn (e.g. ffmpeg gone) → give up on audio
 					};
 					let new_pid = new_child.id();
-					{
-						// Under the same lock teardown/(re)stream drain `procs`: if our old
-						// child is already gone the session moved on, so don't track the new
-						// one (it would be an untracked orphan) — kill it and stop.
+					// Under the same lock teardown/(re)stream drain `procs`: if our old
+					// child is already gone the session moved on, so don't track the new
+					// one (it would be an untracked orphan) — kill it and stop.
+					let mut old = {
 						let mut g = procs.lock().unwrap();
 						let Some(idx) = g.iter().position(|c| c.id() == cur_pid) else {
 							drop(g);
@@ -152,11 +152,13 @@ pub(super) fn spawn_loopback_audio(
 							let _ = new_child.kill();
 							return;
 						};
-						let mut old = g.remove(idx);
-						let _ = old.kill();
-						let _ = old.wait();
+						let old = g.remove(idx);
 						g.push(new_child);
-					}
+						old
+						// lock released here, before wait()
+					};
+					let _ = old.kill();
+					let _ = old.wait();
 					stdin = new_stdin;
 					cur_fmt = new_fmt;
 					cur_pid = new_pid;

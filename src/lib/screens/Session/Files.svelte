@@ -84,19 +84,52 @@
 		return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
 	}
 
-	function download(name: string) {
-		flash(t('files.downloading', { name }));
-		api.fsGet(playId, join(remotePath, name)).catch(() => flash(t('files.downloadFail', { name })));
+	// ── Transfer concurrency guard ────────────────────────────────────────────
+	// The Rust reassemblers (handlers.rs / hold.rs) cap concurrent in-flight
+	// transfers at MAX_CONCURRENT_XFERS=8 and evict the oldest active entry when
+	// the cap is reached, which silently fails the evicted transfer.  To prevent
+	// that, we limit the number of transfers we put on the wire at once to
+	// MAX_WIRE_XFERS (< 8) and queue the rest; each completed transfer (resolved
+	// or rejected) drains one item from the queue.
+	const MAX_WIRE_XFERS = 6; // safely below the reassembler cap of 8
+	let activeXfers = 0;
+	const xferQueue: Array<() => void> = [];
+
+	/** Run `fn` now if under the wire limit, otherwise enqueue it. */
+	function enqueueXfer(fn: () => Promise<void>): void {
+		if (activeXfers < MAX_WIRE_XFERS) {
+			startXfer(fn);
+		} else {
+			xferQueue.push(() => startXfer(fn));
+		}
 	}
 
-	async function upload(name: string) {
+	function startXfer(fn: () => Promise<void>): void {
+		activeXfers++;
+		fn().finally(() => {
+			activeXfers--;
+			const next = xferQueue.shift();
+			if (next) next();
+		});
+	}
+
+	function download(name: string) {
+		flash(t('files.downloading', { name }));
+		enqueueXfer(() =>
+			api.fsGet(playId, join(remotePath, name)).catch(() => flash(t('files.downloadFail', { name })))
+		);
+	}
+
+	function upload(name: string) {
 		flash(t('session.fileSending', { name }));
-		try {
-			await api.sendFilePath(playId, join(localPath, name));
-			flash(t('session.fileSent', { name }));
-		} catch {
-			flash(t('session.fileError', { name }));
-		}
+		enqueueXfer(async () => {
+			try {
+				await api.sendFilePath(playId, join(localPath, name));
+				flash(t('session.fileSent', { name }));
+			} catch {
+				flash(t('session.fileError', { name }));
+			}
+		});
 	}
 </script>
 

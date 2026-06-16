@@ -282,6 +282,10 @@ pub(crate) struct StreamCfg {
 	pub(crate) capture: String,
 	pub(crate) display: String,
 	pub(crate) vaapi_device: String,
+	/// Request HDR encoding (Settings → Display → "HDR aktar"). The env var
+	/// PULSAR_HDR is a debug override that wins if set; the UI toggle is
+	/// the normal production path.
+	pub(crate) hdr: bool,
 }
 
 impl Default for StreamCfg {
@@ -295,6 +299,7 @@ impl Default for StreamCfg {
 			capture: "auto".into(),
 			display: std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into()),
 			vaapi_device: "/dev/dri/renderD128".into(),
+			hdr: false,
 		}
 	}
 }

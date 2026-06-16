@@ -59,6 +59,7 @@ pub(super) async fn hold_session(
 	req_fps: u32,
 	base_kbps: u32,
 	cursor_external: bool,
+	req_hdr: bool,
 ) {
 	let mut keep = tokio::time::interval(std::time::Duration::from_secs(2));
 	keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -132,6 +133,9 @@ pub(super) async fn hold_session(
 	} else {
 		QualityPref::Quality
 	};
+	// HDR preference from the UI toggle (Settings → Display). The PULSAR_HDR env var
+	// is a debug override: if set it wins regardless of the UI value.
+	let cur_hdr = req_hdr || std::env::var_os("PULSAR_HDR").is_some();
 	// Inbound file reassembly (file-manager downloads — the host streams an FsGet
 	// back as FileBegin/Chunk/End): Begin → state, Chunk → store BY INDEX,
 	// End → save under "Pulsar Alınanlar". The session transport is unordered UDP,
@@ -563,7 +567,7 @@ pub(super) async fn hold_session(
 							game_mode,
 							bitrate_kbps: cur_bitrate,
 							quality: cur_quality,
-							hdr: std::env::var_os("PULSAR_HDR").is_some(),
+							hdr: cur_hdr,
 							yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
 							decode_codecs: decode_codecs.clone(),
 							media_over_session: mos,
@@ -621,9 +625,8 @@ pub(super) async fn hold_session(
 						game_mode,
 						bitrate_kbps: cur_bitrate,
 						quality: cur_quality,
-						// Preserve the HDR/4:4:4 preference across live re-requests (same env
-						// source as the initial request in play.rs).
-						hdr: std::env::var_os("PULSAR_HDR").is_some(),
+						// Preserve the HDR/4:4:4 preference across live re-requests.
+						hdr: cur_hdr,
 						yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
 						decode_codecs: decode_codecs.clone(),
 						media_over_session: mos,

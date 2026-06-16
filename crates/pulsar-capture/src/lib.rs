@@ -274,10 +274,18 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 				//    falls back to ffmpeg; on a later (switch) build it tears the stream down (the
 				//    host can re-request).
 				// `announced` is the "already streaming" flag — true ⇒ this is an in-session SWITCH
-				// (or revert) build, so use the SHORT transient-retry budget: a switch to a
-				// fullscreen monitor must not freeze video for ~5 s (and the revert would pay it
+				// (or revert) build, so normally we use the SHORT transient-retry budget: a switch to
+				// a fullscreen monitor must not freeze video for ~5 s (and the revert would pay it
 				// again). The initial build (announced=false) keeps the long budget. (B30)
-				let mut cap = match dxgi::CaptureDevice::create(output_idx, stop_t.clone(), announced) {
+				//
+				// EXCEPTION (C3): a same-index rebuild triggered by RunExit::Switch(output_idx) is a
+				// RESOLUTION CHANGE on the SAME monitor (pacing.rs:147-150), NOT a cross-monitor
+				// switch. There is nowhere to revert (prev_good_output == output_idx), so the short
+				// budget converts a transient >600ms unavailability (e.g. a fullscreen-exclusive game
+				// taking the output) into permanent thread death. Use the LONG budget for same-index
+				// rebuilds so the mode transition resolves within ~5 s and capture recovers.
+				let fast_transient = announced && output_idx != prev_good_output;
+				let mut cap = match dxgi::CaptureDevice::create(output_idx, stop_t.clone(), fast_transient) {
 					Ok(c) => c,
 					Err(e) => {
 						if !announced {

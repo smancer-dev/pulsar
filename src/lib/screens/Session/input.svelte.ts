@@ -193,6 +193,12 @@ export class SessionInput {
 			this.#in.mode() === 'remote' &&
 			e.key.length === 1 &&
 			e.key.codePointAt(0)! >= 0x20 &&
+			// Space and Tab carry positional/VK semantics (button activation, focus, pan, scroll,
+			// page-down) that Unicode text injection (KEYEVENTF_UNICODE / CGEvent set_string)
+			// cannot reproduce — Win32 controls and browsers react to VK_SPACE/VK_TAB key events,
+			// not WM_CHAR. Exclude them so they take the evdev/VK Key path even in remote mode.
+			e.code !== 'Space' &&
+			e.code !== 'Tab' &&
 			!isShortcut;
 		// Char path is resolved BEFORE the evdev-code guard: international/ISO keys
 		// (IntlBackslash, IntlRo, IntlYen, etc.) have no entry in the EVDEV table so

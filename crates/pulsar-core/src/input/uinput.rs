@@ -288,13 +288,21 @@ impl DesktopInput {
 			return;
 		};
 		let code = key.code();
+		// If Shift is already physically held by the client (tracked in held_keys), do NOT
+		// emit a synthetic LEFTSHIFT down/up around the keytap. The kernel already sees Shift
+		// held and will produce the shifted character on its own. Adding a trailing
+		// LEFTSHIFT(0) would release the host's held Shift at the kernel/X layer even though
+		// the client's Shift key is still down — the held_keys set and the actual kernel
+		// modifier state would diverge, breaking subsequent Shift+Arrow / Shift+Home / etc.
+		let shift_already_held = self.held_keys.contains(&Key::KEY_LEFTSHIFT.code())
+			|| self.held_keys.contains(&Key::KEY_RIGHTSHIFT.code());
 		let mut ev = Vec::with_capacity(4);
-		if shift {
+		if shift && !shift_already_held {
 			ev.push(InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 1));
 		}
 		ev.push(InputEvent::new(EventType::KEY, code, 1));
 		ev.push(InputEvent::new(EventType::KEY, code, 0));
-		if shift {
+		if shift && !shift_already_held {
 			ev.push(InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 0));
 		}
 		let _ = self.keyboard.emit(&ev);

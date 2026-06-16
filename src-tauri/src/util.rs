@@ -63,13 +63,27 @@ fn known_peers_path(app: &AppHandle) -> PathBuf {
 		.join("known_peers.json")
 }
 
-/// The pinned public key for a canonical 9-digit relay id, if we've connected to it
-/// before. Keyed by the despaced digits so "641 724 395" and "641724395" are one peer
-/// (mirrors the frontend `peers` store's `normalizeId`).
-fn known_peer_key(app: &AppHandle, id: &DeviceId) -> Option<PublicKey> {
+/// Compose the `known_peers.json` map key from a relay endpoint and a device id.
+///
+/// IDs are minted per-relay (each relay's `by_pubkey` is independent), so the same
+/// 9-digit ID legitimately denotes DIFFERENT devices on different relays.  Scoping
+/// the pin to `(relay, id)` prevents a TOFU pin learned on relay A from
+/// short-circuiting (or hard-failing) a connect made through relay B, which is the
+/// C17 bug: switching to a self-hosted relay where the same ID maps to a different
+/// device made that device permanently unconnectable.
+fn peer_key_entry(relay: &str, id: &DeviceId) -> String {
+	// Normalise the relay string: strip surrounding whitespace and lower-case so that
+	// "127.0.0.1:21116" and "127.0.0.1:21116 " aren't two different scopes.
+	format!("{}/{}", relay.trim().to_ascii_lowercase(), id.0)
+}
+
+/// The pinned public key for a device id on a specific relay, if we've connected to it
+/// before. Keyed by (relay, id) — see `peer_key_entry` — so that a pin learned on one
+/// relay does not influence connects made through a different relay.
+fn known_peer_key(app: &AppHandle, relay: &str, id: &DeviceId) -> Option<PublicKey> {
 	let raw = std::fs::read_to_string(known_peers_path(app)).ok()?;
 	let map: std::collections::HashMap<String, String> = serde_json::from_str(&raw).ok()?;
-	let hex = map.get(&id.0.to_string())?;
+	let hex = map.get(&peer_key_entry(relay, id))?;
 	let mut key = [0u8; 32];
 	if hex.len() != 64 {
 		return None;
@@ -80,18 +94,18 @@ fn known_peer_key(app: &AppHandle, id: &DeviceId) -> Option<PublicKey> {
 	Some(key)
 }
 
-/// Remove the pinned key for `id` from known_peers.json, so the next connect
-/// re-pins via TOFU. Called by the `forget_peer` Tauri command when the user
-/// confirms they want to accept a new identity behind a known relay ID (e.g. after
-/// `ConnError::IdentityChanged` is surfaced as a UI prompt).
-pub(crate) fn forget_peer_key(app: &AppHandle, id: &DeviceId) {
+/// Remove the pinned key for `(relay, id)` from known_peers.json, so the next
+/// connect re-pins via TOFU. Called by the `forget_peer` Tauri command when the
+/// user confirms they want to accept a new identity behind a known relay ID (e.g.
+/// after `ConnError::IdentityChanged` is surfaced as a UI prompt).
+pub(crate) fn forget_peer_key(app: &AppHandle, relay: &str, id: &DeviceId) {
 	let path = known_peers_path(app);
 	let _guard = PEERS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 	let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(&path)
 		.ok()
 		.and_then(|raw| serde_json::from_str(&raw).ok())
 		.unwrap_or_default();
-	let entry = id.0.to_string();
+	let entry = peer_key_entry(relay, id);
 	if !map.contains_key(&entry) {
 		return; // nothing to do
 	}
@@ -101,11 +115,11 @@ pub(crate) fn forget_peer_key(app: &AppHandle, id: &DeviceId) {
 	}
 }
 
-/// Record the pubkey first seen behind a relay id (TOFU). No-op if already pinned —
-/// a later key change must NOT silently overwrite the pin (that is the very
-/// substitution we guard against), so `connect_pinned` rejects the mismatched
+/// Record the pubkey first seen behind `(relay, id)` (TOFU). No-op if already
+/// pinned — a later key change must NOT silently overwrite the pin (that is the
+/// very substitution we guard against), so `connect_pinned` rejects the mismatched
 /// connect upstream and this is never reached for a changed key on a known id.
-fn pin_peer_key(app: &AppHandle, id: &DeviceId, key: &PublicKey) {
+fn pin_peer_key(app: &AppHandle, relay: &str, id: &DeviceId, key: &PublicKey) {
 	let path = known_peers_path(app);
 	// Hold the lock for the entire read-check-write sequence so two concurrent
 	// first-connects to different peers can't each read the same on-disk map and
@@ -115,7 +129,7 @@ fn pin_peer_key(app: &AppHandle, id: &DeviceId, key: &PublicKey) {
 		.ok()
 		.and_then(|raw| serde_json::from_str(&raw).ok())
 		.unwrap_or_default();
-	let entry = id.0.to_string();
+	let entry = peer_key_entry(relay, id);
 	if map.contains_key(&entry) {
 		return;
 	}
@@ -191,6 +205,7 @@ pub(crate) async fn connect_target(
 	discovery: Option<Arc<pulsar_core::discovery::Discovery>>,
 	target: &str,
 	network_mode: pulsar_core::config::NetworkMode,
+	relay: &str,
 ) -> Result<(pulsar_core::Session, String), String> {
 	let s = target.trim();
 	if let Some(addr) = parse_target_addr(s) {
@@ -204,11 +219,11 @@ pub(crate) async fn connect_target(
 		return Ok((sess, addr.to_string()));
 	}
 	let id = DeviceId::parse(s).ok_or_else(|| crate::i18n::t("err.badTarget").to_string())?;
-	// TOFU: the key we pinned the FIRST time we connected to this id, if any. Passed
-	// to the pinned connect paths so a malicious relay / pubkey-race attacker can't
-	// silently swap a different peer behind a known id — a changed key hard-fails the
-	// connect instead.
-	let pinned = known_peer_key(app, &id);
+	// TOFU: the key we pinned the FIRST time we connected to this (relay, id) pair,
+	// if any. Scoped to the relay endpoint so that a pin learned on relay A does not
+	// hard-fail (or silently pass) a connect made through relay B — the same 9-digit
+	// ID can map to a different physical device on a different relay (C17 fix).
+	let pinned = known_peer_key(app, relay, &id);
 	// Relay-only must NOT take the same-LAN direct shortcut — the whole point of
 	// that mode is that traffic goes through the relay (policy/diagnostics).
 	let lan_allowed = !matches!(
@@ -232,7 +247,7 @@ pub(crate) async fn connect_target(
 				Ok(Ok(sess)) => {
 					tracing::info!(%addr, id = %id.grouped(), "same-LAN fast path: connected directly (discovery match)");
 					if let Some(k) = sess.peer_pubkey().await {
-						pin_peer_key(app, &id, &k);
+						pin_peer_key(app, relay, &id, &k);
 					}
 					return Ok((sess, id.grouped()));
 				}
@@ -258,7 +273,7 @@ pub(crate) async fn connect_target(
 			}
 		})?;
 	if let Some(k) = sess.peer_pubkey().await {
-		pin_peer_key(app, &id, &k);
+		pin_peer_key(app, relay, &id, &k);
 	}
 	Ok((sess, id.grouped()))
 }

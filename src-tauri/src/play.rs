@@ -41,6 +41,10 @@ pub(crate) struct ResidentRender {
 	/// id — so when the renderer is reused for a new session, updating this Arc redirects all
 	/// events to the new session without restarting the reader thread.
 	pub(crate) live_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+	/// The session mode (`game_mode=true` → game, `false` → remote) the renderer was originally
+	/// spawned with. Tracked so the resident-reuse path can detect a cross-session mode change
+	/// and send a `mode game|remote` command to apply the correct overlay/pace-ceiling on reconnect.
+	pub(crate) game_mode: bool,
 }
 
 /// Whether this client advertises the cursor side-channel ([`StreamReq::cursor_external`]):
@@ -87,10 +91,15 @@ fn fmt_displays(displays: &[pulsar_core::service::DisplayInfo]) -> String {
 /// RK3588 (see `stop_render_child`). Also drops the per-id GTK state created
 /// earlier (in-app container / single-surface GL renderer) — ids are never
 /// reused, so skipping that leaks a hidden child window per failed connect.
+///
+/// `preserve_native_container`: when `true` (Linux only, resident renderer re-parked)
+/// the GDK container for `id` is NOT destroyed — the resident renderer's `--wid`
+/// X parent window must remain valid for the next reconnect.
 async fn teardown_partial(
 	app: &AppHandle,
 	id: u64,
 	single_surface: bool,
+	preserve_native_container: bool,
 	view: viewer::Viewer,
 	children: Vec<Option<Child>>,
 ) {
@@ -103,10 +112,12 @@ async fn teardown_partial(
 		if single_surface {
 			crate::render::teardown_single_surface(app, id).await;
 		}
-		crate::render::destroy_native_container(app, id);
+		if !preserve_native_container {
+			crate::render::destroy_native_container(app, id);
+		}
 	}
 	#[cfg(not(all(unix, not(target_os = "macos"))))]
-	let _ = (app, id, single_surface);
+	let _ = (app, id, single_surface, preserve_native_container);
 }
 
 /// Client: connect to a host, start receiving its video (embedded WebCodecs
@@ -138,8 +149,11 @@ pub(crate) async fn start_remote_play(
 	let codec = std::env::var("PULSAR_FORCE_CODEC").unwrap_or(codec);
 
 	let disc = state.discovery.lock().unwrap().clone();
-	let net_mode = state.config.lock().unwrap().network_mode;
-	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode).await?;
+	let (net_mode, relay) = {
+		let cfg = state.config.lock().unwrap();
+		(cfg.network_mode, cfg.relay.clone())
+	};
+	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
 	// Real connection phase: the transport is now actually established (direct P2P or
 	// relay). Tell the Connecting screen so it reflects the truth instead of guessing.
 	let transport = match sess.transport() {
@@ -298,6 +312,12 @@ pub(crate) async fn start_remote_play(
 	// which feeds live `stat …` lines). Spawned alongside the vidsink on the Linux native path.
 	#[allow(unused_mut, unused_assignments)]
 	let mut render_child: Option<Child> = None;
+	// True when `render_child` is a REUSED resident renderer (Linux only).  On a failed
+	// reconnect teardown_partial must NOT call stop_render_child on it — doing so destroys
+	// the EGL context on the shared RK3588 Mali display and wedges WebKitGTK input (the
+	// very wedge the resident model exists to prevent).  Instead we re-park it.
+	#[allow(unused_mut, unused_assignments, unused_variables)]
+	let mut render_child_is_resident: bool = false;
 	// Shared live session id for the resident renderer's stdout reader (Linux only; None on
 	// other platforms where the reader uses a fixed id for the renderer's single lifetime).
 	#[allow(unused_mut, unused_assignments)]
@@ -505,20 +525,67 @@ pub(crate) async fn start_remote_play(
 								.map(|v| v == "1" || v == "on" || v == "true")
 								.unwrap_or(true);
 							// Try the resident renderer first; fall back to a fresh spawn.
+							// Belt-and-suspenders liveness check: even if stop_stream's guard
+							// should have caught a dead renderer at park time, probe again here
+							// so a race (child dies between stop_stream's try_wait and now) or
+							// an unexpected code path cannot poison this session with a dead
+							// process. If the child has exited, drop the resident and fall
+							// through to the fresh-spawn path.
+							let resident = resident.and_then(|mut res| {
+								match res.child.try_wait() {
+									Ok(None) => Some(res), // still running — safe to reuse
+									Ok(Some(status)) => {
+										tracing::warn!(
+											pid = res.child.id(),
+											?status,
+											"parked pulsar-render already exited — dropping dead resident, spawning fresh"
+										);
+										let _ = res.child.wait();
+										None
+									}
+									Err(e) => {
+										tracing::warn!(
+											pid = res.child.id(),
+											err = %e,
+											"try_wait on parked pulsar-render failed — treating as dead, spawning fresh"
+										);
+										None
+									}
+								}
+							});
 							let mut rc = if let Some(res) = resident {
 								use std::io::Write as _;
 								// Activate the resident: show the window + switch to the new SDP.
+								// If the session mode changed (game→remote or remote→game) send a
+								// `mode` command so the renderer updates its overlay personality and
+								// pace ceiling — the `--mode` arg was set at original spawn and never
+								// changes otherwise, causing the wrong menu/look/ceiling on reconnect.
 								if let Some(si) = res.stdin.lock().unwrap().as_mut() {
+									if res.game_mode != game_mode {
+										let _ = writeln!(
+											si,
+											"mode {}",
+											if game_mode { "game" } else { "remote" }
+										);
+									}
 									let _ = writeln!(si, "reopen {}", sdp.display());
 									let _ = writeln!(si, "show");
 									let _ = si.flush();
 								}
-								tracing::info!(pid = res.child.id(), "reusing resident pulsar-render for reconnect");
+								tracing::info!(
+									pid = res.child.id(),
+									resident_game_mode = res.game_mode,
+									new_game_mode = game_mode,
+									"reusing resident pulsar-render for reconnect"
+								);
 								// Reconstitute as a Child for the session bookkeeping path below.
 								// The stdin was already taken into render_stdin at the previous spawn;
 								// here we restore the shared Arc so the session's stat/pace writers
 								// find it in the same Arc they already hold.
 								*overlay_stdin.lock().unwrap() = res.stdin.lock().unwrap().take();
+								// Mark as reused resident so teardown_partial re-parks instead of
+								// killing if request_launch / request_stream fails below.
+								render_child_is_resident = true;
 								Some(res.child)
 							} else if std::env::var_os("PULSAR_USE_MPV").is_some() {
 								None
@@ -730,11 +797,40 @@ pub(crate) async fn start_remote_play(
 
 	if !game_id.is_empty() {
 		if let Err(e) = request_launch(&mut sess, &game_id).await {
+			// If we reused the resident renderer, re-park it instead of killing it.
+			// Killing it (even via SIGTERM) destroys its EGL context on the shared RK3588 Mali
+			// display and wedges WebKitGTK click input — the wedge the resident model exists to
+			// prevent.  Send `hide` (unmaps the window, keeps EGL alive) and put it back into
+			// AppState::resident_render, then pass None in the children vec to teardown_partial.
+			#[cfg(all(unix, not(target_os = "macos")))]
+			if render_child_is_resident {
+				if let Some(child) = render_child.take() {
+					use std::io::Write as _;
+					if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
+						let _ = writeln!(si, "hide");
+						let _ = si.flush();
+					}
+					let live_id = render_live_id.clone().unwrap_or_else(|| {
+						std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
+					});
+					*state.resident_render.lock().unwrap() = Some(ResidentRender {
+						child,
+						stdin: overlay_stdin.clone(),
+						container_id: id,
+						live_id,
+						game_mode,
+					});
+					tracing::info!(session_id = id, "request_launch failed: re-parked resident renderer (EGL context preserved)");
+				}
+			}
 			// Clean up the viewer + native renderer we already brought up before bailing.
+			// preserve_native_container: the resident re-park block above already extracted
+			// render_child (set to None) and re-parked it, so the container must stay alive.
 			teardown_partial(
 				&app,
 				id,
 				single_surface,
+				render_child_is_resident,
 				view,
 				vec![native_child, render_child],
 			)
@@ -745,6 +841,9 @@ pub(crate) async fn start_remote_play(
 	// Held copies so the session menu can re-request the stream at a new resolution.
 	let codec_h = codec.clone();
 	let encoder_h = encoder.clone();
+	// HDR: read from the UI setting persisted in stream_cfg. The PULSAR_HDR env var is a
+	// debug override that wins if set. The UI value is the normal production path.
+	let req_hdr = state.stream_cfg.lock().unwrap().hdr || std::env::var_os("PULSAR_HDR").is_some();
 	// Linux/Pi native renderer caps. mpv 0.34 here decodes with rkmpp but the gpu VO has
 	// no DRM_PRIME→EGL interop on this build, so every frame is HW-DOWNLOADED (GPU→CPU)
 	// and re-uploaded for Panfrost GL — far too slow to drain a 1440p60 high-bitrate
@@ -824,10 +923,7 @@ pub(crate) async fn start_remote_play(
 		} else {
 			QualityPref::Quality
 		},
-		// HDR / 4:4:4 are opt-in; default off. Env overrides let us exercise the host path
-		// before the session-menu toggles are wired in the frontend. The host validates and
-		// degrades if the chosen encoder+codec can't actually do them.
-		hdr: std::env::var_os("PULSAR_HDR").is_some(),
+		hdr: req_hdr,
 		yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
 		// PRUNED set (host-encoder-aware), not raw `client_codecs`: the host clamps its
 		// auto-degraded codec to this, so it can never land on a codec the client dropped
@@ -852,11 +948,38 @@ pub(crate) async fn start_remote_play(
 		audio_layout: pulsar_core::audio::ChannelLayout::Stereo,
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
+		// If we reused the resident renderer, re-park it instead of killing it.
+		// Same rationale as the request_launch guard above: SIGTERM destroys the EGL context
+		// on the shared RK3588 Mali display and wedges WebKitGTK click input.
+		#[cfg(all(unix, not(target_os = "macos")))]
+		if render_child_is_resident {
+			if let Some(child) = render_child.take() {
+				use std::io::Write as _;
+				if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
+					let _ = writeln!(si, "hide");
+					let _ = si.flush();
+				}
+				let live_id = render_live_id.clone().unwrap_or_else(|| {
+					std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
+				});
+				*state.resident_render.lock().unwrap() = Some(ResidentRender {
+					child,
+					stdin: overlay_stdin.clone(),
+					container_id: id,
+					live_id,
+					game_mode,
+				});
+				tracing::info!(session_id = id, "request_stream failed: re-parked resident renderer (EGL context preserved)");
+			}
+		}
 		// Clean up the viewer + native renderer we already brought up before bailing.
+		// preserve_native_container: the resident re-park block above already extracted
+		// render_child (set to None) and re-parked it, so the container must stay alive.
 		teardown_partial(
 			&app,
 			id,
 			single_surface,
+			render_child_is_resident,
 			view,
 			vec![native_child, render_child],
 		)
@@ -984,6 +1107,7 @@ pub(crate) async fn start_remote_play(
 		req_fps,
 		req_kbps,
 		req.cursor_external,
+		req_hdr,
 	));
 
 	let audio_is_native = audio_native.is_some();
@@ -1093,9 +1217,14 @@ pub(crate) async fn stop_stream(
 	// A session torn down with its overlay still open must release the global
 	// SUSPENDED latch (see AppState::overlay_open) — otherwise the next session
 	// starts permanently un-engageable.
+	// `overlay_was_open` is used below (Linux resident path) to send SIGUSR2 so
+	// the parked renderer's OPEN flag is reset before it is reused.
+	#[allow(unused_variables)]
+	let overlay_was_open;
 	{
 		let mut set = state.overlay_open.lock().unwrap();
-		if set.remove(&id) {
+		overlay_was_open = set.remove(&id);
+		if overlay_was_open {
 			crate::kbdhook::overlay_suspend(!set.is_empty());
 		}
 	}
@@ -1133,32 +1262,67 @@ pub(crate) async fn stop_stream(
 		// Non-Linux / mpv-fallback: fall through to stop_render_child as before (Windows/macOS
 		// have no shared-Mali-GL issue).
 		#[cfg(all(unix, not(target_os = "macos")))]
-		if let Some(child) = play.render_child.take() {
+		if let Some(mut child) = play.render_child.take() {
 			use std::io::Write as _;
-			// Signal the renderer to hide (unmap video window, idle-loop, keep EGL alive).
-			if let Some(si) = play.render_stdin.lock().unwrap().as_mut() {
-				let _ = writeln!(si, "hide");
-				let _ = si.flush();
+			// If the overlay was open when the session ended, force-close it before parking:
+			// send SIGUSR2 so the renderer's OPEN AtomicBool is reset to false and it stops
+			// drawing the egui menu. Without this the renderer parks with OPEN=true and
+			// the next reused session immediately renders the overlay over the fresh video
+			// (the frontend's overlayOpen is false for the new session, so nothing re-closes it).
+			// Also restore the container's input pass-through so the new session's video
+			// window receives pointer events by default (not blocked by the stale egui overlay).
+			if overlay_was_open {
+				unsafe {
+					libc::kill(child.id() as i32, libc::SIGUSR2);
+				}
+				crate::render::set_container_pass_through(&app, id, true);
 			}
-			// Park in AppState. Any previously parked resident (shouldn't exist — only one
-			// session at a time — but if somehow present) is killed now via stop_render_child
-			// to avoid a double-park.
-			if let Some(old) = state.resident_render.lock().unwrap().take() {
-				tracing::warn!(pid = old.child.id(), "evicting stale resident renderer before parking new one");
-				stop_render_child_blocking(old.child);
+			// Before parking, verify the child is still alive. If it exited during the session
+			// (crash, OOM-kill, external signal), parking a dead Child would poison the next
+			// reconnect (the reuse path would write to a broken stdin and produce a black
+			// screen with no recovery). Reap it instead and leave resident_render empty so the
+			// next connect falls through to a fresh spawn.
+			let child_alive = match child.try_wait() {
+				Ok(None) => true,        // still running — safe to park
+				Ok(Some(status)) => {
+					tracing::warn!(pid = child.id(), ?status, "pulsar-render exited mid-session — dropping dead resident, will spawn fresh on next connect");
+					let _ = child.wait(); // reap the zombie
+					false
+				}
+				Err(e) => {
+					tracing::warn!(pid = child.id(), err = %e, "try_wait failed on pulsar-render — treating as dead, will spawn fresh on next connect");
+					false
+				}
+			};
+			if child_alive {
+				// Signal the renderer to hide (unmap video window, idle-loop, keep EGL alive).
+				if let Some(si) = play.render_stdin.lock().unwrap().as_mut() {
+					let _ = writeln!(si, "hide");
+					let _ = si.flush();
+				}
+				// Park in AppState. Any previously parked resident (shouldn't exist — only one
+				// session at a time — but if somehow present) is killed now via stop_render_child
+				// to avoid a double-park.
+				if let Some(old) = state.resident_render.lock().unwrap().take() {
+					tracing::warn!(pid = old.child.id(), "evicting stale resident renderer before parking new one");
+					stop_render_child_blocking(old.child);
+				}
+				// Take the live_id Arc from the session so the reader can be updated on reconnect.
+				let live_id = play
+					.render_live_id
+					.clone()
+					.unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id)));
+				*state.resident_render.lock().unwrap() = Some(ResidentRender {
+					child,
+					stdin: play.render_stdin.clone(),
+					container_id: id,
+					live_id,
+					game_mode: play.game_mode,
+				});
+				resident_container_kept = true; // container must NOT be destroyed — kept for next session
 			}
-			// Take the live_id Arc from the session so the reader can be updated on reconnect.
-			let live_id = play
-				.render_live_id
-				.clone()
-				.unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id)));
-			*state.resident_render.lock().unwrap() = Some(ResidentRender {
-				child,
-				stdin: play.render_stdin.clone(),
-				container_id: id,
-				live_id,
-			});
-			resident_container_kept = true; // container must NOT be destroyed — kept for next session
+			// If the child was dead, resident_container_kept stays false → the container is
+			// destroyed below (it will be re-created on the next fresh spawn).
 		}
 		// Non-Linux (Windows/macOS) or mpv/ffplay fallback on Linux (render_child is None
 		// there; the ffplay child is handled via play.ffplay above):

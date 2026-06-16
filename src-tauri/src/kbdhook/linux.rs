@@ -793,6 +793,21 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										None
 									};
 									if let Some(c) = ch {
+										// Transitioning INTO char-mode: if this key was previously
+										// sent as a raw VK (Ctrl was held on the initial press but
+										// released before this repeat/re-press), the host is still
+										// holding that raw VK. Release it now before sending the
+										// Char so the host VK never stays stuck. Sending a key-up
+										// for a key not held on the host is a harmless no-op.
+										if !char_keys.contains(&code) {
+											fwd(
+												&tx,
+												InputEvent::Key {
+													code: code as u32,
+													down: false,
+												},
+											);
+										}
 										char_keys.insert(code);
 										fwd(&tx, InputEvent::Char(c));
 									} else if !char_keys.contains(&code) {

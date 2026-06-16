@@ -169,11 +169,6 @@ export class SessionControls {
 		const playId = this.#in.playId();
 		if (playId >= 0) api.setOverlayButton(playId, on).catch(() => {});
 	};
-	// Keep the control handle/menu always visible (even fullscreen / while controlling).
-	toggleKeepVisible = () => {
-		ui.keepVisible = !ui.keepVisible;
-		saveUi();
-	};
 	// Live encoder switch (host re-encodes) — sent to the host, which restarts ffmpeg.
 	setEncoder = (v: Encoder) => {
 		ui.encoder = v;

@@ -15,12 +15,19 @@ pub const MAX_XFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Strip path separators so a peer can't write outside the received-files dir.
 pub fn sanitize_filename(name: &str) -> String {
 	let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
-	// ':' is rejected too: on Windows a separator-less name like "C:evil.exe" is a
+	// On Windows ':' is also stripped: a separator-less name like "C:evil.exe" is a
 	// drive-relative path — PathBuf::push with it REPLACES the received-files dir
 	// (drive-CWD-relative write outside the jail); it also covers NTFS ADS names.
+	// On macOS/Linux ':' is an ordinary, valid filename byte — leave it untouched.
+	#[cfg(windows)]
 	let cleaned: String = base
 		.chars()
 		.filter(|c| !matches!(c, '\0'..='\u{1f}' | ':'))
+		.collect();
+	#[cfg(not(windows))]
+	let cleaned: String = base
+		.chars()
+		.filter(|c| !matches!(c, '\0'..='\u{1f}'))
 		.collect();
 	// Structural guard: the result must parse as exactly ONE normal path component
 	// on THIS platform — anything else (empty, ".", "..", a surviving prefix/root)

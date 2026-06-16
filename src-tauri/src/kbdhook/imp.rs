@@ -113,6 +113,11 @@ fn fwd(tx: &Sender<InputEvent>, ev: InputEvent) {
 
 /// Send up-strokes for every key still held on the host and clear the set — called
 /// whenever forwarding stops (disengage, disable) so no modifier stays stuck remotely.
+///
+/// MUST NOT be called while holding the `globals()` MutexGuard on the WH_KEYBOARD_LL
+/// hook callback thread: `fwd` uses `blocking_send` for key/button UP edges, which would
+/// stall the OS input queue (LowLevelHooksTimeout ~300 ms). Use `flush_held_wh` on the
+/// hook thread instead.
 fn flush_held(g: &mut Globals) {
 	if let Some(tx) = &g.tx {
 		for code in g.held.drain() {
@@ -140,6 +145,45 @@ fn flush_held(g: &mut Globals) {
 	g.alt_down = false;
 	g.shift_down = false;
 	g.rctrl_presses.clear();
+}
+
+/// Variant of `flush_held` safe to call on the WH_KEYBOARD_LL hook callback thread.
+///
+/// Drains `held`/`held_buttons` and resets modifier state UNDER the lock (via the
+/// caller's `MutexGuard`), then returns the sender + collected events so the caller can
+/// drop the guard BEFORE sending.  The actual sends (done by the caller with the guard
+/// released) use `try_send` — bounded, non-blocking — which is the correct discipline
+/// for the LL hook callback thread where ANY blocking stalls the OS input queue and
+/// trips `LowLevelHooksTimeout` (~300 ms).  Up-strokes are never coalescible, so
+/// `try_send` may drop them if the channel is full (256 slots); however, a combo fires
+/// exactly once, the held set is bounded by physically-reachable keys (≤10 in practice),
+/// and a full channel under extreme congestion is preferable to freezing the OS.
+fn flush_held_wh(g: &mut std::sync::MutexGuard<'_, Globals>) -> (Option<tokio::sync::mpsc::Sender<InputEvent>>, Vec<InputEvent>) {
+	let tx = g.tx.clone();
+	let mut events: Vec<InputEvent> = Vec::with_capacity(g.held.len() + g.held_buttons.len());
+	for code in g.held.drain() {
+		events.push(InputEvent::Key { code, down: false });
+	}
+	for button in g.held_buttons.drain() {
+		events.push(InputEvent::PointerButton { button, down: false });
+	}
+	// Reset modifier tracking (same as flush_held — stale modifier booleans can mis-fire
+	// combos on a later bare keypress while merely app-focused).
+	g.ctrl_down = false;
+	g.alt_down = false;
+	g.shift_down = false;
+	g.rctrl_presses.clear();
+	(tx, events)
+}
+
+/// Send the up-stroke events collected by `flush_held_wh` AFTER the globals lock has
+/// been dropped.  Uses `try_send` (non-blocking) — see `flush_held_wh` for rationale.
+fn send_flush_events(tx: Option<tokio::sync::mpsc::Sender<InputEvent>>, events: Vec<InputEvent>) {
+	if let Some(tx) = tx {
+		for ev in events {
+			let _ = tx.try_send(ev);
+		}
+	}
 }
 
 /// Arm kiosk auto-engage: the next `enable()` engages immediately (CLI `--connect`).
@@ -422,14 +466,26 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 		// can lag SECONDS while the video child occludes the webview (WebView2
 		// occlusion throttling) — until it landed, the user's next click was still
 		// captured and went to the host ("first click swallowed").
-		if ENGAGED.swap(false, Ordering::SeqCst) {
+		//
+		// C16 fix: collect flush events + clone app handle under the lock, then DROP
+		// the guard before sending — the WH_KEYBOARD_LL callback thread must not block
+		// (LowLevelHooksTimeout ~300 ms), and flush sends must not hold the mutex
+		// (blocks disable()/set_focused() during recovery).
+		let (flush_tx, flush_evs, was_engaged, app_handle) = if ENGAGED.swap(false, Ordering::SeqCst) {
 			tracing::info!("kbd capture RELEASED (overlay combo, immediate)");
-			flush_held(&mut g);
-			if let Some(app) = &g.app {
+			let (tx, evs) = flush_held_wh(&mut g);
+			(tx, evs, true, g.app.clone())
+		} else {
+			(None, Vec::new(), false, g.app.clone())
+		};
+		drop(g);
+		send_flush_events(flush_tx, flush_evs);
+		if was_engaged {
+			if let Some(app) = &app_handle {
 				let _ = app.emit("kbd-released", ());
 			}
 		}
-		if let Some(app) = &g.app {
+		if let Some(app) = &app_handle {
 			let _ = app.emit("overlay-toggle", ());
 		}
 		return true;
@@ -442,8 +498,12 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 		&& g.shift_down
 		&& (ENGAGED.load(Ordering::SeqCst) || APP_FOCUSED.load(Ordering::SeqCst))
 	{
-		flush_held(&mut g); // un-stick the chord on the (still-alive) host
-		if let Some(app) = &g.app {
+		// C16 fix: collect flush events under lock, drop guard, then send non-blocking.
+		let (flush_tx, flush_evs) = flush_held_wh(&mut g);
+		let app_handle = g.app.clone();
+		drop(g);
+		send_flush_events(flush_tx, flush_evs); // un-stick the chord on the (still-alive) host
+		if let Some(app) = &app_handle {
 			let _ = app.emit("kbd-leave", ());
 		}
 		return true; // never leak the Q locally
@@ -477,10 +537,15 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 			g.rctrl_presses.clear();
 			// The combo's own down-stroke is on the host too — count it, then flush
 			// everything held so nothing stays stuck remotely.
+			// C16 fix: collect flush events + app handle under lock, drop guard BEFORE
+			// sending — WH_KEYBOARD_LL callback thread must never block on a send.
 			g.held.insert(97);
-			flush_held(&mut g);
+			let (flush_tx, flush_evs) = flush_held_wh(&mut g);
 			ENGAGED.store(false, Ordering::SeqCst);
-			if let Some(app) = &g.app {
+			let app_handle = g.app.clone();
+			drop(g);
+			send_flush_events(flush_tx, flush_evs);
+			if let Some(app) = &app_handle {
 				let _ = app.emit("kbd-released", ());
 			}
 			return true;
@@ -491,8 +556,12 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 	if down && evdev == 44 && g.ctrl_down && g.alt_down {
 		ENGAGED.store(false, Ordering::SeqCst);
 		// Un-stick everything held on the host (the chord's up-strokes won't be forwarded).
-		flush_held(&mut g);
-		if let Some(app) = &g.app {
+		// C16 fix: collect flush events + app handle under lock, drop guard BEFORE sending.
+		let (flush_tx, flush_evs) = flush_held_wh(&mut g);
+		let app_handle = g.app.clone();
+		drop(g);
+		send_flush_events(flush_tx, flush_evs);
+		if let Some(app) = &app_handle {
 			let _ = app.emit("kbd-released", ());
 		}
 		return true; // never leak the Z locally

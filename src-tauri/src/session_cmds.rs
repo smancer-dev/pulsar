@@ -205,10 +205,20 @@ async fn respawn_render_for_codec(
 	// (the freshly-spawned child from the first) instead of the transient None, and
 	// applies its own codec/monitor params correctly in sequence.
 	let _guard = lock.lock().await;
-	let (vport, wid, game_mode, old_child) = {
+	let (vport, wid, game_mode, old_child, respawn_live_id) = {
+		use std::sync::atomic::AtomicU64;
 		let mut plays = state.plays.lock().unwrap();
 		let Some(p) = plays.get_mut(&id) else { return };
-		(p.video_port, p.mpv_wid, p.game_mode, p.render_child.take())
+		// Preserve the live_id Arc so the new reader stays updateable on future
+		// reconnects (resident model). Reuse the existing Arc (so the reader from a
+		// previous respawn is not orphaned on a double-switch) or create a fresh one
+		// seeded with the current id if none exists yet.
+		let live_id = p
+			.render_live_id
+			.clone()
+			.unwrap_or_else(|| std::sync::Arc::new(AtomicU64::new(id)));
+		live_id.store(id, std::sync::atomic::Ordering::Relaxed);
+		(p.video_port, p.mpv_wid, p.game_mode, p.render_child.take(), live_id)
 	};
 	if old_child.is_none() {
 		// render_child is None and we hold the exclusive respawn lock, so no other
@@ -285,7 +295,16 @@ async fn respawn_render_for_codec(
 		#[cfg(all(unix, not(target_os = "macos")))]
 		let new_pid = c.id();
 		if let Some(out) = c.stdout.take() {
-			crate::render_stats::start_render_reader(app, id, out, None);
+			// Pass the live_id Arc (same one the fresh-spawn path uses) so this reader
+			// is updateable on future reconnects — without this the reader's id was fixed
+			// to the spawn-time id and ignored res.live_id.store() on the next reconnect,
+			// causing play-ready to never fire for the new session (hung Connecting screen).
+			crate::render_stats::start_render_reader(
+				app,
+				id,
+				out,
+				Some(respawn_live_id.clone()),
+			);
 		}
 		let si = c.stdin.take();
 		// Pull the per-id Arcs out under the lock, install the fresh stdin + mpv_sdp, then
@@ -301,6 +320,10 @@ async fn respawn_render_for_codec(
 				// Track the freshly-written SDP for teardown (the old one stays tracked too).
 				p.sdp_files.lock().unwrap().push(sdp.clone());
 				p.mpv_sdp = Some(sdp);
+				// Keep render_live_id in sync: the new reader holds respawn_live_id, so
+				// stop_stream must park THIS Arc (not the old pre-switch one) so a subsequent
+				// reconnect's res.live_id.store() updates the correct Arc the reader holds.
+				p.render_live_id = Some(respawn_live_id.clone());
 				(
 					p.render_stdin.clone(),
 					p.caps_line.clone(),
@@ -562,25 +585,30 @@ pub(crate) async fn set_play_monitor(
 ) -> Result<(), String> {
 	tracing::info!(id, display_idx, "set_play_monitor command");
 	let now = mon_now_ms();
-	let last = {
+	// Leading-edge gate: check cooldown AND update last_ms atomically under one lock
+	// acquisition so that two concurrent calls for the same id both reading `last == 0`
+	// cannot both pass the gate (TOCTOU fix — C26).
+	// Returns `Some(last_ms_before_update)` when inside the cooldown (for wait calculation),
+	// or `None` when the leading edge fires (last_ms already updated to `now`).
+	let inside_cooldown_last = {
 		let mut map = MON_STATE.lock().unwrap();
 		let st = map.get_or_insert_with(Default::default).entry(id).or_default();
-		st.last_ms
+		let last = st.last_ms;
+		// `last == 0` means this session has never fired a switch — always treat that as
+		// eligible so the very first monitor pick of a session isn't penalised the cooldown.
+		if last == 0 || now.saturating_sub(last) >= MON_COOLDOWN_MS {
+			st.last_ms = now;
+			None
+		} else {
+			Some(last)
+		}
 	};
 	// Leading edge: a switch outside the cooldown fires IMMEDIATELY (no added latency).
-	// `last == 0` means this session has never fired a switch — always treat that as eligible
-	// so the very first monitor pick of a session isn't penalised the full 400 ms cooldown.
-	if last == 0 || now.saturating_sub(last) >= MON_COOLDOWN_MS {
-		MON_STATE
-			.lock()
-			.unwrap()
-			.get_or_insert_with(Default::default)
-			.entry(id)
-			.or_default()
-			.last_ms = now;
+	if inside_cooldown_last.is_none() {
 		do_monitor_switch(&app, &state, id, display_idx).await;
 		return Ok(());
 	}
+	let last = inside_cooldown_last.unwrap();
 	// Inside the cooldown: record the latest target FOR THIS SESSION, wait out the remainder, and
 	// only the newest coalesced call (highest generation) for this id fires the trailing switch.
 	let g = {
