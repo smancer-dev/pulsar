@@ -177,9 +177,27 @@ pub(crate) async fn start_remote_play(
 			transport: transport.clone(),
 		},
 	);
-	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
-		.await?
-	{
+	// Timeout on the auth handshake: if the host never answers (e.g. it opened the
+	// session but its Allow/Deny popup was dismissed, or the link silently dropped
+	// mid-handshake after connect), the recv_host_auth loop inside client_authenticate
+	// has no deadline and would park forever. 40 s < the 45 s JS UI timeout so the
+	// Rust future fails first and the JS catch sees a real error (not the JS timer's
+	// synthetic CONNECT_TIMEOUT string). When the timeout fires the future is
+	// cancelled; `sess` then falls out of scope when we return Err, which drops the
+	// Session and closes the connection — the host's recv_client_auth sees Gone and
+	// tears down its Allow/Deny state cleanly.
+	const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+	let auth_result = tokio::time::timeout(
+		AUTH_TIMEOUT,
+		crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label),
+	)
+	.await
+	// The JS friendlyConnectError checks for the literal substring "connect-timed-out"
+	// (the same sentinel the UI-side CONNECT_TIMEOUT constant uses) — returning it here
+	// lets the JS route both the Rust-side and JS-side timeouts to the same friendly
+	// connErr.timeout translation instead of showing the raw English string.
+	.map_err(|_| "connect-timed-out".to_string())?;
+	if !auth_result? {
 		return Err(crate::i18n::t("err.denied").into());
 	}
 	// Default codec ("auto"): prefer H.265, but only when the HOST can actually encode
@@ -808,40 +826,50 @@ pub(crate) async fn start_remote_play(
 
 	if !game_id.is_empty() {
 		if let Err(e) = request_launch(&mut sess, &game_id).await {
-			// If we reused the resident renderer, re-park it instead of killing it.
-			// Killing it (even via SIGTERM) destroys its EGL context on the shared RK3588 Mali
-			// display and wedges WebKitGTK click input — the wedge the resident model exists to
-			// prevent.  Send `hide` (unmaps the window, keeps EGL alive) and put it back into
-			// AppState::resident_render, then pass None in the children vec to teardown_partial.
+			// Park ANY live pulsar-render child instead of killing it — regardless of whether
+			// it was a reused resident or a freshly-spawned one. On RK3588 the EGL context is
+			// shared with WebKitGTK's Mali display: destroying it (even via clean SIGTERM) wedges
+			// WebKit click input with no in-session recovery. The reuse guard previously checked
+			// `render_child_is_resident` but a fresh renderer on an empty pool carries the same
+			// risk — it is live and rendering into the same shared Mali EGL surface.
 			#[cfg(all(unix, not(target_os = "macos")))]
-			if render_child_is_resident {
-				if let Some(child) = render_child.take() {
-					use std::io::Write as _;
-					if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
-						let _ = writeln!(si, "hide");
-						let _ = si.flush();
-					}
-					let live_id = render_live_id.clone().unwrap_or_else(|| {
-						std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
-					});
-					state.resident_render.lock().unwrap().push(ResidentRender {
-						child,
-						stdin: overlay_stdin.clone(),
-						container_id: id,
-						live_id,
-						game_mode,
-					});
-					tracing::info!(session_id = id, "request_launch failed: re-parked resident renderer (EGL context preserved)");
+			let render_child_parked = if let Some(child) = render_child.take() {
+				use std::io::Write as _;
+				if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
+					let _ = writeln!(si, "hide");
+					let _ = si.flush();
 				}
-			}
+				let live_id = render_live_id.clone().unwrap_or_else(|| {
+					std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
+				});
+				state.resident_render.lock().unwrap().push(ResidentRender {
+					child,
+					stdin: overlay_stdin.clone(),
+					container_id: id,
+					live_id,
+					game_mode,
+				});
+				// Cap the pool at 1 — reap any excess idle residents now that we pushed.
+				reap_excess_resident_pool(&app, &*state, 1);
+				tracing::info!(
+					session_id = id,
+					was_resident = render_child_is_resident,
+					"request_launch failed: parked renderer (EGL context preserved)",
+				);
+				true
+			} else {
+				false
+			};
+			#[cfg(not(all(unix, not(target_os = "macos"))))]
+			let render_child_parked = false;
 			// Clean up the viewer + native renderer we already brought up before bailing.
-			// preserve_native_container: the resident re-park block above already extracted
-			// render_child (set to None) and re-parked it, so the container must stay alive.
+			// preserve_native_container: if we parked the render child above, its GDK container
+			// must stay alive so the renderer's --wid X parent remains valid for the next connect.
 			teardown_partial(
 				&app,
 				id,
 				single_surface,
-				render_child_is_resident,
+				render_child_parked,
 				view,
 				vec![native_child, render_child],
 			)
@@ -964,38 +992,49 @@ pub(crate) async fn start_remote_play(
 		audio_layout: pulsar_core::audio::ChannelLayout::Stereo,
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
-		// If we reused the resident renderer, re-park it instead of killing it.
-		// Same rationale as the request_launch guard above: SIGTERM destroys the EGL context
-		// on the shared RK3588 Mali display and wedges WebKitGTK click input.
+		// Park ANY live pulsar-render child instead of killing it — regardless of whether
+		// it was a reused resident or a freshly-spawned one. Same rationale as the
+		// request_launch guard above: destroying the EGL context on the shared RK3588 Mali
+		// display (even via clean SIGTERM) wedges WebKitGTK click input. A fresh renderer
+		// on an empty pool carries the same risk as a reused one.
 		#[cfg(all(unix, not(target_os = "macos")))]
-		if render_child_is_resident {
-			if let Some(child) = render_child.take() {
-				use std::io::Write as _;
-				if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
-					let _ = writeln!(si, "hide");
-					let _ = si.flush();
-				}
-				let live_id = render_live_id.clone().unwrap_or_else(|| {
-					std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
-				});
-				state.resident_render.lock().unwrap().push(ResidentRender {
-					child,
-					stdin: overlay_stdin.clone(),
-					container_id: id,
-					live_id,
-					game_mode,
-				});
-				tracing::info!(session_id = id, "request_stream failed: re-parked resident renderer (EGL context preserved)");
+		let render_child_parked = if let Some(child) = render_child.take() {
+			use std::io::Write as _;
+			if let Some(si) = overlay_stdin.lock().unwrap().as_mut() {
+				let _ = writeln!(si, "hide");
+				let _ = si.flush();
 			}
-		}
+			let live_id = render_live_id.clone().unwrap_or_else(|| {
+				std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
+			});
+			state.resident_render.lock().unwrap().push(ResidentRender {
+				child,
+				stdin: overlay_stdin.clone(),
+				container_id: id,
+				live_id,
+				game_mode,
+			});
+			// Cap the pool at 1 — reap any excess idle residents now that we pushed.
+			reap_excess_resident_pool(&app, &*state, 1);
+			tracing::info!(
+				session_id = id,
+				was_resident = render_child_is_resident,
+				"request_stream failed: parked renderer (EGL context preserved)",
+			);
+			true
+		} else {
+			false
+		};
+		#[cfg(not(all(unix, not(target_os = "macos"))))]
+		let render_child_parked = false;
 		// Clean up the viewer + native renderer we already brought up before bailing.
-		// preserve_native_container: the resident re-park block above already extracted
-		// render_child (set to None) and re-parked it, so the container must stay alive.
+		// preserve_native_container: if we parked the render child above, its GDK container
+		// must stay alive so the renderer's --wid X parent remains valid for the next connect.
 		teardown_partial(
 			&app,
 			id,
 			single_surface,
-			render_child_is_resident,
+			render_child_parked,
 			view,
 			vec![native_child, render_child],
 		)
@@ -1175,6 +1214,46 @@ pub(crate) async fn start_remote_play(
 	})
 }
 
+/// Drain excess entries from `AppState::resident_render` so the pool never exceeds `cap`
+/// entries. Called immediately after every `.push()` at the three park sites.
+///
+/// # Why this is safe
+/// Only idle (hidden) renderers are ever in the pool — each was sent `hide\n` before being
+/// parked, so its X window is already unmapped and its EGL surface is dormant. A SIGTERM
+/// causes the renderer to run its full clean teardown sequence (eglDestroyContext →
+/// XDestroyWindow → XCloseDisplay) and then exit. This is the SAME sequence as a normal
+/// session end and does NOT corrupt WebKitGTK's shared Mali GL state. The wedge only occurs
+/// when a SIGKILL abandons an active EGL context mid-frame; an idle renderer hit with SIGTERM
+/// exits cleanly.
+///
+/// Excess entries are drained from the FRONT of the Vec (oldest entries first); the most
+/// recently parked entry (at the back, which `.pop()` will take on the next connect) is kept.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn reap_excess_resident_pool(app: &AppHandle, state: &AppState, cap: usize) {
+	let excess: Vec<ResidentRender> = {
+		let mut pool = state.resident_render.lock().unwrap();
+		if pool.len() > cap {
+			let n_excess = pool.len() - cap;
+			pool.drain(..n_excess).collect()
+		} else {
+			return;
+		}
+	};
+	for excess_r in excess {
+		tracing::info!(
+			pid = excess_r.child.id(),
+			container_id = excess_r.container_id,
+			"resident_render pool over cap — reaping excess idle renderer (SIGTERM, EGL-safe)"
+		);
+		// SIGTERM the idle renderer: clean EGL teardown, no Mali wedge.
+		stop_render_child_blocking(excess_r.child);
+		// The renderer's X window is destroyed by its own teardown, but the GDK container
+		// (the parent GdkWindow we created for `--wid` embedding) is owned by this process
+		// and must be explicitly released so it doesn't leak in the GTK widget tree.
+		crate::render::destroy_native_container(app, excess_r.container_id);
+	}
+}
+
 /// Gracefully stop a native renderer child that owns a GL/EGL context + an X window sharing
 /// the display with WebKitGTK (Linux `pulsar-render` / vidsink / mpv). A hard SIGKILL abandons
 /// the EGL context mid-bind and WEDGES the webview's input on RK3588 — after the session ends the
@@ -1317,12 +1396,15 @@ pub(crate) async fn stop_stream(
 					let _ = writeln!(si, "hide");
 					let _ = si.flush();
 				}
-				// Park in AppState pool. Do NOT evict any already-parked resident: with
-				// multiple concurrent session tabs each tab parks its OWN renderer, and
-				// evicting another tab's renderer via SIGTERM/SIGKILL destroys its EGL
-				// context on the shared Mali display — the exact wedge the resident model
-				// exists to prevent. Push to the Vec so all parked renderers survive until
-				// the next reconnect (or app exit, when the OS reclaims them).
+				// Park in AppState pool. Cap the pool at 1 after pushing: excess idle
+				// parked renderers (e.g. from a prior multi-tab session) are drained from
+				// the front and SIGTERM'd. SIGTERM is safe for idle (hidden-window)
+				// renderers — they run their own EGL teardown cleanly. Only SIGKILL of an
+				// active renderer corrupts the shared Mali GL; idle renderers are not
+				// actively rendering and exit cleanly on SIGTERM (see
+				// `reap_excess_resident_pool` for the full rationale). Capping at 1
+				// prevents the pool from growing to the multi-tab high-water mark and
+				// leaking CPU/GPU/socket resources indefinitely (the orphan-pile-up fix).
 				let live_id = play
 					.render_live_id
 					.clone()
@@ -1334,6 +1416,8 @@ pub(crate) async fn stop_stream(
 					live_id,
 					game_mode: play.game_mode,
 				});
+				// Reap excess idle residents beyond the cap of 1.
+				reap_excess_resident_pool(&app, &*state, 1);
 				resident_container_kept = true; // container must NOT be destroyed — kept for next session
 			}
 			// If the child was dead, resident_container_kept stays false → the container is

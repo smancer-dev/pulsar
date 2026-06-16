@@ -70,6 +70,11 @@ struct SessionCleanupGuard {
 	fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 	#[cfg(target_os = "linux")]
 	cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
+	/// Non-Windows display-mode watcher task; aborted here so an abort()-path
+	/// teardown (e.g. go_online reconnect) cancels it immediately instead of
+	/// waiting up to ~1.5 s for the next restream_tx.is_closed() check.
+	#[cfg(not(windows))]
+	mode_watcher: tokio::task::JoinHandle<()>,
 	sid: u64,
 }
 
@@ -101,6 +106,11 @@ impl Drop for SessionCleanupGuard {
 		for h in self.fwd_slot.lock().unwrap().drain(..) {
 			h.abort();
 		}
+		// Non-Windows: abort the display-mode watcher immediately so it does not
+		// linger for up to ~1.5 s waiting for its next restream_tx.is_closed()
+		// check.  abort() is safe to call after the task has already finished.
+		#[cfg(not(windows))]
+		self.mode_watcher.abort();
 		// Linux: close the XDG ScreenCast portal session so the compositor's
 		// "your screen is being shared" indicator disappears.
 		// `WaylandCapture::stop` is async, so we fire-and-forget a background task.
@@ -496,30 +506,69 @@ pub(crate) async fn go_online(
 						detail: String::new(),
 					},
 				);
-				// Connection time for the connections window. Registration into
-				// `active`/`incoming`/`host_out` is DEFERRED to the first stream request
-				// (`make_on_stream`): a short-lived control session from the same peer
-				// (Home's "fetch games" while a play session is live) must never clobber
-				// the live session's entries — overwriting `incoming` drops the live
-				// stop_tx, which instantly tears its stream down. A second STREAMING
-				// session from the same peer still takes over (the overwritten stop_tx
-				// drop ends the old session — the documented same-peer reconnect path).
+				// Connection time for the connections window.
 				let since_ms = std::time::SystemTime::now()
 					.duration_since(std::time::UNIX_EPOCH)
 					.map(|d| d.as_millis() as u64)
 					.unwrap_or(0);
-				// Allows the host UI to kick this client (`disconnect_peer`) once
-				// make_on_stream registers it in `incoming`.
+				// stop channel: the receiver drives the tokio::select! below; the sender is
+				// registered in `incoming` so the host UI can kick this peer at any time.
 				let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
 
 				// Side channels: a queue the host UI drains to push chat/clipboard back
 				// to this client (registered by peer id in `host_out` so `host_send_*`
-				// can find it — registration deferred with the rest, see above).
+				// can find it).
 				let (out_tx, out_rx) = tokio::sync::mpsc::channel::<DataMsg>(256);
 				// A clone for on_stream to push the encode summary to the client.
 				let stats_out = out_tx.clone();
 				// A clone for the file-manager handler's replies (FsEntries / file stream).
 				let fs_out = out_tx.clone();
+
+				// C9: Register this session at accept time (not deferred to the first
+				// StartStream) so the host operator can always see and kick any
+				// authenticated peer — including data-channel-only, scripted, or
+				// malicious clients that never send StartStream.
+				//
+				// We skip registration when a LIVE streaming session already occupies
+				// this peer slot: overwriting `incoming` would drop its stop_tx, which
+				// fires stop_rx and immediately tears the live stream down. A fresh
+				// STREAMING session from the same peer still takes over via make_on_stream
+				// (the overwritten stop_tx drop ends the old session — same-peer reconnect
+				// path). A data-channel-only same-peer shadow (the "fetch games while
+				// streaming" scenario) is therefore not visible while the stream is live,
+				// but that is an acceptable trade-off (it cannot be kicked via the UI
+				// anyway without ending the live stream).
+				//
+				// Mode defaults to Remote; make_on_stream upgrades it to Game/Remote on
+				// the first StartStream (and re-opens/focuses the connections window with
+				// the correct mode). The window opens minimized here so the host's screen
+				// is not disrupted before the session's mode is confirmed.
+				//
+				// make_on_stream receives None for stop_tx when we registered early (the
+				// real sender is already in `incoming`), so it skips the re-insert.
+				let stop_tx_opt: Option<oneshot::Sender<()>> = {
+					if incoming.lock().unwrap().contains_key(&peer) {
+						// Live session holds the slot — don't clobber it.
+						Some(stop_tx)
+					} else {
+						active.lock().unwrap().insert(
+							peer.clone(),
+							crate::state::ConnInfo {
+								sid,
+								since_ms,
+								// Unknown until StartStream; make_on_stream will overwrite.
+								mode: crate::state::ConnMode::Remote,
+								view_only: false,
+							},
+						);
+						incoming.lock().unwrap().insert(peer.clone(), (sid, stop_tx));
+						host_out.lock().unwrap().insert(peer.clone(), (sid, out_tx.clone()));
+						// Minimized: mode unknown until first StartStream; make_on_stream
+						// calls open_or_update again with the real mode.
+						crate::connections::open_or_update(&app_h, false);
+						None
+					}
+				};
 
 				// Media-over-session: a send-only session handle for the RTP forwarder
 				// tasks (they transmit concurrently with the serve loop's recv), and the
@@ -743,7 +792,7 @@ pub(crate) async fn go_online(
 					active.clone(),
 					incoming.clone(),
 					host_out.clone(),
-					stop_tx,
+					stop_tx_opt,
 					out_tx,
 					since_ms,
 					sid,
@@ -1223,6 +1272,8 @@ pub(crate) async fn go_online(
 					fwd_slot: fwd_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_slot: cap_slot.clone(),
+					#[cfg(not(windows))]
+					mode_watcher,
 					sid,
 				};
 				tokio::select! {
@@ -1242,9 +1293,8 @@ pub(crate) async fn go_online(
 				for h in fwd_slot.lock().unwrap().drain(..) {
 					h.abort();
 				}
-				// Stop the host display-mode watcher (its restream receiver is gone with serve_with).
-				#[cfg(not(windows))]
-				mode_watcher.abort();
+				// The host display-mode watcher is aborted by SessionCleanupGuard::drop
+				// (both on the normal path here and on the abort() path from go_online).
 				// Stop the native capture thread (releases the NVENC session + DXGI duplication).
 				#[cfg(windows)]
 				if let Some(h) = native_slot.lock().unwrap().take() {

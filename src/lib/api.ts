@@ -31,6 +31,7 @@ export {
 	onClipboardIn,
 	onDataClip,
 	onFileRecv,
+	onFileBegin,
 	onFsEntries,
 	onPeerAvatar,
 	onPeerName,

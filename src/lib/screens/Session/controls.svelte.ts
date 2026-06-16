@@ -118,7 +118,13 @@ export class SessionControls {
 	setQuality = (v: 'latency' | 'quality') => {
 		this.streamQuality = v;
 		const playId = this.#in.playId();
-		if (playId >= 0) api.setPlayQuality(playId, v).catch(() => {});
+		if (playId < 0) return;
+		// set_play_quality sends Restream::Quality → request_stream on the host,
+		// which kills and rebuilds the encoder pipeline (same depth as a codec/fps
+		// switch). Suppress the stall detector for the same window so the rebuild
+		// gap does not flash a false "stream stopped" error.
+		this.#beginSwitch(2800);
+		api.setPlayQuality(playId, v).catch(() => {});
 	};
 	setMonitor = (idx: number) => {
 		this.streamDisplay = idx;

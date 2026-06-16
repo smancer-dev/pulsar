@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Icon from '$lib/Icon.svelte';
 	import { t } from '$lib/i18n.svelte';
-	import { api, onFsEntries, onFileRecv, type FsEntry } from '$lib/api';
+	import { api, onFsEntries, onFileRecv, onFileBegin, type FsEntry } from '$lib/api';
 	import { listenScope } from '$lib/api.events';
 
 	// Two-pane (AnyDesk-style) file manager inside the session menu: LEFT = this
@@ -34,6 +34,46 @@
 	const segs = (p: string) => (p ? p.split('/') : []);
 	const parent = (p: string) => p.split('/').slice(0, -1).join('/');
 
+	// Mirror of Rust's `sanitize_filename` (files.rs) so pendingDownloads is keyed by
+	// the same name the Rust reassembler will emit in the file-recv event.  Without this
+	// any file whose name is altered by sanitize_filename (colons on Windows, leading/
+	// trailing whitespace, or control chars on any platform) produces a map key that
+	// never matches e.name, so the concurrency slot drains only via the 30 s timeout
+	// and the success/fail flash is never shown.
+	const onWindows = typeof navigator !== 'undefined' && /Win/i.test(navigator.platform);
+	// Reserved DOS device stems (checked case-insensitively, before extension).
+	const DOS_RESERVED = new Set([
+		'CON','PRN','AUX','NUL',
+		'COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',
+		'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9',
+	]);
+	function sanitizeFilename(name: string): string {
+		// Step 1: last path component, trim surrounding whitespace.
+		const base = (name.split(/[/\\]/).pop() ?? name).trim();
+		// Step 2: strip control chars (and ':' on Windows).
+		let cleaned = '';
+		for (const ch of base) {
+			const cp = ch.codePointAt(0) ?? 0;
+			if (cp <= 0x1f) continue;
+			if (onWindows && ch === ':') continue;
+			cleaned += ch;
+		}
+		// Step 3: structural guard — must be a single normal path component.
+		// Treat empty, '.', and '..' as invalid (mirrors Path::components check).
+		if (!cleaned || cleaned === '.' || cleaned === '..') return 'dosya';
+		// Step 4: Windows-only escape_reserved — trim trailing dots/spaces, prefix
+		// reserved device names.
+		if (onWindows) {
+			const trimmed = cleaned.replace(/[. ]+$/, '') || cleaned;
+			const stem = (trimmed.split('.')[0] ?? trimmed).toUpperCase();
+			if (DOS_RESERVED.has(stem) || trimmed.length !== cleaned.length) {
+				return '_' + trimmed;
+			}
+			return trimmed;
+		}
+		return cleaned;
+	}
+
 	async function loadLocal(path: string) {
 		localLoading = true;
 		localPath = path;
@@ -51,11 +91,28 @@
 		api.fsList(playId, path).catch(() => (remoteLoading = false));
 	}
 
-	// Pending download completions keyed by filename — each entry is a queue of
-	// {resolve, reject} for in-flight enqueueXfer slots waiting on file-recv.
-	// Using an array per name so two simultaneous downloads of the same filename
-	// are handled in FIFO order.
-	const pendingDownloads = new Map<string, Array<{ resolve: () => void; reject: () => void }>>();
+	// Two-level pending-download tracking (C21 fix: keyed by transfer id, not name).
+	//
+	// Phase 1 — before `file-begin` arrives: entries live in `waitingByName`, a
+	// FIFO queue per filename.  A download() call registers here immediately (before
+	// the FsGet even reaches the host) so nothing is lost if file-begin is fast.
+	//
+	// Phase 2 — once `file-begin` fires with the host-assigned xferId: the head of
+	// the matching waitingByName queue is popped and moved into `pendingById` under
+	// its numeric xferId.  `onBegin()` is called here (cancels the short no-response
+	// timeout and arms the long safety backstop).
+	//
+	// Phase 3 — `file-recv` arrives with the same xferId: look up `pendingById`
+	// and resolve/reject that exact slot, then delete it.
+	//
+	// This guarantees that a late file-recv for a timed-out download (whose entry
+	// was already spliced out of waitingByName by the timeout) can never match a
+	// different in-flight download that happens to share the same basename.
+	// `onBegin` receives the host-assigned xferId so the entry's removeEntry helper
+	// can clean up pendingById (not waitingByName) if the safety backstop fires.
+	type PendingEntry = { resolve: () => void; reject: () => void; onBegin: (xferId: number) => void };
+	const waitingByName = new Map<string, Array<PendingEntry>>();
+	const pendingById   = new Map<number, PendingEntry>();
 
 	// Inbound listings + download results for THIS play; initial load of both
 	// panes. Scoped to the component so it tears down when the panel closes.
@@ -69,20 +126,40 @@
 				remoteEntries = e.entries;
 				remoteLoading = false;
 			}),
+			// The host started streaming a download (FileBegin received).
+			// Move the head of waitingByName[name] → pendingById[xferId] and call
+			// onBegin(xferId) to cancel the short no-response timeout and arm the
+			// long safety backstop.  FIFO order inside waitingByName matches the
+			// order the user clicked 'Indir', so the correct entry is always promoted.
+			onFileBegin((e) => {
+				if (e.peer !== idStr) return;
+				const queue = waitingByName.get(e.name);
+				if (queue && queue.length > 0) {
+					const entry = queue.shift()!;
+					if (queue.length === 0) waitingByName.delete(e.name);
+					pendingById.set(e.xferId, entry);
+					entry.onBegin(e.xferId);
+				}
+			}),
 			// A download landed (the host streamed our fsGet back): surface the result —
 			// the file was saved under "Pulsar Alınanlar" by the Rust side.
+			// Keyed by xferId so a late file-recv for a timed-out same-name download
+			// cannot drain a different in-flight download's concurrency slot (C21 fix).
 			onFileRecv((e) => {
 				if (e.peer !== idStr) return;
 				flash(
 					e.ok ? t('files.downloaded', { name: e.name }) : t('files.downloadFail', { name: e.name })
 				);
-				// Drain the concurrency slot held for this download (keyed by filename).
-				const queue = pendingDownloads.get(e.name);
-				if (queue && queue.length > 0) {
-					const { resolve, reject } = queue.shift()!;
-					if (queue.length === 0) pendingDownloads.delete(e.name);
-					if (e.ok) resolve(); else reject();
+				// Drain the concurrency slot held for this exact transfer.
+				const entry = pendingById.get(e.xferId);
+				if (entry) {
+					pendingById.delete(e.xferId);
+					if (e.ok) entry.resolve(); else entry.reject();
 				}
+				// If xferId is absent from pendingById this file-recv belongs to a
+				// transfer that already timed out (its entry was spliced out by the
+				// no-response or safety-backstop timer) — silently ignore it so it
+				// cannot affect any other queued slot.
 			})
 		);
 		loadLocal('');
@@ -126,38 +203,89 @@
 		});
 	}
 
-	// Timeout (ms) after which a download slot is released even if file-recv never
-	// arrives (host refusal / lost FileEnd / jailed path returns nothing).
-	const DOWNLOAD_TIMEOUT_MS = 30_000;
+	// How long to wait for the FIRST response from the host (FileBegin / file-recv)
+	// before giving up and releasing the concurrency slot.  Covers the "host refused /
+	// jailed path / network lost before the host could reply" case.  Once FileBegin
+	// arrives the `onBegin` callback cancels this and arms DOWNLOAD_SAFETY_TIMEOUT_MS
+	// instead, so a legitimately-slow transfer is never evicted.
+	const DOWNLOAD_NO_RESPONSE_MS = 30_000;
+	// Safety backstop armed after FileBegin: 2× the Rust idle-sweep window (60 s) so
+	// the Rust side gets a chance to emit file-recv{ok:false} via its own sweep first,
+	// and we only release as a last resort for a truly dead transfer (lost FileEnd with
+	// no subsequent download to trigger the sweep).
+	const DOWNLOAD_SAFETY_TIMEOUT_MS = 120_000;
 
 	function download(name: string) {
 		flash(t('files.downloading', { name }));
+		// Key by the sanitized name so it matches what the Rust FileBegin event
+		// carries in `e.name` (sanitize_filename in files.rs strips ':' on Windows,
+		// trims leading/trailing whitespace, and handles reserved names).
+		const key = sanitizeFilename(name);
 		enqueueXfer(async () => {
 			// 1. Send the FsGet request to the host.
 			await api.fsGet(playId, join(remotePath, name)).catch(() => {
 				flash(t('files.downloadFail', { name }));
 			});
 			// 2. Wait for the actual file-recv completion event for this file.
-			//    The slot stays occupied until the host finishes streaming back OR
-			//    the timeout fires — whichever comes first.
+			//    Phase A: a short no-response timer covers "host never replied at all".
+			//    Phase B: onFileBegin (fired when FileBegin datagram arrives) moves
+			//    this entry from waitingByName into pendingById[xferId], cancels the
+			//    short timer, and arms a long safety backstop — the slot stays occupied
+			//    for the whole duration of a legitimately-slow transfer.
+			//    Phase C: onFileRecv (keyed by xferId) resolves/rejects this entry.
 			await new Promise<void>((resolve, reject) => {
 				let timer: ReturnType<typeof setTimeout> | undefined;
-				const entry = {
+
+				// removeEntry removes this entry from whichever map currently holds it.
+				// Before file-begin: waitingByName (no xferId yet).
+				// After file-begin: pendingById (onBegin sets assignedId below).
+				let assignedId: number | undefined;
+				function removeEntry() {
+					if (assignedId !== undefined) {
+						pendingById.delete(assignedId);
+					} else {
+						const queue = waitingByName.get(key);
+						if (queue) {
+							const idx = queue.indexOf(entry);
+							if (idx !== -1) queue.splice(idx, 1);
+							if (queue.length === 0) waitingByName.delete(key);
+						}
+					}
+				}
+
+				const entry: PendingEntry = {
 					resolve: () => { clearTimeout(timer); resolve(); },
 					reject:  () => { clearTimeout(timer); reject(); },
+					// Called by onFileBegin when the host starts streaming: the entry
+					// has already been moved from waitingByName to pendingById[xferId]
+					// by the onFileBegin handler above.  Record xferId for removeEntry,
+					// cancel the short no-response timer, and arm the long safety backstop.
+					onBegin: (xferId: number) => {
+						assignedId = xferId;
+						clearTimeout(timer);
+						timer = setTimeout(() => {
+							removeEntry();
+							// Safety backstop: FileBegin arrived but FileEnd never came
+							// (lost packet or mid-stream host crash).  The Rust idle-sweep
+							// should have already emitted file-recv{ok:false}, but if that
+							// event was also lost show the failure flash here as a last resort.
+							flash(t('files.downloadFail', { name }));
+							resolve(); // drain the slot so queued downloads can proceed
+						}, DOWNLOAD_SAFETY_TIMEOUT_MS);
+					},
 				};
-				if (!pendingDownloads.has(name)) pendingDownloads.set(name, []);
-				pendingDownloads.get(name)!.push(entry);
-				// Timeout: release the slot even if the host never answers.
+				if (!waitingByName.has(key)) waitingByName.set(key, []);
+				waitingByName.get(key)!.push(entry);
+				// Phase A: no-response timeout — release the slot if the host never
+				// sends FileBegin (e.g. path refused / network lost before host reply,
+				// or the synthetic FileBegin+FileEnd was itself lost on a lossy link).
+				// Show a failure flash so the user is not left with a silent
+				// "indiriliyor…" note stuck on screen.
 				timer = setTimeout(() => {
-					const queue = pendingDownloads.get(name);
-					if (queue) {
-						const idx = queue.indexOf(entry);
-						if (idx !== -1) queue.splice(idx, 1);
-						if (queue.length === 0) pendingDownloads.delete(name);
-					}
-					resolve(); // drain the slot; the flash was already shown by onFileRecv or stays as "downloading"
-				}, DOWNLOAD_TIMEOUT_MS);
+					removeEntry();
+					flash(t('files.downloadFail', { name }));
+					resolve(); // drain the slot so queued downloads can proceed
+				}, DOWNLOAD_NO_RESPONSE_MS);
 			}).catch(() => {/* reject just means failed download — slot still drains */});
 		});
 	}

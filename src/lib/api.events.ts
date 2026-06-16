@@ -2,7 +2,7 @@
 // prompts, and the client-side play telemetry stream. Re-exported by `api.ts`.
 
 import { isTauri } from './api.invoke';
-import type { AuthPrompt, DataText, FileRecv, FsEntries, LocalCaps, SessionEvent } from './api.types';
+import type { AuthPrompt, DataText, FileBegin, FileRecv, FsEntries, LocalCaps, SessionEvent } from './api.types';
 
 async function listenTo<T>(event: string, cb: (e: T) => void): Promise<() => void> {
 	if (!isTauri) return () => {};
@@ -64,6 +64,10 @@ export const onDataClip = (cb: (e: DataText) => void) => listenTo<DataText>('dat
 /** Host: an inbound file transfer finished. Also fires on the CLIENT when a
  * file-manager download lands (`peer` = play id as string then). */
 export const onFileRecv = (cb: (e: FileRecv) => void) => listenTo<FileRecv>('file-recv', cb);
+/** Client: the host started streaming a file-manager download (FileBegin received).
+ * Used to cancel the short wall-clock timeout so the concurrency slot isn't released
+ * while the transfer is legitimately in flight. `peer` = play id as string. */
+export const onFileBegin = (cb: (e: FileBegin) => void) => listenTo<FileBegin>('file-begin', cb);
 /** Client: a host directory listing arrived for the file panel (the reply to
  * `api.fsList`; `id` = play id, `path` = the echoed HOME-relative path). */
 export const onFsEntries = (cb: (e: FsEntries) => void) => listenTo<FsEntries>('fs-entries', cb);

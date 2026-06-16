@@ -380,8 +380,9 @@ pub(super) async fn hold_session(
 								// If early FileChunks created a lazy entry (UDP reorder), merge
 								// the name + expected into it to preserve buffered chunks.
 								// Otherwise insert a fresh entry.
+								let sane_name = crate::files::sanitize_filename(&name);
 								if let Some(r) = f_xfers.get_mut(&xfer) {
-									r.name = crate::files::sanitize_filename(&name);
+									r.name = sane_name.clone();
 									r.expected = Some(chunks);
 									r.last_activity = now;
 									// Prune any pre-buffered chunks whose index is now >= chunks.
@@ -399,13 +400,26 @@ pub(super) async fn hold_session(
 									});
 								} else {
 									f_xfers.insert(xfer, FileReasm {
-										name: crate::files::sanitize_filename(&name),
+										name: sane_name.clone(),
 										expected: Some(chunks),
 										chunks: std::collections::BTreeMap::new(),
 										received: 0,
 										last_activity: now,
 									});
 								}
+								// Notify the client UI that the host has started streaming
+								// this file — the concurrency guard must NOT release the
+								// wire slot on the short wall-clock timeout once a FileBegin
+								// has been seen (the transfer is legitimately in flight).
+								// xfer_id lets the UI associate this event with the exact
+								// download() call that triggered it (keyed by id, not name),
+								// preventing a timed-out same-name download from draining a
+								// different in-flight slot (C21 fix).
+								let _ = app_ev.emit("file-begin", crate::events::FileBeginPayload {
+									peer: id.to_string(),
+									name: sane_name,
+									xfer_id: xfer,
+								});
 							}
 							DataMsg::FileChunk { id: xfer, index, data } => {
 								// If no entry exists yet (FileBegin hasn't arrived — UDP reorder),
@@ -471,6 +485,7 @@ pub(super) async fn hold_session(
 											name: r.name.clone(),
 											bytes: 0,
 											ok: false,
+											xfer_id: xfer,
 										});
 									}
 								}
@@ -512,6 +527,7 @@ pub(super) async fn hold_session(
 									name: r.name.clone(),
 									bytes: written,
 									ok: saved.is_some(),
+									xfer_id: xfer,
 								});
 							}
 							_ => {}

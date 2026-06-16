@@ -67,12 +67,32 @@ pub(crate) struct AvatarPayload {
 /// finishes (or fails the gap check). Also emitted to the CLIENT UI when a
 /// file-manager download lands (with `peer` holding the play id, like
 /// [`DataPayload`]'s client-side addressing).
+/// `xfer_id` is the host-assigned transfer id (u32 from `next_transfer_id`),
+/// serialised as `xferId` so the client can key pending completions by transfer
+/// id rather than by filename — preventing a timed-out same-name download from
+/// draining a different in-flight download's concurrency slot (C21).
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct FilePayload {
 	pub(crate) peer: String,
 	pub(crate) name: String,
 	pub(crate) bytes: u64,
 	pub(crate) ok: bool,
+	pub(crate) xfer_id: u32,
+}
+
+/// Emitted to the CLIENT UI (`file-begin`) when a `FileBegin` datagram arrives
+/// for a file-manager download — signals that the host has started streaming the
+/// file and the concurrency slot should not be released on the short wall-clock
+/// timeout (the transfer is legitimately in flight). `peer` = play id as string.
+/// `xfer_id` is the host-assigned transfer id so the client can map this
+/// `file-begin` to the queued `download()` call for that filename (C21 fix).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileBeginPayload {
+	pub(crate) peer: String,
+	pub(crate) name: String,
+	pub(crate) xfer_id: u32,
 }
 
 /// A host directory listing (the file panel's right pane), emitted to the client

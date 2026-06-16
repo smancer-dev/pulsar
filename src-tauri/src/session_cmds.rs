@@ -59,10 +59,19 @@ pub(crate) async fn set_play_encoder(
 	#[cfg(all(unix, not(target_os = "macos")))]
 	{
 		let app2 = app.clone();
+		// Clone the plays Arc so the task can re-check session liveness after its
+		// sleep without borrowing the Tauri State (C20: the session may be torn down
+		// during the 1200 ms window, in which case the post-sleep show must be skipped
+		// to avoid re-raising a dead-session's container over the webview).
+		let plays2 = state.plays.clone();
 		tokio::spawn(async move {
 			crate::render::set_container_visible(&app2, id, false);
 			tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-			crate::render::set_container_visible(&app2, id, true);
+			// Only reveal if the session is still alive (guard against disconnect racing
+			// the encoder-switch veil — C20).
+			if plays2.lock().unwrap().contains_key(&id) {
+				crate::render::set_container_visible(&app2, id, true);
+			}
 		});
 	}
 	#[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -462,7 +471,13 @@ async fn respawn_render_for_codec(
 	#[cfg(not(windows))]
 	{
 		tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-		crate::render::set_container_visible(app, id, true);
+		// Re-check session liveness after the sleep: a disconnect during the
+		// respawn gap would have called stop_stream (which removed the play entry)
+		// while we were waiting. Revealing a dead session's container would briefly
+		// raise it over the webview as a stray black/last-frame box (C20).
+		if state.plays.lock().unwrap().contains_key(&id) {
+			crate::render::set_container_visible(app, id, true);
+		}
 	}
 }
 

@@ -439,6 +439,10 @@ pub fn run() {
 						*FS_REMOTE.lock().unwrap() = (String::new(), Vec::new());
 						*CURSOR_POS.lock().unwrap() = None;
 						*CURSOR_IMG.lock().unwrap() = None;
+						// Bump the generation so the render loop detects the clear and drops
+						// the stale GPU texture — otherwise host-A's pointer bitmap stays
+						// uploaded and is drawn over host-B's video on the resident-reuse path.
+						CURSOR_IMG_GEN.fetch_add(1, Ordering::SeqCst);
 						video::request_reopen(p);
 					}
 				}
@@ -1156,6 +1160,10 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 				cursor_tex = Some(egui_ctx.load_texture("pulsar-cursor", ci, egui::TextureOptions::LINEAR));
 				cursor_hot = (img.hot_x, img.hot_y);
 				cursor_dims = (img.w as f32, img.h as f32);
+			} else {
+				// CURSOR_IMG was cleared (e.g. reopen for a new host): drop the stale
+				// GPU texture so we cannot paint the previous host's pointer shape.
+				cursor_tex = None;
 			}
 		}
 		// Where to draw it (egui points, top-left origin): map the normalized host pointer into

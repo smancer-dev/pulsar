@@ -1,8 +1,8 @@
-//! Connection authorization: the host's Allow/Deny popup, the client's password
+﻿//! Connection authorization: the host's Allow/Deny popup, the client's password
 //! prompt, the race between them, and the small Tauri commands that resolve them.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pulsar_core::service::{
@@ -127,7 +127,13 @@ pub(crate) mod throttle {
 		let peer = key(peer);
 		let mut g = ATTEMPTS.lock().unwrap();
 		let e = g.entry(peer).or_insert((0, Instant::now()));
-		if e.1.elapsed() > WINDOW {
+		// Reset the counter if the failure window has expired OR if a previous
+		// lockout has fully elapsed.  Without the second condition a user who
+		// retries exactly once after the 300 s lockout expires — while still
+		// within the 600 s WINDOW — is instantly re-locked on that single wrong
+		// guess because the count is still >= MAX_FAILURES (C15 fix).
+		let lockout_served = e.0 >= MAX_FAILURES && e.1.elapsed() >= LOCKOUT;
+		if e.1.elapsed() > WINDOW || lockout_served {
 			*e = (0, Instant::now());
 		}
 		e.0 += 1;
@@ -211,6 +217,18 @@ pub(crate) mod throttle {
 	}
 }
 
+/// Maximum number of Allow/Deny popups that may be open at the same time.
+///
+/// An id-cycling attacker who sends a fresh connection on each of N relay ids
+/// would otherwise open N always-on-top, focused, Critical-attention windows —
+/// a desktop-level denial of service. This cap limits the damage: once this
+/// many popups are open, new auth races are denied immediately without opening
+/// another window.
+const MAX_CONCURRENT_POPUPS: usize = 3;
+
+/// Count of currently-open Allow/Deny popup windows.
+static OPEN_POPUP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Spawn the Allow/Deny popup as a separate, focused, always-on-top window that
 /// requests the user's attention (they may be in another app).
 pub(crate) fn open_approval_window(app: &AppHandle, id: u64, peer: &str, pw_status: &str) {
@@ -245,9 +263,19 @@ pub(crate) fn open_approval_window(app: &AppHandle, id: u64, peer: &str, pw_stat
 	.build()
 	{
 		Ok(win) => {
+			OPEN_POPUP_COUNT.fetch_add(1, Ordering::Relaxed);
 			let _ = win.request_user_attention(Some(tauri::UserAttentionType::Critical));
 		}
 		Err(e) => tracing::warn!(%e, "approval window failed to open"),
+	}
+}
+
+/// Decrement the open-popup counter when a popup is closed (called from
+/// [`race_host_auth`] after closing the window).
+fn close_approval_window(app: &AppHandle, id: u64) {
+	if let Some(win) = app.get_webview_window(&format!("approve-{id}")) {
+		let _ = win.close();
+		OPEN_POPUP_COUNT.fetch_sub(1, Ordering::Relaxed);
 	}
 }
 
@@ -287,6 +315,19 @@ pub(crate) async fn race_host_auth(
 	accepted_pws: &[String],
 	one_time_pw: &str,
 ) -> RaceOutcome {
+	// Cap concurrent popups: an id-cycling attacker opens a fresh connection on
+	// each relay id, each reaching this race before the popup limit is known.
+	// If the cap is already at the maximum, deny immediately — no new popup, no
+	// new window, no new attention steal (C8 fix).
+	if OPEN_POPUP_COUNT.load(Ordering::Relaxed) >= MAX_CONCURRENT_POPUPS {
+		tracing::warn!(
+			%peer,
+			limit = MAX_CONCURRENT_POPUPS,
+			"auth: concurrent popup cap reached — denying without opening a new window"
+		);
+		return RaceOutcome { approved: false, matched_one_time: false };
+	}
+
 	let id = next_req.fetch_add(1, Ordering::SeqCst);
 	let (tx, mut rx) = oneshot::channel::<bool>();
 	pending.lock().unwrap().insert(id, tx);
@@ -300,23 +341,45 @@ pub(crate) async fn race_host_auth(
 	);
 	open_approval_window(app, id, peer, "wait");
 
-	// Inactivity deadline: UDP gives no close, so a client that dies silently
-	// mid-prompt would otherwise leave the Allow/Deny popup open forever. Any
-	// client message (keepalive, password retry) re-arms it; expiry denies.
+	// Inactivity deadline: a client that sends NO password attempt within this
+	// window is auto-denied. ONLY actual password submissions (ClientAuth::Password)
+	// re-arm this timer — bare keepalives (Ping) must NOT re-arm it, because a
+	// peer that keeps pinging without ever sending a password would otherwise pin
+	// the popup open indefinitely (C8 root cause fix).
 	const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
-	let deadline = tokio::time::sleep(IDLE);
-	tokio::pin!(deadline);
+	// Absolute budget: regardless of password retries the popup is always closed
+	// and the peer is denied after this wall-clock cap. This bounds the popup
+	// lifetime even for a peer that keeps submitting wrong passwords forever.
+	const MAX_TOTAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+	let idle_deadline = tokio::time::sleep(IDLE);
+	tokio::pin!(idle_deadline);
+	let absolute_deadline = tokio::time::sleep(MAX_TOTAL);
+	tokio::pin!(absolute_deadline);
+
 	// (approved, matched_one_time): a passwordless Allow never rotates the OTP, a
 	// password match reports whether it was the single-use OTP vs the reusable one.
 	let result: (bool, bool) = loop {
 		tokio::select! {
 			biased;
 			d = &mut rx => break (matches!(d, Ok(true)), false),
-			_ = &mut deadline => break (false, false), // client silent too long → deny
+			// Idle timeout: client sent no useful message recently → deny.
+			_ = &mut idle_deadline => {
+				tracing::debug!(%peer, "auth: idle timeout — auto-denying");
+				break (false, false);
+			}
+			// Absolute budget exhausted: deny regardless of activity.
+			_ = &mut absolute_deadline => {
+				tracing::warn!(%peer, "auth: absolute time budget exhausted — denying");
+				break (false, false);
+			}
 			msg = recv_client_auth(session) => {
-				deadline.as_mut().reset(tokio::time::Instant::now() + IDLE);
 				match msg {
 					ClientAuth::Password(pw) => {
+						// A real password attempt: re-arm the idle deadline so the
+						// operator has time to respond after a retry, but the absolute
+						// cap above still applies regardless.
+						idle_deadline.as_mut().reset(tokio::time::Instant::now() + IDLE);
 						// Either the rotating one-time password or the persistent
 						// connect password (Settings → Güvenlik) unlocks the session.
 						if accepted_pws.iter().any(|a| !a.is_empty() && secret_eq(&pw, a)) {
@@ -325,21 +388,36 @@ pub(crate) async fn race_host_auth(
 							let otp = !one_time_pw.is_empty() && secret_eq(&pw, one_time_pw);
 							break (true, otp);
 						}
-						// Wrong: count it. Crossing the throttle threshold ends the
-						// race as a deny (no more retries for this peer for a while).
-						let locked = throttle::record_failure(peer);
-						// Also count it against the source-independent global limit:
-						// a relay attacker who cycles ids gets a fresh per-peer bucket
-						// each time, so the per-peer lockout alone can't stop sustained
-						// guessing — rotate the OTP after enough TOTAL wrong guesses.
-						if throttle::note_global_failure() {
-							crate::commands::rotate_session_password(app);
-						}
+						// Wrong: only count non-empty submissions. An empty pw is the
+						// client's automatic "I have no password yet" probe — the same
+						// no-op the up-front path skips (host.rs). Counting it would
+						// let any peer drive per-peer + global throttle counters for
+						// free by spamming empty Auth frames, and would burn a
+						// legitimate user's attempt for accidentally submitting an empty
+						// field (asymmetric with the deliberate up-front empty-skip).
+						let locked = if !pw.is_empty() {
+							let locked = throttle::record_failure(peer);
+							// Also count it against the source-independent global limit:
+							// a relay attacker who cycles ids gets a fresh per-peer bucket
+							// each time, so the per-peer lockout alone can't stop sustained
+							// guessing — rotate the OTP after enough TOTAL wrong guesses.
+							if throttle::note_global_failure() {
+								crate::commands::rotate_session_password(app);
+							}
+							locked
+						} else {
+							false
+						};
 						if locked {
 							break (false, false);
 						}
 						let _ = need_password(session).await; // wrong → ask client to retry
 					}
+					// Keepalive / Ping: do NOT re-arm the idle deadline. A peer that
+					// only sends pings without ever submitting a password would
+					// otherwise hold the popup open forever (C8 root cause). The
+					// absolute deadline above is the only bound for a pure-keepalive
+					// attacker; the idle deadline auto-denies once keepalives stop.
 					ClientAuth::Keepalive => {}
 					ClientAuth::Gone => break (false, false),
 				}
@@ -347,9 +425,7 @@ pub(crate) async fn race_host_auth(
 		}
 	};
 	pending.lock().unwrap().remove(&id);
-	if let Some(win) = app.get_webview_window(&format!("approve-{id}")) {
-		let _ = win.close();
-	}
+	close_approval_window(app, id);
 	RaceOutcome {
 		approved: result.0,
 		matched_one_time: result.1,

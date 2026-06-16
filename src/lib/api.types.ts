@@ -71,12 +71,29 @@ export interface DataText {
 }
 
 /** A finished (or failed) inbound file transfer, host side — and client side for
- * file-manager downloads (`peer` = play id as string then). */
+ * file-manager downloads (`peer` = play id as string then).
+ * `xferId` is the host-assigned transfer id (mirrors `FileBegin.xferId`) so the
+ * client UI can key pending completions by transfer id rather than by filename,
+ * preventing a timed-out same-name download from draining a different in-flight
+ * download's concurrency slot (C21 fix). */
 export interface FileRecv {
 	peer: string;
 	name: string;
 	bytes: number;
 	ok: boolean;
+	xferId: number;
+}
+
+/** Emitted to the client UI when the host starts streaming a file-manager download
+ * (`FileBegin` datagram received). `peer` = play id as string. Signals that the
+ * concurrency slot must NOT be released on the short wall-clock timeout — the
+ * transfer is legitimately in flight.
+ * `xferId` is the host-assigned transfer id used to associate this event with
+ * the queued `download()` call for the same filename (C21 fix). */
+export interface FileBegin {
+	peer: string;
+	name: string;
+	xferId: number;
 }
 
 /** One entry of a directory listing (file manager). Same JSON shape for the

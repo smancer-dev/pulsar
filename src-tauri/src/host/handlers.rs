@@ -248,6 +248,16 @@ static REDIRECT_MUTE_FALLBACK: std::sync::atomic::AtomicBool =
 static REDIRECT_SINK_ID: std::sync::LazyLock<Mutex<Option<String>>> =
 	std::sync::LazyLock::new(|| Mutex::new(None));
 
+/// The channel layout currently installed on the virtual sink via
+/// `set_render_device_format`. Tracked so that when a second peer (or a re-negotiated
+/// stream) requests a WIDER layout while the redirect is already armed we re-apply
+/// the format rather than silently leaving the sink at the first peer's narrower
+/// channel count. Reset to `None` when the redirect is torn down (owner set empties).
+#[cfg(windows)]
+static REDIRECT_SINK_LAYOUT: std::sync::LazyLock<
+	Mutex<Option<pulsar_core::audio::ChannelLayout>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
 /// Record `sid`'s host-silent wish and switch the redirect on/off when the owner set
 /// flips between empty and non-empty. Sunshine model: redirect the default render
 /// endpoint to the bundled virtual sink (never mute). `layout` is the negotiated
@@ -282,6 +292,27 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 	}
 	let now = !owners.is_empty();
 	if was == now {
+		// Owner set didn't cross the empty↔non-empty boundary, so the redirect arm/disarm
+		// state is unchanged. However, when the redirect is ALREADY ARMED (was && now) and
+		// the incoming request wants host-silent with a WIDER layout than the one currently
+		// installed on the virtual sink, we must re-apply the format — otherwise the sink
+		// stays at the first peer's narrower channel count and subsequent peers (or
+		// re-negotiated streams) are silently capped to it.
+		if was && want {
+			let installed = REDIRECT_SINK_LAYOUT.lock().unwrap().clone();
+			let needs_widen = installed.map_or(true, |cur| layout.channels() > cur.channels());
+			if needs_widen {
+				let sink_id = REDIRECT_SINK_ID.lock().unwrap().clone();
+				if let Some(ref id) = sink_id {
+					tracing::info!(sid, ?layout, ?installed, "host-silent: widening virtual sink format for already-armed redirect");
+					if let Err(e) = pulsar_core::audio::set_render_device_format(id, layout) {
+						tracing::warn!(?layout, "set virtual sink device format (widen) failed: {e} — keeping existing sink format");
+					} else {
+						*REDIRECT_SINK_LAYOUT.lock().unwrap() = Some(layout);
+					}
+				}
+			}
+		}
 		return false;
 	}
 	tracing::info!(sid, want, ?layout, owners = ?owners, "host-silent (sink-redirect) request");
@@ -303,6 +334,9 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 						// Pin the loopback to this exact device-id (re-asserted as the OS
 						// default on every reinit — review HIGH-2).
 						*REDIRECT_SINK_ID.lock().unwrap() = Some(dev.id.clone());
+						// Record the channel layout we just installed so widening re-arms
+						// can check whether a re-application is needed (C18 fix).
+						*REDIRECT_SINK_LAYOUT.lock().unwrap() = Some(layout);
 						false
 					}
 					Err(e) => {
@@ -325,9 +359,10 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 		}
 	} else {
 		// Last owner left: restore. Drop the guard (restores the saved default), clear
-		// the pinned-sink id, and/or undo any mute fallback we took.
+		// the pinned-sink id and installed layout, and/or undo any mute fallback we took.
 		*REDIRECT_GUARD.lock().unwrap() = None;
 		*REDIRECT_SINK_ID.lock().unwrap() = None;
+		*REDIRECT_SINK_LAYOUT.lock().unwrap() = None;
 		mute_fallback(false);
 		false
 	}
@@ -1006,7 +1041,8 @@ pub(super) fn make_on_stream(
 	host_out: Arc<
 		Mutex<std::collections::HashMap<String, (u64, tokio::sync::mpsc::Sender<DataMsg>)>>,
 	>,
-	stop_tx: oneshot::Sender<()>,
+	// None when the session was already registered in `incoming` at accept time (C9).
+	stop_tx: Option<oneshot::Sender<()>>,
 	out_tx: tokio::sync::mpsc::Sender<DataMsg>,
 	since_ms: u64,
 	sid: u64,
@@ -1037,7 +1073,9 @@ pub(super) fn make_on_stream(
 	#[cfg(not(windows))] last_req_store: Arc<Mutex<Option<StreamReq>>>,
 ) -> impl FnMut(StreamReq, SocketAddr) + Send + 'static {
 	let mut announced = false;
-	let mut stop_tx = Some(stop_tx);
+	// stop_tx is already None when the session was pre-registered at accept time (C9),
+	// meaning `incoming` already holds the real sender — no re-insert needed.
+	let mut stop_tx = stop_tx;
 	// Cursor side-channel poller's liveness flag (Linux KMS path). Held across re-streams so a
 	// re-stream can stop the prior poller before (maybe) starting a new one — avoids stacking
 	// pollers when a session re-requests while still on the cursorless KMS capture.
@@ -1142,9 +1180,8 @@ pub(super) fn make_on_stream(
 			)
 		};
 
-		// First stream request reveals this connection's mode: register it and open the
-		// dedicated connections window — brought forward for a Remote connection, opened
-		// hidden for a Game one (so it doesn't disrupt / leak into the streamed game).
+		// First stream request reveals this connection's mode: upgrade the connections
+		// window entry and bring the window forward (Remote) or leave it minimized (Game).
 		// Done once (not on re-streams) so a live resolution change doesn't re-pop it.
 		if !announced {
 			announced = true;
@@ -1153,11 +1190,10 @@ pub(super) fn make_on_stream(
 			} else {
 				crate::state::ConnMode::Remote
 			};
-			// Registration happens HERE, not at accept (see go_online): a control
-			// session that never streams must not clobber a live same-peer session's
-			// entries — overwriting `incoming` drops the live stop_tx and instantly
-			// tears its stream down. A second STREAMING session still takes over
-			// (the overwritten stop_tx drop ends the old session cleanly).
+			// Upgrade the active entry with the confirmed mode (go_online pre-registered
+			// it as Remote as a default; now we know the real value). A second STREAMING
+			// session from the same peer takes over here (overwriting stop_tx in incoming
+			// drops the old session's oneshot sender, firing stop_rx and ending it cleanly).
 			active.lock().unwrap().insert(
 				peer.clone(),
 				crate::state::ConnInfo {
@@ -1167,6 +1203,10 @@ pub(super) fn make_on_stream(
 					view_only: false,
 				},
 			);
+			// stop_tx is Some only when go_online could NOT pre-register (a live streaming
+			// session already held the slot). In that case we register now (same-peer
+			// reconnect / stream takeover). When it is None the entry in `incoming` was
+			// written at accept time and remains valid — no re-insert needed.
 			if let Some(tx) = stop_tx.take() {
 				incoming.lock().unwrap().insert(peer.clone(), (sid, tx));
 			}
@@ -1174,6 +1214,9 @@ pub(super) fn make_on_stream(
 				.lock()
 				.unwrap()
 				.insert(peer.clone(), (sid, out_tx.clone()));
+			// Open or update the connections window: bring forward for Remote, leave
+			// minimized for Game. If the window was already opened minimized at accept
+			// time, this upgrades it to the correct focus/visibility for the real mode.
 			crate::connections::open_or_update(&app_h, !req.game_mode);
 			// Identity push (host → client) is ALSO deferred to here: at accept time
 			// the client is still inside query_stream_caps' wait loop, which discards
@@ -2231,6 +2274,7 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 							name: r.name.clone(),
 							bytes: 0,
 							ok: false,
+							xfer_id: id,
 						},
 					);
 				}
@@ -2271,6 +2315,7 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 					name: r.name.clone(),
 					bytes: written,
 					ok,
+					xfer_id: id,
 				},
 			);
 			if ok {

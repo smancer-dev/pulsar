@@ -332,6 +332,67 @@ async fn post_registration_protocol_error_fires_version_error() {
 		.expect("version_error must be notified within 2 s after post-registration Protocol error");
 }
 
+/// Regression test for C3: a post-registration `ErrCode::Protocol` error whose
+/// message is NOT "incompatible protocol version" (e.g. "no such session" from a
+/// relay-fallback GC or relay restart) must NOT fire `version_error`.
+///
+/// Before the fix, the handler matched `ErrCode::Protocol` alone (without checking
+/// the message), so any benign stale-session Protocol error sent the node offline
+/// with a false "update required" banner and permanently blocked auto-retry.
+///
+/// Flow: fake relay accepts the initial Register (Registered), then sends a
+/// Protocol error with a benign message ("no such session"). The test asserts that
+/// `version_error` is NOT notified within a short window.
+#[tokio::test]
+async fn post_registration_benign_protocol_error_does_not_fire_version_error() {
+	let fake = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let relay_addr = fake.local_addr().unwrap();
+
+	tokio::spawn(async move {
+		let mut buf = vec![0u8; 65_536];
+
+		// Step 1 — initial Register → Registered.
+		let (n, from) = fake.recv_from(&mut buf).await.unwrap();
+		assert!(matches!(
+			proto::decode::<proto::ClientMsg>(&buf[..n]),
+			Ok(proto::ClientMsg::Register { .. })
+		));
+		use pulsar_core::proto::{DeviceId, Token};
+		let registered = proto::encode(&proto::RelayMsg::Registered {
+			id: DeviceId::new(100_000_002).unwrap(),
+			token: Token([0x43; 16]),
+		});
+		fake.send_to(&registered, from).await.unwrap();
+
+		// Step 2 — immediately send a Protocol error with a benign stale-session
+		// message (as the relay emits for RelayData on an evicted session).
+		let benign_err = proto::encode(&proto::RelayMsg::Error {
+			code: proto::ErrCode::Protocol,
+			message: "no such session".into(),
+		});
+		fake.send_to(&benign_err, from).await.unwrap();
+
+		// Keep the socket alive so the node's heartbeats don't immediately get
+		// ECONNREFUSED (which would close the test prematurely on some platforms).
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	});
+
+	let node = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	let ver_signal = node.version_error_handle();
+	node.register().await.expect("initial register must succeed");
+	assert!(node.self_id().await.is_some(), "should have an id after register");
+
+	// version_error must NOT be notified — the benign Protocol error (wrong message)
+	// should fall through without triggering the version-mismatch path.
+	let fired = timeout(Duration::from_millis(400), ver_signal.notified()).await;
+	assert!(
+		fired.is_err(),
+		"version_error must NOT fire for a benign ErrCode::Protocol (non-version message)"
+	);
+}
+
 /// Media-over-session: tagged RTP frames ride the SAME encrypted session as the
 /// JSON control messages — through the RELAY (the single-socket promise must hold
 /// on the worst-case transport), sent from a concurrent `SessionSender` while the

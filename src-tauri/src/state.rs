@@ -113,11 +113,14 @@ pub(crate) struct AppState {
 	/// connect take one back, send `show\n` + `reopen <new-sdp>\n` + new caps lines. The
 	/// GDK container (child GdkWindow) id that owns the renderer's `--wid` is kept so it
 	/// can be re-registered under the new session id without re-creating the X window.
-	/// A Vec instead of Option so multiple concurrent session tabs can each park their OWN
-	/// renderer without evicting the other tab's parked renderer via SIGTERM (which would
-	/// destroy its EGL context and corrupt the shared Mali display — the very wedge the
-	/// resident model exists to prevent). Empty on every platform except Linux (`#[cfg(…)]`
-	/// unavailable on struct fields, so we use a Vec that is always empty on non-Linux builds).
+	/// A Vec (capped at 1 by `reap_excess_resident_pool`) so multiple concurrent session
+	/// tabs can each park their OWN renderer without evicting a sibling tab's parked renderer
+	/// mid-session (a sibling is still ACTIVE — SIGTERM-killing it would destroy its EGL
+	/// context and corrupt the shared Mali display). Excess IDLE (hidden) parked renderers —
+	/// those pushed when returning from N-tab to single-tab usage — are SIGTERM'd immediately
+	/// at each push site so the pool never exceeds 1 entry and the orphan pile-up is bounded.
+	/// Empty on every platform except Linux (`#[cfg(…)]` unavailable on struct fields, so we
+	/// use a Vec that is always empty on non-Linux builds).
 	pub(crate) resident_render: Mutex<Vec<crate::play::ResidentRender>>,
 }
 

@@ -348,6 +348,10 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 		// Keycodes currently down that were forwarded as a resolved `Char`; their key-UP is
 		// suppressed (a Unicode insert is one-shot — there is no VK to release).
 		let mut char_keys: std::collections::HashSet<u16> = std::collections::HashSet::new();
+		// Keycodes that were forwarded as a raw Key-down (VK path). Used to gate the
+		// stuck-VK transition release: only emit a key-up when the code was ACTUALLY sent
+		// as a raw VK earlier, not on every fresh printable first-press (C19).
+		let mut vk_sent: std::collections::HashSet<u16> = std::collections::HashSet::new();
 		// Mouse buttons currently held (forwarded down, not yet up). Tracked so a disengage flush
 		// releases ONLY genuinely-held buttons — the old `for button in 0..3` blindly sent a
 		// RIGHT+MIDDLE button-UP every flush → a phantom right-click/context-menu on the host
@@ -542,6 +546,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 					shift = false;
 					lalt = false;
 					char_keys.clear();
+					vk_sent.clear();
 				} else {
 					for d in grabbed.iter_mut() {
 						let _ = d.grab();
@@ -797,9 +802,11 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										// sent as a raw VK (Ctrl was held on the initial press but
 										// released before this repeat/re-press), the host is still
 										// holding that raw VK. Release it now before sending the
-										// Char so the host VK never stays stuck. Sending a key-up
-										// for a key not held on the host is a harmless no-op.
-										if !char_keys.contains(&code) {
+										// Char so the host VK never stays stuck. Gate on vk_sent
+										// (not !char_keys) so we only emit the release when a raw
+										// VK-down was ACTUALLY sent for this code — not on every
+										// fresh first press of a printable key (C19).
+										if vk_sent.remove(&code) {
 											fwd(
 												&tx,
 												InputEvent::Key {
@@ -811,6 +818,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										char_keys.insert(code);
 										fwd(&tx, InputEvent::Char(c));
 									} else if !char_keys.contains(&code) {
+										vk_sent.insert(code);
 										fwd(
 											&tx,
 											InputEvent::Key {

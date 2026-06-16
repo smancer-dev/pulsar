@@ -194,26 +194,33 @@ impl Node {
 						drop(g);
 						self.registered.notify_waiters();
 						self.registered.notify_one();
-					} else if code == ErrCode::IncompatibleVersion || code == ErrCode::Protocol {
-						// Already registered but the relay now rejects us (relay was
-						// redeployed with a newer PROTOCOL_VERSION). The heartbeat will
-						// keep bouncing; every future Register attempt will be refused too.
-						// Signal the version-error watcher so the app can surface an
-						// "update required" message and go offline — instead of silently
-						// advertising a dead id forever.
+					} else if code == ErrCode::IncompatibleVersion
+						|| (code == ErrCode::Protocol
+							&& message == "incompatible protocol version")
+					{
+						// Already registered but the relay now rejects a re-Register with a
+						// version-mismatch error (relay was redeployed with a newer
+						// PROTOCOL_VERSION). The heartbeat will keep bouncing; every future
+						// Register attempt will be refused too. Signal the version-error
+						// watcher so the app can surface an "update required" message and go
+						// offline — instead of silently advertising a dead id forever.
 						//
-						// NOTE: the relay currently emits `ErrCode::Protocol` (not
-						// `IncompatibleVersion`) for version-mismatch replies so that old
-						// builds (which pre-date the `IncompatibleVersion` variant) can
-						// still decode the error (see relay/src/lib.rs — the Protocol
-						// variant is present in ALL released builds). After a relay
-						// redeploy bumps PROTOCOL_VERSION the cycle is:
-						//   heartbeat → NotRegistered → re-Register → Protocol(version mismatch)
-						// A post-registration `Protocol` error has no other plausible
-						// meaning, so we treat it identically to `IncompatibleVersion`.
-						// `IncompatibleVersion` is kept in the condition for the planned
-						// two-phase rollout where the relay switches to that variant once
-						// all deployed clients can decode it.
+						// IMPORTANT — only treat `ErrCode::Protocol` as a version error when
+						// the message is exactly "incompatible protocol version" (the relay's
+						// dedicated string for Register-version rejections). The relay also
+						// emits `ErrCode::Protocol` for benign stale-session conditions on
+						// RelayData/Accept ("no such session", "not a session member",
+						// "not the session target") — those arrive in relay-fallback sessions
+						// whenever the relay restarts and loses its in-memory sessions map or
+						// the session is GC'd at SESSION_TTL. Treating those as a version
+						// error would falsely strand a still-registered host offline with a
+						// permanent "update required" banner.
+						//
+						// Wire-compat note: the relay emits `ErrCode::Protocol` (not
+						// `IncompatibleVersion`) for version-mismatch so old builds that
+						// pre-date `IncompatibleVersion` can decode the error. We match both
+						// so the future two-phase rollout (flip the relay to `IncompatibleVersion`
+						// once all deployed clients can decode it) needs no client change.
 						drop(g);
 						self.version_error.notify_one();
 					}

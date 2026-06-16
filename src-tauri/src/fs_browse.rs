@@ -233,9 +233,35 @@ pub(crate) fn make_on_fs(out_tx: Sender<DataMsg>) -> impl FnMut(DataMsg) + Send 
 		DataMsg::FsGet { path } => {
 			let tx = out_tx.clone();
 			tokio::spawn(async move {
-				// A refused/failed get sends nothing further — the client's flash
-				// note just never upgrades to "indirildi" (best-effort v1).
-				let _ = send_file_at(&tx, &path).await;
+				if send_file_at(&tx, &path).await.is_none() {
+					// The host refused or failed (jailed path, missing/non-file, I/O
+					// error mid-stream).  Send a synthetic FileBegin{chunks:1} +
+					// FileEnd with no intervening chunk so the client's reassembler
+					// sees expected=Some(1) but 0 chunks → complete=false →
+					// file-recv{ok:false}.  This drains the client's concurrency slot
+					// immediately instead of holding it for the full no-response
+					// timeout.
+					//
+					// Name: the basename of the requested path as a plain String —
+					// the client keys pendingDownloads by sanitizeFilename(basename),
+					// so using the raw basename here lets the existing sanitize path
+					// in files.rs (called on FileEnd save) emit the same key.
+					let name = Path::new(&path)
+						.file_name()
+						.map(|n| n.to_string_lossy().into_owned())
+						.unwrap_or_else(|| path.clone());
+					let id = next_transfer_id();
+					// FileBegin announces 1 chunk that will never arrive.
+					let _ = tx.send(DataMsg::FileBegin {
+						id,
+						name,
+						size: 0,
+						chunks: 1,
+					}).await;
+					// FileEnd with no preceding chunk → reassembler marks incomplete
+					// → file-recv{ok:false} fires on the client side promptly.
+					let _ = tx.send(DataMsg::FileEnd { id }).await;
+				}
 			});
 		}
 		_ => {}

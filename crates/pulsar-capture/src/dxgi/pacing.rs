@@ -62,13 +62,19 @@ impl CaptureDevice {
 		let mut start = self.qpc.now_ns();
 		let mut frame_no: i64 = 0;
 
-		// Native dimensions the ENCODER was built for (the duplication mode at build time, set by
-		// build_duplication before run() is called). A host display MODE change invalidates the
-		// duplication (ACCESS_LOST → Capture::Reinit); after the reinit we compare against these to
-		// distinguish a RESOLUTION change (rebuild the encoder — it is sized to the old dims) from a
-		// refresh-rate-only change (keep the encoder; just force one IDR so the client re-syncs).
+		// Native dimensions and rotation the ENCODER was built for (the duplication mode at build
+		// time, set by build_duplication before run() is called). A host display MODE change
+		// invalidates the duplication (ACCESS_LOST → Capture::Reinit); after the reinit we compare
+		// against these to distinguish a RESOLUTION or ROTATION change (rebuild the encoder — it is
+		// sized to the old dims and bakes the old rotation) from a refresh-rate-only change (keep
+		// the encoder; just force one IDR so the client re-syncs).
 		let built_w = self.dup_desc.ModeDesc.Width;
 		let built_h = self.dup_desc.ModeDesc.Height;
+		// Rotation at build time (degrees CW: 0/90/180/270) — from the same dup_desc. DXGI
+		// keeps Width/Height UNCHANGED on a rotation-only change (it always reports the unrotated
+		// scan-out surface; orientation lives in dup_desc.Rotation), so a rotation change is
+		// INVISIBLE to the Width/Height comparison below without this extra baseline.
+		let built_rotation = self.rotation_deg();
 		// Set after a same-resolution reinit; the next emitted Frame carries it so the encoder
 		// forces an IDR (the client dropped the GOP it was mid-decode of during the blip).
 		let mut force_next_idr = false;
@@ -136,16 +142,23 @@ impl CaptureDevice {
 						return RunExit::Stop;
 					}
 					// reinit() rebuilt the duplication at the (possibly new) mode. If the RESOLUTION
-					// changed, the encoder + its NV12 target / VideoProcessor are sized to the OLD
-					// dimensions and would emit garbage (the old in-place reinit kept the stale
-					// encoder → "stream freezes on a resolution change, fixed only by reconnect").
-					// Bail so the capture loop (lib.rs) rebuilds capture+encoder at the new size —
-					// that path also forces a fresh IDR burst, so the client re-syncs cleanly. If
-					// only the refresh rate changed (same WxH) the encoder is still valid: keep it
-					// (no costly NVENC re-open) but force ONE IDR on the next frame so the client
-					// re-syncs after the blip instead of freezing until the next safety GOP.
+					// or ROTATION changed, the encoder + its NV12 target / VideoProcessor are sized
+					// to the OLD dimensions and bake the OLD rotation (Encoder.rotation is captured
+					// once at build time and drives VideoProcessorSetStreamRotation every frame).
+					// Bail so the capture loop (lib.rs) rebuilds capture+encoder at the new size/
+					// rotation — that path also forces a fresh IDR burst, so the client re-syncs
+					// cleanly. If only the refresh rate changed (same WxH, same rotation) the
+					// encoder is still valid: keep it (no costly NVENC re-open) but force ONE IDR
+					// on the next frame so the client re-syncs after the blip instead of freezing
+					// until the next safety GOP.
+					//
+					// NOTE: DXGI keeps Width/Height UNCHANGED on a rotation-only change (it reports
+					// the unrotated scan-out surface; orientation lives in dup_desc.Rotation), so
+					// without the rotation check a landscape↔portrait flip slips through as a
+					// "rate-only reinit" and the stream permanently bakes the stale orientation.
 					if self.dup_desc.ModeDesc.Width != built_w
 						|| self.dup_desc.ModeDesc.Height != built_h
+						|| self.rotation_deg() != built_rotation
 					{
 						return RunExit::Switch(self.output_idx);
 					}
