@@ -122,6 +122,7 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'relaunch_to_home':
 			return Promise.resolve(undefined as unknown as T);
 		case 'set_controller_order':
+		case 'set_controller_emulation':
 		case 'set_stream_settings':
 		case 'stop_stream':
 		case 'set_play_resolution':

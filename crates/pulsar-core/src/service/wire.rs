@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::ChannelLayout;
-use crate::input::GamepadState;
+use crate::input::{EmulationTarget, GamepadState};
 
 /// A game/app the host exposes to clients.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -24,15 +24,23 @@ pub enum InputEvent {
 	/// Player 1. A new host treats this as `GamepadSlot { slot: 0, kind: Xbox, .. }`.
 	/// New-to-new sessions use `GamepadSlot` for multi-controller support.
 	Gamepad(GamepadState),
-	/// Controller state tagged with a player slot (0-based) and the pad family.
+	/// Controller state tagged with a player slot (0-based), the detected pad family,
+	/// and the desired emulation target.
 	///
 	/// Added for multi-controller support (additive new→new variant). Old peers that
 	/// receive an unknown JSON variant silently drop it — no wire breakage. The host
-	/// maps `slot` to a virtual pad (up to 4 pads). `kind` lets the host pick the
-	/// right emulation target in the future; today all slots use Xbox360 emulation.
+	/// maps `slot` to a virtual pad (up to 4 pads) and resolves `(kind, target)` to a
+	/// concrete backend via [`EmulationTarget::resolve`]: Auto maps Sony families
+	/// (Ds3/Ds4/Ds5) to DS4 and everything else to Xbox 360; explicit `Xbox360`/`Ds4`
+	/// override the detected kind. `target` carries `#[serde(default)]` so an omitted
+	/// field (older clients) deserializes to `EmulationTarget::Auto`, which makes the
+	/// host pick the same backend it would have picked from `kind` alone — full back-compat.
+	/// `kind` is still sent unchanged so the host/overlay can display "detected → emulated".
 	GamepadSlot {
 		slot: u8,
 		kind: crate::input::GamepadKind,
+		#[serde(default)]
+		target: EmulationTarget,
 		state: GamepadState,
 	},
 	/// A controller at `slot` has disconnected — the host should release its virtual pad.
@@ -829,6 +837,53 @@ mod tests {
 				&back, msg,
 				"DataMsg::{msg:?} roundtrip mismatch (From<DataMsgWire> bug?)"
 			);
+		}
+	}
+
+	/// Locks the additive wire contract for the new `target` field in `GamepadSlot`:
+	/// a slot with an explicit target serializes and deserializes intact.
+	#[test]
+	fn gamepad_slot_roundtrips_target() {
+		use crate::input::{EmulationTarget, GamepadKind, GamepadState};
+		let ev = InputEvent::GamepadSlot {
+			slot: 1,
+			kind: GamepadKind::Ds5,
+			target: EmulationTarget::Ds4,
+			state: GamepadState {
+				buttons: 0x0080,   // START pressed
+				left_x: -10000,
+				left_y: 5000,
+				right_x: 0,
+				right_y: 0,
+				left_trigger: 128,
+				right_trigger: 0,
+			},
+		};
+		let json = serde_json::to_string(&ev).unwrap();
+		let back: InputEvent = serde_json::from_str(&json).unwrap();
+		assert_eq!(ev, back, "GamepadSlot with explicit target must roundtrip");
+	}
+
+	/// Locks back-compat: an old client that omits `target` deserializes with
+	/// `EmulationTarget::Auto` (aa27077 compatibility guarantee).
+	#[test]
+	fn gamepad_slot_missing_target_defaults_auto() {
+		use crate::input::{EmulationTarget, GamepadKind, GamepadState};
+		// Literal JSON produced by a pre-T6 client (no `target` field).
+		let json = r#"{"GamepadSlot":{"slot":0,"kind":"Ds4","state":{"buttons":0,"left_x":0,"left_y":0,"right_x":0,"right_y":0,"left_trigger":0,"right_trigger":0}}}"#;
+		let ev: InputEvent = serde_json::from_str(json).expect("old GamepadSlot must deserialize");
+		match ev {
+			InputEvent::GamepadSlot { slot, kind, target, state } => {
+				assert_eq!(slot, 0);
+				assert_eq!(kind, GamepadKind::Ds4);
+				assert_eq!(
+					target,
+					EmulationTarget::Auto,
+					"missing target must default to Auto (back-compat)"
+				);
+				assert_eq!(state, GamepadState::default());
+			}
+			other => panic!("expected GamepadSlot, got {other:?}"),
 		}
 	}
 }

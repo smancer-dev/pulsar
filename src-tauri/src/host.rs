@@ -8,7 +8,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pulsar_core::input::{create_virtual_pad, GamepadKind, VirtualGamepad};
+use pulsar_core::input::{create_virtual_pad_target, EmulationTarget, GamepadKind, ResolvedTarget, VirtualGamepad};
 use pulsar_core::pipeline::{self, CaptureMethod, HwEncoder, StreamPlan};
 use pulsar_core::proto::DeviceId;
 use pulsar_core::service::{
@@ -907,7 +907,7 @@ pub(crate) async fn go_online(
 						// maps to slot 0; `GamepadSlot`/`GamepadDisconnect` address slots directly.
 						// Pads are created lazily on the first frame for a slot and dropped on
 						// disconnect so the host releases the emulated device (ViGEm/uinput).
-						let mut pads: std::collections::HashMap<u8, Box<dyn VirtualGamepad>> =
+						let mut pads: std::collections::HashMap<u8, (ResolvedTarget, Box<dyn VirtualGamepad>)> =
 							std::collections::HashMap::new();
 					let mut desktop: Option<pulsar_core::input::DesktopInput> = None;
 					let mut tried = false;
@@ -962,7 +962,7 @@ pub(crate) async fn go_online(
 								if let Some(d) = desktop.as_mut() {
 									d.flush_held();
 								}
-								for p in pads.values_mut() {
+								for (_, p) in pads.values_mut() {
 									p.apply(&pulsar_core::input::GamepadState::default());
 								}
 							}
@@ -973,22 +973,32 @@ pub(crate) async fn go_online(
 							// Legacy single-pad variant → Player 1 (slot 0), Xbox emulation.
 							InputEvent::Gamepad(state) => {
 								pads.entry(0)
-									.or_insert_with(|| create_virtual_pad(GamepadKind::Xbox))
-									.apply(&state);
+									.or_insert_with(|| (ResolvedTarget::Xbox360, create_virtual_pad_target(GamepadKind::Xbox, EmulationTarget::Auto)))
+									.1.apply(&state);
 							}
-							// Slot-tagged controller (multi-pad). Uses the REAL kind so future
-							// per-family virtual targets (DS4 touchpad, etc.) can be added without
-							// a wire change; today create_virtual_pad maps all kinds to Xbox360.
-							InputEvent::GamepadSlot { slot, kind, state } => {
-								pads.entry(slot)
-									.or_insert_with(|| create_virtual_pad(kind))
-									.apply(&state);
+							// Slot-tagged controller (multi-pad). The `target` field carries the
+							// client's chosen emulation target (Auto/Xbox360/Ds4). create_virtual_pad_target
+							// now honors the resolved (kind, target) — DS4 target gives a DS4 backend,
+							// Xbox360 (or Auto+Xbox) gives Xbox360. The pad is recreated only when the
+							// resolved target changes, so ViGEm/uinput replug is bounded and rare.
+							InputEvent::GamepadSlot { slot, kind, target, state } => {
+								let want = target.resolve(kind);
+								match pads.get(&slot) {
+									Some((have, _)) if *have != want => {
+										pads.insert(slot, (want, create_virtual_pad_target(kind, target)));
+									}
+									None => {
+										pads.insert(slot, (want, create_virtual_pad_target(kind, target)));
+									}
+									_ => {}
+								}
+								pads.get_mut(&slot).unwrap().1.apply(&state);
 							}
 							// A client controller went away: neutralize to all-zero but keep the
 							// Box alive so the emulated device stays registered on the host —
 							// avoids reconnect churn when the client briefly re-enumerates pads.
 							InputEvent::GamepadDisconnect { slot } => {
-								if let Some(p) = pads.get_mut(&slot) {
+								if let Some((_, p)) = pads.get_mut(&slot) {
 									p.apply(&pulsar_core::input::GamepadState::default());
 								}
 							}

@@ -2,11 +2,11 @@
 //! and the mouse + keyboard injector [`DesktopInput`]. Both work on Wayland and
 //! X11 (kernel input layer), unlike `x11grab`/`xdotool`.
 
-use super::{button, GamepadKind, GamepadState, VirtualGamepad};
+use super::{button, GamepadKind, GamepadState, ResolvedTarget, VirtualGamepad};
 use evdev::{
 	uinput::{VirtualDevice, VirtualDeviceBuilder},
-	AbsInfo, AbsoluteAxisType, AttributeSet, EventType, InputEvent, Key, PropType,
-	RelativeAxisType, UinputAbsSetup,
+	AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, InputEvent, InputId, Key,
+	PropType, RelativeAxisType, UinputAbsSetup,
 };
 
 /// Maps our normalized button bits to evdev gamepad key codes (used by the
@@ -38,7 +38,23 @@ pub struct UinputGamepad {
 }
 
 impl UinputGamepad {
+	/// Create a virtual gamepad using `EmulationTarget::Auto` resolution (Xbox 360
+	/// identity). This delegates to [`Self::new_target`] with `ResolvedTarget::Xbox360`
+	/// so all existing call sites continue to work unchanged.
 	pub fn new(kind: GamepadKind) -> std::io::Result<Self> {
+		Self::new_target(kind, ResolvedTarget::Xbox360)
+	}
+
+	/// Create a virtual gamepad with an explicit emulation target.
+	///
+	/// - `ResolvedTarget::Ds4` → Sony identity: name "Pulsar Wireless Controller",
+	///   VID/PID 054C:05C4 (DualShock 4 rev1), bus USB. SDL/Steam match the Sony
+	///   pad from the name + VID/PID; a full DS4 axis/hat descriptor is a follow-up.
+	/// - `ResolvedTarget::Xbox360` → keeps the current "Pulsar Virtual Gamepad" name
+	///   with Microsoft identity (VID/PID 045E:028E, Xbox 360 controller).
+	///
+	/// Both targets share the same evdev_buttons() + ABS axis layout.
+	pub fn new_target(kind: GamepadKind, resolved: ResolvedTarget) -> std::io::Result<Self> {
 		let mut keys = AttributeSet::<Key>::new();
 		for (_, key) in evdev_buttons() {
 			keys.insert(key);
@@ -50,8 +66,19 @@ impl UinputGamepad {
 			)
 		};
 		let trig = |axis| UinputAbsSetup::new(axis, AbsInfo::new(0, 0, 255, 0, 0, 1));
+		let (name, input_id) = match resolved {
+			ResolvedTarget::Ds4 => (
+				"Pulsar Wireless Controller",
+				InputId::new(BusType::BUS_USB, 0x054C, 0x05C4, 0x8111),
+			),
+			ResolvedTarget::Xbox360 => (
+				"Pulsar Virtual Gamepad",
+				InputId::new(BusType::BUS_USB, 0x045E, 0x028E, 0x0114),
+			),
+		};
 		let dev = VirtualDeviceBuilder::new()?
-			.name("Pulsar Virtual Gamepad")
+			.name(name)
+			.input_id(input_id)
 			.with_keys(&keys)?
 			.with_absolute_axis(&stick(AbsoluteAxisType::ABS_X))?
 			.with_absolute_axis(&stick(AbsoluteAxisType::ABS_Y))?

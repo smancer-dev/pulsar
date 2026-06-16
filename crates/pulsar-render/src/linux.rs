@@ -108,10 +108,11 @@ static CURSOR_IMG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// command. The render loop reads this each frame so a cross-session mode change (game→remote
 /// or vice-versa) takes effect without a renderer restart. `false` = Game, `true` = Remote.
 static MODE_REMOTE: AtomicBool = AtomicBool::new(false);
-/// Connected controllers pushed by the app over stdin (`ctrls slot:kind:name,...`).
+/// Connected controllers pushed by the app over stdin (`ctrls slot:kind:name:uuid:target,...`).
 /// Game mode only; empty list in remote mode or when no pads are connected. Copied
 /// into `state.controllers` each frame in the render loop.
-static CONTROLLERS: std::sync::Mutex<Vec<(u8, String, String)>> =
+/// Tuple: (slot, kind_label, device_name, uuid, target). Legacy 3-field lines get uuid="" target="auto".
+static CONTROLLERS: std::sync::Mutex<Vec<(u8, String, String, String, String)>> =
 	std::sync::Mutex::new(Vec::new());
 
 #[derive(Clone)]
@@ -565,22 +566,26 @@ pub fn run() {
 						}
 					}
 				}
-				// Connected controller list (game mode only): `ctrls slot:kind:name,...`
-				// Each entry is `slot:kind_tag:device_name` (underscores for spaces).
+				// Connected controller list (game mode only): `ctrls slot:kind:name[:uuid:target],...`
+				// 5-field form (T11+): slot:kind_tag:name:uuid:target
+				// 3-field form (legacy): slot:kind_tag:name  → uuid="" target="auto"
+				// Underscores for spaces in kind/name; uuid/target are never underscored.
 				// Mirrors win/mod.rs's CONTROLLERS static + parse (same protocol).
 				Some("ctrls") => {
 					let payload = it.next().unwrap_or("").trim();
-					let list: Vec<(u8, String, String)> = if payload.is_empty() {
+					let list: Vec<(u8, String, String, String, String)> = if payload.is_empty() {
 						Vec::new()
 					} else {
 						payload
 							.split(',')
 							.filter_map(|e| {
-								let mut p = e.splitn(3, ':');
+								let mut p = e.splitn(5, ':');
 								let slot: u8 = p.next()?.parse().ok()?;
 								let kind = p.next()?.replace('_', " ");
 								let name = p.next()?.replace('_', " ");
-								Some((slot, kind, name))
+								let uuid = p.next().unwrap_or("").to_string();
+								let target = p.next().unwrap_or("auto").to_string();
+								Some((slot, kind, name, uuid, target))
 							})
 							.collect()
 					};
@@ -1442,6 +1447,20 @@ fn emit_cmd(state: &mut OverlayState, c: OverlayCmd) {
 							let len = ctrls.len();
 							if ai < len && bi < len {
 								ctrls.swap(ai, bi);
+							}
+						}
+					}
+				}
+				// Optimistic emulation-target update: the overlay picker was clicked.
+				// Update the matching row's target in CONTROLLERS by uuid so the
+				// row re-renders immediately without waiting for the next ctrls line.
+				"ctrlemu" => {
+					if let Some((uuid, target)) = val.split_once(',') {
+						let mut ctrls = CONTROLLERS.lock().unwrap();
+						for row in ctrls.iter_mut() {
+							if row.3 == uuid {
+								row.4 = target.to_string();
+								break;
 							}
 						}
 					}

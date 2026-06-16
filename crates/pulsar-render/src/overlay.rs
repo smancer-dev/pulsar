@@ -69,9 +69,10 @@ pub struct OverlayState {
 	/// Remote file pane: current HOME-relative path + its entries (`fsjson` stdin).
 	pub fs_remote_path: String,
 	pub fs_remote: Vec<FsRow>,
-	/// Connected controllers (slot, kind_label, device_name) — synced from the app
-	/// over stdin (`ctrllist <json>` or similar). Game mode only.
-	pub controllers: Vec<(u8, String, String)>,
+	/// Connected controllers (slot, kind_label, device_name, uuid, target) — synced from the
+	/// app over stdin (`ctrls slot:kind:name:uuid:target,...`). Game mode only.
+	/// `target` is "auto", "xbox360", or "ds4". Legacy 3-field lines set uuid="" target="auto".
+	pub controllers: Vec<(u8, String, String, String, String)>,
 }
 
 /// Which overlay page is showing: the compact ROOT (category boxes) or a section.
@@ -161,7 +162,7 @@ impl Default for OverlayState {
 			chat_enter: false,
 			fs_remote_path: String::new(),
 			fs_remote: Vec::new(),
-			controllers: Vec::new(),
+			controllers: Vec::new(), // Vec<(slot, kind_label, name, uuid, target)>
 		}
 	}
 }
@@ -1074,12 +1075,14 @@ fn draw_gauges(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 	});
 }
 
-/// Controllers section: ordered player-slot list with painted ▲/▼ swap buttons.
+/// Controllers section: ordered player-slot list with ▲/▼ swap buttons and a
+/// per-row emulation-target picker (Otomatik / Xbox 360 / DualShock 4).
 /// Game mode only — the box does not appear in remote_boxes.
 /// ▲ click on row i pushes `OverlayCmd::Set("ctrlswap", "{i},{i-1}")`.
 /// ▼ click on row i pushes `OverlayCmd::Set("ctrlswap", "{i},{i+1}")`.
+/// Emulation picker pushes `OverlayCmd::Set("ctrlemu", "{uuid},{target}")`.
 /// The bundled egui font lacks ▲/▼ glyphs — both arrows are painted with
-/// `line_segment`, matching the back-arrow style used in the header (lines 380-397).
+/// `line_segment`, matching the back-arrow style used in the header.
 fn draw_controllers(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
 	if st.controllers.is_empty() {
 		ui.add_space(20.0);
@@ -1092,21 +1095,62 @@ fn draw_controllers(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<Overlay
 		return;
 	}
 	let n = st.controllers.len();
-	for (i, (slot, kind, name)) in st.controllers.iter().enumerate() {
+	for (i, (slot, kind, name, uuid, target)) in st.controllers.iter().enumerate() {
+		// Row label: "Oyuncu 1 · Xbox · Controller name"
+		let label = format!(
+			"{} {} · {} · {}",
+			t("controllers.slot"),
+			slot + 1,
+			kind,
+			name,
+		);
 		ui.horizontal(|ui| {
-			// Row label: "Oyuncu 1 · Xbox · Controller name"
-			let label = format!(
-				"{} {} · {} · {}",
-				t("controllers.slot"),
-				slot + 1,
-				kind,
-				name,
-			);
 			ui.label(
-				egui::RichText::new(label)
+				egui::RichText::new(&label)
 					.size(12.5)
 					.color(egui::Color32::from_rgb(228, 230, 240)),
 			);
+		});
+		// Emulation picker row (indented, smaller): Otomatik / Xbox 360 / DualShock 4.
+		// Only shown when we have a uuid (5-field protocol); legacy 3-field rows have uuid="".
+		if !uuid.is_empty() {
+			ui.horizontal(|ui| {
+				ui.add_space(12.0);
+				// Three seg buttons side-by-side.
+				let opts: &[(&str, &str)] = &[
+					("auto", t("controllers.emuAuto")),
+					("xbox360", t("controllers.emuXbox")),
+					("ds4", t("controllers.emuDs4")),
+				];
+				for (val, label) in opts {
+					let selected = target == val;
+					let col = if selected {
+						egui::Color32::from_rgb(99, 102, 241) // indigo accent
+					} else {
+						egui::Color32::from_rgb(50, 53, 70)
+					};
+					let text_col = if selected {
+						egui::Color32::WHITE
+					} else {
+						egui::Color32::from_rgb(160, 163, 180)
+					};
+					let btn = egui::Button::new(
+						egui::RichText::new(*label).size(11.0).color(text_col),
+					)
+					.fill(col)
+					.rounding(4.0);
+					let resp = ui.add(btn);
+					if resp.clicked() && !selected {
+						cmds.push(OverlayCmd::Set(
+							"ctrlemu",
+							format!("{uuid},{val}"),
+						));
+					}
+					resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+				}
+			});
+		}
+		ui.horizontal(|ui| {
 			ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
 				// ▼ button (swap with next) — only if not the last row.
 				if i + 1 < n {
@@ -1150,7 +1194,7 @@ fn draw_controllers(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<Overlay
 				}
 			});
 		});
-		ui.add_space(2.0);
+		ui.add_space(4.0);
 	}
 }
 

@@ -57,7 +57,7 @@ use commands::{
 	lan_devices, launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password,
 	node_port, publish_games,
 	relaunch_to_home, run_command, scan_folder, self_update_possible, session_password, set_config,
-	set_controller_order, set_language, set_stream_settings, set_tray,
+	set_controller_emulation, set_controller_order, set_language, set_stream_settings, set_tray,
 	steam_path,
 };
 use connections::{list_connections, set_view_only, show_connections};
@@ -473,6 +473,7 @@ pub fn run() {
 			lan_devices,
 			controllers,
 			set_controller_order,
+			set_controller_emulation,
 			local_ip,
 			node_port,
 			auto_connect_target,

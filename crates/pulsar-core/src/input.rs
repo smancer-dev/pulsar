@@ -13,9 +13,9 @@
 mod types;
 
 pub use types::{
-	axis_to_i16, button, create_virtual_pad, touch_to_delta, trigger_to_u8,
-	vid_pid_from_sdl_guid, xinput_buttons, ControllerInfo, GamepadKind, GamepadState,
-	RecordingPad, VirtualGamepad,
+	axis_to_i16, button, create_virtual_pad, create_virtual_pad_target, ds4_report_fields,
+	touch_to_delta, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons, ControllerInfo,
+	EmulationTarget, GamepadKind, GamepadState, RecordingPad, ResolvedTarget, VirtualGamepad,
 };
 
 /// Windows host-side virtual gamepad via **ViGEmBus** — see [`vigem::ViGEmGamepad`].

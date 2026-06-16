@@ -49,6 +49,9 @@ export interface UiSettings {
 	 * slot (0=Player1 …). Unknown UUIDs are appended at the end. Default [] (natural
 	 * gilrs enumeration order). */
 	controllerOrder: string[];
+	/** Per-controller emulation target keyed by gilrs uuid hex: 'auto' (resolve from
+	 * detected kind), 'xbox' (Xbox 360), or 'ds4' (DualShock 4). Absent = 'auto'. */
+	controllerEmulation: Record<string, 'auto' | 'xbox' | 'ds4'>;
 	/** Feature 2 Piece B: treat the DS4/DS5 touchpad as a relative mouse (pointer
 	 * moves + left-click). Default true. */
 	touchpadAsMouse: boolean;
@@ -71,6 +74,12 @@ export const ENCODERS: { value: Encoder; label: string }[] = [
 	{ value: 'rkmpp', label: 'Rockchip MPP' },
 	{ value: 'software', label: 'Yazılım (CPU)' }
 ];
+
+export const EMULATION_TARGETS = [
+	{ value: 'auto', label: 'Otomatik' },
+	{ value: 'xbox', label: 'Xbox 360' },
+	{ value: 'ds4', label: 'DualShock 4' }
+] as const;
 
 /** Per-platform encoder families: a platform shows ONLY its own backends (foreign
  * entries never render); availability within the family is a separate, probe-driven
@@ -106,6 +115,7 @@ const DEFAULTS: UiSettings = {
 	overlayBtnPos: { x: 90, y: 70 },
 	forwardControllers: true,
 	controllerOrder: [],
+	controllerEmulation: {},
 	touchpadAsMouse: true
 };
 

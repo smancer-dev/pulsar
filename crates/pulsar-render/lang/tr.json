@@ -63,5 +63,9 @@
 	"active": "Aktif:",
 	"view.controllers": "Kumandalar",
 	"controllers.empty": "Bağlı kumanda yok",
-	"controllers.slot": "Oyuncu"
+	"controllers.slot": "Oyuncu",
+	"controllers.emulation": "Emülasyon",
+	"controllers.emuAuto": "Otomatik",
+	"controllers.emuXbox": "Xbox 360",
+	"controllers.emuDs4": "DualShock 4"
 }

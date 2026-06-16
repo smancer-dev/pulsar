@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pulsar_core::input::{button, GamepadKind, GamepadState};
+use pulsar_core::input::{button, EmulationTarget, GamepadKind, GamepadState};
 use pulsar_core::service::{send_input, serve, InputEvent};
 use pulsar_core::{NetworkMode, Node};
 use pulsar_relay::Relay;
@@ -24,6 +24,7 @@ fn gamepad_slot_roundtrip() {
 	let ev = InputEvent::GamepadSlot {
 		slot: 1,
 		kind: GamepadKind::Ds4,
+		target: EmulationTarget::Auto,
 		state,
 	};
 	let json = serde_json::to_string(&ev).expect("GamepadSlot must serialize");
@@ -50,7 +51,7 @@ fn gamepad_slot_json_shape_and_legacy_compat() {
 	state.set(button::A, true);
 
 	// New variant serializes as {"GamepadSlot":{...}}, not the legacy tuple form.
-	let slot_ev = InputEvent::GamepadSlot { slot: 0, kind: GamepadKind::Xbox, state };
+	let slot_ev = InputEvent::GamepadSlot { slot: 0, kind: GamepadKind::Xbox, target: EmulationTarget::Auto, state };
 	let slot_json = serde_json::to_string(&slot_ev).unwrap();
 	assert!(
 		slot_json.contains("\"GamepadSlot\""),
@@ -130,7 +131,7 @@ async fn controller_frames_reach_the_host() {
 	slot_frame.right_x = 8000;
 	send_input(
 		&mut sess,
-		&InputEvent::GamepadSlot { slot: 1, kind: GamepadKind::Ds4, state: slot_frame },
+		&InputEvent::GamepadSlot { slot: 1, kind: GamepadKind::Ds4, target: EmulationTarget::Auto, state: slot_frame },
 	)
 	.await
 	.unwrap();
@@ -217,7 +218,7 @@ async fn two_gamepad_slots_reach_host_with_distinct_slots() {
 	frame0.left_x = 10000;
 	send_input(
 		&mut sess,
-		&InputEvent::GamepadSlot { slot: 0, kind: GamepadKind::Xbox, state: frame0 },
+		&InputEvent::GamepadSlot { slot: 0, kind: GamepadKind::Xbox, target: EmulationTarget::Auto, state: frame0 },
 	)
 	.await
 	.unwrap();
@@ -228,7 +229,7 @@ async fn two_gamepad_slots_reach_host_with_distinct_slots() {
 	frame1.right_y = -8000;
 	send_input(
 		&mut sess,
-		&InputEvent::GamepadSlot { slot: 1, kind: GamepadKind::Ds5, state: frame1 },
+		&InputEvent::GamepadSlot { slot: 1, kind: GamepadKind::Ds5, target: EmulationTarget::Auto, state: frame1 },
 	)
 	.await
 	.unwrap();

@@ -614,6 +614,19 @@ pub(crate) async fn set_controller_order(
 	Ok(())
 }
 
+/// Persist the per-controller emulation target from the UI. Map key = gilrs uuid hex,
+/// value = "auto"|"xbox"|"ds4". The play.rs gilrs reader clones this Arc and reads it each
+/// tick so changes apply live without reconnect. Absent/"auto" lets the host resolve from
+/// the detected pad kind.
+#[tauri::command]
+pub(crate) async fn set_controller_emulation(
+	state: State<'_, AppState>,
+	map: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+	*state.controller_emulation.lock().unwrap() = map;
+	Ok(())
+}
+
 /// Relaunch the app to a fresh home after the user disconnects from a direct-connect (kiosk)
 /// session. On Linux the native video renderer leaves WebKitGTK unable to process clicks once it
 /// tears down on this headless path (the webview is covered from boot and never warmed by a real

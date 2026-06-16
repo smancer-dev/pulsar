@@ -39,7 +39,8 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 # Host-side virtual gamepad on Windows: emulates an Xbox 360 pad through the
 # ViGEmBus driver (pure-Rust client; the driver itself is bundled like Interception).
-vigem-client = "0.1"
+vigem-client = { version = "0.1", features = ["unstable_ds4"] }
+# note: unstable_ds4 is an unstable vigem-client feature, pinned via Cargo.lock 0.1.4
 # Core Audio (IAudioEndpointVolume) for muting the host's local output while
 # streaming; the higher-level `windows` crate gives the COM methods windows-sys lacks.
 windows = { version = "0.59", features = [

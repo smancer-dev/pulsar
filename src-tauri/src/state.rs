@@ -109,6 +109,11 @@ pub(crate) struct AppState {
 	/// cloned and read each tick by the play.rs gilrs reader (T6) so reorders apply live
 	/// without reconnect. Empty = use arrival order (default until the user reorders).
 	pub(crate) controller_order: Arc<Mutex<Vec<String>>>,
+	/// Persisted per-controller emulation target: uuid hex -> "auto"|"xbox"|"ds4".
+	/// Written by set_controller_emulation (from the UI); cloned and read each tick by
+	/// the play.rs gilrs reader (T9) so changes apply live without reconnect. Absent
+	/// uuid = "auto".
+	pub(crate) controller_emulation: Arc<Mutex<std::collections::HashMap<String, String>>>,
 	/// Linux-only: pool of resident `pulsar-render` children kept alive between sessions to
 	/// avoid destroying their EGL contexts. Destroying the EGL context of an embedded `--wid`
 	/// renderer that shares the Mali display with WebKitGTK corrupts WebKit's shared Mali

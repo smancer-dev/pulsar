@@ -8,7 +8,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pulsar_core::input::ControllerHub;
+use pulsar_core::input::{ControllerHub, EmulationTarget};
 use pulsar_core::service::{
 	request_launch, request_stream, DataMsg, InputEvent, QualityPref, StreamReq,
 };
@@ -1091,6 +1091,7 @@ pub(crate) async fn start_remote_play(
 		let reader_flag = running.clone();
 		let gtx = input_tx.clone();
 		let order_arc = state.controller_order.clone();
+		let emul_arc = state.controller_emulation.clone();
 		// Clone the overlay stdin so the reader can emit `ctrls` lines (game mode only).
 		let ctrls_stdin = overlay_stdin.clone();
 		let ctrls_game_mode = game_mode;
@@ -1113,11 +1114,15 @@ pub(crate) async fn start_remote_play(
 				let pads = hub.snapshot_with_keys();
 				// Snapshot the current order Vec (cheap clone of the Vec).
 				let order: Vec<String> = order_arc.lock().unwrap().clone();
+				// Snapshot the per-uuid emulation target map (cheap clone each tick).
+				let emul: std::collections::HashMap<String, String> =
+					emul_arc.lock().unwrap().clone();
 				let mut cur_uuids: std::collections::HashSet<String> =
 					std::collections::HashSet::new();
 				let mut append_idx = order.len() as u8;
 				// Build the ctrls payload while computing slots (avoids a second pass).
-				let mut ctrls_entries: Vec<(u8, pulsar_core::input::GamepadKind, String)> =
+				// Each entry: (slot, kind, uuid, target_str) where target_str is 'auto'/'xbox360'/'ds4'.
+				let mut ctrls_entries: Vec<(u8, pulsar_core::input::GamepadKind, String, String)> =
 					Vec::new();
 				for (uuid, kind, state) in &pads {
 					// Compute slot: position in order Vec, or next append slot (capped at 3).
@@ -1130,14 +1135,27 @@ pub(crate) async fn start_remote_play(
 							append_idx += 1;
 							s
 						});
+					// Resolve emulation target from the per-uuid map ("xbox"/"ds4"/absent→Auto).
+					let target = match emul.get(uuid).map(|s| s.as_str()) {
+						Some("xbox") => EmulationTarget::Xbox360,
+						Some("ds4") => EmulationTarget::Ds4,
+						_ => EmulationTarget::Auto,
+					};
+					// Keep the token as-is for the ctrls line (auto/xbox360/ds4 = serde lowercase).
+					let target_str = match target {
+						EmulationTarget::Xbox360 => "xbox360",
+						EmulationTarget::Ds4 => "ds4",
+						EmulationTarget::Auto => "auto",
+					};
 					cur_uuids.insert(uuid.clone());
 					prev_slot.insert(uuid.clone(), slot);
 					let _ = gtx.blocking_send(InputEvent::GamepadSlot {
 						slot,
 						kind: *kind,
+						target,
 						state: *state,
 					});
-					ctrls_entries.push((slot, *kind, uuid.clone()));
+					ctrls_entries.push((slot, *kind, uuid.clone(), target_str.to_string()));
 				}
 				// Emit GamepadDisconnect for any uuid that was present last tick but is gone now.
 				for uuid in &prev_uuids {
@@ -1167,16 +1185,18 @@ pub(crate) async fn start_remote_play(
 				};
 				let ctrls_payload: String = {
 					let mut entries = ctrls_entries.clone();
-					entries.sort_by_key(|(s, _, _)| *s);
+					entries.sort_by_key(|(s, _, _, _)| *s);
 					entries
 						.iter()
-						.map(|(slot, kind, uuid)| {
+						.map(|(slot, kind, uuid, target_str)| {
 							let kind_tag = kind.label().replace(' ', "_");
 							let name = name_map
 								.get(uuid)
 								.map(|n| n.replace(' ', "_"))
 								.unwrap_or_else(|| uuid.clone());
-							format!("{slot}:{kind_tag}:{name}")
+							// 5-field form: slot:kind_tag:name:uuid:target
+							// Stale renderers (3-field parsers) tolerate the extra tokens via splitn(3).
+							format!("{slot}:{kind_tag}:{name}:{uuid}:{target_str}")
 						})
 						.collect::<Vec<_>>()
 						.join(",")

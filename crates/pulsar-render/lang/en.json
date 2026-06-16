@@ -63,5 +63,9 @@
 	"active": "Active:",
 	"view.controllers": "Controllers",
 	"controllers.empty": "No controllers connected",
-	"controllers.slot": "Player"
+	"controllers.slot": "Player",
+	"controllers.emulation": "Emulation",
+	"controllers.emuAuto": "Auto",
+	"controllers.emuXbox": "Xbox 360",
+	"controllers.emuDs4": "DualShock 4"
 }

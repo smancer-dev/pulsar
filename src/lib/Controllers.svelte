@@ -8,7 +8,7 @@
 	import { api } from '$lib/api';
 	import type { ControllerInfo } from '$lib/types';
 	import { t } from '$lib/i18n.svelte';
-	import { ui, saveUi, slotOf } from '$lib/settings.svelte';
+	import { ui, saveUi, slotOf, EMULATION_TARGETS } from '$lib/settings.svelte';
 
 	// `compact` is the small in-session variant (no card chrome).
 	let { compact = false }: { compact?: boolean } = $props();
@@ -33,6 +33,7 @@
 	const connected = $derived(pads.filter((p) => p.connected).length);
 
 	// Seed any connected pads whose uuids are not yet in controllerOrder.
+	// Also push the current emulation map so the play reader has it before a session starts.
 	// Runs as a side-effect so $derived.by stays pure.
 	$effect(() => {
 		if (compact) return;
@@ -49,6 +50,9 @@
 			saveUi();
 			api.setControllerOrder($state.snapshot(ui.controllerOrder) as string[]);
 		}
+		// Push emulation map once on every refresh so the Arc is populated before a
+		// session starts (no extra IPC if pads haven't changed — the value is the same).
+		api.setControllerEmulation($state.snapshot(ui.controllerEmulation) as Record<string, string>);
 	});
 
 	// Build display rows ordered by current player slot (non-compact only).
@@ -92,6 +96,12 @@
 		saveUi();
 		api.setControllerOrder($state.snapshot(ui.controllerOrder) as string[]);
 	}
+
+	function setEmulation(uuid: string, value: 'auto' | 'xbox' | 'ds4') {
+		ui.controllerEmulation[uuid] = value;
+		saveUi();
+		api.setControllerEmulation($state.snapshot(ui.controllerEmulation) as Record<string, string>);
+	}
 </script>
 
 <div class="ctrls" class:compact>
@@ -112,6 +122,17 @@
 						<span class="dot" class:on={pad.connected}></span>
 						<span class="name">{pad.name}</span>
 						<span class="kind mono">{pad.label}</span>
+						<select
+							class="emul-select"
+							aria-label="Emülasyon hedefi"
+							value={ui.controllerEmulation[pad.uuid] ?? 'auto'}
+							onchange={(e) =>
+								setEmulation(pad.uuid, (e.currentTarget as HTMLSelectElement).value as 'auto' | 'xbox' | 'ds4')}
+						>
+							{#each EMULATION_TARGETS as et}
+								<option value={et.value}>{et.label}</option>
+							{/each}
+						</select>
 						<span class="reorder-btns">
 							<button
 								class="mv-btn"
@@ -243,6 +264,20 @@
 	.kind {
 		font-size: 11.5px;
 		color: var(--text-muted);
+	}
+	.emul-select {
+		font-size: 11.5px;
+		color: var(--text-muted);
+		background: var(--surface-raised, var(--surface));
+		border: 1px solid var(--border);
+		border-radius: var(--r-sm, 4px);
+		padding: 1px 4px;
+		cursor: pointer;
+		flex: none;
+	}
+	.emul-select:focus {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
 	}
 	.state {
 		margin-left: auto;

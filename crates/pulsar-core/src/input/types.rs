@@ -50,6 +50,40 @@ impl GamepadKind {
 	}
 }
 
+/// What virtual controller a client pad should be presented to host games as.
+/// `Auto` (the wire/serde default) lets the host pick from the detected GamepadKind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EmulationTarget {
+	#[default]
+	Auto,
+	Xbox360,
+	Ds4,
+}
+
+/// The concrete backend identity an EmulationTarget resolves to (never Auto).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolvedTarget {
+	Xbox360,
+	Ds4,
+}
+
+impl EmulationTarget {
+	/// Resolve to a concrete backend. Auto maps Sony families (Ds3/Ds4/Ds5) to DS4
+	/// and everything else (Xbox/Standard/Unknown) to Xbox360; explicit variants pass
+	/// through. Never returns Auto.
+	pub fn resolve(self, kind: GamepadKind) -> ResolvedTarget {
+		match self {
+			EmulationTarget::Xbox360 => ResolvedTarget::Xbox360,
+			EmulationTarget::Ds4 => ResolvedTarget::Ds4,
+			EmulationTarget::Auto => match kind {
+				GamepadKind::Ds3 | GamepadKind::Ds4 | GamepadKind::Ds5 => ResolvedTarget::Ds4,
+				_ => ResolvedTarget::Xbox360,
+			},
+		}
+	}
+}
+
 /// A detected controller, for listing in the UI (in-app device list + the live
 /// in-session panel). `connected` distinguishes a pad that's plugged in and usable
 /// right now from one the backend still remembers.
@@ -211,16 +245,99 @@ pub fn xinput_buttons(state: &GamepadState) -> u16 {
 	bits
 }
 
-/// Create a host-side virtual pad for `kind`.
+/// Encode our normalized [`GamepadState`] into the DualShock 4 HID report fields the
+/// ViGEm DS4 target expects. Returns `(buttons, special, lx, ly, rx, ry)`.
+///
+/// `buttons: u16` packs byte0 (low 8 bits) + byte1 (high 8 bits):
+/// - bits 0..3 = DPAD HAT (0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW, 8=neutral)
+/// - bit 4 = Square (our X), bit 5 = Cross (our A), bit 6 = Circle (our B), bit 7 = Triangle (our Y)
+/// - bit 8 = L1, bit 9 = R1, bit 10 = L2-as-bit, bit 11 = R2-as-bit
+/// - bit 12 = Share (our BACK), bit 13 = Options (our START), bit 14 = L3, bit 15 = R3
+///
+/// `special: u8`: bit 0 = PS (our GUIDE), bit 1 = touchpad click (not in our state → 0).
+///
+/// Sticks: `i16 → u8` with 0x80 as center (i16 0 → 128). Y is left as-is (down-positive
+/// convention matches the Xbox path — no inversion on either axis). Pure so it can be
+/// unit-tested without the driver.
+pub fn ds4_report_fields(state: &GamepadState) -> (u16, u8, u8, u8, u8, u8) {
+	// DPAD HAT encoding.
+	let up = state.is_pressed(button::DPAD_UP);
+	let down = state.is_pressed(button::DPAD_DOWN);
+	let left = state.is_pressed(button::DPAD_LEFT);
+	let right = state.is_pressed(button::DPAD_RIGHT);
+	let hat: u16 = match (up, down, left, right) {
+		(true, false, false, false) => 0, // N
+		(true, false, false, true) => 1,  // NE
+		(false, false, false, true) => 2, // E
+		(false, true, false, true) => 3,  // SE
+		(false, true, false, false) => 4, // S
+		(false, true, true, false) => 5,  // SW
+		(false, false, true, false) => 6, // W
+		(true, false, true, false) => 7,  // NW
+		_ => 8,                           // neutral (no input or conflicting)
+	};
+
+	// Face buttons (byte0 high nibble).
+	let square = if state.is_pressed(button::X) { 1u16 << 4 } else { 0 };
+	let cross = if state.is_pressed(button::A) { 1u16 << 5 } else { 0 };
+	let circle = if state.is_pressed(button::B) { 1u16 << 6 } else { 0 };
+	let triangle = if state.is_pressed(button::Y) { 1u16 << 7 } else { 0 };
+
+	// Shoulder / trigger-as-bit / meta (byte1).
+	let l1 = if state.is_pressed(button::LB) { 1u16 << 8 } else { 0 };
+	let r1 = if state.is_pressed(button::RB) { 1u16 << 9 } else { 0 };
+	let l2_bit = if state.left_trigger > 0 { 1u16 << 10 } else { 0 };
+	let r2_bit = if state.right_trigger > 0 { 1u16 << 11 } else { 0 };
+	let share = if state.is_pressed(button::BACK) { 1u16 << 12 } else { 0 };
+	let options = if state.is_pressed(button::START) { 1u16 << 13 } else { 0 };
+	let l3 = if state.is_pressed(button::L3) { 1u16 << 14 } else { 0 };
+	let r3 = if state.is_pressed(button::R3) { 1u16 << 15 } else { 0 };
+
+	let buttons: u16 =
+		hat | square | cross | circle | triangle | l1 | r1 | l2_bit | r2_bit | share | options | l3
+			| r3;
+
+	// Special: PS button in bit 0; touchpad click (bit 1) is not tracked → 0.
+	let special: u8 = if state.is_pressed(button::GUIDE) { 1 } else { 0 };
+
+	// Stick conversion: i16 → u8, 0x80 = center.
+	let conv = |v: i16| ((v as i32 >> 8) + 128).clamp(0, 255) as u8;
+	let lx = conv(state.left_x);
+	let ly = conv(state.left_y);
+	let rx = conv(state.right_x);
+	let ry = conv(state.right_y);
+
+	(buttons, special, lx, ly, rx, ry)
+}
+
+/// Create a host-side virtual pad for `kind` using `EmulationTarget::Auto` to select
+/// the backend. See [`create_virtual_pad_target`] for full control over the target.
 ///
 /// * Linux → a real **uinput** Xbox-style pad (falls back to recording if
 ///   `/dev/uinput` isn't writable).
 /// * Windows → a **ViGEm** Xbox 360 pad (needs the ViGEmBus driver; falls back to
 ///   recording if it isn't installed). macOS → a driver, TODO (recording for now).
 pub fn create_virtual_pad(kind: GamepadKind) -> Box<dyn VirtualGamepad> {
+	create_virtual_pad_target(kind, EmulationTarget::Auto)
+}
+
+/// Create a host-side virtual pad for `kind` with an explicit `target` emulation
+/// strategy. `target` is resolved against `kind` via [`EmulationTarget::resolve`]
+/// so `Auto` maps Sony families (Ds3/Ds4/Ds5) to DS4 and everything else to Xbox
+/// 360. Explicit `Xbox360` / `Ds4` override the detected kind regardless of `kind`.
+///
+/// Platforms:
+/// * Linux → **uinput** (falls back to recording if `/dev/uinput` isn't writable).
+/// * Windows → **ViGEm** (falls back to recording if ViGEmBus isn't installed).
+/// * macOS / other → recording (no-op) backend; `target` is documented-ignored.
+pub fn create_virtual_pad_target(
+	kind: GamepadKind,
+	target: EmulationTarget,
+) -> Box<dyn VirtualGamepad> {
+	let resolved = target.resolve(kind);
 	#[cfg(target_os = "linux")]
 	{
-		match super::uinput::UinputGamepad::new(kind) {
+		match super::uinput::UinputGamepad::new_target(kind, resolved) {
 			Ok(pad) => return Box::new(pad),
 			Err(e) => {
 				tracing::warn!("uinput virtual pad unavailable ({e}); using recording backend")
@@ -229,7 +346,7 @@ pub fn create_virtual_pad(kind: GamepadKind) -> Box<dyn VirtualGamepad> {
 	}
 	#[cfg(windows)]
 	{
-		match super::vigem::ViGEmGamepad::new(kind) {
+		match super::vigem::ViGEmGamepad::new_target(kind, resolved) {
 			Ok(pad) => return Box::new(pad),
 			Err(e) => {
 				tracing::warn!("ViGEm virtual pad unavailable ({e}); using recording backend")
@@ -330,6 +447,9 @@ mod tests {
 	fn create_virtual_pad_reports_its_kind() {
 		let pad = create_virtual_pad(GamepadKind::Ds5);
 		assert_eq!(pad.kind(), GamepadKind::Ds5);
+		// create_virtual_pad_target with Auto must also propagate the kind.
+		let pad2 = create_virtual_pad_target(GamepadKind::Ds5, EmulationTarget::Auto);
+		assert_eq!(pad2.kind(), GamepadKind::Ds5);
 	}
 
 	#[test]
@@ -371,5 +491,119 @@ mod tests {
 		let (dx, dy) = touch_to_delta((0, 0), (100, 50), 0.5);
 		assert!((dx - 50.0).abs() < f64::EPSILON);
 		assert!((dy - 25.0).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn emulation_target_resolve_maps_kinds() {
+		// Auto: Sony families → Ds4
+		assert_eq!(EmulationTarget::Auto.resolve(GamepadKind::Ds3), ResolvedTarget::Ds4);
+		assert_eq!(EmulationTarget::Auto.resolve(GamepadKind::Ds4), ResolvedTarget::Ds4);
+		assert_eq!(EmulationTarget::Auto.resolve(GamepadKind::Ds5), ResolvedTarget::Ds4);
+		// Auto: everything else → Xbox360
+		assert_eq!(EmulationTarget::Auto.resolve(GamepadKind::Xbox), ResolvedTarget::Xbox360);
+		assert_eq!(EmulationTarget::Auto.resolve(GamepadKind::Standard), ResolvedTarget::Xbox360);
+		assert_eq!(EmulationTarget::Auto.resolve(GamepadKind::Unknown), ResolvedTarget::Xbox360);
+		// Explicit overrides: Xbox360 forces Xbox360 regardless of detected kind
+		assert_eq!(EmulationTarget::Xbox360.resolve(GamepadKind::Ds4), ResolvedTarget::Xbox360);
+		// Explicit overrides: Ds4 forces Ds4 regardless of detected kind
+		assert_eq!(EmulationTarget::Ds4.resolve(GamepadKind::Xbox), ResolvedTarget::Ds4);
+	}
+
+	#[test]
+	fn emulation_target_serializes_lowercase() {
+		assert_eq!(serde_json::to_string(&EmulationTarget::Auto).unwrap(), "\"auto\"");
+		assert_eq!(serde_json::to_string(&EmulationTarget::Xbox360).unwrap(), "\"xbox360\"");
+		assert_eq!(serde_json::to_string(&EmulationTarget::Ds4).unwrap(), "\"ds4\"");
+		// Round-trip
+		let back: EmulationTarget = serde_json::from_str("\"ds4\"").unwrap();
+		assert_eq!(back, EmulationTarget::Ds4);
+		let back: EmulationTarget = serde_json::from_str("\"auto\"").unwrap();
+		assert_eq!(back, EmulationTarget::Auto);
+	}
+
+	#[test]
+	fn ds4_report_neutral() {
+		let st = GamepadState::default();
+		let (buttons, special, lx, ly, rx, ry) = ds4_report_fields(&st);
+		// DPAD HAT low nibble must be 8 (neutral).
+		assert_eq!(buttons & 0x000F, 8, "hat should be 8 (neutral), got {}", buttons & 0x000F);
+		assert_eq!(special, 0);
+		assert_eq!(lx, 0x80);
+		assert_eq!(ly, 0x80);
+		assert_eq!(rx, 0x80);
+		assert_eq!(ry, 0x80);
+	}
+
+	#[test]
+	fn ds4_report_faces() {
+		let mut st = GamepadState::default();
+		// A (Cross) → bit 5.
+		st.set(button::A, true);
+		let (buttons, _, _, _, _, _) = ds4_report_fields(&st);
+		assert_ne!(buttons & (1 << 5), 0, "Cross (bit5) should be set");
+		assert_eq!(buttons & (1 << 7), 0, "Triangle (bit7) should be clear");
+
+		// Y (Triangle) → bit 7.
+		let mut st2 = GamepadState::default();
+		st2.set(button::Y, true);
+		let (buttons2, _, _, _, _, _) = ds4_report_fields(&st2);
+		assert_ne!(buttons2 & (1 << 7), 0, "Triangle (bit7) should be set");
+		assert_eq!(buttons2 & (1 << 5), 0, "Cross (bit5) should be clear");
+	}
+
+	#[test]
+	fn ds4_report_dpad_diagonals() {
+		// UP + RIGHT → NE = nibble 1.
+		let mut st = GamepadState::default();
+		st.set(button::DPAD_UP | button::DPAD_RIGHT, true);
+		let (buttons, _, _, _, _, _) = ds4_report_fields(&st);
+		assert_eq!(buttons & 0x000F, 1, "UP+RIGHT should give NE (1)");
+
+		// DOWN + LEFT → SW = nibble 5.
+		let mut st2 = GamepadState::default();
+		st2.set(button::DPAD_DOWN | button::DPAD_LEFT, true);
+		let (buttons2, _, _, _, _, _) = ds4_report_fields(&st2);
+		assert_eq!(buttons2 & 0x000F, 5, "DOWN+LEFT should give SW (5)");
+
+		// LEFT only → W = nibble 6.
+		let mut st3 = GamepadState::default();
+		st3.set(button::DPAD_LEFT, true);
+		let (buttons3, _, _, _, _, _) = ds4_report_fields(&st3);
+		assert_eq!(buttons3 & 0x000F, 6, "LEFT only should give W (6)");
+	}
+
+	#[test]
+	fn ds4_report_sticks() {
+		// left_x = i16::MAX → ~0xFF (near 255).
+		let mut st = GamepadState::default();
+		st.left_x = i16::MAX;
+		let (_, _, lx, _, _, _) = ds4_report_fields(&st);
+		assert!(lx >= 254, "i16::MAX left_x should map to ~0xFF, got {lx}");
+
+		// left_x = i16::MIN → 0x00 (or very close).
+		let mut st2 = GamepadState::default();
+		st2.left_x = i16::MIN;
+		let (_, _, lx2, _, _, _) = ds4_report_fields(&st2);
+		assert!(lx2 <= 1, "i16::MIN left_x should map to ~0x00, got {lx2}");
+
+		// left_x = 0 → 0x80.
+		let st3 = GamepadState::default();
+		let (_, _, lx3, _, _, _) = ds4_report_fields(&st3);
+		assert_eq!(lx3, 0x80, "zero left_x should map to 0x80 (center)");
+	}
+
+	#[test]
+	fn ds4_report_triggers_as_bits() {
+		let mut st = GamepadState::default();
+		st.left_trigger = 200;
+		let (buttons, _, _, _, _, _) = ds4_report_fields(&st);
+		// bit 10 = L2-as-bit.
+		assert_ne!(
+			buttons & (1 << 10),
+			0,
+			"left_trigger > 0 should set L2-as-bit (bit 10)"
+		);
+		// R2 bit should be clear.
+		assert_eq!(buttons & (1 << 11), 0, "R2-as-bit (bit 11) should be clear");
 	}
 }

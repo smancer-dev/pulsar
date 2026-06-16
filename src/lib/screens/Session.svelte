@@ -611,6 +611,23 @@
 					}).catch(() => {});
 					break;
 				}
+				// Overlay emulation-target picker: the egui seg buttons emit
+				// `ov set ctrlemu uuid,target` where target is 'auto'/'xbox360'/'ds4'.
+				// Persist to ui.controllerEmulation and push the new map to the Rust reader.
+				case 'ctrlemu': {
+					const comma = val.indexOf(',');
+					if (comma < 0) break;
+					const uuid = val.slice(0, comma);
+					const target = val.slice(comma + 1) as 'auto' | 'xbox' | 'xbox360' | 'ds4';
+					// Normalise 'xbox360' token from the renderer to 'xbox' used by the settings map.
+					const normalised: 'auto' | 'xbox' | 'ds4' = target === 'xbox360' ? 'xbox' : target;
+					if (uuid) {
+						ui.controllerEmulation[uuid] = normalised;
+						saveUi();
+						api.setControllerEmulation($state.snapshot(ui.controllerEmulation) as Record<string, string>).catch(() => {});
+					}
+					break;
+				}
 				case 'reverse': reverse(); break;
 				case 'fullscreen': onToggleFullscreen(); break;
 			}
