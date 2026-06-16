@@ -428,11 +428,37 @@ pub fn run() {
 			// A destroyed window must leave the focus map (no Focused(false) is
 			// guaranteed first — see WIN_FOCUS): drop its entry and recompute the
 			// gate so a popup that died focused can't hold the global grab on.
+			//
+			// For approval popups (`approve-<id>` labels): if the operator closed the
+			// window via the OS chrome (title-bar X) instead of clicking Allow/Deny,
+			// the pending oneshot was never resolved — the client would hang for up to
+			// 60–120 s and OPEN_POPUP_COUNT would have leaked (C1 fix). Resolve it
+			// with a deny so the race exits immediately and the counter is decremented
+			// by the normal `close_approval_window` path in `race_host_auth`.
 			WindowEvent::Destroyed => {
-				let mut g = WIN_FOCUS.lock().unwrap();
-				if let Some(map) = g.as_mut() {
-					if map.remove(window.label()).is_some() {
-						refresh_focus_gate(map);
+				{
+					let mut g = WIN_FOCUS.lock().unwrap();
+					if let Some(map) = g.as_mut() {
+						if map.remove(window.label()).is_some() {
+							refresh_focus_gate(map);
+						}
+					}
+				}
+				// Deny the pending auth request if an approval popup was closed by the OS.
+				let label = window.label();
+				if let Some(id_str) = label.strip_prefix("approve-") {
+					if let Ok(id) = id_str.parse::<u64>() {
+						// Extract the Arc clone so `State<'_>` (which borrows `window`)
+						// is fully dropped before the MutexGuard is created. Then pull
+						// the sender out of the map and drop the guard before sending,
+						// which is what the borrow checker requires here.
+						let pending = std::sync::Arc::clone(
+							&window.state::<AppState>().pending,
+						);
+						let tx = pending.lock().unwrap().remove(&id);
+						if let Some(tx) = tx {
+							let _ = tx.send(false);
+						}
 					}
 				}
 			}

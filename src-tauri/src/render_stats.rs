@@ -90,7 +90,7 @@ pub(crate) fn start_render_reader(
 		// data, so play-ready must fire again for the new session id.
 		let mut ready_sent_for: Option<u64> = None;
 		let mut first_line_logged = false;
-		for line in reader.lines() {
+		'lines: for line in reader.lines() {
 			let Ok(line) = line else { break };
 			// Resolve the current session id: either live (resident reconnect) or fixed.
 			let cur_id = live_id
@@ -166,6 +166,62 @@ pub(crate) fn start_render_reader(
 												}
 											}
 											_ => {}
+										}
+									}
+								}
+								// "Dosya gönder" from the egui overlay Tools box: the click
+								// happened in the renderer process, so there is no webview
+								// user-activation and both WebView2 and WebKitGTK silently
+								// block a programmatic <input type=file>.click(). Open the
+								// native OS file picker Rust-side (rfd) and stream the chosen
+								// file directly over the session data channel — no webview
+								// gesture needed (C7). The rfd GTK backend needs the GTK
+								// main thread (macOS: NSOpenPanel likewise), so this Rust-side
+								// path is restricted to the two confirmed-broken platforms;
+								// on others the overlay-cmd falls through to the webview path.
+								"pickfile" => {
+									#[cfg(any(windows, target_os = "linux"))]
+									{
+										use tauri::Manager;
+										let state = app.state::<crate::state::AppState>();
+										let tx = state
+											.plays
+											.lock()
+											.unwrap()
+											.get(&cur_id)
+											.map(|p| p.data_tx.clone());
+										if let Some(tx) = tx {
+											std::thread::spawn(move || {
+												// rfd::FileDialog::pick_file() is synchronous (fine
+												// on a dedicated thread) and opens a real native
+												// dialog — no webview activation required.
+												if let Some(path) = rfd::FileDialog::new().pick_file() {
+													// The reader thread lives outside the Tauri async
+													// runtime; build a minimal single-thread runtime to
+													// drive the async send_file_abs call.
+													let rt =
+														tokio::runtime::Builder::new_current_thread()
+															.enable_all()
+															.build();
+													if let Ok(rt) = rt {
+														rt.block_on(async {
+															if crate::fs_browse::send_file_abs(&tx, &path)
+																.await
+																.is_none()
+															{
+																tracing::warn!(
+																	?path,
+																	"pickfile: send_file_abs failed"
+																);
+															}
+														});
+													}
+												}
+											});
+											// Consume the field — do NOT fall through to the
+											// overlay-cmd emit (that would route pickfile to
+											// the webview where .click() is silently blocked).
+											continue 'lines;
 										}
 									}
 								}

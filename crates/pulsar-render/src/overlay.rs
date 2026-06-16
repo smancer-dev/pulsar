@@ -253,6 +253,41 @@ pub fn draw_switching(ctx: &egui::Context) {
 		});
 }
 
+/// Centered "stream stopped" indicator drawn over the frozen last frame when the stall
+/// detector has tripped (no fresh frame for ≥ 3 s while video was live). Mirrors the
+/// webview's `.stall` div that is permanently occluded by the native renderer window;
+/// this surfaces the same message inside the renderer where the user can see it.
+pub fn draw_stalled(ctx: &egui::Context) {
+	egui::Area::new(egui::Id::new("stalled"))
+		.anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+		.show(ctx, |ui| {
+			egui::Frame::none()
+				.fill(egui::Color32::from_rgba_unmultiplied(44, 18, 18, 230))
+				.stroke(egui::Stroke::new(
+					1.0,
+					egui::Color32::from_rgba_unmultiplied(200, 60, 60, 180),
+				))
+				.rounding(12.0)
+				.inner_margin(egui::Margin::symmetric(22.0, 18.0))
+				.show(ui, |ui| {
+					ui.set_max_width(320.0);
+					ui.vertical_centered(|ui| {
+						ui.label(
+							egui::RichText::new("⚠")
+								.size(28.0)
+								.color(egui::Color32::from_rgb(255, 160, 100)),
+						);
+						ui.add_space(6.0);
+						ui.label(
+							egui::RichText::new(t("stalled"))
+								.size(13.5)
+								.color(egui::Color32::from_rgb(255, 210, 200)),
+						);
+					});
+				});
+		});
+}
+
 /// Parse the `caps` line's `displays=idx:name:w:h:primary,…` field into the overlay's
 /// `(idx, label)` monitor list (primary marked). Tolerant: skips malformed entries.
 pub fn parse_displays(s: &str) -> Vec<(u32, String)> {
@@ -735,7 +770,7 @@ fn draw_tools(ui: &mut egui::Ui, view: &mut View, cmds: &mut Vec<OverlayCmd>) {
 		.add(egui::Button::new(format!("📁  {}", t("tools.file"))).min_size(egui::vec2(w, 30.0)))
 		.clicked()
 	{
-		// The OS file dialog is its own toplevel — visible over the video.
+		// Handled Rust-side (rfd) in render_stats.rs — no webview activation needed.
 		cmds.push(OverlayCmd::Set("pickfile", "1".into()));
 	}
 	if ui

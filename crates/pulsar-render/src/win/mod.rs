@@ -120,6 +120,10 @@ static DISPLAY_IDX_SEED: std::sync::atomic::AtomicU32 =
 static CURSOR_POS: Mutex<Option<(f32, f32)>> = Mutex::new(None);
 static CURSOR_IMG: Mutex<Option<CursorImg>> = Mutex::new(None);
 static CURSOR_IMG_GEN: AtomicU64 = AtomicU64::new(0);
+/// True while the stream is stalled (no AU for ≥ STALL_SECS and decoder was live).
+/// The render loop sets this; it is cleared as soon as AUs start arriving again.
+/// Mirrors video::STALLED on Linux — kept separate because video.rs is unix-only.
+static STALLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct CursorImg {
@@ -835,6 +839,13 @@ impl Renderer {
 		let mut cmds = Vec::new();
 		let out = self.egui_ctx.run(raw, |ctx| {
 			cmds = crate::overlay::draw(ctx, ostate, ov_ui);
+			// Show the "stream stopped" indicator even while the overlay is open so the
+			// user sees the state change regardless of whether the overlay is up.
+			// (Windows respawns the renderer on a codec switch, so there is no local
+			// SWITCHING state here — only STALLED applies.)
+			if STALLED.load(Ordering::Relaxed) {
+				crate::overlay::draw_stalled(ctx);
+			}
 			paint_side_cursor(ctx, cursor_draw);
 		});
 		// Apply + emit commands (mirrors desktop.rs / the Linux backend).
@@ -1025,7 +1036,8 @@ impl Renderer {
 		};
 		let stats_hud = STATS_HUD.load(Ordering::SeqCst);
 		let ovbtn = OVERLAY_BTN.load(Ordering::SeqCst);
-		if !stats_hud && !ovbtn && hint_text.is_none() && cursor_draw.is_none() {
+		let stalled = STALLED.load(Ordering::Relaxed);
+		if !stats_hud && !ovbtn && hint_text.is_none() && cursor_draw.is_none() && !stalled {
 			return;
 		}
 		// Sync the display state (same sources as the open path).
@@ -1064,6 +1076,11 @@ impl Renderer {
 		self.ostate.chat_unread = CHAT_UNREAD.load(Ordering::SeqCst);
 		let ostate = &self.ostate;
 		let out = self.egui_ctx.run(raw, |ctx| {
+			// Stream-stopped indicator: surfaces the stall state that the webview's .stall
+			// div cannot show because the native renderer window occludes it.
+			if stalled {
+				crate::overlay::draw_stalled(ctx);
+			}
 			if stats_hud {
 				crate::overlay::draw_hud(ctx, ostate);
 			}
@@ -1486,6 +1503,12 @@ unsafe fn event_loop(
 	// Rate-cap the idle (video-stall) overlay repaint to ~60 Hz so a frozen/paused host
 	// doesn't pin the CPU re-presenting the same frame every 2 ms loop tick.
 	let mut last_idle_paint = std::time::Instant::now();
+	// Stall detection: track when the last AU arrived so we can surface a "stream stopped"
+	// indicator after STALL_SECS of silence (video was live = decoder exists).
+	// This mirrors the webview media.svelte stall detector but lives inside the renderer
+	// so it is visible on native paths where the webview is occluded.
+	const STALL_SECS: u64 = 3;
+	let mut last_au_at = std::time::Instant::now();
 	loop {
 		while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
 			let _ = TranslateMessage(&msg);
@@ -1524,11 +1547,22 @@ unsafe fn event_loop(
 				// input and re-present the last frame + overlay, capped at ~60 Hz. Only when
 				// there is actually chrome to draw (overlay open OR any closed-state HUD /
 				// open-button / hint / side-cursor) so a plain frozen frame stays idle.
+				//
+				// After STALL_SECS of silence (decoder exists → video was live) set STALLED
+				// so paint_closed / repaint_idle surfaces the "stream stopped" indicator
+				// that the webview's .stall div cannot show (it is occluded by this window).
+				// Windows respawns the renderer on a codec switch, so there is no local
+				// SWITCHING state to suppress here (a respawn resets last_au_at).
+				if last_au_at.elapsed().as_secs() >= STALL_SECS {
+					STALLED.store(true, Ordering::Relaxed);
+				}
+				let stalled = STALLED.load(Ordering::Relaxed);
 				let chrome = OPEN.load(Ordering::SeqCst)
 					|| STATS_HUD.load(Ordering::SeqCst)
 					|| OVERLAY_BTN.load(Ordering::SeqCst)
 					|| HINT.lock().unwrap().is_some()
-					|| CURSOR_POS.lock().unwrap().is_some();
+					|| CURSOR_POS.lock().unwrap().is_some()
+					|| stalled;
 				if chrome && last_idle_paint.elapsed() >= std::time::Duration::from_millis(16) {
 					r.repaint_idle();
 					last_idle_paint = std::time::Instant::now();
@@ -1536,6 +1570,9 @@ unsafe fn event_loop(
 			}
 			std::thread::sleep(std::time::Duration::from_millis(2));
 		} else {
+			// AUs are arriving — clear any stall indicator and reset the stall timer.
+			STALLED.store(false, Ordering::Relaxed);
+			last_au_at = std::time::Instant::now();
 			for au in &aus {
 				r.on_access_unit(au);
 			}

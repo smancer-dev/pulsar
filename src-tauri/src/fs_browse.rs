@@ -100,6 +100,7 @@ pub(crate) fn list_dir(rel: &str) -> Vec<FsEntry> {
 							name: e.file_name().to_string_lossy().into_owned(),
 							dir: false,
 							size: 0,
+							sentinel: false,
 						});
 					}
 				}
@@ -110,6 +111,7 @@ pub(crate) fn list_dir(rel: &str) -> Vec<FsEntry> {
 				name: e.file_name().to_string_lossy().into_owned(),
 				dir: md.is_dir(),
 				size: if md.is_dir() { 0 } else { md.len() },
+				sentinel: false,
 			})
 		})
 		.collect();
@@ -174,6 +176,60 @@ pub(crate) async fn send_file_at(tx: &Sender<DataMsg>, rel: &str) -> Option<()> 
 	Some(())
 }
 
+/// Stream a file by its ABSOLUTE path into a session's data queue. This is the
+/// internal path for the native file-picker flow (the user explicitly chose the
+/// file through an OS dialog — no HOME-jail check is appropriate there). The wire
+/// format is identical to `send_file_at` so the receiver's reassembly path is
+/// unchanged. `None` = path is not a file or an I/O error occurred mid-stream.
+pub(crate) async fn send_file_abs(
+	tx: &Sender<DataMsg>,
+	abs: &std::path::Path,
+) -> Option<()> {
+	use tokio::io::AsyncReadExt;
+	let md = tokio::fs::metadata(abs).await.ok()?;
+	if !md.is_file() {
+		return None;
+	}
+	let name = abs.file_name()?.to_string_lossy().into_owned();
+	let size = md.len();
+	let chunks = size.div_ceil(CHUNK as u64) as u32;
+	let id = next_transfer_id();
+	tx.send(DataMsg::FileBegin {
+		id,
+		name,
+		size,
+		chunks,
+	})
+	.await
+	.ok()?;
+	let mut f = tokio::fs::File::open(abs).await.ok()?;
+	let mut buf = vec![0u8; CHUNK];
+	let mut index = 0u32;
+	loop {
+		let mut filled = 0;
+		while filled < CHUNK {
+			match f.read(&mut buf[filled..]).await {
+				Ok(0) => break,
+				Ok(n) => filled += n,
+				Err(_) => return None,
+			}
+		}
+		if filled == 0 {
+			break;
+		}
+		tx.send(DataMsg::FileChunk {
+			id,
+			index,
+			data: buf[..filled].to_vec(),
+		})
+		.await
+		.ok()?;
+		index += 1;
+	}
+	tx.send(DataMsg::FileEnd { id }).await.ok()?;
+	Some(())
+}
+
 /// Trim a listing to the session's one-datagram wire budget. `FsEntries` goes out
 /// as ONE serde_json datagram; a big directory (Downloads, node_modules) would
 /// serialize past the UDP send limit, the send fails EMSGSIZE, serve_with swallows
@@ -203,10 +259,14 @@ fn cap_for_wire(mut entries: Vec<FsEntry>) -> Vec<FsEntry> {
 	if keep < entries.len() {
 		let more = entries.len() - keep;
 		entries.truncate(keep);
+		// `sentinel: true` marks this entry as a non-actionable truncation
+		// notice so the client can render it as inert text instead of as a
+		// clickable file row with a download button.
 		entries.push(FsEntry {
 			name: format!("… {more} daha"),
 			dir: false,
 			size: 0,
+			sentinel: true,
 		});
 	}
 	entries

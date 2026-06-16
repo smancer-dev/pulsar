@@ -27,6 +27,7 @@
 	"off": "Off",
 	"muted": "Muted",
 	"switching": "Switching screen…",
+	"stalled": "Stream stopped — the host may have stopped screen sharing.",
 	"monitor.title": "Monitor",
 	"monitor.primary": "primary",
 	"fit.title": "View fit",

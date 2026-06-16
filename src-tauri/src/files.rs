@@ -117,6 +117,11 @@ pub fn save_received_file(name: &str, data: &[u8]) -> Option<PathBuf> {
 ///
 /// This avoids the ~2x peak-memory spike that occurs when `extend_from_slice`
 /// builds a second contiguous `Vec` while the per-chunk `BTreeMap` is still live.
+///
+/// Writes to a `.part` temp file first and renames to the final dedup-suffixed
+/// name only after all chunks are flushed successfully. On any write error the
+/// temp file is removed so no partial/corrupt file is left under the real name
+/// and the dedup counter stays accurate for a subsequent retry.
 pub fn save_received_file_chunks<'a>(
 	name: &str,
 	chunks: impl Iterator<Item = &'a Vec<u8>>,
@@ -134,9 +139,24 @@ pub fn save_received_file_chunks<'a>(
 		path = dir.join(format!("{stem} ({n}){ext}"));
 		n += 1;
 	}
-	let mut file = std::fs::File::create(&path).ok()?;
-	for chunk in chunks {
-		file.write_all(chunk).ok()?;
+	// Write to a sibling `.part` temp file so that a mid-stream failure never
+	// leaves a partial file under the real name and never poisons the dedup
+	// counter for a subsequent retry of the same transfer.
+	let tmp_path = path.with_extension(format!("{}.part", ext.trim_start_matches('.')));
+	let write_result = (|| {
+		let mut file = std::fs::File::create(&tmp_path).ok()?;
+		for chunk in chunks {
+			file.write_all(chunk).ok()?;
+		}
+		Some(())
+	})();
+	if write_result.is_none() {
+		let _ = std::fs::remove_file(&tmp_path);
+		return None;
+	}
+	if std::fs::rename(&tmp_path, &path).is_err() {
+		let _ = std::fs::remove_file(&tmp_path);
+		return None;
 	}
 	Some((path, total_bytes))
 }

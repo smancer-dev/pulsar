@@ -173,6 +173,12 @@ fn probe_ok(mut cmd: std::process::Command) -> bool {
 	let Ok(mut child) = cmd.spawn() else {
 		return false;
 	};
+	// Assign the probe child to the Windows Job Object so it dies with Pulsar on
+	// abnormal exit (crash / taskkill), honouring job.rs's "assign every spawned
+	// child" invariant.  spawn_tracked / spawn_tracked_enc_paced already do this;
+	// probes previously did not, leaving an orphaned ffmpeg.exe on abnormal exit.
+	#[cfg(windows)]
+	crate::job::assign(&child);
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
 	loop {
 		match child.try_wait() {

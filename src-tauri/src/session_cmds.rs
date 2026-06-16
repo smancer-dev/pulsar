@@ -674,10 +674,13 @@ pub(crate) async fn set_play_monitor(
 		if p != u32::MAX {
 			st.last_ms = mon_now_ms();
 		}
-		// This coalesced call is the winner.  Remove the entry so the map doesn't accumulate
-		// stale entries after the trailing switch fires — forget_monitor_debounce won't see
-		// this id again (the session is still alive here), so we must self-clean.
-		map.remove(&id);
+		// Do NOT remove the entry here.  Removing it would discard the last_ms we just
+		// wrote, so the very next pick within MON_COOLDOWN_MS would find a fresh
+		// MonDebounce (last_ms == 0) and fire immediately — defeating the cooldown that
+		// should follow the trailing switch.  The entry is bounded per-session-id and is
+		// reclaimed by forget_monitor_debounce when the session stops, so leaving it is
+		// not a leak.  pending is already reset to u32::MAX above, so the entry is inert
+		// until the next set_play_monitor call updates it.
 		p
 	};
 	if p != u32::MAX {

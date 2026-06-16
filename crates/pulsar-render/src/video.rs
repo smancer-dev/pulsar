@@ -71,6 +71,11 @@ fn mono_ms() -> u64 {
 	E.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Public alias for linux.rs stall detection (linux.rs cannot call the private `mono_ms`).
+pub fn mono_ms_pub() -> u64 {
+	mono_ms()
+}
+
 /// True once a switch (reopen) has been waiting past `SWITCH_TIMEOUT_MS` without a keyframe.
 fn switch_timed_out() -> bool {
 	let d = SWITCH_DEADLINE_MS.load(Ordering::Relaxed);
@@ -121,6 +126,15 @@ static VBYTES: AtomicU64 = AtomicU64::new(0);
 /// hand us a decoded frame. Drives the overlay's "Çözme ms" tile (was hardcoded 0 before).
 pub static DEC_US: AtomicU64 = AtomicU64::new(0);
 pub static FPS: Mutex<[f32; 3]> = Mutex::new([0.0; 3]); // fps, mbit, ms (filled by main on present)
+/// True while the stream is stalled (no fresh frame for ≥ STALL_SECS) and video was
+/// previously live. Cleared the moment a fresh frame arrives again. The render loop
+/// drives this on Windows (per-AU queue); linux.rs drives it from LAST_FRAME_MS.
+pub static STALLED: AtomicBool = AtomicBool::new(false);
+/// Monotonic-millis timestamp of the LAST fresh decoded frame handed to the GL
+/// presenter (updated on every `Presenter::draw()` with a non-empty MBX pop).
+/// Used by the Linux render loop to detect a stall without a separate timer thread.
+/// 0 = no frame presented yet.
+pub static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 /// Human label of the ACTUAL decoder in use (e.g. "h264_rkmpp (HW)") — the egui
 /// overlay displays it read-only; selection is always automatic.
 pub static DEC_LABEL: Mutex<String> = Mutex::new(String::new());
@@ -1036,6 +1050,10 @@ impl Presenter {
 				self.max_gap_ms = gap;
 			}
 			self.last_fresh_t = t;
+			// Record the wall-clock of this fresh frame so linux.rs can detect a stall
+			// (no frame for ≥ STALL_SECS) and clear STALLED as soon as frames resume.
+			LAST_FRAME_MS.store(mono_ms(), Ordering::Relaxed);
+			STALLED.store(false, Ordering::Relaxed);
 		}
 		let cur = self.last;
 		if cur.is_null() {

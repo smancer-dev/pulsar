@@ -229,9 +229,54 @@ const MAX_CONCURRENT_POPUPS: usize = 3;
 /// Count of currently-open Allow/Deny popup windows.
 static OPEN_POPUP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// RAII guard that holds one slot in [`OPEN_POPUP_COUNT`] and releases it — plus
+/// closes the popup window if it is still open — on drop.
+///
+/// Owning this guard for the full lifetime of [`race_host_auth`] (including across
+/// every `.await` point) ensures the count is ALWAYS decremented, even when:
+///   - the operator closes the decorated popup via the OS title-bar X / Alt+F4
+///     (the `WindowEvent::Destroyed` handler resolves the pending oneshot, the race
+///     exits normally, and the guard drops);
+///   - the per-session task is aborted (e.g. `go_online` is re-run while a race is
+///     in progress): Tokio cancels the future at the current `.await` point, which
+///     drops the guard and triggers `Drop::drop`, releasing the slot even though the
+///     code after the `select!` loop never runs (C2 fix).
+///
+/// `close_approval_window` now only closes the OS window; the counter update is
+/// exclusively managed here, preventing any double-decrement.
+pub(crate) struct PopupSlotGuard {
+	app: AppHandle,
+	id: u64,
+}
+
+impl Drop for PopupSlotGuard {
+	fn drop(&mut self) {
+		// Release the popup slot unconditionally. Saturating to guard against any
+		// hypothetical double-drop (shouldn't happen, but safe).
+		OPEN_POPUP_COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+			Some(n.saturating_sub(1))
+		})
+		.ok();
+		// Close the window if it is still open (it may already be gone if the
+		// operator dismissed it with the OS chrome — that's fine).
+		if let Some(win) = self.app.get_webview_window(&format!("approve-{}", self.id)) {
+			let _ = win.close();
+		}
+	}
+}
+
 /// Spawn the Allow/Deny popup as a separate, focused, always-on-top window that
 /// requests the user's attention (they may be in another app).
-pub(crate) fn open_approval_window(app: &AppHandle, id: u64, peer: &str, pw_status: &str) {
+///
+/// Returns a [`PopupSlotGuard`] on success. The caller MUST hold the guard for the
+/// entire duration of the auth race — dropping it (including on task cancellation)
+/// unconditionally releases the popup slot and closes the window.
+pub(crate) fn open_approval_window(
+	app: &AppHandle,
+	id: u64,
+	peer: &str,
+	pw_status: &str,
+) -> Option<PopupSlotGuard> {
 	// A relay id is a grouped 9-digit string ("482 913 056"); normalize it to plain
 	// digits for the popup. A DIRECT (relay-less) connect's `peer` is an address like
 	// "192.168.1.5:9000" — digit-stripping that yields meaningless "192168159000", so
@@ -265,17 +310,25 @@ pub(crate) fn open_approval_window(app: &AppHandle, id: u64, peer: &str, pw_stat
 		Ok(win) => {
 			OPEN_POPUP_COUNT.fetch_add(1, Ordering::Relaxed);
 			let _ = win.request_user_attention(Some(tauri::UserAttentionType::Critical));
+			Some(PopupSlotGuard { app: app.clone(), id })
 		}
-		Err(e) => tracing::warn!(%e, "approval window failed to open"),
+		Err(e) => {
+			tracing::warn!(%e, "approval window failed to open");
+			None
+		}
 	}
 }
 
-/// Decrement the open-popup counter when a popup is closed (called from
-/// [`race_host_auth`] after closing the window).
+/// Close the approval popup window.
+///
+/// The counter decrement is handled exclusively by [`PopupSlotGuard::drop`]; this
+/// function only closes the OS window so the caller does not need to hold a window
+/// handle when signalling early exit (e.g. idle timeout).
 fn close_approval_window(app: &AppHandle, id: u64) {
+	// Close the window if it is still open (it may already be gone if the
+	// operator dismissed it with the OS chrome — that's fine, we just skip).
 	if let Some(win) = app.get_webview_window(&format!("approve-{id}")) {
 		let _ = win.close();
-		OPEN_POPUP_COUNT.fetch_sub(1, Ordering::Relaxed);
 	}
 }
 
@@ -339,7 +392,11 @@ pub(crate) async fn race_host_auth(
 			detail: "wait".into(),
 		},
 	);
-	open_approval_window(app, id, peer, "wait");
+	// Hold the guard for the entire race. Its Drop impl decrements OPEN_POPUP_COUNT
+	// and closes the window regardless of how the race exits — normal return, timeout,
+	// or future cancellation (task abort via JoinHandle::abort when go_online restarts).
+	// This is the C2 fix: a cancelled task can no longer leak a popup slot.
+	let _popup_guard = open_approval_window(app, id, peer, "wait");
 
 	// Inactivity deadline: a client that sends NO password attempt within this
 	// window is auto-denied. ONLY actual password submissions (ClientAuth::Password)
@@ -425,6 +482,9 @@ pub(crate) async fn race_host_auth(
 		}
 	};
 	pending.lock().unwrap().remove(&id);
+	// close_approval_window closes the OS window; _popup_guard.drop() (below) handles
+	// OPEN_POPUP_COUNT. Call it explicitly here so the window closes before we return
+	// (the guard will still decrement the counter when it drops at end-of-scope).
 	close_approval_window(app, id);
 	RaceOutcome {
 		approved: result.0,

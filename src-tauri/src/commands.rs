@@ -273,6 +273,15 @@ pub(crate) async fn publish_games(
 	Ok(())
 }
 
+/// Timeout applied to every `client_authenticate` call that is NOT inside
+/// `start_remote_play` (which has its own inline constant for the same reason).
+/// Must be less than the JS-side CONNECT_TIMEOUT (45 s) so the Rust future
+/// fails first and the frontend sees a real error string rather than the JS
+/// timer's synthetic "connect-timed-out" sentinel.  When the deadline fires,
+/// `sess` drops on return → `Session::drop` closes the connection → the host's
+/// `recv_client_auth` sees `Gone` and tears down its Allow/Deny state cleanly.
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
 /// Client: list the games published by the host at `target`.
 #[tauri::command]
 pub(crate) async fn list_remote_games(
@@ -293,9 +302,17 @@ pub(crate) async fn list_remote_games(
 		(cfg.network_mode, cfg.relay.clone())
 	};
 	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
-	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
-		.await?
-	{
+	// Timeout on the auth handshake: a host that never returns a definitive
+	// auth result (Allow/Deny/NeedPassword) would park this future indefinitely,
+	// holding a half-open Session and accumulating stuck futures on repeated
+	// attempts.  Mirror the same guard already applied in start_remote_play.
+	let auth_result = tokio::time::timeout(
+		AUTH_TIMEOUT,
+		crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label),
+	)
+	.await
+	.map_err(|_| "connect-timed-out".to_string())?;
+	if !auth_result? {
 		return Err(crate::i18n::t("err.denied").into());
 	}
 	request_games(&mut sess).await.map_err(|e| e.to_string())
@@ -322,9 +339,14 @@ pub(crate) async fn launch_remote_game(
 		(cfg.network_mode, cfg.relay.clone())
 	};
 	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
-	if !crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label)
-		.await?
-	{
+	// Same auth-timeout guard as list_remote_games and start_remote_play.
+	let auth_result = tokio::time::timeout(
+		AUTH_TIMEOUT,
+		crate::auth::client_authenticate(&mut sess, &app, &pw_pending, &next_auth, &peer_label),
+	)
+	.await
+	.map_err(|_| "connect-timed-out".to_string())?;
+	if !auth_result? {
 		return Err(crate::i18n::t("err.denied").into());
 	}
 	request_launch(&mut sess, &game_id)

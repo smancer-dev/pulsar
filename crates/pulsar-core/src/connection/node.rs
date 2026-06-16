@@ -400,6 +400,11 @@ impl Node {
 
 		// Announce ours, await the peer's HelloAck (carrying their pubkey + salt).
 		let hp = Arc::new(Notify::new());
+		// When we have a pinned key, arm an identity-mismatch flag so we can
+		// distinguish a legitimate-but-changed identity from a plain P2P failure
+		// (mirrors the same plumbing in connect_pinned for the relay path).
+		let im: Option<Arc<std::sync::atomic::AtomicBool>> =
+			peer_pubkey.map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 		{
 			let mut g = self.inner.lock().await;
 			g.hello_done.insert(session, hp.clone());
@@ -410,6 +415,9 @@ impl Node {
 			// (silent MITM of the direct path). Absent ⇒ in-band/TOFU as before.
 			if let Some(pk) = peer_pubkey {
 				g.expected_pubkey.insert(session, pk);
+			}
+			if let Some(flag) = &im {
+				g.identity_mismatch.insert(session, flag.clone());
 			}
 		}
 		// The caller may race this whole future against its own (shorter) timeout
@@ -434,13 +442,30 @@ impl Node {
 			g.hello_done.remove(&session);
 			g.pending_salt.remove(&session);
 			g.expected_pubkey.remove(&session);
+			g.identity_mismatch.remove(&session);
 			g.sessions.remove(&session);
 			guard.armed = false;
-			return Err(ConnError::P2pFailed);
+			// Was the timeout caused by a pinned-key mismatch? The HelloAck handler
+			// sets the `im` flag before dropping the ack, so if the flag is set the
+			// peer DID answer but with a different key (legitimate identity rotation)
+			// — return `IdentityChanged` so the caller can surface the actionable
+			// "identity changed — forget and retry?" prompt instead of the generic
+			// `P2pFailed`. Mirrors the same check in `connect_pinned`.
+			let mismatched = im
+				.as_ref()
+				.map(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+				.unwrap_or(false);
+			return Err(if mismatched {
+				ConnError::IdentityChanged(DeviceId(0))
+			} else {
+				ConnError::P2pFailed
+			});
 		}
 		{
 			let mut g = self.inner.lock().await;
 			g.hello_done.remove(&session);
+			// The handshake succeeded — the mismatch flag is no longer needed.
+			g.identity_mismatch.remove(&session);
 			match g.sessions.get_mut(&session) {
 				Some(s) => s.data_tx = Some(data_tx),
 				None => return Err(ConnError::P2pFailed), // guard sweeps the salt
@@ -491,6 +516,7 @@ impl Drop for DirectGuard {
 				g.hello_done.remove(&session);
 				g.pending_salt.remove(&session);
 				g.expected_pubkey.remove(&session);
+				g.identity_mismatch.remove(&session);
 				g.punched.remove(&session);
 				g.sessions.remove(&session);
 			});

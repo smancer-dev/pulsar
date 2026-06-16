@@ -522,9 +522,17 @@ pub(super) async fn hold_session(
 									None
 								};
 								let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
+								// Use the actual on-disk filename (may have a dedup suffix like
+								// " (1)") so the UI flash names the file the user can actually open.
+								let saved_name = saved
+									.as_ref()
+									.and_then(|(p, _)| p.file_name())
+									.and_then(|n| n.to_str())
+									.unwrap_or(&r.name)
+									.to_string();
 								let _ = app_ev.emit("file-recv", FilePayload {
 									peer: id.to_string(),
-									name: r.name.clone(),
+									name: saved_name,
 									bytes: written,
 									ok: saved.is_some(),
 									xfer_id: xfer,

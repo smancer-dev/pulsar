@@ -103,6 +103,11 @@ export interface FsEntry {
 	dir: boolean;
 	/** Byte size for files; 0 for directories. */
 	size: number;
+	/** True only for the trailing truncation marker injected by the host when a
+	 * large directory is cut to fit the wire budget ("… N daha").  A sentinel
+	 * entry must be rendered as inert text — it is not a real file and has no
+	 * downloadable content.  Absent on older hosts → treated as false. */
+	sentinel?: boolean;
 }
 
 /** A host directory listing for the file panel (the `fs-entries` event):

@@ -27,6 +27,7 @@
 	"off": "Kapalı",
 	"muted": "Sessiz",
 	"switching": "Ekran değiştiriliyor…",
+	"stalled": "Yayın durdu — host ekran paylaşımını durdurmuş olabilir.",
 	"monitor.title": "Ekran",
 	"monitor.primary": "ana",
 	"fit.title": "Ekran sığdırma",

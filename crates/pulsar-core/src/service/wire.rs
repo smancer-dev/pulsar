@@ -188,14 +188,28 @@ fn default_true() -> bool {
 	true
 }
 
+/// `skip_serializing_if` helper: skip a `bool` field when it is `false`.
+fn is_false(v: &bool) -> bool {
+	!v
+}
+
 /// One entry of a host directory listing (the `FsEntries` reply): name only (no
 /// path components), whether it's a directory, and the byte size for files
 /// (0 for directories). Listings are sorted dirs-first, then alphabetically.
+///
+/// `sentinel` is `true` only for the trailing truncation marker injected by
+/// `cap_for_wire` ("… N daha") when a large directory is cut to fit the wire
+/// budget.  `#[serde(default)]` makes it wire-compatible: an old host that
+/// does not emit this field deserializes as `false` on a new client, and the
+/// field is skipped entirely when false (same as absent) to keep the wire size
+/// the same as before for every normal entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FsEntry {
 	pub name: String,
 	pub dir: bool,
 	pub size: u64,
+	#[serde(default, skip_serializing_if = "is_false")]
+	pub sentinel: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -600,11 +614,13 @@ mod tests {
 					name: "Projeler".into(),
 					dir: true,
 					size: 0,
+					sentinel: false,
 				},
 				FsEntry {
 					name: "not.txt".into(),
 					dir: false,
 					size: 1234,
+					sentinel: false,
 				},
 			],
 		};
@@ -765,7 +781,7 @@ mod tests {
 			DataMsg::FsList { path: "Belgeler".into() },
 			DataMsg::FsEntries {
 				path: "Belgeler".into(),
-				entries: vec![FsEntry { name: "a.txt".into(), dir: false, size: 42 }],
+				entries: vec![FsEntry { name: "a.txt".into(), dir: false, size: 42, sentinel: false }],
 			},
 			DataMsg::FsGet { path: "Belgeler/a.txt".into() },
 			DataMsg::PeerName("Ahmet".into()),

@@ -32,7 +32,7 @@ export const en: Dict = {
 	'connErr.notOnline': "You are not online yet — go online first.",
 	'connErr.p2pFailed': 'Direct connection failed and relay use is disabled (see Network settings).',
 	'connErr.unreachable': 'Could not connect to the target — check the address and your network.',
-	'connErr.timeout': 'Connection timed out — the device may be offline or blocked by a firewall.',
+	'connErr.timeout': 'Connection timed out — the handshake did not complete in time. The device may be offline or unreachable.',
 	'connErr.incompatibleVersion': 'Relay requires a newer version — please update Pulsar.',
 	'host.local': 'Local host',
 	'host.chatTitle': 'Chat',

@@ -51,6 +51,14 @@ fn media_features() -> Vec<String> {
 ///   - on Linux: the XDG ScreenCast portal session live (compositor keeps showing
 ///     "your screen is being shared" even though nothing is captured)
 ///   - host audio redirected until the next `go_online` calls `reset_redirect_all`
+///   - `incoming`/`host_out`/`active`/`peer_meta` maps retaining stale entries for
+///     the aborted peer (ghost connection leaking ~50-70 KB avatar data-URL + a
+///     dead mpsc sender per ghost)
+///   - the Connections window showing the now-dead peer indefinitely (it only
+///     removes a row on a `disconnected` SessionEvent)
+///   - `hostSessions` in +page.svelte permanently non-empty (the boot/idle
+///     auto-updater is gated on `hostSessions.length === 0` and never fires again
+///     until the app is fully restarted)
 ///
 /// `Drop` performs the critical synchronous parts immediately; the Linux portal
 /// close (async D-Bus call) is fire-and-forget spawned so the runtime cleans it up
@@ -70,12 +78,24 @@ struct SessionCleanupGuard {
 	fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 	#[cfg(target_os = "linux")]
 	cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
-	/// Non-Windows display-mode watcher task; aborted here so an abort()-path
-	/// teardown (e.g. go_online reconnect) cancels it immediately instead of
-	/// waiting up to ~1.5 s for the next restream_tx.is_closed() check.
-	#[cfg(not(windows))]
+	/// Display-mode watcher task; aborted here so an abort()-path teardown (e.g.
+	/// go_online reconnect) cancels it immediately instead of waiting up to ~1.5 s
+	/// for the next restream_tx.is_closed() check.  On Windows this watcher is
+	/// active only for ffmpeg-path sessions (native DXGI self-heals via ACCESS_LOST;
+	/// the watcher fires only when last_req_store is populated, which on_stream does
+	/// only when native_started=false).
 	mode_watcher: tokio::task::JoinHandle<()>,
 	sid: u64,
+	/// Bookkeeping maps that must be cleaned up even on the abort() path so the
+	/// Connections window and +page.svelte's `hostSessions` do not show phantom
+	/// peers and so the auto-updater liveness gate is not permanently suppressed.
+	/// These are all the same Arcs captured in the session closure.
+	incoming: Arc<Mutex<std::collections::HashMap<String, (u64, tokio::sync::oneshot::Sender<()>)>>>,
+	host_out: Arc<Mutex<std::collections::HashMap<String, (u64, tokio::sync::mpsc::Sender<pulsar_core::service::DataMsg>)>>>,
+	active: Arc<Mutex<std::collections::HashMap<String, crate::state::ConnInfo>>>,
+	peer_meta: Arc<Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>>,
+	peer: String,
+	app_handle: AppHandle,
 }
 
 impl Drop for SessionCleanupGuard {
@@ -106,10 +126,9 @@ impl Drop for SessionCleanupGuard {
 		for h in self.fwd_slot.lock().unwrap().drain(..) {
 			h.abort();
 		}
-		// Non-Windows: abort the display-mode watcher immediately so it does not
-		// linger for up to ~1.5 s waiting for its next restream_tx.is_closed()
-		// check.  abort() is safe to call after the task has already finished.
-		#[cfg(not(windows))]
+		// Abort the display-mode watcher immediately so it does not linger for up
+		// to ~1.5 s waiting for its next restream_tx.is_closed() check.
+		// abort() is safe to call after the task has already finished.
 		self.mode_watcher.abort();
 		// Linux: close the XDG ScreenCast portal session so the compositor's
 		// "your screen is being shared" indicator disappears.
@@ -123,6 +142,64 @@ impl Drop for SessionCleanupGuard {
 		// Release per-session redirect ownership; idempotent if already released
 		// by the normal teardown block.
 		handlers::release_redirect(self.sid);
+		// C3: Emit a `disconnected` SessionEvent and clean up the bookkeeping maps
+		// even when this session task was cancelled by `JoinHandle::abort()` (the
+		// go_online reconnect path). Without this, the abort() path skips the entire
+		// post-tokio::select! cleanup tail, leaving:
+		//   - stale (sid, dead-sender) entries in incoming/host_out/active/peer_meta
+		//   - the Connections window showing a phantom peer row forever
+		//   - +page.svelte's `hostSessions` permanently non-empty → auto-updater wedged
+		// All operations below are idempotent (sid-guarded compare-and-remove), so
+		// double-execution with the normal teardown path is safe: the normal path runs
+		// first (or may already have run), finds the maps empty / entries already gone,
+		// and is a no-op.
+		let sid = self.sid;
+		let peer = self.peer.clone();
+		// sid-guarded removal: only remove entries that still belong to THIS session.
+		// A same-peer reconnection may have already overwritten them with a newer sid.
+		{
+			let mut g = self.incoming.lock().unwrap();
+			if g.get(&peer).map(|(id, _)| *id) == Some(sid) {
+				g.remove(&peer);
+			}
+		}
+		{
+			let mut g = self.host_out.lock().unwrap();
+			if g.get(&peer).map(|(id, _)| *id) == Some(sid) {
+				g.remove(&peer);
+			}
+		}
+		let (was_mine, conns_emptied) = {
+			let mut g = self.active.lock().unwrap();
+			let mine = g.get(&peer).map(|ci| ci.sid) == Some(sid);
+			if mine {
+				g.remove(&peer);
+			}
+			(mine, g.is_empty())
+		};
+		if was_mine {
+			// Release the ~50-70 KB avatar data-URL and peer name cached for this
+			// peer; a reconnect will re-push them.
+			self.peer_meta.lock().unwrap().remove(&peer);
+		}
+		if conns_emptied {
+			crate::connections::close(&self.app_handle);
+		}
+		// Emit the `disconnected` SessionEvent so both the Connections window and
+		// +page.svelte's `hostSessions` drop this peer. Without this event:
+		//   - Connections.svelte:44 never removes the row → phantom peer shown forever
+		//   - +page.svelte:369 never drains the entry → hostSessions.length stays > 0
+		//     → isBusy() returns true → boot + idle auto-update checks are suppressed
+		// We always emit (not gated on was_mine) so the UI is guaranteed a cleanup
+		// signal even if active was already cleared by the normal teardown path.
+		let _ = self.app_handle.emit(
+			"session",
+			crate::events::SessionEvent {
+				kind: "disconnected".into(),
+				peer,
+				detail: String::new(),
+			},
+		);
 	}
 }
 
@@ -216,6 +293,11 @@ pub(crate) async fn go_online(
 	// guard dropped left the host on the sinkless sink (real speakers silent). Restore
 	// the saved default from the on-disk marker (no-op for a clean previous exit).
 	handlers::restore_stale_redirect();
+	// Crash-restore for the endpoint-mute fallback (no-virtual-sink / no-null-sink
+	// case): a prior process that fell back to endpoint-mute and died before the
+	// session ended left the host output muted. Unmute iff our marker says we set it
+	// (never touches a mute the user set independently). No-op for a clean exit.
+	handlers::restore_stale_mute_fallback();
 	tracing::info!(relay = %cfg.relay, "go_online: resolving relay");
 	let relay = resolve_relay(&cfg.relay)
 		.await
@@ -593,23 +675,22 @@ pub(crate) async fn go_online(
 				// of storing it into a dead/superseded session (orphaned portal cast).
 				#[cfg(target_os = "linux")]
 				let cap_gen: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
-				// Records the latest StreamReq so the host-side display-mode watcher (non-Windows)
-				// can re-issue it to restart capture at the new geometry. Windows self-heals in
-				// pulsar-capture, so it's cfg-removed there.
-				#[cfg(not(windows))]
+				// Records the latest StreamReq so the host-side display-mode watcher can
+				// re-issue it to restart capture at the new geometry.  On Windows this is
+				// populated only when the ffmpeg fallback path is active (native_started=false);
+				// native DXGI sessions self-heal via ACCESS_LOST in pulsar-capture.
 				let last_req_store: Arc<Mutex<Option<StreamReq>>> = Arc::new(Mutex::new(None));
 				// Producer half of the re-stream channel feeding `serve_with`'s restream branch:
 				// when the HOST's own display mode changes mid-session the watcher re-sends the
-				// last StreamReq so capture restarts at the new geometry (ffmpeg/Wayland have no
-				// DXGI ACCESS_LOST signal). Cfg'd out on Windows — the native path self-heals.
-				#[cfg(not(windows))]
+				// last StreamReq so capture restarts at the new geometry (ffmpeg/Wayland/gdigrab
+				// have no DXGI ACCESS_LOST signal).  On Windows this only fires for ffmpeg-path
+				// sessions because on_stream only populates last_req_store when native_started=false.
 				let (restream_tx, restream_rx) = tokio::sync::mpsc::channel::<StreamReq>(4);
 				// Poll the host's own display geometry; on a STABLE change to the streamed
 				// display's size, re-issue the stored StreamReq once so capture rebuilds at the
 				// new size. Inert when nothing has streamed yet (no stored req) and on platforms
 				// where `host_displays()` is empty (Wayland w/o Mutter, macOS) — there it just
 				// loops without ever firing. Exits when the channel closes (session teardown).
-				#[cfg(not(windows))]
 				let mode_watcher = {
 					let last_req_store = last_req_store.clone();
 					tokio::spawn(async move {
@@ -817,7 +898,6 @@ pub(crate) async fn go_online(
 					cap_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_gen.clone(),
-					#[cfg(not(windows))]
 					last_req_store.clone(),
 				);
 				// Route the client's input: controllers into a virtual gamepad, and
@@ -1253,12 +1333,10 @@ pub(crate) async fn go_online(
 					// File manager: FsList/FsGet from this client, answered through the
 					// same outbound queue (HOME-jailed; see fs_browse).
 					on_fs: Box::new(crate::fs_browse::make_on_fs(fs_out)),
-					// Host-initiated re-stream: fed by the display-mode watcher above (non-Windows).
-					// Windows' native capture self-heals on ACCESS_LOST, so it stays inert there.
-					#[cfg(not(windows))]
+					// Host-initiated re-stream: fed by the display-mode watcher above.
+					// On Windows this fires only for ffmpeg-path sessions (native DXGI self-heals
+					// via ACCESS_LOST; last_req_store is only populated when native_started=false).
 					restream: Some(restream_rx),
-					#[cfg(windows)]
-					restream: None,
 				};
 				// Guard that runs critical cleanup even if this task is cancelled via
 				// `JoinHandle::abort()` (e.g. by `go_online` on a reconnect). Abort
@@ -1266,15 +1344,21 @@ pub(crate) async fn go_online(
 				// essential teardown inside `Drop` as a safety net. The normal path still
 				// runs the block below; every operation is idempotent so double-execution
 				// is safe (procs drain finds an empty vec, cap_slot.take() returns None,
-				// release_redirect is a no-op when already removed).
+				// release_redirect is a no-op when already removed, and the map removals
+				// are sid-guarded so they silently no-op when already cleared).
 				let _cleanup_guard = SessionCleanupGuard {
 					procs: procs.clone(),
 					fwd_slot: fwd_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_slot: cap_slot.clone(),
-					#[cfg(not(windows))]
 					mode_watcher,
 					sid,
+					incoming: incoming.clone(),
+					host_out: host_out.clone(),
+					active: active.clone(),
+					peer_meta: peer_meta.clone(),
+					peer: peer.clone(),
+					app_handle: app_h.clone(),
 				};
 				tokio::select! {
 					_ = serve_with(session, provider, on_launch, on_stream, on_input, handlers) => {}

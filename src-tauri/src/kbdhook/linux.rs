@@ -762,6 +762,10 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 								_ if !down => {
 									// key UP: a Char key had a one-shot Unicode insert (no VK to release) -> suppress
 									// its up; otherwise release the VK as before.
+									// Also remove from vk_sent so a later plain-char press of this key
+									// doesn't hit a stale entry and emit a spurious Key{down:false} before the Char.
+									// vk_sent must only track keys with an OUTSTANDING (un-released) raw VK-down.
+									vk_sent.remove(&code);
 									if !char_keys.remove(&code) {
 										fwd(
 											&tx,

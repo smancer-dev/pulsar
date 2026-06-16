@@ -51,6 +51,7 @@ export class SessionSideChannels {
 					if (e.peer !== idStr) return;
 					copyText(e.text).catch(() => {});
 					this.flash(t('session.clipboardRecv'));
+					api.renderToast(inputs.playId(), t('session.clipboardRecv')).catch(() => {});
 				})
 			);
 			return scope.dispose;
@@ -80,6 +81,7 @@ export class SessionSideChannels {
 		}
 		api.sendClipboard(playId, text).catch(() => {});
 		this.flash(t('session.clipboardSent'));
+		api.renderToast(playId, t('session.clipboardSent')).catch(() => {});
 	};
 
 	// File → remote.

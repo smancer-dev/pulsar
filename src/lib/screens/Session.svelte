@@ -579,9 +579,10 @@
 					break;
 				}
 				case 'sendclip': sidechan.sendClipboard(); break;
-				// Tools shortcuts that live app-side: the OS file dialog (its own
-				// toplevel — visible over the video), reverse direction, fullscreen.
-				case 'pickfile': sidechan.pickFile(); break;
+				// 'pickfile' is handled Rust-side (rfd native dialog) — the renderer
+				// intercepts the cmd before emitting overlay-cmd so this case is never
+				// reached; kept as a no-op guard against stale renderer builds.
+				case 'pickfile': break;
 				case 'reverse': reverse(); break;
 				case 'fullscreen': onToggleFullscreen(); break;
 			}

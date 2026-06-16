@@ -54,6 +54,13 @@ base64 = "0.22"
 # with subtle's constant-time `ct_eq` (digesting also hides the secret length).
 sha2 = { workspace = true }
 subtle = "2"
+# Native OS file-picker dialog: used when the egui overlay's "Dosya gönder" button
+# fires from the renderer process — a cross-process event can never carry webview
+# user-activation, so the webview's <input type=file>.click() is silently blocked
+# by WebView2/WebKitGTK. rfd opens the picker Rust-side (no activation needed),
+# then streams the chosen file straight via the session data channel (no roundtrip
+# through the webview). Uses Win32 IFileOpenDialog on Windows; GTK3/portal on Linux.
+rfd = "0.14"
 
 # Raw Win32 for true taskbar-covering fullscreen (borderless-fullscreen via SetWindowPos).
 [target.'cfg(windows)'.dependencies]

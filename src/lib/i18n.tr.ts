@@ -32,7 +32,7 @@ export const tr: Dict = {
 	'connErr.notOnline': 'Henüz çevrimiçi değilsiniz — önce çevrimiçi olun.',
 	'connErr.p2pFailed': 'Doğrudan bağlantı kurulamadı ve aktarıcı kullanımı kapalı (Ağ ayarlarına bakın).',
 	'connErr.unreachable': 'Hedefe bağlanılamadı — adresi ve ağ bağlantınızı kontrol edin.',
-	'connErr.timeout': 'Bağlantı zaman aşımına uğradı — cihaz çevrimdışı olabilir ya da güvenlik duvarı engelliyor olabilir.',
+	'connErr.timeout': 'Bağlantı zaman aşımına uğradı — el sıkışma tamamlanamadı. Cihaz çevrimdışı veya erişilemiyor olabilir.',
 	'connErr.incompatibleVersion': 'Aktarıcı daha yeni bir sürüm gerektiriyor — lütfen Pulsar\'ı güncelleyin.',
 	'host.local': 'Yerel host',
 	'host.chatTitle': 'Sohbet',

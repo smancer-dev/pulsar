@@ -46,7 +46,7 @@ pub use loopback::{
 	loopback_format, run_loopback_capture, run_loopback_capture_pinned,
 	run_loopback_capture_tracking, LoopbackFormat,
 };
-pub use mute::set_host_muted;
+pub use mute::{mute_fallback_marker_path, restore_stale_mute_fallback, set_host_muted};
 pub use settings::{
 	AudioInput, AudioPolicy, AudioSettings, ChannelLayout, CHANNELS, SAMPLE_RATE,
 };

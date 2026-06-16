@@ -344,7 +344,11 @@
 				<div class="state">{t('files.empty')}</div>
 			{:else}
 				{#each entries as e (e.name)}
-					{#if e.dir}
+					{#if e.sentinel}
+						<div class="row sentinel" aria-label={e.name}>
+							<span class="nm trunc">{e.name}</span>
+						</div>
+					{:else if e.dir}
 						<button class="row" onclick={() => nav(join(path, e.name))}>
 							<Icon name="folder" size={14} />
 							<span class="nm">{e.name}</span>
@@ -526,6 +530,13 @@
 	}
 	.row.file {
 		cursor: default;
+	}
+	.row.sentinel {
+		cursor: default;
+		opacity: 0.5;
+	}
+	.nm.trunc {
+		font-style: italic;
 	}
 	.nm {
 		flex: 1;

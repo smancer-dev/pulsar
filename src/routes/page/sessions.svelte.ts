@@ -51,6 +51,11 @@ const CONNECT_TIMEOUT_MS = 45_000;
 /** Marker thrown when the connect attempt blows past `CONNECT_TIMEOUT_MS`. */
 const CONNECT_TIMEOUT = 'connect-timed-out';
 
+// How long to wait after auth resumes (password submitted / prompt closed) before
+// timing out the post-auth handshake. Separate from CONNECT_TIMEOUT_MS because the
+// full 45 s is generous for a network handshake but auth itself is unbounded.
+const POST_AUTH_TIMEOUT_MS = 30_000;
+
 // Known core connect errors arrive as raw English Rust strings (ConnError) — map them
 // to friendly copy IN THE ACTIVE UI LANGUAGE for the connect flash (substring match
 // so wrapped/formatted variants still hit). Unknown messages fall through verbatim.
@@ -84,6 +89,17 @@ export class SessionManager {
 
 	#nextTab = 0;
 	#deps: Deps;
+	// Targets (despaced peer id) for which interactive auth (password prompt or
+	// host Allow/Deny) is currently in progress. The connect timeout is paused
+	// while the target is in this set — auth time must not count against the
+	// handshake deadline, since auth is a human-interaction step.
+	#authInProgress = new Set<string>();
+	// When the timeout fires while auth is in progress it parks {reject, arm} here
+	// (keyed by despaced peer id) rather than immediately rejecting. Once the user
+	// submits a password (notifyAuthSubmit) we re-arm for POST_AUTH_TIMEOUT_MS.
+	// Once the connect finishes (finally block) or the tab closes, the entry is
+	// deleted — any parked arm that lost its race just becomes a no-op.
+	#pendingTimeoutReject = new Map<string, { reject: (e: Error) => void; arm: (ms: number) => void }>();
 
 	constructor(deps: Deps) {
 		this.#deps = deps;
@@ -155,6 +171,9 @@ export class SessionManager {
 		}
 		// Auth (password prompt + host Allow/Deny) happens during this call, driven
 		// by events — no password is passed up front.
+		// Hoisted so the finally block can clean up auth-pause state regardless of
+		// whether the try body threw before or after peerKey was used.
+		const peerKey = target.id.replace(/\s/g, '');
 		try {
 			// Guard the connect with a deadline: if it neither resolves nor rejects in
 			// time, abort with a timeout error (routed through friendlyConnectError) so
@@ -173,11 +192,26 @@ export class SessionManager {
 			);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			let timedOut = false;
+			// Capture `this` for use in closures below (class private fields can't be
+			// accessed via a free `this` alias in all TS targets, so we assign early).
+			const self = this;
 			const timeout = new Promise<never>((_, reject) => {
-				timer = setTimeout(() => {
-					timedOut = true;
-					reject(new Error(CONNECT_TIMEOUT));
-				}, CONNECT_TIMEOUT_MS);
+				// Reschedule when auth is in progress so human interaction time (typing a
+				// password, waiting for Allow/Deny) does not count against the deadline.
+				// Each reschedule grants POST_AUTH_TIMEOUT_MS for the post-auth handshake.
+				function arm(ms: number) {
+					timer = setTimeout(() => {
+						if (peerKey && self.#authInProgress.has(peerKey)) {
+							// Auth is active — park the reject+arm until notifyAuthSubmit
+							// re-arms or notifyAuthEnd clears the pause.
+							self.#pendingTimeoutReject.set(peerKey, { reject, arm });
+							return;
+						}
+						timedOut = true;
+						reject(new Error(CONNECT_TIMEOUT));
+					}, ms);
+				}
+				arm(CONNECT_TIMEOUT_MS);
 			});
 			// If the connect wins the race, stop the timeout from later rejecting (and
 			// leaking the timer). If the timeout wins, a late-resolving connect must still
@@ -223,7 +257,34 @@ export class SessionManager {
 			this.connectErr = friendlyConnectError(e instanceof Error ? e.message : String(e));
 			this.removeTab(tabId);
 		} finally {
+			// Clean up auth-pause state so a stale entry can't affect future connects.
+			if (peerKey) {
+				this.#authInProgress.delete(peerKey);
+				this.#pendingTimeoutReject.delete(peerKey);
+			}
 			this.#deps.onAuthDone(target.id); // this connection's prompt (if any) is done
+		}
+	};
+
+	/** Called when an auth prompt (password / Allow-Deny) becomes active for a peer.
+	 * Pauses the connect timeout so human-interaction time doesn't count. */
+	notifyAuthStart = (peerId: string) => {
+		const key = peerId.replace(/\s/g, '');
+		if (key) this.#authInProgress.add(key);
+	};
+
+	/** Called when the user submits a password (or the prompt is dismissed) for a peer.
+	 * Resumes the timeout — granting POST_AUTH_TIMEOUT_MS for the post-auth handshake. */
+	notifyAuthSubmit = (peerId: string) => {
+		const key = peerId.replace(/\s/g, '');
+		if (!key) return;
+		this.#authInProgress.delete(key);
+		// If the timeout fired while auth was paused, it parked itself here — re-arm
+		// it now so the post-auth handshake is still bounded.
+		const parked = this.#pendingTimeoutReject.get(key);
+		if (parked) {
+			this.#pendingTimeoutReject.delete(key);
+			parked.arm(POST_AUTH_TIMEOUT_MS);
 		}
 	};
 

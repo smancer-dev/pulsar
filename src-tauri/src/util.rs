@@ -251,6 +251,13 @@ pub(crate) async fn connect_target(
 					}
 					return Ok((sess, id.grouped()));
 				}
+				// The peer answered with a different key than we pinned: surface the
+				// actionable identity-changed error immediately (with the real id, not
+				// the DeviceId(0) placeholder from the direct path) rather than spending
+				// another relay round-trip to discover the same thing.
+				Ok(Err(pulsar_core::ConnError::IdentityChanged(_))) => {
+					return Err(format!("IDENTITY_CHANGED:{}", id.grouped()));
+				}
 				_ => {
 					tracing::info!(%addr, "LAN fast path failed — falling back to the relay rendezvous");
 				}
@@ -358,30 +365,44 @@ pub(crate) async fn client_auto_fps(_app: &AppHandle) -> u32 {
 	60
 }
 
-/// Host: this machine's primary display orientation in degrees (0/90/180/270). The captured
-/// framebuffer carries this rotation, so the client renders the video rotated by the inverse to
-/// show it upright (e.g. a laptop configured upside-down reports 180). `PULSAR_HOST_ROTATE` forces
-/// a value (override if the auto-detect is wrong, or to test). Windows-only auto-detect; other
-/// host OSes report 0 for now (X11 could read RandR, macOS CoreGraphics — TODO).
-pub(crate) fn display_rotation() -> u32 {
+/// Host display orientation in degrees (0/90/180/270) for the given GDI device name (Windows:
+/// `"DISPLAY1"` — the trimmed form stored in `DisplayInfo::name`; `None` queries the primary
+/// display). The captured framebuffer carries this rotation, so the client renders the video
+/// rotated by the inverse to show it upright. `PULSAR_HOST_ROTATE` forces a value for all
+/// monitors (override/test). Windows-only auto-detect; other host OSes always return 0.
+///
+/// Passing the streamed monitor's device name is important when the streamed display is NOT the
+/// primary: `EnumDisplaySettingsW(NULL, …)` only returns the primary's orientation. A rotated
+/// secondary/non-primary monitor would be reported as 0 (wrong) without this.
+pub(crate) fn display_rotation(device_name: Option<&str>) -> u32 {
 	if let Some(d) = std::env::var("PULSAR_HOST_ROTATE")
 		.ok()
 		.and_then(|s| s.parse::<u32>().ok())
 	{
 		return d % 360;
 	}
-	display_rotation_detect()
+	display_rotation_detect(device_name)
 }
 
 #[cfg(windows)]
-fn display_rotation_detect() -> u32 {
+fn display_rotation_detect(device_name: Option<&str>) -> u32 {
 	use windows_sys::Win32::Graphics::Gdi::{
 		EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
 	};
 	unsafe {
 		let mut dm: DEVMODEW = std::mem::zeroed();
 		dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-		if EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) != 0 {
+		// Build the wide device-name string (`\\.\DISPLAYn`) when a specific monitor is
+		// requested; pass null to query the primary (EnumDisplaySettingsW contract).
+		let name_wide: Option<Vec<u16>> = device_name.map(|n| {
+			let full = format!(r"\\.\{n}");
+			full.encode_utf16().chain(std::iter::once(0u16)).collect()
+		});
+		let name_ptr = match name_wide.as_deref() {
+			Some(s) => s.as_ptr(),
+			None => std::ptr::null(),
+		};
+		if EnumDisplaySettingsW(name_ptr, ENUM_CURRENT_SETTINGS, &mut dm) != 0 {
 			// dmDisplayOrientation (display branch of the DEVMODE union): DMDO_90=1/180=2/270=3.
 			return match dm.Anonymous1.Anonymous2.dmDisplayOrientation {
 				1 => 90,
@@ -394,7 +415,7 @@ fn display_rotation_detect() -> u32 {
 	0
 }
 #[cfg(not(windows))]
-fn display_rotation_detect() -> u32 {
+fn display_rotation_detect(_device_name: Option<&str>) -> u32 {
 	0
 }
 

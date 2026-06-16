@@ -1142,6 +1142,21 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			state.decode_ms = video::DEC_US.load(Ordering::Relaxed) as f32 / 1000.0;
 		}
 
+		// Stall detection: if a fresh frame was delivered before (LAST_FRAME_MS ≠ 0) but
+		// none has arrived for ≥ 3 s (and we're not mid-switch), set STALLED so the
+		// closed-state chrome draws the "stream stopped" indicator over the frozen frame.
+		// STALLED is cleared automatically by Presenter::draw() when a fresh frame arrives.
+		{
+			const STALL_MS: u64 = 3_000;
+			let last = video::LAST_FRAME_MS.load(Ordering::Relaxed);
+			if last != 0 && !video::SWITCHING.load(Ordering::Relaxed) {
+				let now = video::mono_ms_pub();
+				if now.saturating_sub(last) >= STALL_MS {
+					video::STALLED.store(true, Ordering::Relaxed);
+				}
+			}
+		}
+
 		// ---- Render: video first (opaque), then egui overlay on top (blended) ----
 		use glow::HasContext;
 		gl.disable(glow::BLEND);
@@ -1227,9 +1242,11 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			let mut cmds: Vec<OverlayCmd> = Vec::new();
 			let full = egui_ctx.run(raw_input, |ctx| {
 				cmds = overlay::draw(ctx, &state, &mut ov_ui);
-				// "Switching screen…" indicator over the held last frame during a switch.
+				// "Switching screen…" or "stream stopped" indicator over the held last frame.
 				if video::SWITCHING.load(Ordering::Relaxed) {
 					overlay::draw_switching(ctx);
+				} else if video::STALLED.load(Ordering::Relaxed) {
+					overlay::draw_stalled(ctx);
 				}
 				paint_cursor(ctx);
 			});
@@ -1263,13 +1280,14 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			};
 			let hint_text = hint;
 			let switching = video::SWITCHING.load(Ordering::Relaxed);
-			if state.stats_hud || state.overlay_btn || hint_text.is_some() || cursor_draw.is_some() || switching
+			let stalled = video::STALLED.load(Ordering::Relaxed);
+			if state.stats_hud || state.overlay_btn || hint_text.is_some() || cursor_draw.is_some() || switching || stalled
 			{
 				// Closed-state chrome: the mini stats HUD, the Parsec-style open button
 				// and/or the helper tooltip. Display-only on Linux (the container is input
 				// pass-through — the matching CLICK hotspot lives in the webview).
-				// Also paints the "Switching screen…" spinner when a monitor/codec switch
-				// is in progress, regardless of whether any other chrome is active.
+				// Also paints the "Switching screen…" spinner or "stream stopped" indicator
+				// when needed, regardless of whether any other chrome is active.
 				let raw_input = egui::RawInput {
 					screen_rect: Some(egui::Rect::from_min_size(
 						egui::pos2(0.0, 0.0),
@@ -1281,6 +1299,10 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 				let full = egui_ctx.run(raw_input, |ctx| {
 					if switching {
 						overlay::draw_switching(ctx);
+					} else if stalled {
+						// Stream-stopped indicator: surfaces the stall state that the webview's
+						// .stall div cannot show because the mpv --wid surface composites on top.
+						overlay::draw_stalled(ctx);
 					}
 					if state.stats_hud {
 						overlay::draw_hud(ctx, &state);

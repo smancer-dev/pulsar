@@ -84,13 +84,28 @@ impl Drop for HostSilentGuard {
 /// endpoint-mute path — but **only** ever after capture is live, per the post-mute
 /// latching caveat).
 ///
+/// `layout` is the negotiated channel layout for the session (stereo / 5.1 / 7.1).
+/// On Linux it is forwarded to `module-null-sink` so the null sink and its `.monitor`
+/// are created with the correct number of channels — a null sink defaults to stereo,
+/// so without this a 5.1/7.1 request silently gets a 2-channel monitor and ffmpeg
+/// upmixes stereo into a fake surround container. On macOS the virtual device's
+/// channel count is fixed by the device itself (e.g. BlackHole 2ch vs 16ch) and
+/// cannot be changed by the redirect, so `layout` is accepted but not used — the
+/// caller should clamp the encode layout to the device's real channel count if known.
+///
 /// Best-effort: any hard error is returned as `Err(String)` for the caller to log;
 /// it never panics and never blocks the stream. On platforms other than Linux/macOS
 /// this is always `Ok(None)`.
-pub fn arm() -> Result<Option<HostSilent>, String> {
+pub fn arm(
+	// Used on Linux to set the null sink's channel count/map.
+	// On macOS the virtual device's channel count is fixed by the device itself.
+	// On other platforms the function always returns Ok(None).
+	#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+	layout: super::settings::ChannelLayout,
+) -> Result<Option<HostSilent>, String> {
 	#[cfg(target_os = "linux")]
 	{
-		match linux::NullSink::create()? {
+		match linux::NullSink::create(layout)? {
 			Some(null) => {
 				let source = null.monitor_source();
 				Ok(Some(HostSilent {
@@ -218,19 +233,46 @@ mod linux {
 		/// currently-playing stream onto it. Returns `Ok(None)` if `pactl` is missing
 		/// or the module wouldn't load (caller falls back to the mute path); `Ok(Some)`
 		/// once the redirect is live.
-		pub(super) fn create() -> Result<Option<Self>, String> {
+		///
+		/// `layout` sets the sink (and its `.monitor`) to the correct channel count and
+		/// channel map. A PulseAudio null sink with no `channels=` arg defaults to
+		/// stereo, so without this a 5.1/7.1 capture would get a 2-channel monitor and
+		/// ffmpeg would upmix stereo into a fake surround container. Ports Sunshine's
+		/// per-layout null-sink args (`rate=48000 format=float32le channels=N
+		/// channel_map=...`) from `_ref/Sunshine/src/platform/linux/audio.cpp`.
+		pub(super) fn create(layout: super::super::settings::ChannelLayout) -> Result<Option<Self>, String> {
 			// Clear any leftover from a prior crash before adding ours.
 			unload_stale();
 
 			let prev_default = get_default_sink();
 
-			// Load the null sink. Sunshine's args: rate/format/channels + a friendly
-			// description. We keep the description ("Pulsar") so the user sees a sane
-			// name if they open a mixer; the monitor reader picks the real channel count.
+			// Build the channel_map string for this layout. PulseAudio channel-map
+			// names mirror Sunshine's `platf::speaker` constants.
+			let channel_map = match layout {
+				super::super::settings::ChannelLayout::Stereo => {
+					"front-left,front-right".to_string()
+				}
+				super::super::settings::ChannelLayout::Surround51 => {
+					"front-left,front-right,front-center,lfe,rear-left,rear-right".to_string()
+				}
+				super::super::settings::ChannelLayout::Surround71 => {
+					"front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right"
+						.to_string()
+				}
+			};
+			let channels_arg = format!("channels={}", layout.channels());
+			let channel_map_arg = format!("channel_map={channel_map}");
+
+			// Load the null sink. Ports Sunshine's args: rate/format/channels/channel_map
+			// + a friendly description so the user sees a sane name if they open a mixer.
 			let load = pactl(&[
 				"load-module",
 				"module-null-sink",
 				&format!("sink_name={SINK_NAME}"),
+				"rate=48000",
+				"format=float32le",
+				&channels_arg,
+				&channel_map_arg,
 				"sink_properties=device.description=Pulsar",
 			]);
 			let module_id = match load {
@@ -270,6 +312,7 @@ mod linux {
 
 			tracing::info!(
 				module_id,
+				channels = layout.channels(),
 				prev_default = ?prev_default,
 				"pulsar host-silent: redirected default sink to null sink (Linux)"
 			);
@@ -444,7 +487,7 @@ mod tests {
 		// clean, non-panicking best-effort. On Linux/macOS CI without the tools this
 		// returns Ok(None) (tool missing); off both it's a compile-time Ok(None). Either
 		// way it must never panic and the guard (if any) must drop cleanly.
-		match arm() {
+		match arm(super::settings::ChannelLayout::Stereo) {
 			Ok(None) => {}
 			Ok(Some(hs)) => {
 				// A redirect actually armed (a dev box WITH the tools): the source must be

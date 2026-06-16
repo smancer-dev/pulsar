@@ -109,13 +109,21 @@
 
 	function submitPw() {
 		if (!pwPrompt) return;
+		// Signal the connect timeout that auth interaction ended — re-arms the post-auth
+		// handshake deadline (so only network time counts from here).
+		sm.notifyAuthSubmit(pwPrompt.peer);
 		api.submitPassword(pwPrompt.req, pwInput).catch(() => {});
 		pwChecking = true;
 		pwCheckingReq = pwPrompt.req;
 		pwError = '';
 	}
 	function cancelPw() {
-		if (pwPrompt) api.submitPassword(pwPrompt.req, null).catch(() => {});
+		if (pwPrompt) {
+			// Resume the timeout: user dismissed auth, so the connect will error from the
+			// host (auth refused) or hang — either way let the normal deadline apply.
+			sm.notifyAuthSubmit(pwPrompt.peer);
+			api.submitPassword(pwPrompt.req, null).catch(() => {});
+		}
 		closePw();
 	}
 	// Dequeue the current (head) prompt and re-arm the inputs for the next one, if any.
@@ -408,6 +416,7 @@
 				if (p === want || p.startsWith(want + ':') || want.startsWith(p + ':')) {
 					const pw = autoPw.pw;
 					autoPw = null;
+					// Auto-submit is instant: no need to pause the timeout (no human delay).
 					api.submitPassword(e.req, pw).catch(() => {});
 					return;
 				}
@@ -417,6 +426,8 @@
 			// Match on the SPECIFIC req we submitted (pwCheckingReq), not just the peer: two
 			// concurrent connects to the same peer id would otherwise swap the wrong head.
 			if (pwPrompt && pwChecking && pwPrompt.req === pwCheckingReq && pwPrompt.peer === e.peer) {
+				// Wrong-password re-fire: auth is still interactive — keep the pause alive.
+				sm.notifyAuthStart(e.peer);
 				pwQueue = [{ req: e.req, peer: e.peer }, ...pwQueue.slice(1)];
 				pwError = t('pw.error');
 				pwChecking = false;
@@ -425,6 +436,9 @@
 			}
 			// Otherwise it's a (possibly concurrent) new connection's prompt — queue it. If it
 			// becomes the visible head, arm the inputs for it.
+			// Pause this connection's timeout: the user now has unlimited time to type the
+			// password or wait for the host operator to click Allow/Deny.
+			sm.notifyAuthStart(e.peer);
 			const wasEmpty = pwQueue.length === 0;
 			pwQueue = [...pwQueue, { req: e.req, peer: e.peer }];
 			if (wasEmpty) {

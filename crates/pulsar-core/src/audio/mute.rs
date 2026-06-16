@@ -3,6 +3,36 @@
 //!
 //! [`AudioPolicy::mute_host`]: super::AudioPolicy::mute_host
 
+/// Path of the crash-recovery marker for the endpoint-mute fallback. Written when the
+/// fallback mute is applied; deleted on the matching unmute. On the next launch
+/// [`restore_stale_mute_fallback`] reads it and issues the unmute so a crashed process
+/// can't leave the host output muted indefinitely.
+pub fn mute_fallback_marker_path() -> std::path::PathBuf {
+	std::env::temp_dir().join("pulsar-mute-fallback.active")
+}
+
+/// Startup crash-restore for the endpoint-mute fallback. If the previous process wrote
+/// the marker (i.e. it applied the mute fallback and then died abnormally before the
+/// session ended), unmute the default output now and remove the marker. No-op when the
+/// marker is absent (clean previous exit or fallback was never used).
+///
+/// Gated by the marker so a deliberate user mute set independently of Pulsar is never
+/// clobbered — we only unmute when WE are known to be the ones who muted it (same
+/// guarantee C12 required for the unconditional startup-unmute it removed).
+pub fn restore_stale_mute_fallback() {
+	let path = mute_fallback_marker_path();
+	if !path.exists() {
+		return; // no marker → clean previous exit, nothing to restore
+	}
+	// Consume the marker first so a failure in set_host_muted can't loop us forever.
+	let _ = std::fs::remove_file(&path);
+	if let Err(e) = set_host_muted(false) {
+		tracing::warn!("mute-fallback crash-restore: unmute failed: {e}");
+	} else {
+		tracing::info!("restored host output after a prior crash left the mute-fallback active");
+	}
+}
+
 /// Mute or unmute the host's **default output device** for the duration of a
 /// session (the [`AudioPolicy::mute_host`] action). Best-effort + reversible:
 /// Linux uses `pactl`, Windows uses Core Audio (`IAudioEndpointVolume`), macOS uses

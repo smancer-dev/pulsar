@@ -305,11 +305,16 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 				let sink_id = REDIRECT_SINK_ID.lock().unwrap().clone();
 				if let Some(ref id) = sink_id {
 					tracing::info!(sid, ?layout, ?installed, "host-silent: widening virtual sink format for already-armed redirect");
+					// Drop the owners lock BEFORE the blocking COM call (IPolicyConfig::SetDeviceFormat)
+					// so concurrent release_redirect / reset_redirect_all callers are not serialised
+					// behind this driver round-trip (mirrors the arm/restore branches at line 319).
+					drop(owners);
 					if let Err(e) = pulsar_core::audio::set_render_device_format(id, layout) {
 						tracing::warn!(?layout, "set virtual sink device format (widen) failed: {e} — keeping existing sink format");
 					} else {
 						*REDIRECT_SINK_LAYOUT.lock().unwrap() = Some(layout);
 					}
+					return false;
 				}
 			}
 		}
@@ -377,6 +382,9 @@ fn mute_fallback(mute: bool) {
 	use std::sync::atomic::Ordering;
 	if mute {
 		if !REDIRECT_MUTE_FALLBACK.swap(true, Ordering::SeqCst) {
+			// Write the crash-recovery marker BEFORE muting, so a crash immediately
+			// after the mute syscall still leaves a marker for the next launch to act on.
+			let _ = std::fs::write(pulsar_core::audio::mute_fallback_marker_path(), b"1");
 			if let Err(e) = pulsar_core::audio::set_host_muted(true) {
 				tracing::warn!("host mute fallback failed: {e}");
 			}
@@ -385,6 +393,9 @@ fn mute_fallback(mute: bool) {
 		if let Err(e) = pulsar_core::audio::set_host_muted(false) {
 			tracing::warn!("host unmute (fallback) failed: {e}");
 		}
+		// Clean exit: remove the crash-recovery marker so the next launch doesn't
+		// attempt a spurious unmute.
+		let _ = std::fs::remove_file(pulsar_core::audio::mute_fallback_marker_path());
 	}
 }
 
@@ -544,6 +555,12 @@ fn avfoundation_input_index(ffmpeg: &str, target: &str) -> Option<u32> {
 /// On the empty→non-empty transition the redirect's capture source is stashed in
 /// `UNIX_SILENT_SOURCE` so `start_audio_and_mute` taps it; cleared on restore.
 ///
+/// `layout` is the negotiated channel layout for the session. On Linux it is forwarded
+/// to `module-null-sink` so the null sink and its `.monitor` are created at the right
+/// channel count (a null sink defaults to stereo, so without this a 5.1/7.1 request
+/// would get a 2-channel monitor and ffmpeg would upmix stereo into a fake-surround
+/// container). Mirrors the Windows path's `set_render_device_format(neg_layout)` call.
+///
 /// Returns `true` when no sinkless device could be armed and an endpoint-mute fallback
 /// is WANTED — the caller (`start_audio_and_mute`) must then apply `unix_mute_fallback(true)`
 /// AFTER the capture is spawned, never here: a muted `@DEFAULT_SINK@` silences its
@@ -555,6 +572,7 @@ fn set_unix_silent_request(
 	sid: u64,
 	want: bool,
 	#[cfg_attr(target_os = "linux", allow(unused_variables))] ffmpeg: &str,
+	layout: pulsar_core::audio::ChannelLayout,
 ) -> bool {
 	let mut owners = UNIX_SILENT_OWNERS.lock().unwrap();
 	let was = !owners.is_empty();
@@ -571,7 +589,10 @@ fn set_unix_silent_request(
 	drop(owners);
 	if now {
 		// Going silent: arm the platform redirect (Linux null sink / macOS virtual out).
-		match pulsar_core::audio::arm_host_silent() {
+		// Pass the negotiated layout so the Linux null sink is created at the right
+		// channel count — a stereo-only null sink against a 5.1/7.1 encode produces
+		// a fake-surround container with empty/duplicated surround channels.
+		match pulsar_core::audio::arm_host_silent(layout) {
 			Ok(Some(hs)) => {
 				tracing::info!(source = %hs.source, "armed host-silent capture redirect (unix)");
 				// macOS: resolve the AVFoundation input index for the virtual output device
@@ -641,6 +662,9 @@ fn unix_mute_fallback(mute: bool) {
 	use std::sync::atomic::Ordering;
 	if mute {
 		if !UNIX_SILENT_MUTE_FALLBACK.swap(true, Ordering::SeqCst) {
+			// Write the crash-recovery marker BEFORE muting, so a crash immediately
+			// after the mute syscall still leaves a marker for the next launch to act on.
+			let _ = std::fs::write(pulsar_core::audio::mute_fallback_marker_path(), b"1");
 			if let Err(e) = pulsar_core::audio::set_host_muted(true) {
 				tracing::warn!("host mute fallback failed: {e}");
 			}
@@ -649,6 +673,9 @@ fn unix_mute_fallback(mute: bool) {
 		if let Err(e) = pulsar_core::audio::set_host_muted(false) {
 			tracing::warn!("host unmute (fallback) failed: {e}");
 		}
+		// Clean exit: remove the crash-recovery marker so the next launch doesn't
+		// attempt a spurious unmute.
+		let _ = std::fs::remove_file(pulsar_core::audio::mute_fallback_marker_path());
 	}
 }
 
@@ -666,8 +693,8 @@ pub(super) fn release_redirect(sid: u64) {
 	// Drop this session's host-silent request; restores the host (default sink + null
 	// sink teardown / output switch-back) when it was the last owner. The `false`
 	// (release) transition never requests a mute fallback, so the return is moot here.
-	// ffmpeg is not used on the disarm (want=false) path — pass "" as a placeholder.
-	let _ = set_unix_silent_request(sid, false, "");
+	// ffmpeg and layout are not used on the disarm (want=false) path — pass placeholders.
+	let _ = set_unix_silent_request(sid, false, "", pulsar_core::audio::ChannelLayout::Stereo);
 }
 
 /// go_online re-run hook: a fresh serve loop has no live sessions, so clear any
@@ -707,6 +734,15 @@ pub(super) fn reset_redirect_all() {
 /// from the on-disk marker. No-op when there's no marker (clean previous exit).
 pub(super) fn restore_stale_redirect() {
 	pulsar_core::audio::restore_stale_redirect();
+}
+
+/// Startup crash-restore for the endpoint-mute fallback. If the previous process
+/// applied the deferred mute fallback (no virtual sink / null sink present) and then
+/// died abnormally before the session ended, unmute the host's default output now.
+/// No-op when the marker is absent (clean exit or fallback was never used).
+/// Gated by the on-disk marker so a deliberate user mute is never clobbered.
+pub(super) fn restore_stale_mute_fallback() {
+	pulsar_core::audio::restore_stale_mute_fallback();
 }
 
 /// Start the host→client audio stream (Opus/RTP) and apply the requested host-silent
@@ -769,7 +805,7 @@ fn start_audio_and_mute(
 	// to after the capture is spawned (a muted `@DEFAULT_SINK@` silences its `.monitor`
 	// too, so opening the capture into the mute would latch silence).
 	#[cfg(not(windows))]
-	let want_mute_fallback = set_unix_silent_request(sid, req.mute_host, ffmpeg);
+	let want_mute_fallback = set_unix_silent_request(sid, req.mute_host, ffmpeg, neg_layout);
 	if req.transmit_audio && audio_dest.port() > 0 {
 		let dest = format!("rtp://{audio_dest}");
 		// Windows: prefer WASAPI loopback — it taps whatever is playing on the
@@ -1068,9 +1104,10 @@ pub(super) fn make_on_stream(
 	#[cfg(target_os = "linux")] restore_token: Arc<Mutex<Option<String>>>,
 	#[cfg(target_os = "linux")] cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
 	#[cfg(target_os = "linux")] cap_gen: Arc<std::sync::atomic::AtomicU64>,
-	// Records the latest StreamReq so the host-side display-mode watcher (non-Windows) can
-	// re-issue it to restart capture at the new geometry. Windows self-heals in pulsar-capture.
-	#[cfg(not(windows))] last_req_store: Arc<Mutex<Option<StreamReq>>>,
+	// Records the latest StreamReq so the host-side display-mode watcher can re-issue it to
+	// restart capture at the new geometry.  On Windows this is only populated when
+	// native_started=false (ffmpeg fallback); native DXGI sessions self-heal via ACCESS_LOST.
+	last_req_store: Arc<Mutex<Option<StreamReq>>>,
 ) -> impl FnMut(StreamReq, SocketAddr) + Send + 'static {
 	let mut announced = false;
 	// stop_tx is already None when the session was pre-registered at accept time (C9),
@@ -1088,12 +1125,8 @@ pub(super) fn make_on_stream(
 	#[cfg(windows)]
 	let mut last_native_req: Option<StreamReq> = None;
 	move |req: StreamReq, addr: SocketAddr| {
-		// Remember the latest request so the host-side display-mode watcher can re-issue it to
-		// restart capture at the new geometry when the host's resolution/refresh changes.
-		#[cfg(not(windows))]
-		{
-			*last_req_store.lock().unwrap() = Some(req.clone());
-		}
+		// last_req_store is updated below (after native_started is resolved) so the
+		// display-mode watcher only fires for ffmpeg-path sessions on Windows.
 		// FAST PATH — a live, in-session restream the running native capture can absorb without a
 		// full rebuild: a MONITOR switch (`switch_output` → in-thread re-capture on the new GPU)
 		// and/or an adaptive BITRATE step (`set_bitrate` → live nvEncReconfigureEncoder). Crucially
@@ -1194,13 +1227,21 @@ pub(super) fn make_on_stream(
 			// it as Remote as a default; now we know the real value). A second STREAMING
 			// session from the same peer takes over here (overwriting stop_tx in incoming
 			// drops the old session's oneshot sender, firing stop_rx and ending it cleanly).
+			// Preserve any view_only flag the operator may have toggled in the
+			// accept-time → first-StartStream window (C9): do NOT clobber it with false.
+			let prev_view_only = active
+				.lock()
+				.unwrap()
+				.get(&peer)
+				.map(|ci| ci.view_only)
+				.unwrap_or(false);
 			active.lock().unwrap().insert(
 				peer.clone(),
 				crate::state::ConnInfo {
 					sid,
 					since_ms,
 					mode,
-					view_only: false,
+					view_only: prev_view_only,
 				},
 			);
 			// stop_tx is Some only when go_online could NOT pre-register (a live streaming
@@ -1730,7 +1771,7 @@ pub(super) fn make_on_stream(
 						};
 						tracing::info!(encoder = ?genc, codec = ?gcodec, started, "x11 gst encode spawned");
 						let _ = stats_out.try_send(DataMsg::Stats(base_label));
-						let _ = stats_out.try_send(DataMsg::DisplayRotation(display_rotation()));
+						let _ = stats_out.try_send(DataMsg::DisplayRotation(display_rotation(None)));
 						start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid);
 						let _ = app_h.emit(
 							"session",
@@ -1870,6 +1911,22 @@ pub(super) fn make_on_stream(
 			cur_display.store(0, std::sync::atomic::Ordering::Relaxed);
 		}
 
+		// Remember the latest request so the host-side display-mode watcher can re-issue it
+		// to restart capture at the new geometry when the host's own resolution/refresh changes.
+		// On Windows: only store when the ffmpeg path is active (native_started=false); native
+		// DXGI sessions self-heal via ACCESS_LOST in pulsar-capture so the watcher must NOT
+		// fire for them (it would restart ffmpeg on top of a running native capture). Clearing
+		// to None here ensures the watcher stays inert for the duration of a native session even
+		// if a prior ffmpeg session on this same connection left a stale entry.
+		// On non-Windows: native_started is always false so we always store.
+		if !native_started {
+			*last_req_store.lock().unwrap() = Some(req.clone());
+		} else {
+			// Native path active: clear any stale req from a prior ffmpeg session so the
+			// watcher can't trigger a spurious restart.
+			*last_req_store.lock().unwrap() = None;
+		}
+
 		// Encode summary (codec · encoder · res · fps · bitrate target) — the base the
 		// client's stats panel shows; the ffmpeg path appends a live "… ms kodlama"
 		// part from the encode-pace meter below.
@@ -1923,10 +1980,31 @@ pub(super) fn make_on_stream(
 		// (pulsar-capture) already BAKES the rotation into the encoded stream via the
 		// VideoProcessor Blt, so we report 0 then (avoids double-rotation); the ffmpeg fallback
 		// path does NOT rotate, so it reports the real rotation for the client to apply.
+		//
+		// On Windows, query the STREAMED monitor's GDI device name so
+		// EnumDisplaySettingsW reads the right monitor's orientation — querying NULL
+		// (primary) would report the wrong rotation if a non-primary monitor is being
+		// streamed (C11). list_displays() is cheap (DXGI enum, already called above).
+		#[cfg(windows)]
+		let streamed_device_name: Option<String> = if !native_started {
+			pulsar_capture::list_displays()
+				.into_iter()
+				.find(|(idx, _, _, _, _)| *idx == req.display_idx)
+				.map(|(_, name, _, _, _)| name)
+		} else {
+			None
+		};
 		let reported_rotation = if native_started {
 			0
 		} else {
-			display_rotation()
+			#[cfg(windows)]
+			{
+				display_rotation(streamed_device_name.as_deref())
+			}
+			#[cfg(not(windows))]
+			{
+				display_rotation(None)
+			}
 		};
 		let _ = stats_out.try_send(DataMsg::DisplayRotation(reported_rotation));
 		start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid);
@@ -2308,11 +2386,20 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 			};
 			let ok = saved.is_some();
 			let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
+			// Use the actual on-disk filename (may have a dedup suffix like " (1)")
+			// instead of r.name so the UI flash and session log name the file the
+			// user can actually open.
+			let saved_name = saved
+				.as_ref()
+				.and_then(|(p, _)| p.file_name())
+				.and_then(|n| n.to_str())
+				.unwrap_or(&r.name)
+				.to_string();
 			let _ = app_h.emit(
 				"file-recv",
 				FilePayload {
 					peer: peer.clone(),
-					name: r.name.clone(),
+					name: saved_name.clone(),
 					bytes: written,
 					ok,
 					xfer_id: id,
@@ -2324,7 +2411,7 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 					SessionEvent {
 						kind: "file".into(),
 						peer: peer.clone(),
-						detail: format!("{} · {} B", r.name, written),
+						detail: format!("{} · {} B", saved_name, written),
 					},
 				);
 			}
