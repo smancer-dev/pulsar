@@ -487,7 +487,7 @@ mod tests {
 		// clean, non-panicking best-effort. On Linux/macOS CI without the tools this
 		// returns Ok(None) (tool missing); off both it's a compile-time Ok(None). Either
 		// way it must never panic and the guard (if any) must drop cleanly.
-		match arm(super::settings::ChannelLayout::Stereo) {
+		match arm(super::super::settings::ChannelLayout::Stereo) {
 			Ok(None) => {}
 			Ok(Some(hs)) => {
 				// A redirect actually armed (a dev box WITH the tools): the source must be
