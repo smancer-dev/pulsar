@@ -124,6 +124,10 @@ static CURSOR_IMG_GEN: AtomicU64 = AtomicU64::new(0);
 /// The render loop sets this; it is cleared as soon as AUs start arriving again.
 /// Mirrors video::STALLED on Linux — kept separate because video.rs is unix-only.
 static STALLED: AtomicBool = AtomicBool::new(false);
+/// Connected controllers pushed by the app over stdin (`ctrls slot:kind:name,...`).
+/// Game mode only; empty list in remote mode or when no pads are connected. Copied
+/// into `ostate.controllers` each frame (paint_overlay + paint_closed parity).
+static CONTROLLERS: Mutex<Vec<(u8, String, String)>> = Mutex::new(Vec::new());
 
 #[derive(Clone)]
 struct CursorImg {
@@ -451,6 +455,25 @@ fn stdin_control() {
 			if let Ok(idx) = rest.trim().parse::<u32>() {
 				DISPLAY_IDX_SEED.store(idx, Ordering::SeqCst);
 			}
+		} else if let Some(rest) = l.strip_prefix("ctrls ") {
+			// Connected controller list (game mode only): `ctrls slot:kind:name,...`
+			// Each entry is `slot:kind_tag:device_name` (underscores for spaces).
+			// Mirrors linux.rs's CONTROLLERS static + parse (same protocol).
+			let rest = rest.trim();
+			let list: Vec<(u8, String, String)> = if rest.is_empty() {
+				Vec::new()
+			} else {
+				rest.split(',')
+					.filter_map(|e| {
+						let mut p = e.splitn(3, ':');
+						let slot: u8 = p.next()?.parse().ok()?;
+						let kind = p.next()?.replace('_', " ");
+						let name = p.next()?.replace('_', " ");
+						Some((slot, kind, name))
+					})
+					.collect()
+			};
+			*CONTROLLERS.lock().unwrap() = list;
 		}
 		// `toast <text>` (and `hint …`) are drawn by the closed-state paint pass
 		// (`paint_closed` via `draw_hint`), alongside the mini stats HUD and the
@@ -835,6 +858,8 @@ impl Renderer {
 			ostate.fs_remote = rows.clone();
 		}
 		ostate.chat_enter = ENTER_IN.swap(false, Ordering::SeqCst);
+		// Connected controllers (game mode only — sent by play.rs gilrs reader via `ctrls` line).
+		ostate.controllers = CONTROLLERS.lock().unwrap().clone();
 		let ov_ui = &mut self.ov_ui;
 		let mut cmds = Vec::new();
 		let out = self.egui_ctx.run(raw, |ctx| {
@@ -885,6 +910,23 @@ impl Renderer {
 						// View fit is renderer-local (instant Blt rect change) + forwarded
 						// so the frontend mirrors/persists it — Linux-parity (linux.rs).
 						"fit" => present::set_fit(&val),
+						// Optimistic controller swap: the overlay row ▲/▼ was clicked.
+						// Swap the two entries in CONTROLLERS immediately so the list
+						// re-renders at the next frame without waiting for the gilrs
+						// reader's next `ctrls` line (~16 ms later). The frontend will
+						// re-emit the canonical ctrls line via set_controller_order, which
+						// confirms the same state.
+						"ctrlswap" => {
+							if let Some((ai, bi)) = val.split_once(',') {
+								if let (Ok(ai), Ok(bi)) = (ai.parse::<usize>(), bi.parse::<usize>()) {
+									let mut ctrls = CONTROLLERS.lock().unwrap();
+									let len = ctrls.len();
+									if ai < len && bi < len {
+										ctrls.swap(ai, bi);
+									}
+								}
+							}
+						}
 						_ => {}
 					}
 					println!("ov set {field} {val}");

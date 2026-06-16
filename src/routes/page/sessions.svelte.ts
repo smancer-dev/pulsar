@@ -186,9 +186,10 @@ export class SessionManager {
 				STREAM_PORT,
 				ui.codec,
 				ui.encoder,
+				ui.forwardControllers,
 				useMode === 'game',
-				useMode === 'game',
-				ui.quality
+				ui.quality,
+				ui.touchpadAsMouse
 			);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			let timedOut = false;

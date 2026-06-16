@@ -144,6 +144,7 @@ pub(crate) async fn start_remote_play(
 	gamepad: bool,
 	game_mode: bool,
 	quality: Option<String>,
+	touchpad_as_mouse: bool,
 ) -> Result<PlayInfo, String> {
 	let node = state
 		.node
@@ -1085,20 +1086,134 @@ pub(crate) async fn start_remote_play(
 
 	if gamepad {
 		// Read controllers on a blocking thread (gilrs isn't async/Send-friendly).
+		// Clones the live controller_order Arc so slot reorders apply each tick without
+		// requiring a reconnect (the UI writes via set_controller_order → AppState).
 		let reader_flag = running.clone();
 		let gtx = input_tx.clone();
+		let order_arc = state.controller_order.clone();
+		// Clone the overlay stdin so the reader can emit `ctrls` lines (game mode only).
+		let ctrls_stdin = overlay_stdin.clone();
+		let ctrls_game_mode = game_mode;
 		tokio::task::spawn_blocking(move || {
 			let Ok(mut hub) = ControllerHub::new() else {
 				return;
 			};
+			// Track which uuids were connected last tick so we can detect disconnects.
+			let mut prev_uuids: std::collections::HashSet<String> =
+				std::collections::HashSet::new();
+			// Remember each uuid → slot mapping from last tick for disconnect events.
+			let mut prev_slot: std::collections::HashMap<String, u8> =
+				std::collections::HashMap::new();
+			// Last-emitted `ctrls` payload — only re-send when it changes (hotplug /
+			// order change). Also throttled to ~1 Hz (every 60 ticks × 16 ms) so a
+			// stale renderer that missed the initial line eventually gets it.
+			let mut prev_ctrls_line = String::new();
+			let mut ctrls_tick: u32 = 0;
 			while reader_flag.load(Ordering::SeqCst) {
-				if let Some((_, st)) = hub.snapshot().into_iter().next() {
-					let _ = gtx.blocking_send(InputEvent::Gamepad(st));
+				let pads = hub.snapshot_with_keys();
+				// Snapshot the current order Vec (cheap clone of the Vec).
+				let order: Vec<String> = order_arc.lock().unwrap().clone();
+				let mut cur_uuids: std::collections::HashSet<String> =
+					std::collections::HashSet::new();
+				let mut append_idx = order.len() as u8;
+				// Build the ctrls payload while computing slots (avoids a second pass).
+				let mut ctrls_entries: Vec<(u8, pulsar_core::input::GamepadKind, String)> =
+					Vec::new();
+				for (uuid, kind, state) in &pads {
+					// Compute slot: position in order Vec, or next append slot (capped at 3).
+					let slot = order
+						.iter()
+						.position(|k| k == uuid)
+						.map(|i| i as u8)
+						.unwrap_or_else(|| {
+							let s = append_idx.min(3);
+							append_idx += 1;
+							s
+						});
+					cur_uuids.insert(uuid.clone());
+					prev_slot.insert(uuid.clone(), slot);
+					let _ = gtx.blocking_send(InputEvent::GamepadSlot {
+						slot,
+						kind: *kind,
+						state: *state,
+					});
+					ctrls_entries.push((slot, *kind, uuid.clone()));
+				}
+				// Emit GamepadDisconnect for any uuid that was present last tick but is gone now.
+				for uuid in &prev_uuids {
+					if !cur_uuids.contains(uuid) {
+						if let Some(&slot) = prev_slot.get(uuid) {
+							let _ = gtx.blocking_send(InputEvent::GamepadDisconnect { slot });
+						}
+						prev_slot.remove(uuid);
+					}
+				}
+				prev_uuids = cur_uuids;
+				// Build `ctrls slot:kind:name,...` line and push it to the overlay whenever
+				// the set changes or every ~1 Hz (so a late-spawned renderer gets the list).
+				// Format: NO spaces in the payload; name spaces become underscores. Kind is
+				// the GamepadKind label() string with spaces replaced by underscores.
+				ctrls_tick = ctrls_tick.wrapping_add(1);
+				// Fetch names from hub.list() (cheap: same gilrs context, no extra alloc
+				// beyond the list itself; called ~1Hz or on change, not every 16 ms tick).
+				let name_map: std::collections::HashMap<String, String> = if !ctrls_entries.is_empty() {
+					hub.list()
+						.into_iter()
+						.filter(|c| c.connected)
+						.map(|c| (c.uuid, c.name))
+						.collect()
+				} else {
+					std::collections::HashMap::new()
+				};
+				let ctrls_payload: String = {
+					let mut entries = ctrls_entries.clone();
+					entries.sort_by_key(|(s, _, _)| *s);
+					entries
+						.iter()
+						.map(|(slot, kind, uuid)| {
+							let kind_tag = kind.label().replace(' ', "_");
+							let name = name_map
+								.get(uuid)
+								.map(|n| n.replace(' ', "_"))
+								.unwrap_or_else(|| uuid.clone());
+							format!("{slot}:{kind_tag}:{name}")
+						})
+						.collect::<Vec<_>>()
+						.join(",")
+				};
+				// Only emit `ctrls` in game mode — the two-mode rule: the controller
+				// overlay view is game-mode-only, and remote mode should not receive it.
+				let changed = ctrls_payload != prev_ctrls_line;
+				let periodic = ctrls_tick % 60 == 0;
+				if ctrls_game_mode && (changed || periodic) {
+					use std::io::Write as _;
+					if let Some(si) = ctrls_stdin.lock().unwrap().as_mut() {
+						let _ = writeln!(si, "ctrls {ctrls_payload}");
+						let _ = si.flush();
+					}
+					if changed {
+						prev_ctrls_line = ctrls_payload;
+					}
 				}
 				std::thread::sleep(std::time::Duration::from_millis(16));
 			}
 		});
 	}
+
+	// DS4/DS5 touchpad-as-mouse: Linux only. Synthesizes PointerRelative /
+	// PointerButton events from the physical touchpad surface and sends them
+	// through the SAME input channel as the gamepad and keyboard readers.
+	// No-ops silently when the device isn't found or isn't accessible.
+	#[cfg(target_os = "linux")]
+	if touchpad_as_mouse {
+		pulsar_core::input::touchpad_linux::spawn_touchpad_reader(
+			input_tx.clone(),
+			running.clone(),
+			None,
+		);
+	}
+	#[cfg(not(target_os = "linux"))]
+	let _ = touchpad_as_mouse; // suppress unused-variable warning on Windows/macOS
 
 	// Side-channel queue (clipboard / chat / file / mic audio → host).
 	let (data_tx, data_rx) = tokio::sync::mpsc::channel::<DataMsg>(512);

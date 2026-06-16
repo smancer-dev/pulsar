@@ -57,6 +57,10 @@ impl GamepadKind {
 pub struct ControllerInfo {
 	/// Positional index in the backend's list (stable within a session).
 	pub index: u32,
+	/// Stable device key: the gilrs `Gamepad::uuid()` bytes encoded as a lowercase
+	/// hex string. Used as the key in `controllerOrder` / `AppState::controller_order`
+	/// so player-slot assignments survive gilrs enumeration-order reshuffles on hotplug.
+	pub uuid: String,
 	/// Human-readable name reported by the OS/driver, e.g. "Wireless Controller".
 	pub name: String,
 	/// Detected family (DS4/DS5/Xbox/…), from the USB vendor/product id.
@@ -163,6 +167,19 @@ impl VirtualGamepad for RecordingPad {
 		self.applied += 1;
 		self.last = Some(*state);
 	}
+}
+
+/// Convert a touchpad-finger delta into a relative mouse `(dx, dy)` motion pair.
+///
+/// `prev` and `cur` are raw ABS_MT_POSITION (or ABS_X/Y) integer coordinates as
+/// reported by the DS4/DS5 touchpad. `sens` is a multiplier (e.g. 0.5 maps one
+/// touchpad unit to half a screen pixel; typical values 0.1 – 1.0).
+///
+/// Pure (no evdev dependency) so it can be unit-tested without a device.
+pub fn touch_to_delta(prev: (i32, i32), cur: (i32, i32), sens: f64) -> (f64, f64) {
+	let dx = (cur.0 - prev.0) as f64 * sens;
+	let dy = (cur.1 - prev.1) as f64 * sens;
+	(dx, dy)
 }
 
 /// Map our normalized button bits to the XInput button bitmask (the wire format
@@ -332,6 +349,7 @@ mod tests {
 	fn controller_info_serializes_for_the_wire() {
 		let info = ControllerInfo {
 			index: 0,
+			uuid: "030000004c050000cc09000000006800".into(),
 			name: "Wireless Controller".into(),
 			kind: GamepadKind::Ds4,
 			connected: true,
@@ -339,5 +357,19 @@ mod tests {
 		let json = serde_json::to_string(&info).unwrap();
 		let back: ControllerInfo = serde_json::from_str(&json).unwrap();
 		assert_eq!(info, back);
+	}
+
+	#[test]
+	fn touch_to_delta_scales_correctly() {
+		// Zero delta when prev == cur.
+		assert_eq!(touch_to_delta((100, 200), (100, 200), 1.0), (0.0, 0.0));
+		// Positive movement with sens = 1.0.
+		assert_eq!(touch_to_delta((0, 0), (10, 5), 1.0), (10.0, 5.0));
+		// Negative (left/up) movement.
+		assert_eq!(touch_to_delta((50, 50), (30, 40), 1.0), (-20.0, -10.0));
+		// Sensitivity scaling.
+		let (dx, dy) = touch_to_delta((0, 0), (100, 50), 0.5);
+		assert!((dx - 50.0).abs() < f64::EPSILON);
+		assert!((dy - 25.0).abs() < f64::EPSILON);
 	}
 }

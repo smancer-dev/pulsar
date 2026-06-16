@@ -416,6 +416,7 @@ pub(crate) async fn controllers() -> Result<Vec<ControllerInfo>, String> {
 			.into_iter()
 			.map(|c| ControllerInfo {
 				index: c.index,
+				uuid: c.uuid,
 				name: c.name,
 				kind: format!("{:?}", c.kind),
 				label: c.kind.label().to_string(),
@@ -598,6 +599,19 @@ pub(crate) fn set_tray(state: State<'_, AppState>, enabled: bool) {
 	state
 		.tray_disabled
 		.store(!enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Persist the controller slot permutation from the UI. `order[n]` is the gilrs uuid
+/// hex of the pad assigned to player-slot `n`; unknown/new pads append at the end.
+/// The play.rs gilrs reader (T6) clones this Arc and reads it each tick so reorders
+/// apply live without reconnect.
+#[tauri::command]
+pub(crate) async fn set_controller_order(
+	state: State<'_, AppState>,
+	order: Vec<String>,
+) -> Result<(), String> {
+	*state.controller_order.lock().unwrap() = order;
+	Ok(())
 }
 
 /// Relaunch the app to a fresh home after the user disconnects from a direct-connect (kiosk)

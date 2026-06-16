@@ -15,6 +15,10 @@ export const api = {
 	/** Pulsar devices auto-discovered on the local network (multicast beacon). */
 	lanDevices: () => invoke<LanDevice[]>('lan_devices'),
 	controllers: () => invoke<ControllerInfo[]>('controllers'),
+	/** Persist the controller slot permutation. order[n] = gilrs uuid hex of the pad
+	 * assigned to player-slot n. Written by the controller reorder UI; the play reader
+	 * reads it each tick so changes apply live without reconnect. */
+	setControllerOrder: (order: string[]) => invoke<void>('set_controller_order', { order }),
 	/** This machine's primary LAN IPv4 (for "connect to me by IP"); empty if none. */
 	localIp: () => invoke<string>('local_ip'),
 	/** The node's actual bound UDP port (0 = not online yet) — shown as "ip:port". */
@@ -90,6 +94,10 @@ export const api = {
 	 * Client: connect to a host, open its video (ffplay window), and optionally
 	 * stream local controller input — over one session held open until stopStream.
 	 * Returns the transport used (`direct`/`relay`).
+	 *
+	 * `gamepad` is independent of `gameMode`: controllers can be forwarded in both
+	 * remote-desktop and game-streaming sessions. It reflects the user's
+	 * `ui.forwardControllers` preference, not the session mode.
 	 */
 	startRemotePlay: (
 		target: string,
@@ -100,7 +108,9 @@ export const api = {
 		gamepad: boolean,
 		gameMode = false,
 		/** 'auto' | 'hq' | 'fast' — from Settings → Display 'Varsayılan kalite'. */
-		quality?: string
+		quality?: string,
+		/** Treat the DS4/DS5 touchpad as a relative mouse (Linux only; Feature 2B). */
+		touchpadAsMouse = true
 	) =>
 		invoke<PlayInfo>('start_remote_play', {
 			target,
@@ -110,7 +120,8 @@ export const api = {
 			encoder,
 			gamepad,
 			gameMode,
-			quality: quality ?? null
+			quality: quality ?? null,
+			touchpadAsMouse
 		}),
 	/** CLI `--connect` auto-connect target (id/ip + password + mode + app), or null. */
 	autoConnectTarget: () =>

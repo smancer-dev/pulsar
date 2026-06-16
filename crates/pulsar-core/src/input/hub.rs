@@ -92,6 +92,25 @@ impl ControllerHub {
 			.collect()
 	}
 
+	/// Pump pending events and return `(uuid_hex, kind, state)` for every connected pad.
+	/// `uuid_hex` is the gilrs `Gamepad::uuid()` encoded as a lowercase hex string — the
+	/// same stable device key stored in `controllerOrder` / `AppState::controller_order`.
+	pub fn snapshot_with_keys(&mut self) -> Vec<(String, GamepadKind, GamepadState)> {
+		while self.gilrs.next_event().is_some() {}
+		self.gilrs
+			.gamepads()
+			.filter(|(_, gp)| gp.is_connected())
+			.map(|(_, gp)| {
+				let uuid_hex = gp
+					.uuid()
+					.iter()
+					.map(|b| format!("{b:02x}"))
+					.collect::<String>();
+				(uuid_hex, kind_of(&gp), state_from_gamepad(&gp))
+			})
+			.collect()
+	}
+
 	/// Enumerate every controller the backend knows about (connected or not),
 	/// with its name + detected kind — for the UI's device list and the live
 	/// in-session controller panel.
@@ -102,6 +121,7 @@ impl ControllerHub {
 			.enumerate()
 			.map(|(i, (_, gp))| ControllerInfo {
 				index: i as u32,
+				uuid: gp.uuid().iter().map(|b| format!("{b:02x}")).collect(),
 				name: gp.name().to_string(),
 				kind: kind_of(&gp),
 				connected: gp.is_connected(),

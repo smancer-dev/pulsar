@@ -104,6 +104,11 @@ pub(crate) struct AppState {
 	/// Synced from the UI's `ui.tray` setting via `set_tray` (tray_disabled = !ui.tray).
 	/// Default `false` (tray enabled) — preserves the existing behavior on first launch.
 	pub(crate) tray_disabled: AtomicBool,
+	/// Persisted controller slot permutation: `order[n]` is the gilrs uuid hex of the
+	/// pad assigned to player-slot `n`. Written by `set_controller_order` (from the UI);
+	/// cloned and read each tick by the play.rs gilrs reader (T6) so reorders apply live
+	/// without reconnect. Empty = use arrival order (default until the user reorders).
+	pub(crate) controller_order: Arc<Mutex<Vec<String>>>,
 	/// Linux-only: pool of resident `pulsar-render` children kept alive between sessions to
 	/// avoid destroying their EGL contexts. Destroying the EGL context of an embedded `--wid`
 	/// renderer that shares the Mali display with WebKitGTK corrupts WebKit's shared Mali

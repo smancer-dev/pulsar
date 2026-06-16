@@ -57,6 +57,9 @@ export interface Device {
 export interface ControllerInfo {
 	/** Positional index in the backend list. */
 	index: number;
+	/** Stable device key: gilrs uuid bytes as a lowercase hex string.
+	 * Used as the key in `controllerOrder` for player-slot assignments. */
+	uuid: string;
 	/** OS/driver-reported name, e.g. "Wireless Controller". */
 	name: string;
 	/** Detected family tag, e.g. "Ds4" / "Xbox". */

@@ -69,6 +69,9 @@ pub struct OverlayState {
 	/// Remote file pane: current HOME-relative path + its entries (`fsjson` stdin).
 	pub fs_remote_path: String,
 	pub fs_remote: Vec<FsRow>,
+	/// Connected controllers (slot, kind_label, device_name) — synced from the app
+	/// over stdin (`ctrllist <json>` or similar). Game mode only.
+	pub controllers: Vec<(u8, String, String)>,
 }
 
 /// Which overlay page is showing: the compact ROOT (category boxes) or a section.
@@ -78,13 +81,14 @@ pub struct OverlayState {
 pub enum View {
 	#[default]
 	Root,
-	Stream,  // codec/encoder/decoder/res/fps/bandwidth/quality/pacing
-	Display, // view-fit modes
-	Audio,   // transmit / host-mute / mic / call
-	Tools,   // clipboard / reverse / fullscreen / file-pick
-	Chat,    // NATIVE chat (the webview menu is gone on Linux)
-	Files,   // NATIVE two-pane file manager
-	Gauges,  // stats HUD + overlay button toggles
+	Stream,      // codec/encoder/decoder/res/fps/bandwidth/quality/pacing
+	Display,     // view-fit modes
+	Audio,       // transmit / host-mute / mic / call
+	Tools,       // clipboard / reverse / fullscreen / file-pick
+	Chat,        // NATIVE chat (the webview menu is gone on Linux)
+	Files,       // NATIVE two-pane file manager
+	Gauges,      // stats HUD + overlay button toggles
+	Controllers, // player-slot list + swap order (game mode only)
 }
 
 /// One row of a file listing (local pane = the renderer's own std::fs; remote pane
@@ -157,6 +161,7 @@ impl Default for OverlayState {
 			chat_enter: false,
 			fs_remote_path: String::new(),
 			fs_remote: Vec::new(),
+			controllers: Vec::new(),
 		}
 	}
 }
@@ -405,6 +410,7 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 					(View::Chat, _) => ("💬", "view.chat"),
 					(View::Files, _) => ("📁", "view.files"),
 					(View::Gauges, _) => ("📊", "view.gauges"),
+					(View::Controllers, _) => ("🎮", "view.controllers"),
 					(View::Root, Mode::Game) => ("🎮", "mode.game"),
 					(View::Root, Mode::Remote) => ("🖥", "mode.remote"),
 				};
@@ -450,6 +456,7 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 					View::Chat => draw_chat(ui, st, &mut ui_state.chat_input, &mut cmds),
 					View::Files => draw_files(ui, st, ui_state, &mut cmds),
 					View::Gauges => draw_gauges(ui, st, &mut cmds),
+					View::Controllers => draw_controllers(ui, st, &mut cmds),
 				}
 			});
 			ui.add_space(6.0);
@@ -498,6 +505,7 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 		("📡", t("view.stream"), View::Stream),
 		("🖥", t("view.display"), View::Display),
 		("📊", t("view.gauges"), View::Gauges),
+		("🎮", t("view.controllers"), View::Controllers),
 	];
 	let remote_boxes: &[(&str, &str, View)] = &[
 		("📡", t("view.stream"), View::Stream),
@@ -1064,6 +1072,86 @@ fn draw_gauges(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 			cmds.push(OverlayCmd::Set("ovbtn", "off".into()));
 		}
 	});
+}
+
+/// Controllers section: ordered player-slot list with painted ▲/▼ swap buttons.
+/// Game mode only — the box does not appear in remote_boxes.
+/// ▲ click on row i pushes `OverlayCmd::Set("ctrlswap", "{i},{i-1}")`.
+/// ▼ click on row i pushes `OverlayCmd::Set("ctrlswap", "{i},{i+1}")`.
+/// The bundled egui font lacks ▲/▼ glyphs — both arrows are painted with
+/// `line_segment`, matching the back-arrow style used in the header (lines 380-397).
+fn draw_controllers(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
+	if st.controllers.is_empty() {
+		ui.add_space(20.0);
+		ui.vertical_centered(|ui| {
+			ui.label(
+				egui::RichText::new(t("controllers.empty"))
+					.color(egui::Color32::from_gray(120)),
+			);
+		});
+		return;
+	}
+	let n = st.controllers.len();
+	for (i, (slot, kind, name)) in st.controllers.iter().enumerate() {
+		ui.horizontal(|ui| {
+			// Row label: "Oyuncu 1 · Xbox · Controller name"
+			let label = format!(
+				"{} {} · {} · {}",
+				t("controllers.slot"),
+				slot + 1,
+				kind,
+				name,
+			);
+			ui.label(
+				egui::RichText::new(label)
+					.size(12.5)
+					.color(egui::Color32::from_rgb(228, 230, 240)),
+			);
+			ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+				// ▼ button (swap with next) — only if not the last row.
+				if i + 1 < n {
+					let (rect, resp) =
+						ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+					let col = if resp.hovered() {
+						egui::Color32::WHITE
+					} else {
+						egui::Color32::from_rgb(150, 155, 170)
+					};
+					// Paint ▼: a downward-pointing chevron (two line_segments).
+					let c = rect.center();
+					let s = egui::Stroke::new(2.0, col);
+					let p = ui.painter();
+					p.line_segment([c + egui::vec2(-5.0, -3.0), c + egui::vec2(0.0, 3.0)], s);
+					p.line_segment([c + egui::vec2(5.0, -3.0), c + egui::vec2(0.0, 3.0)], s);
+					if resp.clicked() {
+						cmds.push(OverlayCmd::Set("ctrlswap", format!("{i},{}", i + 1)));
+					}
+					resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+				}
+				// ▲ button (swap with previous) — only if not the first row.
+				if i > 0 {
+					let (rect, resp) =
+						ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+					let col = if resp.hovered() {
+						egui::Color32::WHITE
+					} else {
+						egui::Color32::from_rgb(150, 155, 170)
+					};
+					// Paint ▲: an upward-pointing chevron (two line_segments).
+					let c = rect.center();
+					let s = egui::Stroke::new(2.0, col);
+					let p = ui.painter();
+					p.line_segment([c + egui::vec2(-5.0, 3.0), c + egui::vec2(0.0, -3.0)], s);
+					p.line_segment([c + egui::vec2(5.0, 3.0), c + egui::vec2(0.0, -3.0)], s);
+					if resp.clicked() {
+						cmds.push(OverlayCmd::Set("ctrlswap", format!("{i},{}", i - 1)));
+					}
+					resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+				}
+			});
+		});
+		ui.add_space(2.0);
+	}
 }
 
 /// Parse the host's Stats label parts we surface as tiles: encode pace (optional

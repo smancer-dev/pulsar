@@ -25,6 +25,9 @@ pub(crate) struct ConnInfo {
 pub(crate) struct ControllerInfo {
 	/// Positional index in the backend list (stable within a session).
 	pub(crate) index: u32,
+	/// Stable device key: gilrs uuid bytes as a lowercase hex string.
+	/// Used as the key in the UI's `controllerOrder` player-slot permutation.
+	pub(crate) uuid: String,
 	/// OS/driver-reported name, e.g. "Wireless Controller".
 	pub(crate) name: String,
 	/// Detected family as a stable tag, e.g. "Ds4" / "Xbox".

@@ -18,7 +18,28 @@ pub struct GameInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
 	/// Controller state (game streaming).
+	///
+	/// **Legacy single-pad variant** — kept for cross-version safety. A new client
+	/// talking to an OLD host sends only this variant so the old host still drives
+	/// Player 1. A new host treats this as `GamepadSlot { slot: 0, kind: Xbox, .. }`.
+	/// New-to-new sessions use `GamepadSlot` for multi-controller support.
 	Gamepad(GamepadState),
+	/// Controller state tagged with a player slot (0-based) and the pad family.
+	///
+	/// Added for multi-controller support (additive new→new variant). Old peers that
+	/// receive an unknown JSON variant silently drop it — no wire breakage. The host
+	/// maps `slot` to a virtual pad (up to 4 pads). `kind` lets the host pick the
+	/// right emulation target in the future; today all slots use Xbox360 emulation.
+	GamepadSlot {
+		slot: u8,
+		kind: crate::input::GamepadKind,
+		state: GamepadState,
+	},
+	/// A controller at `slot` has disconnected — the host should release its virtual pad.
+	///
+	/// Additive new→new variant; old peers silently drop it. Slot numbering matches
+	/// `GamepadSlot`.
+	GamepadDisconnect { slot: u8 },
 	/// Absolute pointer position, normalized 0..1 within the streamed screen.
 	PointerMotion { x: f64, y: f64 },
 	/// Relative pointer movement (raw mouse deltas) — used by the native renderer,

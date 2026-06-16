@@ -34,7 +34,7 @@
 	import { SessionControls } from './Session/controls.svelte';
 	import { SessionSideChannels } from './Session/sidechannels.svelte';
 	import { SessionUi } from './Session/ui.svelte';
-	import { ui, saveUi, type Encoder, type VideoCodec } from '$lib/settings.svelte';
+	import { ui, saveUi, applyCtrlSwap, type Encoder, type VideoCodec } from '$lib/settings.svelte';
 	import { t } from '$lib/i18n.svelte';
 
 	type Target = { name: string; id: string };
@@ -583,6 +583,34 @@
 				// intercepts the cmd before emitting overlay-cmd so this case is never
 				// reached; kept as a no-op guard against stale renderer builds.
 				case 'pickfile': break;
+				// Overlay controller swap: the egui list's ▲/▼ buttons emit
+				// `ov set ctrlswap i,j` where i and j are row indices (= player slots).
+				// Seed any missing slots from the live controller list first so the
+				// indices always map, then swap the two UUIDs in controllerOrder,
+				// persist, and push the new order to the Rust reader (which will
+				// re-emit the updated `ctrls` line on the next 16 ms tick).
+				case 'ctrlswap': {
+					const [ci, cj] = val.split(',').map(Number);
+					if (!Number.isFinite(ci) || !Number.isFinite(cj) || ci === cj) break;
+					api.controllers().then((pads) => {
+						const connected = pads.filter((p) => p.connected);
+						const order = [...ui.controllerOrder];
+						// applyCtrlSwap extends `order` for missing slots (seeded from the
+						// live connected pad list) then swaps ci↔cj in place.
+						const swapped = applyCtrlSwap(
+							order,
+							(slot) => connected.find((p) => !order.includes(p.uuid))?.uuid ?? '',
+							ci,
+							cj
+						);
+						if (!swapped) return;
+						ui.controllerOrder.length = 0;
+						ui.controllerOrder.push(...order);
+						saveUi();
+						api.setControllerOrder($state.snapshot(ui.controllerOrder) as string[]).catch(() => {});
+					}).catch(() => {});
+					break;
+				}
 				case 'reverse': reverse(); break;
 				case 'fullscreen': onToggleFullscreen(); break;
 			}

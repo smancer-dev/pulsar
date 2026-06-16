@@ -108,6 +108,11 @@ static CURSOR_IMG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// command. The render loop reads this each frame so a cross-session mode change (game→remote
 /// or vice-versa) takes effect without a renderer restart. `false` = Game, `true` = Remote.
 static MODE_REMOTE: AtomicBool = AtomicBool::new(false);
+/// Connected controllers pushed by the app over stdin (`ctrls slot:kind:name,...`).
+/// Game mode only; empty list in remote mode or when no pads are connected. Copied
+/// into `state.controllers` each frame in the render loop.
+static CONTROLLERS: std::sync::Mutex<Vec<(u8, String, String)>> =
+	std::sync::Mutex::new(Vec::new());
 
 #[derive(Clone)]
 struct CursorImg {
@@ -560,6 +565,27 @@ pub fn run() {
 						}
 					}
 				}
+				// Connected controller list (game mode only): `ctrls slot:kind:name,...`
+				// Each entry is `slot:kind_tag:device_name` (underscores for spaces).
+				// Mirrors win/mod.rs's CONTROLLERS static + parse (same protocol).
+				Some("ctrls") => {
+					let payload = it.next().unwrap_or("").trim();
+					let list: Vec<(u8, String, String)> = if payload.is_empty() {
+						Vec::new()
+					} else {
+						payload
+							.split(',')
+							.filter_map(|e| {
+								let mut p = e.splitn(3, ':');
+								let slot: u8 = p.next()?.parse().ok()?;
+								let kind = p.next()?.replace('_', " ");
+								let name = p.next()?.replace('_', " ");
+								Some((slot, kind, name))
+							})
+							.collect()
+					};
+					*CONTROLLERS.lock().unwrap() = list;
+				}
 				_ => {}
 			}
 		}
@@ -933,6 +959,8 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			state.fs_remote = rows.clone();
 		}
 		state.chat_enter = ENTER_IN.swap(false, Ordering::SeqCst);
+		// Connected controllers (game mode only — sent by play.rs gilrs reader via `ctrls` line).
+		state.controllers = CONTROLLERS.lock().unwrap().clone();
 		{
 			let cl = CONN_LABEL.lock().unwrap();
 			if !cl.is_empty() && state.conn_label != *cl {
@@ -1401,6 +1429,21 @@ fn emit_cmd(state: &mut OverlayState, c: OverlayCmd) {
 					MIC_ON.store(on, Ordering::SeqCst);
 					if on {
 						AUDIO_TX.store(true, Ordering::SeqCst);
+					}
+				}
+				// Optimistic controller swap: the overlay row ▲/▼ was clicked.
+				// Swap the two entries in CONTROLLERS immediately so the list
+				// re-renders at the next frame without waiting for the gilrs
+				// reader's next `ctrls` line (~16 ms later).
+				"ctrlswap" => {
+					if let Some((ai, bi)) = val.split_once(',') {
+						if let (Ok(ai), Ok(bi)) = (ai.parse::<usize>(), bi.parse::<usize>()) {
+							let mut ctrls = CONTROLLERS.lock().unwrap();
+							let len = ctrls.len();
+							if ai < len && bi < len {
+								ctrls.swap(ai, bi);
+							}
+						}
 					}
 				}
 				_ => {}

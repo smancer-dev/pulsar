@@ -8,6 +8,7 @@
 	import { api } from '$lib/api';
 	import type { ControllerInfo } from '$lib/types';
 	import { t } from '$lib/i18n.svelte';
+	import { ui, saveUi, slotOf } from '$lib/settings.svelte';
 
 	// `compact` is the small in-session variant (no card chrome).
 	let { compact = false }: { compact?: boolean } = $props();
@@ -30,6 +31,67 @@
 	onDestroy(() => clearInterval(timer));
 
 	const connected = $derived(pads.filter((p) => p.connected).length);
+
+	// Seed any connected pads whose uuids are not yet in controllerOrder.
+	// Runs as a side-effect so $derived.by stays pure.
+	$effect(() => {
+		if (compact) return;
+		const seen = new Set(ui.controllerOrder);
+		let changed = false;
+		for (const p of pads) {
+			if (p.connected && !seen.has(p.uuid)) {
+				ui.controllerOrder.push(p.uuid);
+				seen.add(p.uuid);
+				changed = true;
+			}
+		}
+		if (changed) {
+			saveUi();
+			api.setControllerOrder($state.snapshot(ui.controllerOrder) as string[]);
+		}
+	});
+
+	// Build display rows ordered by current player slot (non-compact only).
+	// Uses slotOf(p.uuid) to compute each pad's slot index.
+	const slotRows = $derived.by(() => {
+		return pads
+			.map((p) => ({ slot: slotOf(p.uuid), pad: p }))
+			.sort((a, b) => a.slot - b.slot);
+	});
+
+	function ensureSeeded() {
+		const seen = new Set(ui.controllerOrder);
+		for (const p of pads) {
+			if (!seen.has(p.uuid)) {
+				ui.controllerOrder.push(p.uuid);
+				seen.add(p.uuid);
+			}
+		}
+	}
+
+	function moveUp(uuid: string) {
+		ensureSeeded();
+		const idx = ui.controllerOrder.indexOf(uuid);
+		if (idx <= 0) return;
+		const order = $state.snapshot(ui.controllerOrder) as string[];
+		[order[idx - 1], order[idx]] = [order[idx], order[idx - 1]];
+		ui.controllerOrder.length = 0;
+		ui.controllerOrder.push(...order);
+		saveUi();
+		api.setControllerOrder($state.snapshot(ui.controllerOrder) as string[]);
+	}
+
+	function moveDown(uuid: string) {
+		ensureSeeded();
+		const idx = ui.controllerOrder.indexOf(uuid);
+		if (idx < 0 || idx >= ui.controllerOrder.length - 1) return;
+		const order = $state.snapshot(ui.controllerOrder) as string[];
+		[order[idx], order[idx + 1]] = [order[idx + 1], order[idx]];
+		ui.controllerOrder.length = 0;
+		ui.controllerOrder.push(...order);
+		saveUi();
+		api.setControllerOrder($state.snapshot(ui.controllerOrder) as string[]);
+	}
 </script>
 
 <div class="ctrls" class:compact>
@@ -39,20 +101,49 @@
 			<b>{t('controllers.title')}</b>
 			<span class="count mono">{connected}/{pads.length}</span>
 		</div>
-	{/if}
-	{#if pads.length === 0}
-		<p class="none">{t('controllers.none')}</p>
+		{#if pads.length === 0}
+			<p class="none">{t('controllers.none')}</p>
+		{:else}
+			<p class="hint">{t('controllers.reorderHint')}</p>
+			<ul class="slot-list">
+				{#each slotRows as { slot, pad } (pad.uuid)}
+					<li class:off={!pad.connected}>
+						<span class="slot-label mono">{t('controllers.slot')} {slot + 1}</span>
+						<span class="dot" class:on={pad.connected}></span>
+						<span class="name">{pad.name}</span>
+						<span class="kind mono">{pad.label}</span>
+						<span class="reorder-btns">
+							<button
+								class="mv-btn"
+								aria-label="Yukarı taşı"
+								onclick={() => moveUp(pad.uuid)}
+							>▲</button>
+							<button
+								class="mv-btn"
+								aria-label="Aşağı taşı"
+								onclick={() => moveDown(pad.uuid)}
+							>▼</button>
+						</span>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+		<p class="both-modes">{t('controllers.bothModes')}</p>
 	{:else}
-		<ul>
-			{#each pads as p (p.index)}
-				<li class:off={!p.connected}>
-					<span class="dot" class:on={p.connected}></span>
-					<span class="name">{p.name}</span>
-					<span class="kind mono">{p.label}</span>
-					<span class="state">{p.connected ? t('controllers.live') : t('controllers.idle')}</span>
-				</li>
-			{/each}
-		</ul>
+		{#if pads.length === 0}
+			<p class="none">{t('controllers.none')}</p>
+		{:else}
+			<ul>
+				{#each pads as p (p.index)}
+					<li class:off={!p.connected}>
+						<span class="dot" class:on={p.connected}></span>
+						<span class="name">{p.name}</span>
+						<span class="kind mono">{p.label}</span>
+						<span class="state">{p.connected ? t('controllers.live') : t('controllers.idle')}</span>
+					</li>
+				{/each}
+			</ul>
+		{/if}
 	{/if}
 </div>
 
@@ -88,6 +179,17 @@
 		color: var(--text-faint);
 		margin: 0;
 	}
+	.hint {
+		font-size: 11.5px;
+		color: var(--text-faint);
+		margin: 0 0 8px 0;
+	}
+	.both-modes {
+		font-size: 11.5px;
+		color: var(--text-faint);
+		margin: 10px 0 0 0;
+		font-style: italic;
+	}
 	ul {
 		list-style: none;
 		margin: 0;
@@ -95,6 +197,14 @@
 		display: flex;
 		flex-direction: column;
 		gap: 7px;
+	}
+	.slot-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
 	}
 	li {
 		display: flex;
@@ -104,6 +214,13 @@
 	}
 	li.off {
 		opacity: 0.5;
+	}
+	.slot-label {
+		font-size: 11.5px;
+		color: var(--accent);
+		font-weight: 600;
+		min-width: 7ch;
+		flex: none;
 	}
 	.dot {
 		width: 8px;
@@ -131,5 +248,24 @@
 		margin-left: auto;
 		font-size: 11.5px;
 		color: var(--text-faint);
+	}
+	.reorder-btns {
+		margin-left: auto;
+		display: flex;
+		gap: 2px;
+	}
+	.mv-btn {
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--r-sm, 4px);
+		padding: 1px 5px;
+		font-size: 10px;
+		cursor: pointer;
+		color: var(--text-muted);
+		line-height: 1.4;
+	}
+	.mv-btn:hover {
+		background: var(--surface-raised, var(--surface));
+		color: var(--text);
 	}
 </style>

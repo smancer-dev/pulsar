@@ -13,8 +13,9 @@
 mod types;
 
 pub use types::{
-	axis_to_i16, button, create_virtual_pad, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons,
-	ControllerInfo, GamepadKind, GamepadState, RecordingPad, VirtualGamepad,
+	axis_to_i16, button, create_virtual_pad, touch_to_delta, trigger_to_u8,
+	vid_pid_from_sdl_guid, xinput_buttons, ControllerInfo, GamepadKind, GamepadState,
+	RecordingPad, VirtualGamepad,
 };
 
 /// Windows host-side virtual gamepad via **ViGEmBus** — see [`vigem::ViGEmGamepad`].
@@ -24,6 +25,14 @@ mod vigem;
 /// Linux host-side uinput backends (virtual gamepad + desktop input).
 #[cfg(target_os = "linux")]
 mod uinput;
+
+/// DS4/DS5 touchpad-as-mouse reader via evdev (Linux client-side).
+///
+/// Enumerates `/dev/input/event*` for a Sony touchpad device and synthesizes
+/// `PointerRelative` / `PointerButton` [`InputEvent`]s from raw ABS_MT / BTN
+/// events. Follow-ups: Windows (raw HID via hidapi) and macOS (IOHIDManager).
+#[cfg(target_os = "linux")]
+pub mod touchpad_linux;
 
 /// Windows host-side mouse + keyboard injection via `SendInput`.
 #[cfg(windows)]

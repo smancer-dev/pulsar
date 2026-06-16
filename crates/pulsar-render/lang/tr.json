@@ -60,5 +60,8 @@
 	"info.call": "Sesli görüşme: mikrofonunu karşıya, karşının sesini sana açar (iki yönlü ses).",
 	"info.statshud": "Overlay kapalıyken de ekranın üstünde küçük bir fps/gecikme şeridi gösterir.",
 	"info.ovbtn": "Videonun köşesinde overlay'i açan sürüklenebilir küçük düğme (Parsec tarzı).",
-	"active": "Aktif:"
+	"active": "Aktif:",
+	"view.controllers": "Kumandalar",
+	"controllers.empty": "Bağlı kumanda yok",
+	"controllers.slot": "Oyuncu"
 }
