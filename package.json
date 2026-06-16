@@ -1,7 +1,7 @@
 {
 	"name": "pulsar-desktop",
 	"private": true,
-	"version": "0.1.0-dev.15",
+	"version": "0.1.0-dev.16",
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
