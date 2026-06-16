@@ -1094,7 +1094,7 @@ pub(crate) async fn start_remote_play(
 		let emul_arc = state.controller_emulation.clone();
 		// Clone the overlay stdin so the reader can emit `ctrls` lines (game mode only).
 		let ctrls_stdin = overlay_stdin.clone();
-		let ctrls_game_mode = game_mode;
+		let _ctrls_game_mode = game_mode;
 		tokio::task::spawn_blocking(move || {
 			let Ok(mut hub) = ControllerHub::new() else {
 				return;
@@ -1201,11 +1201,11 @@ pub(crate) async fn start_remote_play(
 						.collect::<Vec<_>>()
 						.join(",")
 				};
-				// Only emit `ctrls` in game mode — the two-mode rule: the controller
-				// overlay view is game-mode-only, and remote mode should not receive it.
+				// Emit `ctrls` in BOTH modes — the controller overlay view (🎮 Kollar)
+				// is available in remote mode too, so it needs the live list there.
 				let changed = ctrls_payload != prev_ctrls_line;
 				let periodic = ctrls_tick % 60 == 0;
-				if ctrls_game_mode && (changed || periodic) {
+				if changed || periodic {
 					use std::io::Write as _;
 					if let Some(si) = ctrls_stdin.lock().unwrap().as_mut() {
 						let _ = writeln!(si, "ctrls {ctrls_payload}");

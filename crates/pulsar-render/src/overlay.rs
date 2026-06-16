@@ -515,6 +515,7 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 		("💬", t("view.chat"), View::Chat),
 		("📁", t("view.files"), View::Files),
 		("🛠", t("view.tools"), View::Tools),
+		("🎮", t("view.controllers"), View::Controllers),
 		("📊", t("view.gauges"), View::Gauges),
 	];
 	let boxes: &[(&str, &str, View)] = match st.mode {
