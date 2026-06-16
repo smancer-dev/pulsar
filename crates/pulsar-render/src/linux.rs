@@ -21,6 +21,18 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// + EGL context ALIVE. Destroying this GL context (process exit) corrupts WebKit's shared Mali
 /// GL on RK3588 and wedges the webview; staying resident-but-hidden avoids that. `show` re-maps.
 static IDLE: AtomicBool = AtomicBool::new(false);
+/// Stream-selection seeds pushed by the app after a renderer respawn (`res <val>`,
+/// `fps <val>`, `bitrate <val>`, `quality <val>`, `display <idx>` stdin lines).
+/// Stored as `Option` so we only overwrite the OverlayState on the first frame after
+/// a respawn seed — not on every frame — leaving the overlay free to update them live
+/// thereafter (via emit_cmd). Uses take-once semantics like `CAPS`.
+static RES_SEED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FPS_SEL_SEED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static BITRATE_SEED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static QUALITY_SEED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// `u32::MAX` = not set (sentinel); any real display index is < MAX.
+static DISPLAY_IDX_SEED: std::sync::atomic::AtomicU32 =
+	std::sync::atomic::AtomicU32::new(u32::MAX);
 /// Host caps + active selections pushed by the app over stdin (`caps …` line):
 /// (host_codecs, host_encoders, active codec, active encoder). The render loop
 /// copies them into the OverlayState each frame.
@@ -413,10 +425,20 @@ pub fn run() {
 						video::set_pace_ceiling(if remote { 3 } else { 2 });
 					}
 				}
-				// Live codec switch: reopen the demuxer+decoder on a rewritten SDP IN PLACE —
-				// this process must survive (killing it corrupts WebKit's shared Mali GL).
+				// Live codec switch / resident-reuse: reopen the demuxer+decoder on a
+				// rewritten SDP IN PLACE — this process must survive (killing it corrupts
+				// WebKit's shared Mali GL). When we are REUSED for a brand-new session we
+				// must also discard the PREVIOUS session's overlay state — chat log, unread
+				// badge, remote file listing, and the side-channel cursor — so the new
+				// session starts clean and host-A's private data is never shown to host-B.
 				Some("reopen") => {
 					if let Some(p) = it.next() {
+						// Reset per-session overlay statics before the new session begins.
+						CHAT_LOG.lock().unwrap().clear();
+						CHAT_UNREAD.store(0, Ordering::SeqCst);
+						*FS_REMOTE.lock().unwrap() = (String::new(), Vec::new());
+						*CURSOR_POS.lock().unwrap() = None;
+						*CURSOR_IMG.lock().unwrap() = None;
 						video::request_reopen(p);
 					}
 				}
@@ -502,6 +524,37 @@ pub fn run() {
 						}
 					}
 					*CAPS.lock().unwrap() = Some((codecs, encoders, codec, encoder));
+				}
+				// Stream-selection seeds pushed by the app after a respawn (C14): the
+				// renderer starts with OverlayState::default, so the app re-sends the
+				// user's last picks over these verbs so the overlay shows the live state.
+				// Take-once: stored in Option statics; the render loop drains them once.
+				Some("res") => {
+					if let Some(v) = it.next() {
+						*RES_SEED.lock().unwrap() = Some(v.to_string());
+					}
+				}
+				Some("fps") => {
+					if let Some(v) = it.next() {
+						*FPS_SEL_SEED.lock().unwrap() = Some(v.to_string());
+					}
+				}
+				Some("bitrate") => {
+					if let Some(v) = it.next() {
+						*BITRATE_SEED.lock().unwrap() = Some(v.to_string());
+					}
+				}
+				Some("quality") => {
+					if let Some(v) = it.next() {
+						*QUALITY_SEED.lock().unwrap() = Some(v.to_string());
+					}
+				}
+				Some("display") => {
+					if let Some(v) = it.next() {
+						if let Ok(idx) = v.parse::<u32>() {
+							DISPLAY_IDX_SEED.store(idx, Ordering::SeqCst);
+						}
+					}
 				}
 				_ => {}
 			}
@@ -816,6 +869,27 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		}
 		// Host monitor list (persists; cloned each frame so the Display picker stays populated).
 		state.displays = DISPLAYS.lock().unwrap().clone();
+		// Stream-selection respawn seeds (C14): apply once when the app seeds a fresh
+		// renderer; cleared after the first apply so the overlay can update them live.
+		if let Some(v) = RES_SEED.lock().unwrap().take() {
+			state.res = v;
+		}
+		if let Some(v) = FPS_SEL_SEED.lock().unwrap().take() {
+			state.fps_sel = v;
+		}
+		if let Some(v) = BITRATE_SEED.lock().unwrap().take() {
+			state.bitrate = v;
+		}
+		if let Some(v) = QUALITY_SEED.lock().unwrap().take() {
+			state.quality = v;
+		}
+		{
+			let idx = DISPLAY_IDX_SEED.load(Ordering::SeqCst);
+			if idx != u32::MAX {
+				state.display_idx = idx;
+				DISPLAY_IDX_SEED.store(u32::MAX, Ordering::SeqCst);
+			}
+		}
 		{
 			let dec = video::DEC_LABEL.lock().unwrap();
 			if !dec.is_empty() && state.decoder != *dec {

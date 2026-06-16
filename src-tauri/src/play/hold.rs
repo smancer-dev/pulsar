@@ -60,6 +60,7 @@ pub(super) async fn hold_session(
 	base_kbps: u32,
 	cursor_external: bool,
 	req_hdr: bool,
+	init_quality: QualityPref,
 ) {
 	let mut keep = tokio::time::interval(std::time::Duration::from_secs(2));
 	keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -128,11 +129,10 @@ pub(super) async fn hold_session(
 	// picking "Otomatik" (0) re-enables it.
 	let mut manual_bitrate = false;
 	let adapt_enabled = mos && base_kbps > 0;
-	let mut cur_quality = if game_mode {
-		QualityPref::Latency
-	} else {
-		QualityPref::Quality
-	};
+	// Quality bias: seeded from the Settings → Display 'Varsayılan kalite' control
+	// (already resolved in play.rs: "hq"→Quality, "fast"→Latency, "auto"→mode default).
+	// The session overlay's quality picker (Restream::Quality) can override it live.
+	let mut cur_quality = init_quality;
 	// HDR preference from the UI toggle (Settings → Display). The PULSAR_HDR env var
 	// is a debug override: if set it wins regardless of the UI value.
 	let cur_hdr = req_hdr || std::env::var_os("PULSAR_HDR").is_some();
@@ -461,10 +461,18 @@ pub(super) async fn hold_session(
 								};
 								if overflow {
 									// Peer is overshooting the sane transfer ceiling — drop the
-									// whole transfer (further chunks for this id find no entry →
-									// ignored, a later FileEnd is a no-op) so the buffer can't
-									// grow unbounded.
-									f_xfers.remove(&xfer);
+									// whole transfer so the buffer can't grow unbounded. Emit
+									// file-recv{ok:false} BEFORE removing so the download UI
+									// learns the transfer was rejected instead of hanging forever
+									// on 'indiriliyor…' with no feedback.
+									if let Some(r) = f_xfers.remove(&xfer) {
+										let _ = app_ev.emit("file-recv", FilePayload {
+											peer: id.to_string(),
+											name: r.name.clone(),
+											bytes: 0,
+											ok: false,
+										});
+									}
 								}
 							}
 							DataMsg::FileEnd { id: xfer } => {

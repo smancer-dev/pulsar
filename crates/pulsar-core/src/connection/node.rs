@@ -208,7 +208,15 @@ impl Node {
 				// (or no recorded code) falls back to a timeout-style error.
 				None => {
 					return Err(match g.register_error {
-						Some(ErrCode::IncompatibleVersion) => ConnError::IncompatibleVersion,
+						// The relay sends `ErrCode::Protocol` (not `IncompatibleVersion`)
+						// for version-mismatch replies so that old builds that predate the
+						// `IncompatibleVersion` variant can decode the error. During initial
+						// registration both codes mean "update required" (no other relay
+						// Protocol error is sent at this stage). Map both so the UI shows
+						// the clear message instead of a generic relay-timeout / retry loop.
+						Some(ErrCode::IncompatibleVersion) | Some(ErrCode::Protocol) => {
+							ConnError::IncompatibleVersion
+						}
 						_ => ConnError::RelayTimeout,
 					})
 				}

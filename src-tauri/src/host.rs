@@ -50,7 +50,7 @@ fn media_features() -> Vec<String> {
 ///   - ffmpeg encoder children running orphaned (GPU leak / NVENC 100% failure mode)
 ///   - on Linux: the XDG ScreenCast portal session live (compositor keeps showing
 ///     "your screen is being shared" even though nothing is captured)
-///   - host audio muted/redirected until the next `go_online` calls `reset_mute_all`
+///   - host audio redirected until the next `go_online` calls `reset_redirect_all`
 ///
 /// `Drop` performs the critical synchronous parts immediately; the Linux portal
 /// close (async D-Bus call) is fire-and-forget spawned so the runtime cleans it up
@@ -81,9 +81,14 @@ impl Drop for SessionCleanupGuard {
 		// empty and is a no-op (safe double-call).
 		for mut child in self.procs.lock().unwrap().drain(..) {
 			let _ = child.kill();
-			// skip wait() — non-blocking; the OS reaps the zombie when we exit or the
-			// Tokio runtime's thread cleans up. Blocking here in Drop would stall the
-			// executor thread that's running abort().
+			// wait() right after SIGKILL returns immediately (the process is already
+			// dead) and reaps the zombie entry from the kernel process table.
+			// Skipping wait() would leave a <defunct> zombie per encoder for the
+			// entire app lifetime — Unix does NOT auto-reap children unless the
+			// parent calls wait() or exits; Tokio has no SIGCHLD reaper for
+			// std::process::Child zombies (confirmed: no SIGCHLD handler in codebase).
+			// This mirrors the normal teardown block at the tokio::select! exit path.
+			let _ = child.wait();
 		}
 		// Abort the RTP media-forwarder tasks (vh/ah).  Each holds a strong
 		// `Arc<Node>` clone (via `SessionSender`) and blocks in `vsock/asock.recv()`;
@@ -105,9 +110,8 @@ impl Drop for SessionCleanupGuard {
 		if let Some(cap) = self.cap_slot.lock().unwrap().take() {
 			let _ = tokio::spawn(cap.stop());
 		}
-		// Release per-session mute/redirect ownership; idempotent if already released
+		// Release per-session redirect ownership; idempotent if already released
 		// by the normal teardown block.
-		handlers::release_mute(self.sid);
 		handlers::release_redirect(self.sid);
 	}
 }
@@ -195,18 +199,9 @@ pub(crate) async fn go_online(
 		.store(0, std::sync::atomic::Ordering::SeqCst);
 	let _ = app.emit("node-port", 0u16);
 	// A previous serve loop's sessions may not have torn down cleanly (independent
-	// spawns survive the accept-loop abort) — never carry a stale host-mute or a stale
-	// sink-redirect over.
-	handlers::reset_mute_all();
+	// spawns survive the accept-loop abort) — never carry a stale sink-redirect over.
 	handlers::reset_redirect_all();
-	// Crash-restore: a PRIOR PROCESS that silenced the host output and then died
-	// abnormally (crash / taskkill / tray-quit) without unmuting would leave the
-	// machine stuck at volume 0. Recover the user's saved level from the on-disk
-	// marker now (no-op when there's no marker — the common clean-exit case).
-	// reset_mute_all above already cleared any marker belonging to THIS process, so
-	// this only ever acts on a genuinely stale one.
-	handlers::restore_stale_host_mute();
-	// Same crash-restore for the Sunshine-style sink redirect: a prior process that
+	// Crash-restore for the Sunshine-style sink redirect: a prior process that
 	// redirected the default render endpoint to the virtual sink and died before its
 	// guard dropped left the host on the sinkless sink (real speakers silent). Restore
 	// the saved default from the on-disk marker (no-op for a clean previous exit).
@@ -631,9 +626,15 @@ pub(crate) async fn go_online(
 										// capture on the new monitor; firing again with the old idx
 										// would override that switch.
 										if fresh_req.display_idx != idx {
-											// Re-baseline to the new display so the next poll starts
-											// fresh for whatever monitor the client is now on.
-											baseline = Some((fresh_req.display_idx, size));
+											// The client switched to a different display during the
+											// confirm window. Clear the baseline so the next poll
+											// does a clean first-observation re-baseline for the new
+											// monitor (B). Using `size` here would be wrong: `size`
+											// was measured for the OLD monitor A, not B, so
+											// `(B_idx, A_size)` would cause a spurious bsize!=size
+											// mismatch on the very next poll and trigger a needless
+											// capture restart.
+											baseline = None;
 											continue;
 										}
 										tracing::info!(
@@ -1216,7 +1217,7 @@ pub(crate) async fn go_online(
 				// essential teardown inside `Drop` as a safety net. The normal path still
 				// runs the block below; every operation is idempotent so double-execution
 				// is safe (procs drain finds an empty vec, cap_slot.take() returns None,
-				// release_mute/redirect are no-ops when already removed).
+				// release_redirect is a no-op when already removed).
 				let _cleanup_guard = SessionCleanupGuard {
 					procs: procs.clone(),
 					fwd_slot: fwd_slot.clone(),
@@ -1249,14 +1250,9 @@ pub(crate) async fn go_online(
 				if let Some(h) = native_slot.lock().unwrap().take() {
 					h.stop();
 				}
-				// Drop this session's host-mute request (global owner set in handlers:
-				// a same-peer reconnect's newer session keeps the host muted through
-				// the OLD session's delayed teardown).
-				handlers::release_mute(sid);
-				// Same for the Sunshine-style sink redirect: drop this session's
-				// host-silent request so the default render endpoint is restored when
-				// this was the last owner (a same-peer reconnect keeps it redirected
-				// through the OLD session's delayed teardown).
+				// Drop this session's Sunshine-style sink redirect request so the default
+				// render endpoint is restored when this was the last owner (a same-peer
+				// reconnect keeps it redirected through the OLD session's delayed teardown).
 				handlers::release_redirect(sid);
 				// Compare-and-remove: only drop the entries if they still belong to THIS
 				// session. A same-peer reconnection may have already overwritten them with

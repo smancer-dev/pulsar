@@ -51,6 +51,12 @@
 		api.fsList(playId, path).catch(() => (remoteLoading = false));
 	}
 
+	// Pending download completions keyed by filename — each entry is a queue of
+	// {resolve, reject} for in-flight enqueueXfer slots waiting on file-recv.
+	// Using an array per name so two simultaneous downloads of the same filename
+	// are handled in FIFO order.
+	const pendingDownloads = new Map<string, Array<{ resolve: () => void; reject: () => void }>>();
+
 	// Inbound listings + download results for THIS play; initial load of both
 	// panes. Scoped to the component so it tears down when the panel closes.
 	$effect(() => {
@@ -70,6 +76,13 @@
 				flash(
 					e.ok ? t('files.downloaded', { name: e.name }) : t('files.downloadFail', { name: e.name })
 				);
+				// Drain the concurrency slot held for this download (keyed by filename).
+				const queue = pendingDownloads.get(e.name);
+				if (queue && queue.length > 0) {
+					const { resolve, reject } = queue.shift()!;
+					if (queue.length === 0) pendingDownloads.delete(e.name);
+					if (e.ok) resolve(); else reject();
+				}
 			})
 		);
 		loadLocal('');
@@ -113,11 +126,40 @@
 		});
 	}
 
+	// Timeout (ms) after which a download slot is released even if file-recv never
+	// arrives (host refusal / lost FileEnd / jailed path returns nothing).
+	const DOWNLOAD_TIMEOUT_MS = 30_000;
+
 	function download(name: string) {
 		flash(t('files.downloading', { name }));
-		enqueueXfer(() =>
-			api.fsGet(playId, join(remotePath, name)).catch(() => flash(t('files.downloadFail', { name })))
-		);
+		enqueueXfer(async () => {
+			// 1. Send the FsGet request to the host.
+			await api.fsGet(playId, join(remotePath, name)).catch(() => {
+				flash(t('files.downloadFail', { name }));
+			});
+			// 2. Wait for the actual file-recv completion event for this file.
+			//    The slot stays occupied until the host finishes streaming back OR
+			//    the timeout fires — whichever comes first.
+			await new Promise<void>((resolve, reject) => {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const entry = {
+					resolve: () => { clearTimeout(timer); resolve(); },
+					reject:  () => { clearTimeout(timer); reject(); },
+				};
+				if (!pendingDownloads.has(name)) pendingDownloads.set(name, []);
+				pendingDownloads.get(name)!.push(entry);
+				// Timeout: release the slot even if the host never answers.
+				timer = setTimeout(() => {
+					const queue = pendingDownloads.get(name);
+					if (queue) {
+						const idx = queue.indexOf(entry);
+						if (idx !== -1) queue.splice(idx, 1);
+						if (queue.length === 0) pendingDownloads.delete(name);
+					}
+					resolve(); // drain the slot; the flash was already shown by onFileRecv or stays as "downloading"
+				}, DOWNLOAD_TIMEOUT_MS);
+			}).catch(() => {/* reject just means failed download — slot still drains */});
+		});
 	}
 
 	function upload(name: string) {

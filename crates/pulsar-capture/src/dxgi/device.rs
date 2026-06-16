@@ -115,7 +115,10 @@ impl CaptureDevice {
 		fast_transient: bool,
 	) -> windows::core::Result<Self> {
 		let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-		let (adapter, output) = Self::find_output(&factory, output_idx)?;
+		let (adapter, output, actual_idx) = Self::find_output(&factory, output_idx)?;
+		// Use the actual chosen index (may differ from output_idx when find_output fell back
+		// to the first attached output because output_idx was out of range — C8).
+		let output_idx = actual_idx;
 
 		// Create the device on the adapter that OWNS this output. DRIVER_TYPE_UNKNOWN is
 		// mandatory when you pass a specific adapter (HARDWARE would assert).
@@ -253,12 +256,19 @@ impl CaptureDevice {
 		})
 	}
 
-	/// Walk adapters/outputs, returning the (adapter, output1) pair for `output_idx`,
-	/// preferring outputs actually attached to the desktop.
+	/// Walk adapters/outputs, returning the `(adapter, output1, actual_idx)` triple for
+	/// `output_idx`, preferring outputs actually attached to the desktop.
+	///
+	/// `actual_idx` is the global attached-output index that was chosen:
+	/// - Equal to `output_idx` when the requested monitor was found.
+	/// - `0` (the first attached output) when `output_idx` is out of range and the
+	///   fallback fires. Callers MUST store `actual_idx` into `CaptureDevice::output_idx`
+	///   so that `current_output()` / `build_gen` report the monitor that is actually being
+	///   captured, not the stale/invalid requested index (C8).
 	pub(super) unsafe fn find_output(
 		factory: &IDXGIFactory1,
 		output_idx: u32,
-	) -> windows::core::Result<(IDXGIAdapter1, IDXGIOutput1)> {
+	) -> windows::core::Result<(IDXGIAdapter1, IDXGIOutput1, u32)> {
 		let mut global_idx: u32 = 0;
 		// First pass: count attached-to-desktop outputs so output_idx maps to a real
 		// monitor (skipping detached/virtual outputs that can't be duplicated).
@@ -283,7 +293,7 @@ impl CaptureDevice {
 				if desc.AttachedToDesktop.as_bool() {
 					if global_idx == output_idx {
 						let out1: IDXGIOutput1 = out.cast()?;
-						return Ok((adapter, out1));
+						return Ok((adapter, out1, global_idx));
 					}
 					global_idx += 1;
 				}
@@ -293,6 +303,8 @@ impl CaptureDevice {
 		}
 		// Requested index not found — fall back to the FIRST attached output so a single
 		// wrong index still streams *something* rather than failing the whole session.
+		// Return actual_idx=0 so the caller knows the fallback fired and can update
+		// self.output_idx to 0 (the real captured output — fixes C8 desync).
 		let mut ai = 0u32;
 		loop {
 			let adapter = match factory.EnumAdapters1(ai) {
@@ -310,7 +322,8 @@ impl CaptureDevice {
 				let desc = out.GetDesc()?;
 				if desc.AttachedToDesktop.as_bool() {
 					let out1: IDXGIOutput1 = out.cast()?;
-					return Ok((adapter, out1));
+					// actual_idx is always 0 here: this is the first attached output.
+					return Ok((adapter, out1, 0));
 				}
 				oi += 1;
 			}
@@ -397,8 +410,12 @@ impl CaptureDevice {
 					// keep retrying up to the budget. Non-transient: give up after 3 tries.
 					let max = if transient { transient_budget } else { 3 };
 					if transient {
-						if let Ok((_, out1)) = Self::find_output(&self.factory, self.output_idx) {
+						if let Ok((_, out1, actual_idx)) = Self::find_output(&self.factory, self.output_idx) {
 							self.output = out1;
+							// Keep output_idx accurate: if find_output fell back to a different
+							// monitor (e.g. the requested one was hot-unplugged) record the real
+							// one so cur_out_t reflects the monitor actually being captured (C8).
+							self.output_idx = actual_idx;
 						}
 					}
 					attempt += 1;
@@ -526,8 +543,14 @@ impl CaptureDevice {
 	pub(super) unsafe fn reinit(&mut self) -> windows::core::Result<()> {
 		std::thread::sleep(std::time::Duration::from_millis(REINIT_BACKOFF_MS));
 		// Re-pick the output that currently owns the desktop (hybrid-GPU reparenting).
-		if let Ok((_, out1)) = Self::find_output(&self.factory, self.output_idx) {
+		// Also update self.output_idx to the ACTUAL chosen index: if the originally-requested
+		// monitor was hot-unplugged, find_output falls back to the first attached output (index
+		// 0) and returns actual_idx=0. Storing that real index means cur_out_t (written by the
+		// lib.rs loop from self.output_idx via RunExit::Switch) reflects the captured monitor,
+		// not the stale unplugged index — fixing the input-mapping desync (C8).
+		if let Ok((_, out1, actual_idx)) = Self::find_output(&self.factory, self.output_idx) {
 			self.output = out1;
+			self.output_idx = actual_idx;
 		}
 		// In-session recovery (Hz change / transient ACCESS_LOST): keep the long retry budget —
 		// the stream is already established and the monitor genuinely needs to come back.

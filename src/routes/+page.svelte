@@ -187,9 +187,19 @@
 			selfId = '—';
 			selfPw = '';
 			const msg = e instanceof Error ? e.message : String(e);
-			// The sidebar shows this as the offline tooltip; the auto-retry effect below
-			// keeps trying, so say so instead of presenting a dead end.
-			connError = isTauri ? `${msg} — ${t('status.willRetry')}` : msg;
+			// The relay replied with a version-mismatch error during initial registration
+			// (ErrCode::Protocol mapped to ConnError::IncompatibleVersion in node.rs).
+			// Show the clean "update required" message and block auto-retry — every retry
+			// would fail the same way and overwrite this message with the generic one.
+			// (The post-registration path uses the onNodeVersionError event instead.)
+			if (msg.includes('incompatible protocol version')) {
+				versionBlocked = true;
+				connError = t('connErr.incompatibleVersion');
+			} else {
+				// The sidebar shows this as the offline tooltip; the auto-retry effect below
+				// keeps trying, so say so instead of presenting a dead end.
+				connError = isTauri ? `${msg} — ${t('status.willRetry')}` : msg;
+			}
 		} finally {
 			connecting = false;
 		}

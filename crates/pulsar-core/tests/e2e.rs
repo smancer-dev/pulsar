@@ -10,8 +10,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use pulsar_core::{NetworkMode, Node, Transport};
+use pulsar_core::{proto, ConnError, NetworkMode, Node, Transport};
 use pulsar_relay::Relay;
+use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -221,6 +222,114 @@ async fn relay_connect_pins_the_peer_pubkey() {
 		client.connect_pinned(host_id, Some(wrong)).await.is_err(),
 		"a pinned key mismatch must fail the connect, not establish a wrong-peer session"
 	);
+}
+
+/// Version-mismatch detection: when a relay rejects a Register with
+/// `ErrCode::Protocol` (the wire-safe stand-in for a version mismatch — see the
+/// comments in relay/src/lib.rs), `Node::register()` must return
+/// `ConnError::IncompatibleVersion` (not a generic `RelayTimeout`) so the UI can
+/// show the clean "update required" message and suppress the auto-retry loop.
+///
+/// This also verifies sub-case (B): a node that was ALREADY registered and then
+/// re-registers against a redeployed relay (same ErrCode::Protocol path) must
+/// fire the `version_error` notifier so the host-side watcher can take the node
+/// offline cleanly.
+#[tokio::test]
+async fn version_mismatch_register_returns_incompatible_version() {
+	// Spin up a fake relay that immediately replies to any Register with the
+	// Protocol error that the real relay emits on a version mismatch.
+	let fake = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let relay_addr = fake.local_addr().unwrap();
+
+	tokio::spawn(async move {
+		let mut buf = vec![0u8; 65_536];
+		// Handle exactly one Register then stop — that's all the test needs.
+		let (n, from) = fake.recv_from(&mut buf).await.unwrap();
+		let msg: proto::ClientMsg = proto::decode(&buf[..n]).expect("decodable ClientMsg");
+		assert!(matches!(msg, proto::ClientMsg::Register { .. }), "expected Register");
+		let reply = proto::encode(&proto::RelayMsg::Error {
+			code: proto::ErrCode::Protocol,
+			message: "incompatible protocol version".into(),
+		});
+		fake.send_to(&reply, from).await.unwrap();
+	});
+
+	let node = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	let err = node.register().await.expect_err("register must fail");
+	assert!(
+		matches!(err, ConnError::IncompatibleVersion),
+		"ErrCode::Protocol on Register must map to ConnError::IncompatibleVersion, got: {err:?}"
+	);
+}
+
+/// Post-registration version mismatch: a node already online fires the
+/// `version_error` notifier when it receives `ErrCode::Protocol` on a re-register
+/// (simulating a relay redeploy bumping PROTOCOL_VERSION while the node is online).
+///
+/// Flow: fake relay accepts the initial Register (Registered), then immediately
+/// sends NotRegistered to the node (without waiting for a heartbeat — the handler
+/// re-registers synchronously on any NotRegistered), then on the re-Register
+/// replies with Protocol.  This keeps the test fast (no 10 s heartbeat wait).
+#[tokio::test]
+async fn post_registration_protocol_error_fires_version_error() {
+	// Spin up a fake relay bound on a known addr so the node always talks to it.
+	let fake = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let relay_addr = fake.local_addr().unwrap();
+
+	// The fake relay task.
+	tokio::spawn(async move {
+		let mut buf = vec![0u8; 65_536];
+
+		// Step 1 — initial Register → Registered.
+		let (n, from) = fake.recv_from(&mut buf).await.unwrap();
+		assert!(matches!(
+			proto::decode::<proto::ClientMsg>(&buf[..n]),
+			Ok(proto::ClientMsg::Register { .. })
+		));
+		use pulsar_core::proto::{DeviceId, Token};
+		let registered = proto::encode(&proto::RelayMsg::Registered {
+			id: DeviceId::new(100_000_001).unwrap(),
+			token: Token([0x42; 16]),
+		});
+		fake.send_to(&registered, from).await.unwrap();
+
+		// Step 2 — immediately push NotRegistered to provoke a fast re-register
+		// (no need to wait for a heartbeat; the handler fires on any NotRegistered).
+		let not_reg = proto::encode(&proto::RelayMsg::Error {
+			code: proto::ErrCode::NotRegistered,
+			message: "unknown id/token".into(),
+		});
+		fake.send_to(&not_reg, from).await.unwrap();
+
+		// Step 3 — wait for the re-Register, reply Protocol (version mismatch).
+		loop {
+			let (n, re_from) = fake.recv_from(&mut buf).await.unwrap();
+			if let Ok(proto::ClientMsg::Register { .. }) = proto::decode(&buf[..n]) {
+				let proto_err = proto::encode(&proto::RelayMsg::Error {
+					code: proto::ErrCode::Protocol,
+					message: "incompatible protocol version".into(),
+				});
+				fake.send_to(&proto_err, re_from).await.unwrap();
+				break;
+			}
+		}
+	});
+
+	let node = Node::bind(LOCAL.parse().unwrap(), relay_addr, NetworkMode::Auto)
+		.await
+		.unwrap();
+	// Grab the version-error handle before registering so a fast signal isn't missed.
+	let ver_signal = node.version_error_handle();
+	node.register().await.expect("initial register must succeed");
+	assert!(node.self_id().await.is_some(), "should have an id after register");
+
+	// The whole NotRegistered → re-Register → Protocol cycle is purely network-driven
+	// with no sleep; it should complete well within 2 s on loopback.
+	timeout(Duration::from_secs(2), ver_signal.notified())
+		.await
+		.expect("version_error must be notified within 2 s after post-registration Protocol error");
 }
 
 /// Media-over-session: tagged RTP frames ride the SAME encrypted session as the

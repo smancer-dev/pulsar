@@ -168,7 +168,8 @@ export class SessionManager {
 				ui.codec,
 				ui.encoder,
 				useMode === 'game',
-				useMode === 'game'
+				useMode === 'game',
+				ui.quality
 			);
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			let timedOut = false;

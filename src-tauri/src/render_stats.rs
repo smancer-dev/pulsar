@@ -145,6 +145,32 @@ pub(crate) fn start_render_reader(
 					(Some("ov"), Some("set")) => {
 						if let (Some(field), Some(val)) = (it.next(), it.next()) {
 							tracing::info!(field, val, "overlay-cmd from renderer");
+							// Mirror stream-selection fields into RenderSeed so a codec-switch
+							// respawn can replay the user's choices onto the fresh renderer
+							// (C14: the overlay would otherwise snap back to defaults).
+							match field {
+								"res" | "fps" | "bitrate" | "quality" | "display" => {
+									use tauri::Manager;
+									let state = app.state::<crate::state::AppState>();
+									let plays = state.plays.lock().unwrap();
+									if let Some(p) = plays.get(&cur_id) {
+										let mut seed = p.render_seed.lock().unwrap();
+										match field {
+											"res" => seed.res = Some(val.to_string()),
+											"fps" => seed.fps_sel = Some(val.to_string()),
+											"bitrate" => seed.bitrate = Some(val.to_string()),
+											"quality" => seed.quality = Some(val.to_string()),
+											"display" => {
+												if let Ok(idx) = val.parse::<u32>() {
+													seed.display_idx = Some(idx);
+												}
+											}
+											_ => {}
+										}
+									}
+								}
+								_ => {}
+							}
 							let _ =
 								app.emit("overlay-cmd", (cur_id, field.to_string(), val.to_string()));
 						}

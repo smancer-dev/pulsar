@@ -103,9 +103,9 @@ mod win_mute {
 
 	/// (Un)mute the default render endpoint via the mute flag. No volume change → the
 	/// WASAPI loopback the host streams from is never silenced (see module docs). A
-	/// crash while muted leaves the endpoint muted; the next `go_online`
-	/// (`restore_stale_host_mute` → `set_host_muted(false)`) clears it, and the user
-	/// can always un-mute from the tray in the meantime.
+	/// crash while muted leaves the endpoint muted; the user can always un-mute from
+	/// the tray in the meantime (Pulsar never unconditionally clears the mute on
+	/// startup — that would clobber a deliberate user mute).
 	pub fn set_default_render_muted(mute: bool) -> Result<(), String> {
 		unsafe {
 			let volume = endpoint_volume()?;

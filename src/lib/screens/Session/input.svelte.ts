@@ -207,6 +207,17 @@ export class SessionInput {
 		// (raw scancode/VK) path below.
 		if (down && printable) {
 			e.preventDefault();
+			// If this physical key was previously held as a raw VK (e.g. the user pressed
+			// Ctrl+'a' so the first down took the Key path, then released Ctrl while holding
+			// 'a' so the auto-repeat now arrives here as printable), release the stale VK on
+			// the host BEFORE switching to the Char path. Without this the held VK is never
+			// released: the matching key-UP below will hit #charKeys.delete and return early,
+			// leaving the host key stuck. Sending a key-up for a not-held VK is a harmless
+			// host no-op (symmetric with C4's fix in the Linux native evdev path).
+			const c = evdevCode(e.code);
+			if (c && this.#heldKeys.delete(c)) {
+				api.inputKey(playId, c, false).catch(() => {});
+			}
 			// One-shot char insert (no held VK on the host); remember it so the key-up is
 			// suppressed and so blur/disengage doesn't try to release a key never held.
 			this.#charKeys.add(e.code);

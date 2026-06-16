@@ -103,6 +103,16 @@ static HOST_ENC: Mutex<String> = Mutex::new(String::new());
 #[allow(clippy::type_complexity)]
 static CAPS_SEED: Mutex<Option<(Vec<String>, Vec<String>, String, String, String)>> =
 	Mutex::new(None);
+/// Stream-selection respawn seeds (C14): pushed by the app over stdin after a codec/monitor
+/// switch respawn so the fresh renderer's overlay shows the user's last picks, not defaults.
+/// Take-once (Option/sentinel) so the overlay can update them live after the initial seed.
+static RES_SEED: Mutex<Option<String>> = Mutex::new(None);
+static FPS_SEL_SEED: Mutex<Option<String>> = Mutex::new(None);
+static BITRATE_SEED: Mutex<Option<String>> = Mutex::new(None);
+static QUALITY_SEED: Mutex<Option<String>> = Mutex::new(None);
+/// `u32::MAX` = not set (sentinel); any real display index is < MAX.
+static DISPLAY_IDX_SEED: std::sync::atomic::AtomicU32 =
+	std::sync::atomic::AtomicU32::new(u32::MAX);
 // Cursor side-channel state (Moonlight model, mirrors linux.rs): the host captured
 // WITHOUT a hardware cursor (KMS zero-copy) and streams the pointer out-of-band; WE
 // draw it over the video. Fed over stdin: `cursor <x> <y>` (normalized 0..1),
@@ -421,6 +431,21 @@ fn stdin_control() {
 					}
 				}
 				_ => {}
+			}
+		// Stream-selection respawn seeds (C14 — mirrors linux.rs): the app pushes these
+		// after a codec/monitor-switch respawn so the fresh renderer's Stream/Display views
+		// show the user's last picks instead of falling back to built-in defaults.
+		} else if let Some(rest) = l.strip_prefix("res ") {
+			*RES_SEED.lock().unwrap() = Some(rest.trim().to_string());
+		} else if let Some(rest) = l.strip_prefix("fps ") {
+			*FPS_SEL_SEED.lock().unwrap() = Some(rest.trim().to_string());
+		} else if let Some(rest) = l.strip_prefix("bitrate ") {
+			*BITRATE_SEED.lock().unwrap() = Some(rest.trim().to_string());
+		} else if let Some(rest) = l.strip_prefix("quality ") {
+			*QUALITY_SEED.lock().unwrap() = Some(rest.trim().to_string());
+		} else if let Some(rest) = l.strip_prefix("display ") {
+			if let Ok(idx) = rest.trim().parse::<u32>() {
+				DISPLAY_IDX_SEED.store(idx, Ordering::SeqCst);
 			}
 		}
 		// `toast <text>` (and `hint …`) are drawn by the closed-state paint pass
@@ -951,6 +976,27 @@ impl Renderer {
 			}
 			if !conn.is_empty() {
 				self.ostate.conn_label = conn;
+			}
+		}
+		// Stream-selection respawn seeds (C14): apply once per respawn seed, then clear,
+		// so the overlay can update them live via emit_cmd thereafter.
+		if let Some(v) = RES_SEED.lock().unwrap().take() {
+			self.ostate.res = v;
+		}
+		if let Some(v) = FPS_SEL_SEED.lock().unwrap().take() {
+			self.ostate.fps_sel = v;
+		}
+		if let Some(v) = BITRATE_SEED.lock().unwrap().take() {
+			self.ostate.bitrate = v;
+		}
+		if let Some(v) = QUALITY_SEED.lock().unwrap().take() {
+			self.ostate.quality = v;
+		}
+		{
+			let idx = DISPLAY_IDX_SEED.load(Ordering::SeqCst);
+			if idx != u32::MAX {
+				self.ostate.display_idx = idx;
+				DISPLAY_IDX_SEED.store(u32::MAX, Ordering::SeqCst);
 			}
 		}
 	}

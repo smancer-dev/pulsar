@@ -98,7 +98,9 @@ export const api = {
 		codec: string,
 		encoder: string,
 		gamepad: boolean,
-		gameMode = false
+		gameMode = false,
+		/** 'auto' | 'hq' | 'fast' — from Settings → Display 'Varsayılan kalite'. */
+		quality?: string
 	) =>
 		invoke<PlayInfo>('start_remote_play', {
 			target,
@@ -107,7 +109,8 @@ export const api = {
 			codec,
 			encoder,
 			gamepad,
-			gameMode
+			gameMode,
+			quality: quality ?? null
 		}),
 	/** CLI `--connect` auto-connect target (id/ip + password + mode + app), or null. */
 	autoConnectTarget: () =>

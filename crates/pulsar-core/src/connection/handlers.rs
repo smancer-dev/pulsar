@@ -194,13 +194,26 @@ impl Node {
 						drop(g);
 						self.registered.notify_waiters();
 						self.registered.notify_one();
-					} else if code == ErrCode::IncompatibleVersion {
+					} else if code == ErrCode::IncompatibleVersion || code == ErrCode::Protocol {
 						// Already registered but the relay now rejects us (relay was
 						// redeployed with a newer PROTOCOL_VERSION). The heartbeat will
 						// keep bouncing; every future Register attempt will be refused too.
 						// Signal the version-error watcher so the app can surface an
 						// "update required" message and go offline — instead of silently
 						// advertising a dead id forever.
+						//
+						// NOTE: the relay currently emits `ErrCode::Protocol` (not
+						// `IncompatibleVersion`) for version-mismatch replies so that old
+						// builds (which pre-date the `IncompatibleVersion` variant) can
+						// still decode the error (see relay/src/lib.rs — the Protocol
+						// variant is present in ALL released builds). After a relay
+						// redeploy bumps PROTOCOL_VERSION the cycle is:
+						//   heartbeat → NotRegistered → re-Register → Protocol(version mismatch)
+						// A post-registration `Protocol` error has no other plausible
+						// meaning, so we treat it identically to `IncompatibleVersion`.
+						// `IncompatibleVersion` is kept in the condition for the planned
+						// two-phase rollout where the relay switches to that variant once
+						// all deployed clients can decode it.
 						drop(g);
 						self.version_error.notify_one();
 					}

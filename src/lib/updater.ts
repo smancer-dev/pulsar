@@ -15,14 +15,21 @@ import { api } from './api.commands';
  * stalled download can't hang a boot path that sequences `connect` after this.
  *
  * `isBusy` is re-evaluated at two points inside `run()`: (1) after the slow
- * `check()` round-trip, before committing to `downloadAndInstall()`; and (2)
- * immediately before `relaunch()`, after the download completes. This covers the
- * boot path (where `overallTimeoutMs` causes `Promise.race` to reject and boot to
- * continue, but the still-running `run()` promise finishes the download later) and
- * the idle path (where there is no overall cap but a download can be slow). If a
- * session is live at either guard point, the update is abandoned — the next boot
- * will pick it up. The installed-but-not-relaunched state is safe: the new binary
- * is in place and will be used on the next normal launch.
+ * `check()` round-trip, before committing to `download()`; and (2) immediately
+ * before `install()`, after the download completes. This covers the boot path
+ * (where `overallTimeoutMs` causes `Promise.race` to reject and boot to continue,
+ * but the still-running `run()` promise finishes the download later) and the idle
+ * path (where there is no overall cap but a download can be slow). If a session is
+ * live at either guard point, the update is abandoned — the next boot will pick it
+ * up. The installed-but-not-relaunched state is safe: the new binary is in place
+ * and will be used on the next normal launch.
+ *
+ * NOTE on Windows: `install()` spawns the (quiet) NSIS installer and calls
+ * process::exit(0) — it never returns. The second guard (before `install()`) is
+ * therefore the ONLY effective busy-check on the Windows code path, because the
+ * older `downloadAndInstall()`-then-check pattern was unreachable. The download
+ * itself is non-destructive, so splitting into `download()` + guard + `install()`
+ * restores the session-protection guarantee on Windows.
  */
 export async function silentUpdateCheck(opts?: {
 	timeoutMs?: number;
@@ -33,7 +40,7 @@ export async function silentUpdateCheck(opts?: {
 		// On Linux the updater self-replaces the file pointed to by $APPIMAGE. When the
 		// AppImage is launched without FUSE (e.g. `--appimage-extract-and-run`, or the raw
 		// `--no-bundle` dev binary), $APPIMAGE is unset and the plugin falls back to a
-		// throwaway extracted temp binary — so downloadAndInstall() would silently rewrite a
+		// throwaway extracted temp binary — so download()+install() would silently rewrite a
 		// temp file (or error) instead of the deployed AppImage, leaving the appliance stuck
 		// on the old version while the updater appears to "succeed". Skip loudly instead.
 		if (!(await api.selfUpdatePossible().catch(() => true))) {
@@ -51,20 +58,26 @@ export async function silentUpdateCheck(opts?: {
 			console.warn('[updater] skipped: a session started during the update check');
 			return;
 		}
-		await update.downloadAndInstall();
-		// Re-check busy state BEFORE the destructive relaunch: the download may have
+		// Phase 1: non-destructive download only.
+		await update.download();
+		// Re-check busy state BEFORE the destructive install: the download may have
 		// taken longer than overallTimeoutMs (boot path) or longer than the user took
 		// to start a session (idle path). Either way, if a session is now live we must
 		// NOT tear it down — defer silently and let the next boot pick up the update.
+		// On Windows install() spawns the NSIS installer and exits the process, so
+		// this is the ONLY effective post-download guard on Windows — the old pattern
+		// (check after downloadAndInstall()) was physically unreachable on Windows.
 		if (opts?.isBusy?.()) {
 			console.warn('[updater] update downloaded but a session is live — deferring relaunch to next boot');
 			return;
 		}
-		// Relaunch into the new version. macOS/Linux only: on Windows
-		// downloadAndInstall() spawns the (now `quiet`) NSIS installer and calls
-		// process::exit(0), so it never returns here — the installer's /R flag
-		// auto-relaunches the app. This line is therefore unreachable on Windows
-		// (harmless) and is the actual relaunch path on macOS/Linux.
+		// Phase 2: destructive install. On Windows this spawns the (quiet) NSIS
+		// installer and calls process::exit(0), so it never returns here — the
+		// installer's /R flag auto-relaunches the app. On macOS/Linux install()
+		// replaces the binary in place and returns, and relaunch() below does the
+		// actual restart.
+		await update.install();
+		// macOS/Linux only — on Windows install() already exited the process above.
 		await relaunch();
 	};
 	try {

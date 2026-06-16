@@ -52,7 +52,7 @@ export const tr: Dict = {
 	'pw.lead':
 		'Host’ta görünen tek seferlik şifreyi gir — ya da host karşı taraftan <b>İzin Ver</b> diyerek şifresiz onaylayabilir.',
 	'pw.error': 'Yanlış şifre, tekrar dene.',
-	'pw.placeholder': 'örn. 7yf2-qk',
+	'pw.placeholder': 'örn. 7yf2-qk9p',
 	'pw.aria': 'Host şifresi',
 	'pw.cancel': 'İptal',
 	'pw.checking': 'Kontrol ediliyor…',

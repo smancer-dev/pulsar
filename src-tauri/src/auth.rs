@@ -57,12 +57,35 @@ pub(crate) mod throttle {
 	/// out from under the attacker regardless of which ids they cycle through.
 	const GLOBAL_MAX_FAILURES: u32 = 20;
 
+	/// Minimum interval between attacker-triggered OTP rotations.
+	///
+	/// An id-cycling attacker can hit the global threshold in as little as 20
+	/// lightweight relay connections (each contributing one wrong guess via a
+	/// fresh peer bucket). Without a cooldown they can rotate the displayed OTP
+	/// on every batch of 20 — churning the code faster than a legitimate user
+	/// can read and type it (denial-of-access, C9).
+	///
+	/// With this gate an attacker-triggered rotation is suppressed if one already
+	/// happened within the last `ROTATION_COOLDOWN` seconds: the counter is reset
+	/// (the batch of wrong guesses is consumed), but the displayed code is NOT
+	/// changed again. The legitimate user therefore has at least this many seconds
+	/// to complete a connection with a code they already read off the screen.
+	///
+	/// The single-use rotation that happens after a CORRECT OTP auth (called
+	/// directly via `rotate_session_password`, not through this path) is NOT
+	/// rate-limited — it always fires so the same code can never unlock a second
+	/// session.
+	const ROTATION_COOLDOWN: Duration = Duration::from_secs(60);
+
 	static ATTEMPTS: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
 		LazyLock::new(|| Mutex::new(HashMap::new()));
 
-	/// Source-independent wrong-guess counter: (count, first-failure instant).
-	static GLOBAL_FAILURES: LazyLock<Mutex<(u32, Instant)>> =
-		LazyLock::new(|| Mutex::new((0, Instant::now())));
+	/// Source-independent wrong-guess counter: (count, first-failure instant, last-rotation instant).
+	///
+	/// The third field tracks when we last performed an attacker-triggered rotation so
+	/// we can enforce [`ROTATION_COOLDOWN`] (C9 fix).
+	static GLOBAL_FAILURES: LazyLock<Mutex<(u32, Instant, Option<Instant>)>> =
+		LazyLock::new(|| Mutex::new((0, Instant::now(), None)));
 
 	/// Throttle key: a relay id passes through, but a direct peer's label is
 	/// "ip:port" with a NEW EPHEMERAL PORT per connection — keyed verbatim, an
@@ -118,22 +141,48 @@ pub(crate) mod throttle {
 	}
 
 	/// Count a wrong guess against the source-independent global counter; returns
-	/// true exactly when the global threshold is crossed, meaning the host should
+	/// true exactly when the global threshold is crossed AND enough time has
+	/// elapsed since the last attacker-triggered rotation, meaning the host should
 	/// force-rotate the one-time password (and resets the counter so the next
-	/// rotation needs a fresh batch of failures). This defeats the relay-id
-	/// rotation that sidesteps the per-peer [`record_failure`] lockout: no matter
-	/// how many ids an attacker cycles, the OTP they are guessing changes after
-	/// [`GLOBAL_MAX_FAILURES`] total wrong attempts.
+	/// rotation needs a fresh batch of failures).
+	///
+	/// This defeats the relay-id rotation that sidesteps the per-peer
+	/// [`record_failure`] lockout: no matter how many ids an attacker cycles, the
+	/// OTP they are guessing changes after [`GLOBAL_MAX_FAILURES`] total wrong
+	/// attempts.
+	///
+	/// The [`ROTATION_COOLDOWN`] gate (C9 fix) prevents an id-cycling attacker
+	/// from churning the displayed OTP faster than a legitimate user can act: if
+	/// the threshold is crossed but a rotation already happened within the cooldown
+	/// window, the counter is reset (the bad-guess batch is consumed) but `false`
+	/// is returned — the code the user already read stays valid until the cooldown
+	/// expires.
 	pub(crate) fn note_global_failure() -> bool {
 		let mut g = GLOBAL_FAILURES.lock().unwrap();
 		if g.1.elapsed() > WINDOW {
-			*g = (0, Instant::now());
+			*g = (0, Instant::now(), g.2);
 		}
 		g.0 += 1;
 		if g.0 >= GLOBAL_MAX_FAILURES {
-			tracing::warn!(failures = g.0, "auth throttle: global wrong-guess limit — rotating one-time password");
-			*g = (0, Instant::now());
-			true
+			// Consume the batch unconditionally (reset count) so the attacker
+			// doesn't "save up" a rotation that fires the moment the cooldown
+			// expires.
+			g.0 = 0;
+			g.1 = Instant::now();
+			// Enforce the cooldown: only signal rotation if we haven't done one
+			// recently. This is the C9 availability fix.
+			let cooldown_elapsed = g.2.map_or(true, |t| t.elapsed() >= ROTATION_COOLDOWN);
+			if cooldown_elapsed {
+				tracing::warn!("auth throttle: global wrong-guess limit — rotating one-time password");
+				g.2 = Some(Instant::now());
+				true
+			} else {
+				tracing::warn!(
+					"auth throttle: global wrong-guess limit reached but rotation suppressed \
+					 (cooldown active — C9 protection); attacker batch consumed, OTP unchanged"
+				);
+				false
+			}
 		} else {
 			false
 		}
@@ -152,6 +201,13 @@ pub(crate) mod throttle {
 	/// [`note_global_failure`]: after that quiet period the counter expires naturally.
 	pub(crate) fn clear(peer: &str) {
 		ATTEMPTS.lock().unwrap().remove(&key(peer));
+	}
+
+	/// Reset the global failure counter to a clean state (count=0, no prior rotation).
+	/// Only available in test builds to ensure test isolation (the static is process-global).
+	#[cfg(test)]
+	pub(crate) fn reset_global_for_test() {
+		*GLOBAL_FAILURES.lock().unwrap() = (0, Instant::now(), None);
 	}
 }
 
@@ -381,6 +437,12 @@ pub(crate) async fn client_authenticate(
 #[cfg(test)]
 mod tests {
 	use super::throttle;
+	use std::sync::Mutex;
+
+	/// Serializes the two global-counter tests so they don't race on
+	/// `GLOBAL_FAILURES` (a process-global static).  Per-peer tests do not need
+	/// this lock — they use distinct peer keys and `clear()` is idempotent.
+	static GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 	/// Interleaving `clear()` calls (which happen on every approved connection,
 	/// including passwordless Allow and connect_password logins) must NOT reset the
@@ -389,6 +451,10 @@ mod tests {
 	/// the global threshold from being crossed and the OTP would never rotate.
 	#[test]
 	fn global_counter_not_reset_by_clear() {
+		let _guard = GLOBAL_TEST_LOCK.lock().unwrap();
+		// Ensure clean state: a prior test or a prior rotation in this process
+		// must not leave a `last_rotation` that suppresses this test's rotation.
+		throttle::reset_global_for_test();
 		// Record GLOBAL_MAX_FAILURES - 1 wrong guesses from different "peers"
 		// (simulating relay-id cycling), interleaved with successful auths from
 		// unrelated peers via clear().  The counter must NOT revert to zero.
@@ -411,6 +477,33 @@ mod tests {
 		assert!(!rotated, "OTP rotated too early (expected exactly 20 failures)");
 		let triggered = throttle::note_global_failure(); // 20th failure
 		assert!(triggered, "global OTP-rotation guard did not fire after 20 total failures interleaved with successful auths");
+	}
+
+	/// C9 fix: a second attacker batch of 20 wrong guesses that arrives immediately
+	/// after the first rotation must NOT trigger a second rotation — the cooldown
+	/// gate must suppress it so the legitimate user's displayed code stays valid.
+	#[test]
+	fn global_rotation_cooldown_prevents_rapid_rechurn() {
+		let _guard = GLOBAL_TEST_LOCK.lock().unwrap();
+		// Start from a state where a rotation just happened (last_rotation = now).
+		throttle::reset_global_for_test();
+		// Drive 20 failures to trigger the first rotation (no prior rotation → fires).
+		for _ in 0..20u32 {
+			throttle::note_global_failure();
+		}
+		// At this point last_rotation = Some(now). Drive another 20 failures immediately.
+		let mut second_rotation = false;
+		for _ in 0..20u32 {
+			if throttle::note_global_failure() {
+				second_rotation = true;
+			}
+		}
+		// The cooldown must have suppressed the second rotation.
+		assert!(
+			!second_rotation,
+			"C9: attacker triggered a second OTP rotation within the cooldown window; \
+			 the displayed code was churned away from the legitimate user"
+		);
 	}
 
 	/// A clear() from an approved peer must still reset THAT peer's per-peer

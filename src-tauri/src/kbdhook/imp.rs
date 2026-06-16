@@ -285,7 +285,12 @@ pub(super) fn release_engage(app: &AppHandle) {
 	if ENGAGED.swap(false, Ordering::SeqCst) {
 		tracing::info!("kbd capture RELEASED");
 		confine_to_video(app, false); // free the cursor — local desktop usable again
-		flush_held(&mut globals().lock().unwrap());
+		// Collect flush events under the lock, then drop it BEFORE sending — `fwd`
+		// uses `blocking_send` which PANICS when called from a tokio worker thread
+		// (set_overlay / kbd_capture_stop are async Tauri commands). Use the
+		// non-blocking flush_held_wh + send_flush_events pattern throughout.
+		let (tx, events) = flush_held_wh(&mut globals().lock().unwrap_or_else(|e| e.into_inner()));
+		send_flush_events(tx, events);
 		let _ = app.emit("kbd-released", ());
 	}
 }
@@ -791,15 +796,21 @@ pub fn disable() {
 	// Interception: drop the filter so we stop capturing (frees keys for any other
 	// instance + the local OS).
 	set_capture_filter(false);
-	let tid = {
-		let mut g = globals().lock().unwrap();
-		flush_held(&mut g); // un-stick anything still held on the host
+	let (tid, tx, flush_events) = {
+		let mut g = globals().lock().unwrap_or_else(|e| e.into_inner());
+		// Collect flush events under the lock (non-blocking — flush_held_wh uses
+		// try_send-safe collection). Send them AFTER dropping the guard so that
+		// blocking_send is never attempted from a tokio worker thread (kbd_capture_stop
+		// is an async Tauri command; blocking_send panics when entered() == true and
+		// would also poison the mutex).
+		let (tx, flush_events) = flush_held_wh(&mut g);
 		g.tx = None;
-		g.ctrl_down = false;
-		g.alt_down = false;
-		g.shift_down = false;
-		g.hook_thread_id
+		// ctrl_down/alt_down/shift_down already reset by flush_held_wh above.
+		let tid = g.hook_thread_id;
+		(tid, tx, flush_events)
 	};
+	// Send outside the lock with non-blocking try_send (flush_held_wh collected them).
+	send_flush_events(tx, flush_events);
 	if tid != 0 {
 		unsafe { PostThreadMessageW(tid, WM_QUIT, 0, 0) };
 		THREAD_STARTED.store(false, Ordering::SeqCst);

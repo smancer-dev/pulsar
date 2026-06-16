@@ -52,7 +52,7 @@ export const en: Dict = {
 	'pw.lead':
 		'Enter the one-time password shown on the host — or the host can approve without a password by clicking <b>Allow</b>.',
 	'pw.error': 'Wrong password, try again.',
-	'pw.placeholder': 'e.g. 7yf2-qk',
+	'pw.placeholder': 'e.g. 7yf2-qk9p',
 	'pw.aria': 'Host password',
 	'pw.cancel': 'Cancel',
 	'pw.checking': 'Checking…',

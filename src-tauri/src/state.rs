@@ -104,18 +104,21 @@ pub(crate) struct AppState {
 	/// Synced from the UI's `ui.tray` setting via `set_tray` (tray_disabled = !ui.tray).
 	/// Default `false` (tray enabled) — preserves the existing behavior on first launch.
 	pub(crate) tray_disabled: AtomicBool,
-	/// Linux-only: the ONE resident `pulsar-render` child kept alive between sessions to
-	/// avoid destroying its EGL context. Destroying the EGL context of an embedded `--wid`
+	/// Linux-only: pool of resident `pulsar-render` children kept alive between sessions to
+	/// avoid destroying their EGL contexts. Destroying the EGL context of an embedded `--wid`
 	/// renderer that shares the Mali display with WebKitGTK corrupts WebKit's shared Mali
 	/// GL on RK3588 — the webview stops processing clicks (hover works, nothing clickable)
 	/// with no in-session recovery short of a reboot. The fix: on session end send `hide\n`
 	/// (renderer unmaps its window but keeps EGL alive), park the child here; on the next
-	/// connect take it back, send `show\n` + `reopen <new-sdp>\n` + new caps lines. The
+	/// connect take one back, send `show\n` + `reopen <new-sdp>\n` + new caps lines. The
 	/// GDK container (child GdkWindow) id that owns the renderer's `--wid` is kept so it
 	/// can be re-registered under the new session id without re-creating the X window.
-	/// `None` on every platform except Linux (`#[cfg(…)]` unavailable on struct fields, so
-	/// we use an `Option` that is always `None` on non-Linux builds).
-	pub(crate) resident_render: Mutex<Option<crate::play::ResidentRender>>,
+	/// A Vec instead of Option so multiple concurrent session tabs can each park their OWN
+	/// renderer without evicting the other tab's parked renderer via SIGTERM (which would
+	/// destroy its EGL context and corrupt the shared Mali display — the very wedge the
+	/// resident model exists to prevent). Empty on every platform except Linux (`#[cfg(…)]`
+	/// unavailable on struct fields, so we use a Vec that is always empty on non-Linux builds).
+	pub(crate) resident_render: Mutex<Vec<crate::play::ResidentRender>>,
 }
 
 /// Whether an inbound connection is a remote-desktop or a game-streaming session.
@@ -181,6 +184,23 @@ pub(crate) struct RenderSeed {
 	pub(crate) fit: Option<String>,
 	/// Audio truth: (transmit, mute_host, mic_on) → "audio tx=… mute=… mic=…".
 	pub(crate) audio: Option<(bool, bool, bool)>,
+	/// Stream resolution selection key ("auto"/"1080p"/"1440p"/"4K"). Updated from
+	/// `ov set res <val>` so the exact overlay key is preserved, not a width/height
+	/// pair that would need reverse-mapping. Replayed as `res <val>` on respawn.
+	pub(crate) res: Option<String>,
+	/// FPS selection key ("auto"/"30"/"60"/"120"). Updated from `ov set fps <val>`;
+	/// stored as the overlay string, not the resolved numeric fps. Replayed as `fps <val>`.
+	pub(crate) fps_sel: Option<String>,
+	/// Bitrate in Mbit ("0" = auto). Updated from `ov set bitrate <val>`.
+	/// Replayed as `bitrate <val>` on respawn.
+	pub(crate) bitrate: Option<String>,
+	/// Quality/perf bias ("latency"/"quality"). Updated from `ov set quality <val>`.
+	/// Replayed as `quality <val>` on respawn.
+	pub(crate) quality: Option<String>,
+	/// Active host monitor index (0 = primary). Updated from `ov set display <idx>`.
+	/// Replayed as `display <idx>` on respawn so the Display picker highlights the
+	/// correct monitor on the freshly-spawned renderer.
+	pub(crate) display_idx: Option<u32>,
 }
 
 /// One active outbound remote-play session (one connected-host tab): the local

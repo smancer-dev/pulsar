@@ -355,7 +355,8 @@ async fn respawn_render_for_codec(
 			}
 			// Re-push stdin-only overlay state the fresh process would otherwise
 			// reset to defaults: open-button toggle + position, stats HUD, frame
-			// pacing, view fit and the audio truth line.
+			// pacing, view fit, audio truth, and the stream selections
+			// (res/fps/bitrate/quality/display_idx — C14).
 			let seed = render_seed.lock().unwrap().clone();
 			{
 				use std::io::Write as _;
@@ -383,6 +384,23 @@ async fn respawn_render_for_codec(
 							if mute { 1 } else { 0 },
 							if mic { 1 } else { 0 }
 						);
+					}
+					// Stream selections (C14): replay the user's last overlay picks so the
+					// fresh renderer doesn't revert to its built-in defaults (auto/latency/0).
+					if let Some(res) = seed.res.as_deref() {
+						let _ = writeln!(si, "res {res}");
+					}
+					if let Some(fps) = seed.fps_sel.as_deref() {
+						let _ = writeln!(si, "fps {fps}");
+					}
+					if let Some(bitrate) = seed.bitrate.as_deref() {
+						let _ = writeln!(si, "bitrate {bitrate}");
+					}
+					if let Some(quality) = seed.quality.as_deref() {
+						let _ = writeln!(si, "quality {quality}");
+					}
+					if let Some(idx) = seed.display_idx {
+						let _ = writeln!(si, "display {idx}");
 					}
 					let _ = si.flush();
 				}

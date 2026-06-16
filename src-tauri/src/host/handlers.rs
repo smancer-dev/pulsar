@@ -172,70 +172,6 @@ pub(super) fn spawn_loopback_audio(
 	true
 }
 
-/// Sessions (by sid) currently requesting the host's local output MUTED; mute is
-/// applied while the set is non-empty. GLOBAL ownership, not a per-session flag:
-/// a same-peer reconnect's new session must not be audibly un-muted by the OLD
-/// session's delayed teardown (PEER_TIMEOUT ~6 s after a silent client death) —
-/// and the stale per-session flag would then block re-muting on later re-streams.
-static MUTE_OWNERS: std::sync::LazyLock<Mutex<std::collections::HashSet<u64>>> =
-	std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-
-/// Record `sid`'s mute wish and (un)mute the host's local output when the owner
-/// set flips between empty and non-empty.
-fn set_mute_request(sid: u64, want: bool) {
-	let mut owners = MUTE_OWNERS.lock().unwrap();
-	let was = !owners.is_empty();
-	if want {
-		owners.insert(sid);
-	} else {
-		owners.remove(&sid);
-	}
-	let now = !owners.is_empty();
-	tracing::info!(sid, want, owners = ?owners, "host mute request");
-	if was != now {
-		if let Err(e) = pulsar_core::audio::set_host_muted(now) {
-			tracing::warn!("host mute toggle failed: {e}");
-		}
-	}
-}
-
-/// Teardown hook: drop `sid`'s mute request (un-mutes when it was the last owner).
-pub(super) fn release_mute(sid: u64) {
-	set_mute_request(sid, false);
-}
-
-/// go_online re-run hook: a reconnect aborts the accept loop but the per-session
-/// tasks are independent spawns — one wedged mid-teardown can strand its
-/// MUTE_OWNERS entry and leave the host audio muted forever. A fresh serve loop
-/// has no live sessions yet, so clear the slate and audibly un-mute to a known-good
-/// baseline (owner set empty + the saved-volume sentinel reset inside set_host_muted).
-pub(super) fn reset_mute_all() {
-	let mut owners = MUTE_OWNERS.lock().unwrap();
-	if !owners.is_empty() {
-		owners.clear();
-		drop(owners);
-		if let Err(e) = pulsar_core::audio::set_host_muted(false) {
-			tracing::warn!("host unmute on go_online failed: {e}");
-		}
-	}
-}
-
-/// Startup crash-restore: a PRIOR process that silenced the host output and then
-/// died abnormally (crash / taskkill / tray-quit) never ran its unmute, so the
-/// machine is stuck at volume 0 with the in-memory saved level gone. The mute
-/// backend persists the user's level to a marker file on the true mute transition
-/// and restores it the first time the mute control is touched in a new process;
-/// this hook makes that "first touch" happen at go_online. With the owner set empty
-/// (a fresh serve loop), the unmute call is a harmless no-op for the volume but
-/// triggers the one-time stale-marker recovery. Best-effort.
-pub(super) fn restore_stale_host_mute() {
-	// Triggers the backend's one-time stale-marker restore (mute.rs); a no-op for a
-	// clean previous exit (no marker) and for the volume when nothing is muted.
-	if let Err(e) = pulsar_core::audio::set_host_muted(false) {
-		tracing::warn!("host mute crash-restore probe failed: {e}");
-	}
-}
-
 // ---- Host-silent via Sunshine-style default-render-endpoint REDIRECTION ----
 //
 // The host-silent intent (`req.mute_host`) is satisfied by REDIRECTING the default
@@ -279,8 +215,8 @@ fn locate_virtual_sink() -> Result<Option<pulsar_core::audio::SinkDevice>, Strin
 }
 
 /// Sessions (by sid) currently requesting the host be SILENT (their `mute_host`
-/// intent). GLOBAL ownership like `MUTE_OWNERS` so a same-peer reconnect's delayed
-/// teardown can't strand the redirect. Paired with `REDIRECT_GUARD`.
+/// intent). GLOBAL ownership so a same-peer reconnect's delayed teardown can't
+/// strand the redirect. Paired with `REDIRECT_GUARD`.
 #[cfg(windows)]
 static REDIRECT_OWNERS: std::sync::LazyLock<Mutex<std::collections::HashSet<u64>>> =
 	std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
@@ -682,7 +618,7 @@ fn unix_mute_fallback(mute: bool) {
 }
 
 /// Teardown hook: drop `sid`'s host-silent request (restores the default render
-/// endpoint when it was the last owner). Paired with `release_mute`.
+/// endpoint when it was the last owner).
 #[cfg(windows)]
 pub(super) fn release_redirect(sid: u64) {
 	// Layout is irrelevant on the release path (no format set, no redirect) — pass the
@@ -700,8 +636,7 @@ pub(super) fn release_redirect(sid: u64) {
 }
 
 /// go_online re-run hook: a fresh serve loop has no live sessions, so clear any
-/// stranded redirect owners and restore the host to a known-good default (mirrors
-/// `reset_mute_all`).
+/// stranded redirect owners and restore the host to a known-good default.
 #[cfg(windows)]
 pub(super) fn reset_redirect_all() {
 	let mut owners = REDIRECT_OWNERS.lock().unwrap();
@@ -1817,6 +1752,19 @@ pub(super) fn make_on_stream(
 				pipeline::VCodec::H265 => pulsar_capture::Codec::H265,
 				pipeline::VCodec::Av1 => pulsar_capture::Codec::Av1,
 			};
+			// Clamp the client-requested monitor index to the current attached-output count.
+			// A stale client picker (built from an earlier QueryStreamCaps) may send an index
+			// that no longer exists after a hot-unplug, and find_output's silent fallback to
+			// output 0 would leave cur_out_t / current_output() reporting the stale index while
+			// actually streaming output 0 — desyncing video and absolute-pointer input (C8).
+			// Clamping here is a cheap early guard; find_output's own actual_idx tracking in
+			// device.rs is the definitive fix for the case where an unplug happens mid-session.
+			let display_count = pulsar_capture::list_displays().len() as u32;
+			let clamped_display_idx = if display_count > 0 {
+				req.display_idx.min(display_count - 1)
+			} else {
+				0
+			};
 			match pulsar_capture::start_capture_encode(pulsar_capture::CaptureConfig {
 				width: eff_w,
 				height: eff_h,
@@ -1825,18 +1773,21 @@ pub(super) fn make_on_stream(
 				dest: format!("rtp://{vdest}"),
 				codec: ncodec,
 				// Client-selected host monitor (session menu); DXGI maps this index 1:1
-				// to the attached-output list `StreamCaps::displays` was built from. An
-				// out-of-range index falls back to the first output inside find_output.
-				output_idx: req.display_idx,
+				// to the attached-output list `StreamCaps::displays` was built from.
+				// Clamped above against the live display count so an out-of-range index
+				// (stale client picker after a hot-unplug) is corrected before it reaches
+				// find_output and causes a silent fallback + input-mapping desync (C8).
+				output_idx: clamped_display_idx,
 				low_latency: plan.low_latency,
 				draw_mouse: true,
 			}) {
 				Ok(h) => {
-					// Publish the confirmed capture monitor for the input path. In the slow path
-					// start_capture_encode initialises the thread on req.display_idx, so this is
-					// the confirmed output (the thread writes current_output=req.display_idx on its
-					// first build). Use req.display_idx directly here — we know init succeeded. (C1)
-					cur_display.store(req.display_idx, std::sync::atomic::Ordering::Relaxed);
+					// Publish the confirmed capture monitor for the input path. Use
+					// h.current_output() rather than clamped_display_idx: the thread writes
+					// current_output() from the actual_idx returned by find_output (which may
+					// differ from clamped_display_idx if a second unplug happened between our
+					// clamp above and the thread's first build). This is the confirmed real idx.
+					cur_display.store(h.current_output(), std::sync::atomic::Ordering::Relaxed);
 					// Expose the handle's current_output Arc to on_input so the input closure can
 					// track the LIVE confirmed output without locking native_slot per event (C4).
 					// The atom is written by the capture thread after every build (including reverts),
@@ -1863,6 +1814,17 @@ pub(super) fn make_on_stream(
 		#[cfg(windows)]
 		{
 			last_native_req = if native_started { Some(req.clone()) } else { None };
+		}
+		// C19: When the native path was NOT taken (native_started=false) the ffmpeg fallback
+		// always captures the PRIMARY monitor (gdigrab/ddagrab via StreamPlan has no output_idx).
+		// native_out_arc was already cleared above so on_input falls back to cur_display — but
+		// cur_display still holds the previously-confirmed native monitor index (e.g. monitor B
+		// from a prior native session), causing absolute-pointer events to be mapped onto the wrong
+		// screen for the rest of the session. Reset cur_display to 0 (primary) so the input
+		// mapping matches what is actually being streamed.
+		#[cfg(windows)]
+		if !native_started {
+			cur_display.store(0, std::sync::atomic::Ordering::Relaxed);
 		}
 
 		// Encode summary (codec · encoder · res · fps · bitrate target) — the base the
@@ -2258,9 +2220,20 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 			};
 			if overflow {
 				// Peer is overshooting the sane transfer ceiling — drop the whole
-				// transfer (further chunks for this id find no entry → ignored, a
-				// later FileEnd is a no-op) so the buffer can't grow unbounded.
-				xfers.remove(&id);
+				// transfer so the buffer can't grow unbounded. Emit file-recv{ok:false}
+				// BEFORE removing so the client learns the transfer was rejected rather
+				// than silently showing 'gönderildi' for a file the host never saved.
+				if let Some(r) = xfers.remove(&id) {
+					let _ = app_h.emit(
+						"file-recv",
+						FilePayload {
+							peer: peer.clone(),
+							name: r.name.clone(),
+							bytes: 0,
+							ok: false,
+						},
+					);
+				}
 			}
 		}
 		DataMsg::FileEnd { id } => {

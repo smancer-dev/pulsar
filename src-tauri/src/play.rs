@@ -104,8 +104,16 @@ async fn teardown_partial(
 	children: Vec<Option<Child>>,
 ) {
 	view.stop();
-	for mut c in children.into_iter().flatten() {
-		stop_render_child(&mut c);
+	// Offload SIGTERM-grace polls to blocking threads so this async fn never parks a
+	// Tokio worker for up to ~600 ms × N children (matches the discipline in stop_stream
+	// and session_cmds; see `stop_render_child_blocking`).
+	let handles: Vec<_> = children
+		.into_iter()
+		.flatten()
+		.map(stop_render_child_blocking)
+		.collect();
+	for h in handles {
+		let _ = h.await;
 	}
 	#[cfg(all(unix, not(target_os = "macos")))]
 	{
@@ -135,6 +143,7 @@ pub(crate) async fn start_remote_play(
 	encoder: String,
 	gamepad: bool,
 	game_mode: bool,
+	quality: Option<String>,
 ) -> Result<PlayInfo, String> {
 	let node = state
 		.node
@@ -462,9 +471,11 @@ pub(crate) async fn start_remote_play(
 							// child. Spawning a new one would destroy-and-recreate the EGL context
 							// (the old child's eglDestroyContext fires when the process exits), which
 							// on RK3588 corrupts WebKitGTK's shared Mali GL (wedges click input).
-							// Reuse: take the child from AppState, re-register its GDK container
+							// Reuse: take one child from the pool, re-register its GDK container
 							// under the new session id, send `show` + `reopen <new-sdp>` + new caps.
-							let resident = state.resident_render.lock().unwrap().take();
+							// The pool may hold several parked renderers when multiple concurrent tabs
+							// ended — pop the first entry (LIFO is fine; all are equivalent).
+							let resident = state.resident_render.lock().unwrap().pop();
 							// Shared session id for the reader thread: when reusing the resident,
 							// update this Arc so the existing reader tags events with the new id;
 							// when spawning fresh, pass it to start_render_reader so the new reader
@@ -813,7 +824,7 @@ pub(crate) async fn start_remote_play(
 					let live_id = render_live_id.clone().unwrap_or_else(|| {
 						std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
 					});
-					*state.resident_render.lock().unwrap() = Some(ResidentRender {
+					state.resident_render.lock().unwrap().push(ResidentRender {
 						child,
 						stdin: overlay_stdin.clone(),
 						container_id: id,
@@ -844,6 +855,15 @@ pub(crate) async fn start_remote_play(
 	// HDR: read from the UI setting persisted in stream_cfg. The PULSAR_HDR env var is a
 	// debug override that wins if set. The UI value is the normal production path.
 	let req_hdr = state.stream_cfg.lock().unwrap().hdr || std::env::var_os("PULSAR_HDR").is_some();
+	// Quality bias from the Settings → Display 'Varsayılan kalite' control (ui.quality).
+	// "hq" → Quality, "fast" → Latency; "auto" (or absent) defers to the mode-natural default
+	// (game=Latency, remote=Quality). Also seeded into hold_session so re-requests (adaptive
+	// bitrate steps + session-menu changes) preserve the user's chosen bias.
+	let req_quality = match quality.as_deref() {
+		Some("hq") => QualityPref::Quality,
+		Some("fast") => QualityPref::Latency,
+		_ => if game_mode { QualityPref::Latency } else { QualityPref::Quality },
+	};
 	// Linux/Pi native renderer caps. mpv 0.34 here decodes with rkmpp but the gpu VO has
 	// no DRM_PRIME→EGL interop on this build, so every frame is HW-DOWNLOADED (GPU→CPU)
 	// and re-uploaded for Panfrost GL — far too slow to drain a 1440p60 high-bitrate
@@ -916,13 +936,9 @@ pub(crate) async fn start_remote_play(
 		transmit_audio: true,
 		mute_host: game_mode,
 		game_mode,
-		// 0 = host default; quality defers to game_mode-natural bias until the menu changes it.
+		// 0 = host default; quality: "hq"→Quality, "fast"→Latency, "auto"/missing→mode-derived default.
 		bitrate_kbps: req_kbps,
-		quality: if game_mode {
-			QualityPref::Latency
-		} else {
-			QualityPref::Quality
-		},
+		quality: req_quality,
 		hdr: req_hdr,
 		yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
 		// PRUNED set (host-encoder-aware), not raw `client_codecs`: the host clamps its
@@ -962,7 +978,7 @@ pub(crate) async fn start_remote_play(
 				let live_id = render_live_id.clone().unwrap_or_else(|| {
 					std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id))
 				});
-				*state.resident_render.lock().unwrap() = Some(ResidentRender {
+				state.resident_render.lock().unwrap().push(ResidentRender {
 					child,
 					stdin: overlay_stdin.clone(),
 					container_id: id,
@@ -1108,6 +1124,7 @@ pub(crate) async fn start_remote_play(
 		req_kbps,
 		req.cursor_external,
 		req_hdr,
+		req_quality,
 	));
 
 	let audio_is_native = audio_native.is_some();
@@ -1300,19 +1317,17 @@ pub(crate) async fn stop_stream(
 					let _ = writeln!(si, "hide");
 					let _ = si.flush();
 				}
-				// Park in AppState. Any previously parked resident (shouldn't exist — only one
-				// session at a time — but if somehow present) is killed now via stop_render_child
-				// to avoid a double-park.
-				if let Some(old) = state.resident_render.lock().unwrap().take() {
-					tracing::warn!(pid = old.child.id(), "evicting stale resident renderer before parking new one");
-					stop_render_child_blocking(old.child);
-				}
-				// Take the live_id Arc from the session so the reader can be updated on reconnect.
+				// Park in AppState pool. Do NOT evict any already-parked resident: with
+				// multiple concurrent session tabs each tab parks its OWN renderer, and
+				// evicting another tab's renderer via SIGTERM/SIGKILL destroys its EGL
+				// context on the shared Mali display — the exact wedge the resident model
+				// exists to prevent. Push to the Vec so all parked renderers survive until
+				// the next reconnect (or app exit, when the OS reclaims them).
 				let live_id = play
 					.render_live_id
 					.clone()
 					.unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(id)));
-				*state.resident_render.lock().unwrap() = Some(ResidentRender {
+				state.resident_render.lock().unwrap().push(ResidentRender {
 					child,
 					stdin: play.render_stdin.clone(),
 					container_id: id,
