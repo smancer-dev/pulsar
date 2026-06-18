@@ -3,11 +3,11 @@
 //! Steam/folder scanning, host-side prep commands, and the password helpers.
 
 use pulsar_core::config::Config;
-use pulsar_core::input::ControllerHub;
+// Controller reading + rumble are via crate::controllers (SDL3) now, not gilrs.
 use pulsar_core::pipeline::HwEncoder;
 use pulsar_core::service::{gen_password, request_games, request_launch, GameInfo};
 use pulsar_core::Transport;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::events::{AutoConnect, ConnInfo, ControllerInfo, LanDevice, ScannedApp};
 #[cfg(windows)]
@@ -410,20 +410,23 @@ pub(crate) async fn lan_devices(state: State<'_, AppState>) -> Result<Vec<LanDev
 pub(crate) async fn controllers() -> Result<Vec<ControllerInfo>, String> {
 	// gilrs enumeration touches the OS gamepad subsystem and can block briefly; run
 	// it off the async runtime so it doesn't stall a tokio worker.
-	let list = tokio::task::spawn_blocking(|| match ControllerHub::new() {
-		Ok(mut hub) => hub
-			.list()
-			.into_iter()
-			.map(|c| ControllerInfo {
-				index: c.index,
-				uuid: c.uuid,
-				name: c.name,
-				kind: format!("{:?}", c.kind),
-				label: c.kind.label().to_string(),
-				connected: c.connected,
+	let list = tokio::task::spawn_blocking(|| {
+		crate::controllers::manager()
+			.map(|m| {
+				m.snapshot()
+					.into_iter()
+					.enumerate()
+					.map(|(i, p)| ControllerInfo {
+						index: i as u32,
+						uuid: p.uuid,
+						name: p.name,
+						kind: format!("{:?}", p.kind),
+						label: p.kind.label().to_string(),
+						connected: true,
+					})
+					.collect()
 			})
-			.collect(),
-		Err(_) => Vec::new(),
+			.unwrap_or_default()
 	})
 	.await
 	.unwrap_or_default();
@@ -599,6 +602,95 @@ pub(crate) fn set_tray(state: State<'_, AppState>, enabled: bool) {
 	state
 		.tray_disabled
 		.store(!enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Enable/disable this device's HOST role from the UI. `serving = false` (set when the
+/// app enters gaming mode — a pure-client personality) makes the host serve loop reject
+/// every inbound connection at auth time, before any Allow/Deny popup, so nobody can
+/// connect to this machine. Registration with the relay is untouched, so outbound
+/// connects still work. Default (never called) = serving, matching `hosting_disabled`'s
+/// `false` zero-value.
+#[tauri::command]
+pub(crate) fn set_host_serving(state: State<'_, AppState>, serving: bool) {
+	state
+		.hosting_disabled
+		.store(!serving, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A controller-navigation snapshot emitted to the gaming-mode UI. Booleans (not raw
+/// axes) so the webview needs no knowledge of gilrs/SDL conventions: `up/down/left/right`
+/// fold the D-pad AND the left stick; `a/b/x` are the face buttons (A=select, B=back,
+/// X=delete); `lb/rb` are the bumpers (section jump).
+#[derive(serde::Serialize, PartialEq, Clone, Default, Debug)]
+struct NavInput {
+	up: bool,
+	down: bool,
+	left: bool,
+	right: bool,
+	a: bool,
+	b: bool,
+	x: bool,
+	lb: bool,
+	rb: bool,
+}
+
+/// Start the gilrs→webview controller-nav bridge. Reads the first connected pad on a
+/// dedicated OS thread (gilrs isn't Send/async — same model as the in-session reader in
+/// `play.rs`) and emits `gamepad-nav` events. This is the menu-nav input path: on Linux
+/// the webview Gamepad API is absent (WebKitGTK has no libmanette), and gilrs gives clean
+/// SDL-mapped input everywhere. Idempotent — a second call while running is a no-op.
+#[tauri::command]
+pub(crate) fn gamepad_nav_start(app: AppHandle, state: State<'_, AppState>) {
+	use std::sync::atomic::Ordering;
+	if state.nav_gamepad_on.swap(true, Ordering::SeqCst) {
+		return; // already running
+	}
+	let flag = state.nav_gamepad_on.clone();
+	std::thread::spawn(move || {
+		let Some(mgr) = crate::controllers::manager() else {
+			flag.store(false, Ordering::SeqCst);
+			return;
+		};
+		use pulsar_core::input::button;
+		const T: i16 = 16_000; // ~0.5 stick deflection
+		let mut prev: Option<NavInput> = None;
+		let mut beat: u32 = 0;
+		while flag.load(Ordering::SeqCst) {
+			// Mimic the old (kind, state) snapshot shape so the nav mapping below is unchanged.
+			let pads: Vec<(pulsar_core::input::GamepadKind, pulsar_core::input::GamepadState)> =
+				mgr.snapshot().into_iter().map(|p| (p.kind, p.state)).collect();
+			// `left_y` is up-positive (see input/hub.rs), so up = positive deflection.
+			let nav = pads
+				.first()
+				.map(|(_, st)| NavInput {
+					up: st.is_pressed(button::DPAD_UP) || st.left_y > T,
+					down: st.is_pressed(button::DPAD_DOWN) || st.left_y < -T,
+					left: st.is_pressed(button::DPAD_LEFT) || st.left_x < -T,
+					right: st.is_pressed(button::DPAD_RIGHT) || st.left_x > T,
+					a: st.is_pressed(button::A),
+					b: st.is_pressed(button::B),
+					x: st.is_pressed(button::X),
+					lb: st.is_pressed(button::LB),
+					rb: st.is_pressed(button::RB),
+				})
+				.unwrap_or_default();
+			// Emit on change, plus a ~4 Hz heartbeat so a late subscriber still syncs.
+			beat = beat.wrapping_add(1);
+			if prev.as_ref() != Some(&nav) || beat % 16 == 0 {
+				let _ = app.emit("gamepad-nav", &nav);
+				prev = Some(nav);
+			}
+			std::thread::sleep(std::time::Duration::from_millis(16));
+		}
+	});
+}
+
+/// Stop the gilrs→webview controller-nav bridge (the reader thread exits on the next tick).
+#[tauri::command]
+pub(crate) fn gamepad_nav_stop(state: State<'_, AppState>) {
+	state
+		.nav_gamepad_on
+		.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Persist the controller slot permutation from the UI. `order[n]` is the gilrs uuid

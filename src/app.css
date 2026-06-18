@@ -72,6 +72,16 @@
 	--accent-soft-2: oklch(0.4 0.1 215);
 }
 
+/* Controller / keyboard roving focus (gaming mode). `gamepadNav` toggles the
+   `data-navfocus` attribute on the focused widget; this draws the cyan focus ring.
+   Defined globally (one source) because the attribute is set at runtime — a
+   component-scoped selector would be pruned as "unused" and the ring would vanish. */
+[data-navfocus] {
+	outline: none !important;
+	box-shadow: 0 0 0 3px var(--accent-ring) !important;
+	border-color: var(--accent) !important;
+}
+
 :root[data-theme='dark'] {
 	--bg: oklch(0.17 0.012 265);
 	--bg-tint: oklch(0.2 0.015 265);

@@ -104,6 +104,18 @@ pub(crate) struct AppState {
 	/// Synced from the UI's `ui.tray` setting via `set_tray` (tray_disabled = !ui.tray).
 	/// Default `false` (tray enabled) — preserves the existing behavior on first launch.
 	pub(crate) tray_disabled: AtomicBool,
+	/// While `true`, a background thread reads the first connected controller via gilrs
+	/// and emits `gamepad-nav` events so the gaming-mode UI can be navigated with a pad.
+	/// This is the ONLY menu-nav input path on Linux (WebKitGTK ships without libmanette,
+	/// so the webview Gamepad API is absent), and the preferred one everywhere (gilrs gives
+	/// clean SDL-mapped buttons + D-pad). Toggled by `gamepad_nav_start` / `_stop`.
+	pub(crate) nav_gamepad_on: Arc<AtomicBool>,
+	/// When `true` this device REFUSES to act as a host: every inbound connection is
+	/// rejected at auth time, before any Allow/Deny popup. Set by `set_host_serving`
+	/// (the UI flips it on whenever the app enters gaming mode — a pure-client
+	/// personality where nobody may connect to this machine). Inverted sense so the
+	/// `#[derive(Default)]` zero (`false` = hosting ENABLED) is the safe, normal state.
+	pub(crate) hosting_disabled: AtomicBool,
 	/// Persisted controller slot permutation: `order[n]` is the gilrs uuid hex of the
 	/// pad assigned to player-slot `n`. Written by `set_controller_order` (from the UI);
 	/// cloned and read each tick by the play.rs gilrs reader (T6) so reorders apply live
@@ -136,7 +148,7 @@ pub(crate) struct AppState {
 
 /// Whether an inbound connection is a remote-desktop or a game-streaming session.
 /// Set from `StreamReq.game_mode` once the client requests its stream.
-#[derive(Clone, Copy, PartialEq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ConnMode {
 	Remote,

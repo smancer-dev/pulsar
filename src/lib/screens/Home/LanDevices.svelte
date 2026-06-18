@@ -6,10 +6,9 @@
 
 	type Target = { name: string; id: string };
 	type Props = {
-		mode: 'remote' | 'game';
 		onConnect: (t: Target, m?: 'remote' | 'game', gameId?: string) => void;
 	};
-	let { mode, onConnect }: Props = $props();
+	let { onConnect }: Props = $props();
 
 	// LAN auto-discovery: poll the core for Pulsar devices announcing on this
 	// network (the multicast beacon). Works even offline (relay-less).
@@ -60,7 +59,7 @@
 					</div>
 					{#if d.has_id}
 						<div class="lactions">
-							<button class="btn btn-primary lbtn" onclick={() => onConnect({ name: d.name, id: d.id }, mode)}>
+							<button class="btn btn-primary lbtn" onclick={() => onConnect({ name: d.name, id: d.id })}>
 								{t('home.connect')}
 							</button>
 							<!-- Already in the address book → nothing at all (no Save button). -->

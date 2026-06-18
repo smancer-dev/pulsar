@@ -55,6 +55,11 @@ export interface UiSettings {
 	/** Feature 2 Piece B: treat the DS4/DS5 touchpad as a relative mouse (pointer
 	 * moves + left-click). Default true. */
 	touchpadAsMouse: boolean;
+	/** App-level personality (persisted): 'remote' = the general remote-desktop app
+	 * (left sidebar, host capability); 'game' = the controller-first game-streaming
+	 * shell (bottom dock, centered ID + numpad, no hosting). Toggled from the top bar;
+	 * the CLI `--mode game` overrides it on launch. Default 'remote'. */
+	appMode: 'remote' | 'game';
 }
 
 export const CODECS: { value: VideoCodec; label: string }[] = [
@@ -116,7 +121,8 @@ const DEFAULTS: UiSettings = {
 	forwardControllers: true,
 	controllerOrder: [],
 	controllerEmulation: {},
-	touchpadAsMouse: true
+	touchpadAsMouse: true,
+	appMode: 'remote'
 };
 
 const KEY = 'pulsar.ui.v1';

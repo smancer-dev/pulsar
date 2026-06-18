@@ -37,6 +37,11 @@ mod process;
 mod render;
 #[cfg(any(unix, target_os = "windows"))]
 mod render_stats;
+// Client-side controller subsystem on SDL3 (sdl3-sys FFI) — ONE process-global SDL
+// gamepad context that reads input (→ host) AND actuates rumble (SDL's HID drivers,
+// working where the evdev node has no EV_FF: BT DualSense, RK3588). Replaces gilrs;
+// see controllers.rs.
+mod controllers;
 mod session_cmds;
 mod state;
 mod util;
@@ -57,8 +62,8 @@ use commands::{
 	lan_devices, launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password,
 	node_port, publish_games,
 	relaunch_to_home, run_command, scan_folder, self_update_possible, session_password, set_config,
-	set_controller_emulation, set_controller_order, set_language, set_stream_settings, set_tray,
-	steam_path,
+	gamepad_nav_start, gamepad_nav_stop, set_controller_emulation, set_controller_order,
+	set_host_serving, set_language, set_stream_settings, set_tray, steam_path,
 };
 use connections::{list_connections, set_view_only, show_connections};
 use files_window::open_files_window;
@@ -222,6 +227,34 @@ fn acquire_single_instance() -> bool {
 		let _ = LOCK_FD.set(-1);
 		false
 	}
+}
+
+/// Diagnostic (`PULSAR_RUMBLE_TEST=1 pulsar`): exercise the SDL3 client rumble path in
+/// isolation — no host session. Brings up the SDL gamepad subsystem, opens any attached
+/// pad, then rumbles slot 0 at full for ~1.2 s and stops, logging each step (subsystem
+/// up, opened pad + GUID, `SDL_RumbleGamepad` ok). Lets the HID rumble path be verified
+/// on a target without a host/game; exits when done. No-op in normal runs.
+pub fn rumble_selftest() {
+	tracing_subscriber::fmt()
+		.with_env_filter(
+			tracing_subscriber::EnvFilter::try_from_default_env()
+				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+		)
+		.init();
+	tracing::info!("rumble self-test: bringing up SDL3 controller subsystem");
+	let Some(sdl) = controllers::manager() else {
+		tracing::error!("rumble self-test: SDL gamepad subsystem failed to start");
+		return;
+	};
+	// Give SDL a moment to enumerate + open any attached pads (it logs each open).
+	std::thread::sleep(std::time::Duration::from_millis(1500));
+	tracing::info!("rumble self-test: FULL rumble → slot 0 for 1.2 s (feel the pad now)");
+	sdl.rumble(None, 0, 255, 255);
+	std::thread::sleep(std::time::Duration::from_millis(1200));
+	tracing::info!("rumble self-test: stop");
+	sdl.rumble(None, 0, 0, 0);
+	std::thread::sleep(std::time::Duration::from_millis(400));
+	tracing::info!("rumble self-test: done");
 }
 
 pub fn run() {
@@ -489,6 +522,9 @@ pub fn run() {
 			list_audio_sources,
 			set_stream_settings,
 			set_tray,
+			set_host_serving,
+			gamepad_nav_start,
+			gamepad_nav_stop,
 			start_remote_play,
 			stop_stream,
 			set_play_resolution,

@@ -253,7 +253,12 @@ export class SessionManager {
 				hostDisplays: info.host_displays ?? []
 			});
 			setTimeout(() => this.#activateByPlayId(pid), 10_000);
-			recordConnection(target.id, target.name, useMode === 'game' ? 'console' : 'pc');
+			recordConnection(
+				target.id,
+				target.name,
+				useMode === 'game' ? 'console' : 'pc',
+				useMode === 'game' ? 'game' : 'remote'
+			);
 		} catch (e) {
 			this.connectErr = friendlyConnectError(e instanceof Error ? e.message : String(e));
 			this.removeTab(tabId);

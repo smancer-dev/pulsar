@@ -274,10 +274,8 @@ pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16, channels: u16) -> Op
 	// audio stays in sync with the ultra-low-latency video. 40 ms ≈ Moonlight's SDL queue
 	// (~30–50 ms); measured ~25–45 ms end-to-end on the sink-input. Env-tunable via
 	// PULSAR_AUDIO_BUFMS (raise if it crackles on a jittery link, lower for even less lag).
-	let bufms = std::env::var("PULSAR_AUDIO_BUFMS")
-		.ok()
-		.filter(|s| s.parse::<u32>().is_ok())
-		.unwrap_or_else(|| "60".into());
+	// (Old PulseAudio output-buffer cap removed — the SDL3 player below bounds latency by
+	// dropping, not buffering. Tunable via PULSAR_AUDIO_CAPMS, read in spawn_sdl_audio_player.)
 	// Build the player command for a given ffmpeg binary (shared by the bundled path and
 	// the system-`ffmpeg` fallback, so the two can never drift). ffmpeg reads the Opus RTP
 	// (forwarded to this loopback port) and plays it to PulseAudio.
@@ -310,35 +308,136 @@ pub fn spawn_native_audio(ffmpeg: &str, loopback_port: u16, channels: u16) -> Op
 			"0",
 			"-reorder_queue_size",
 			"0",
+			// Low-latency input probe (the HOST encoder + the video player both set these;
+			// the audio player was missing them, so ffmpeg ran its default analyze/probe on
+			// the RTP/Opus stream — reading + holding input before emitting, a fixed lag
+			// behind the video). The SDP already declares opus/48000, so 0 probe is safe.
+			"-probesize",
+			"32",
+			"-analyzeduration",
+			"0",
 			"-i",
 		])
 		.arg(&path)
-		.args([
-			"-f",
-			"pulse",
-			// NB: no `-ac` here — the decoder's native channel count is passed straight to
-			// PulseAudio (forcing stereo would fold 5.1/7.1 down to 2ch).
-			"-buffer_duration",
-			bufms.as_str(),
-			"-prebuf",
-			"0",
-			"default",
-		]);
+		// Adaptively resample to keep playback locked to the stream clock: absorbs host↔Pi
+		// clock drift + small jitter by micro-stretching instead of letting the PulseAudio
+		// buffer underrun (measured swinging to 0). Steady sync, no fixed added latency;
+		// preserves channel count (no surround downmix).
+		// DECODE ONLY → raw interleaved f32 PCM on stdout. NO `-f pulse`: the Rust SDL3
+		// consumer (spawn_sdl_audio_player) owns playback + a Moonlight-style drop bound, so
+		// the buffer can't accumulate on host/sink clock drift the way the never-dropping
+		// pulse sink did (it grew to ~300 ms over minutes). `-ac {channels}` makes the pipe
+		// deterministic; the host clamps the stream to <= the negotiated count, so this never
+		// downmixes (only pads silent channels if the endpoint had fewer).
+		.args(["-ac", &channels.to_string(), "-ar", "48000", "-f", "f32le", "pipe:1"]);
 		cmd.stdin(std::process::Stdio::null());
-		cmd.stdout(std::process::Stdio::null());
+		cmd.stdout(std::process::Stdio::piped()); // decoded PCM → SDL3 player thread
 		cmd.stderr(std::process::Stdio::null());
 		die_with_parent(&mut cmd);
 		cmd
 	};
-	match build(ffmpeg).spawn() {
-		Ok(child) => Some(child),
-		// The bundled ffmpeg can be missing/unrunnable (e.g. a wrong-arch copy landed in
-		// resources/, or a build without libpulse) — that left remote audio silently dead.
-		// Fall back to a system `ffmpeg` on PATH, which on a Linux client is the distro build
-		// (carries libpulse + the Opus decoder). Better degraded-via-system than no audio.
-		Err(_) if ffmpeg != "ffmpeg" => build("ffmpeg").spawn().ok(),
-		Err(_) => None,
+	let mut child = match build(ffmpeg).spawn() {
+		Ok(c) => c,
+		// Bundled ffmpeg missing/unrunnable → fall back to a system ffmpeg on PATH (the
+		// distro build, with the Opus decoder). Better degraded-via-system than no audio.
+		Err(_) if ffmpeg != "ffmpeg" => build("ffmpeg").spawn().ok()?,
+		Err(_) => return None,
+	};
+	// Hand ffmpeg's decoded PCM (stdout) to the SDL3 player thread — it owns playback + the
+	// Moonlight-style bounded-queue drop. No stdout → the child is useless; kill it.
+	match child.stdout.take() {
+		Some(out) => spawn_sdl_audio_player(out, channels),
+		None => {
+			let _ = child.kill();
+			return None;
+		}
 	}
+	Some(child)
+}
+
+/// The Linux client's **SDL3 audio player** — the Moonlight model. Reads raw f32 PCM from the
+/// decode-only ffmpeg's stdout and feeds SDL's default playback device, but DROPS a chunk
+/// whenever more than `PULSAR_AUDIO_CAPMS` ms (default 50) is already queued. That hard cap is
+/// exactly what the old `ffmpeg -f pulse` sink lacked: it never dropped, so host-vs-Pi-sink
+/// clock drift integrated into the PulseAudio buffer and audio crept ~300 ms behind the video
+/// over a few minutes. Dropping (instead of buffering) keeps latency bounded forever, like
+/// Moonlight's `sdlaud.cpp` (drop when pending >30 ms, cap the device queue ≤50 ms). We keep
+/// draining the pipe even while dropping, so ffmpeg keeps decoding in real time. The thread
+/// ends when ffmpeg dies (stdout EOF). SDL3 is already linked (sdl3-sys) + inited for gamepads;
+/// AUDIO is an independent subsystem, safe to init off the main thread.
+#[cfg(target_os = "linux")]
+fn spawn_sdl_audio_player(mut out: std::process::ChildStdout, channels: u16) {
+	use sdl3_sys::audio::{
+		SDL_AudioSpec, SDL_ClearAudioStream, SDL_DestroyAudioStream, SDL_GetAudioStreamQueued,
+		SDL_OpenAudioDeviceStream, SDL_PutAudioStreamData, SDL_ResumeAudioStreamDevice,
+		SDL_SetAudioStreamFrequencyRatio, SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_F32,
+	};
+	use sdl3_sys::init::{SDL_InitSubSystem, SDL_QuitSubSystem, SDL_INIT_AUDIO};
+	use std::io::Read;
+	let ch = channels.max(1) as i32;
+	let _ = std::thread::Builder::new()
+		.name("sdl-audio".into())
+		.spawn(move || unsafe {
+			if !SDL_InitSubSystem(SDL_INIT_AUDIO) {
+				tracing::warn!("audio: SDL_InitSubSystem(AUDIO) failed — no client audio");
+				return;
+			}
+			let spec = SDL_AudioSpec { format: SDL_AUDIO_F32, channels: ch, freq: 48_000 };
+			let stream = SDL_OpenAudioDeviceStream(
+				SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+				&spec,
+				None,
+				std::ptr::null_mut(),
+			);
+			if stream.is_null() {
+				tracing::warn!("audio: SDL_OpenAudioDeviceStream failed — no client audio");
+				SDL_QuitSubSystem(SDL_INIT_AUDIO);
+				return;
+			}
+			SDL_ResumeAudioStreamDevice(stream); // the device opens paused
+			let target_ms: usize = std::env::var("PULSAR_AUDIO_TARGETMS")
+				.ok()
+				.and_then(|s| s.parse().ok())
+				.unwrap_or(30);
+			tracing::info!(channels = ch, target_ms, "audio: SDL3 player up (drift-resampled, click-free)");
+			let bytes_per_ms = 48 * ch as usize * 4; // f32 @ 48 kHz
+			let target_bytes = (bytes_per_ms * target_ms) as i32;
+			// Hard-resync ceiling: a startup burst or a long stall can jump the queue far past
+			// target; above this we flush once (one click) rather than slow-draining for seconds.
+			// Steady drift never reaches it — the rate nudge holds the queue near target.
+			let high_bytes = (bytes_per_ms * 120) as i32;
+			// FRAME-ALIGNED chunks (read_exact on a buffer that is a whole number of frames):
+			// dropping/pushing must never split an interleaved frame, or the L/R alignment
+			// shifts permanently and audio turns to garbage after the first drop.
+			let mut buf = vec![0u8; bytes_per_ms * 10]; // exactly 10 ms = 480 frames
+			loop {
+				if out.read_exact(&mut buf).is_err() {
+					break; // ffmpeg gone (EOF) / pipe error → teardown
+				}
+				// Push EVERY (frame-aligned) chunk — never drop (drops = audible clicks). Then
+				// absorb host/sink clock drift by NUDGING the playback rate so the queued depth
+				// holds near target: ratio > 1 plays slightly faster (drains the queue), < 1
+				// slower (lets it fill). Steady drift keeps the ratio within a fraction of a
+				// percent (inaudible); only a big overrun (startup/stall) hard-resets.
+				SDL_PutAudioStreamData(
+					stream,
+					buf.as_ptr() as *const std::ffi::c_void,
+					buf.len() as i32,
+				);
+				let q = SDL_GetAudioStreamQueued(stream);
+				if q > high_bytes {
+					SDL_ClearAudioStream(stream);
+					SDL_SetAudioStreamFrequencyRatio(stream, 1.0);
+				} else {
+					let err = (q - target_bytes) as f32 / target_bytes as f32;
+					let ratio = (1.0 + 0.5 * err).clamp(0.97, 1.03);
+					SDL_SetAudioStreamFrequencyRatio(stream, ratio);
+				}
+			}
+			SDL_DestroyAudioStream(stream);
+			SDL_QuitSubSystem(SDL_INIT_AUDIO);
+			tracing::info!("audio: SDL3 player stopped");
+		});
 }
 
 /// Spawn **mpv** to render the SDP/RTP stream on Linux/macOS with hardware decode and

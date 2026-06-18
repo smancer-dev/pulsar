@@ -250,5 +250,14 @@ export const api = {
 	micStop: (id: number) => invoke<void>('mic_stop', { id }),
 	/** Sync the "run in system tray" preference to the backend so the CloseRequested
 	 * handler knows whether to hide-to-tray (enabled=true) or quit (enabled=false). */
-	setTray: (enabled: boolean) => invoke<void>('set_tray', { enabled })
+	setTray: (enabled: boolean) => invoke<void>('set_tray', { enabled }),
+	/** Enable/disable this device's HOST role. `serving=false` (set when the app enters
+	 * gaming mode) makes the host reject every inbound connection at auth time — nobody
+	 * can connect to this machine. Outbound connects + relay registration are unaffected. */
+	setHostServing: (serving: boolean) => invoke<void>('set_host_serving', { serving }),
+	/** Start the gilrs→webview controller-nav bridge (gaming-mode menu navigation). Emits
+	 * `gamepad-nav` events (see onGamepadNav). The ONLY pad-nav path on Linux (no webview
+	 * Gamepad API there) and the preferred one everywhere. */
+	gamepadNavStart: () => invoke<void>('gamepad_nav_start'),
+	gamepadNavStop: () => invoke<void>('gamepad_nav_stop')
 };

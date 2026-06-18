@@ -9,14 +9,14 @@ describe('Home screen', () => {
 	beforeEach(() => _reset());
 
 	it('shows this device id and an empty recents state by default', () => {
-		render(Home, { props: { selfId: '482 913 056', mode: 'remote', hostSessions: [], activity: [], onMode: noop, onConnect: noop } });
+		render(Home, { props: { selfId: '482 913 056', hostSessions: [], activity: [], onConnect: noop } });
 		expect(screen.getByText('482 913 056')).toBeInTheDocument();
 		expect(screen.getByText(/Henüz bağlantı yok/)).toBeInTheDocument();
 	});
 
 	it('disables connect until a 6+ digit id is entered, then connects', async () => {
 		const onConnect = vi.fn();
-		render(Home, { props: { selfId: '482 913 056', mode: 'remote', hostSessions: [], activity: [], onMode: noop, onConnect } });
+		render(Home, { props: { selfId: '482 913 056', hostSessions: [], activity: [], onConnect } });
 		const btn = screen.getByRole('button', { name: 'Bağlan' });
 		expect(btn).toBeDisabled();
 
@@ -29,13 +29,14 @@ describe('Home screen', () => {
 	});
 
 	it('lists a real recorded connection (id grouped in threes) and re-connects to it', async () => {
-		recordConnection('640117992', 'Oyun Rig’i'); // CLI-style raw id
+		recordConnection('640117992', 'Oyun Rig’i'); // CLI-style raw id (remote history)
 		const onConnect = vi.fn();
-		render(Home, { props: { selfId: '482 913 056', mode: 'game', hostSessions: [], activity: [], onMode: noop, onConnect } });
+		render(Home, { props: { selfId: '482 913 056', hostSessions: [], activity: [], onConnect } });
 		// Displayed grouped even though it was recorded raw.
 		expect(screen.getByText('640 117 992')).toBeTruthy();
 		await fireEvent.click(screen.getByText('Oyun Rig’i'));
-		// The stored id is canonical (despaced).
-		expect(onConnect).toHaveBeenCalledWith({ name: 'Oyun Rig’i', id: '640117992' }, 'game');
+		// The stored id is canonical (despaced); a plain Home connect is always remote
+		// (no mode argument — the shell's default connect mode is remote).
+		expect(onConnect).toHaveBeenCalledWith({ name: 'Oyun Rig’i', id: '640117992' });
 	});
 });

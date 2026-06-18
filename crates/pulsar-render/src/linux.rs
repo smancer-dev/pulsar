@@ -93,6 +93,80 @@ static KEY_IN: std::sync::Mutex<Vec<egui::Event>> = std::sync::Mutex::new(Vec::n
 /// Relayed Enter — consumed by the Chat composer as "send".
 static ENTER_IN: AtomicBool = AtomicBool::new(false);
 
+/// Controller overlay-nav tokens (top-level `k <dir>` stdin lines) awaiting translation to egui
+/// arrow keys in the draw loop, where they merge into the frame's input events.
+static NAV_IN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Translate one controller-nav token into egui key events (press+release). Everything is plain
+/// arrows + Enter/Escape: the overlay drives both the Root grid and the sub-view rows by an
+/// explicit selection index that reads arrow keys (egui's own Tab focus proved unreliable —
+/// it swallowed Tab before a view could read it). Accepts the legacy `shifttab`/`tab` aliases
+/// an older app build emits, mapping them to ArrowUp/ArrowDown, so the renderer can update
+/// without a lock-step app rebuild.
+fn nav_events(tok: &str) -> Vec<egui::Event> {
+	let key = match tok {
+		"left" => egui::Key::ArrowLeft,
+		"right" => egui::Key::ArrowRight,
+		"go" => egui::Key::Enter,
+		"escape" => egui::Key::Escape,
+		"up" | "shifttab" => egui::Key::ArrowUp,
+		"down" | "tab" => egui::Key::ArrowDown,
+		_ => return Vec::new(),
+	};
+	let mut out = Vec::new();
+	for pressed in [true, false] {
+		out.push(egui::Event::Key {
+			key,
+			physical_key: None,
+			pressed,
+			repeat: false,
+			modifiers: egui::Modifiers::default(),
+		});
+	}
+	out
+}
+
+/// Map a relayed key NAME to an egui key event and queue it (press+release) into `KEY_IN`,
+/// so the next overlay frame sees it. Used both for the controller overlay-nav (`k <key>`
+/// from play.rs while the overlay is open) and the Chat composer's special keys
+/// (`kin k <key>` relayed by the webview). `enter` is special-cased to the composer's
+/// send latch (`ENTER_IN`); `go` is the nav "activate" and maps to a real Enter key event.
+fn queue_relayed_key(name: Option<&str>) {
+	let mut shift_mod = false;
+	let key = match name {
+		Some("backspace") => Some(egui::Key::Backspace),
+		Some("enter") => {
+			ENTER_IN.store(true, Ordering::SeqCst);
+			None
+		}
+		Some("left") => Some(egui::Key::ArrowLeft),
+		Some("right") => Some(egui::Key::ArrowRight),
+		// Controller overlay-nav (G6): cursor move + activate/back.
+		Some("up") => Some(egui::Key::ArrowUp),
+		Some("down") => Some(egui::Key::ArrowDown),
+		Some("tab") => Some(egui::Key::Tab),
+		Some("shifttab") => {
+			shift_mod = true;
+			Some(egui::Key::Tab)
+		}
+		Some("escape") => Some(egui::Key::Escape),
+		Some("go") => Some(egui::Key::Enter),
+		_ => None,
+	};
+	if let Some(key) = key {
+		let mut q = KEY_IN.lock().unwrap();
+		for pressed in [true, false] {
+			q.push(egui::Event::Key {
+				key,
+				physical_key: None,
+				pressed,
+				repeat: false,
+				modifiers: egui::Modifiers { shift: shift_mod, ..Default::default() },
+			});
+		}
+	}
+}
+
 /// Cursor side-channel state (Moonlight model): the host captured WITHOUT a hardware cursor
 /// (KMS zero-copy), so it streams the pointer out-of-band and WE draw it over the video. Fed by
 /// the app over stdin (`cursor <x> <y>` normalized 0..1, `cursorimg w h hx hy <b64png>`,
@@ -332,6 +406,14 @@ pub fn run() {
 						*FS_REMOTE.lock().unwrap() = (path, rows);
 					}
 				}
+				// Controller overlay-nav: a relayed direction (`k up|down|left|right|go|escape`)
+				// emitted by play.rs while the overlay is open. Queued RAW for view-aware
+				// translation in the draw loop (see NAV_IN / nav_events).
+				Some("k") => {
+					if let Some(tok) = it.next() {
+						NAV_IN.lock().unwrap().push(tok.to_string());
+					}
+				}
 				// Relayed keyboard for the Chat composer (`kin t <text>` / `kin k <name>`).
 				Some("kin") => match it.next() {
 					Some("t") => {
@@ -340,30 +422,7 @@ pub fn run() {
 							KEY_IN.lock().unwrap().push(egui::Event::Text(text));
 						}
 					}
-					Some("k") => {
-						let key = match it.next() {
-							Some("backspace") => Some(egui::Key::Backspace),
-							Some("enter") => {
-								ENTER_IN.store(true, Ordering::SeqCst);
-								None
-							}
-							Some("left") => Some(egui::Key::ArrowLeft),
-							Some("right") => Some(egui::Key::ArrowRight),
-							_ => None,
-						};
-						if let Some(key) = key {
-							let mut q = KEY_IN.lock().unwrap();
-							for pressed in [true, false] {
-								q.push(egui::Event::Key {
-									key,
-									physical_key: None,
-									pressed,
-									repeat: false,
-									modifiers: egui::Modifiers::default(),
-								});
-							}
-						}
-					}
+					Some("k") => queue_relayed_key(it.next()),
 					_ => {}
 				},
 				// Free-text toast (rest of the line verbatim): inbound chat etc — the
@@ -1261,6 +1320,14 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		};
 
 		if open {
+			// Controller nav tokens → egui arrow/Enter/Escape keys for this frame. The overlay
+			// reads them via its own selection index (Root grid + sub-view rows).
+			{
+				let toks: Vec<String> = NAV_IN.lock().unwrap().drain(..).collect();
+				for tok in toks {
+					events.extend(nav_events(&tok));
+				}
+			}
 			// Merge the webview-relayed keyboard (the Chat composer's only input
 			// channel — see the `kin` stdin arm) into this frame's events.
 			events.append(&mut KEY_IN.lock().unwrap());
@@ -1270,6 +1337,10 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 					egui::vec2(w as f32 / ppp, h as f32 / ppp),
 				)),
 				events,
+				// Overlay window never holds X keyboard focus, but egui must believe it's
+				// focused or it drops widget focus each frame — the pad-nav Tab focus then
+				// snapped back to the first box and could never advance.
+				focused: true,
 				..Default::default()
 			};
 			let mut cmds: Vec<OverlayCmd> = Vec::new();

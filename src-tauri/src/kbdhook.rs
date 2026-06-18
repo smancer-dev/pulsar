@@ -42,8 +42,8 @@ pub use imp::{disable, enable, overlay_suspend, set_focused};
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-	arm_kiosk_engage, disable, enable, engage, engage_render, overlay_suspend, release,
-	set_focused, set_render_focused,
+	arm_kiosk_engage, disable, enable, engage, engage_render, input_active, overlay_suspend,
+	release, set_focused, set_render_focused,
 };
 
 // Windows now has the same click-to-engage lifecycle as Linux: the hook is armed for

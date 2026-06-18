@@ -94,6 +94,14 @@ fn is_focused() -> bool {
 		|| KIOSK_SESSION.load(Ordering::SeqCst)
 }
 
+/// Whether client input is live-forwarding RIGHT NOW: engaged AND focused AND not
+/// overlay-suspended — the exact gate the evdev keyboard/mouse capture applies before
+/// forwarding. The controller touchpad-as-mouse reader consults this so it obeys the
+/// same rule (instead of forwarding unconditionally on its own path).
+pub fn input_active() -> bool {
+	ENGAGED.load(Ordering::SeqCst) && is_focused() && !SUSPENDED.load(Ordering::SeqCst)
+}
+
 /// Build an xkb keyboard state from the X session's ACTIVE layout (e.g. Turkish-Q), so a grabbed
 /// evdev keycode can be resolved to the Unicode char that layout produces — enabling
 /// layout-independent (WYSIWYG) forwarding (the host then types the exact char via
@@ -547,6 +555,12 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 					lalt = false;
 					char_keys.clear();
 					vk_sent.clear();
+					// xkb has its OWN latch: the combo's Ctrl/Shift(/Alt/group) DOWNs were fed to
+					// it, but after the ungrab their physical UPs go to the local OS — never to
+					// fetch_events — so xkb stays latched and the next engaged keypress is wrong
+					// (Turkish-Q ş → ';'). Rebuild a fresh state from the live layout (the tracked
+					// booleans above only fix the raw-VK path, not xkb's internal modifier state).
+					xkb_state = build_xkb_state();
 				} else {
 					for d in grabbed.iter_mut() {
 						let _ = d.grab();
@@ -653,6 +667,9 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 								// without ending the session — same effect as 3×RightCtrl. The user
 								// can then click the overlay button / app chrome; clicking the video
 								// re-engages.
+								// Keyboard combos (unchanged from the original Pulsar scheme — Moonlight
+								// parity was only for the CONTROLLER nav): Ctrl+Shift+M overlay,
+								// Ctrl+Shift+F12 fullscreen, Ctrl+Shift+Q leave, Ctrl+Alt+Z detach.
 								if code == KEY_Z {
 									if cmod && amod {
 										// Ctrl+Alt+Z detach: release every held key/button to the
@@ -709,7 +726,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 								let (cmod, smod, amod) = (ctrl || lc, shift || ls, lalt || la);
 								if (matches!(code, KEY_M | KEY_F12 | KEY_Q) && cmod && smod)
 									|| (code == KEY_Z && cmod && amod)
-								{
+																	{
 									continue;
 								}
 							}

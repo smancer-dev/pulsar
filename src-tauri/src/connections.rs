@@ -17,6 +17,19 @@ use crate::state::{AppState, ConnMode};
 
 const LABEL: &str = "connections";
 
+/// How to surface the connections window, decided by the incoming connection's mode.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Surface {
+	/// Brand-new window opens MINIMIZED (taskbar only); an existing window left as-is.
+	/// Used at accept time, before the mode is known.
+	Background,
+	/// Un-minimize + show but do NOT steal focus — a GAME first-stream: the host gets a
+	/// visible indication without yanking focus off a fullscreen game it may be playing.
+	Reveal,
+	/// Un-minimize + show + focus — a REMOTE first-stream, and the sidebar reveal button.
+	Forward,
+}
+
 /// Open the connections window (if absent) or, when it already exists, bring it
 /// forward only for a Remote connection. `bring_forward == false` (Game) opens a
 /// brand-new window **hidden** and leaves an existing one untouched (background).
@@ -25,14 +38,23 @@ const LABEL: &str = "connections";
 /// `run_on_main_thread`: this is called from a tokio worker thread (the serve loop),
 /// and on Windows show/focus/close/build on a webview window only take effect on the
 /// main thread (off-thread calls silently no-op).
-pub(crate) fn open_or_update(app: &AppHandle, bring_forward: bool) {
+pub(crate) fn open_or_update(app: &AppHandle, surface: Surface) {
 	let handle = app.clone();
 	let _ = app.run_on_main_thread(move || {
 		if let Some(win) = handle.get_webview_window(LABEL) {
-			if bring_forward {
-				let _ = win.unminimize();
-				let _ = win.show();
-				let _ = win.set_focus();
+			match surface {
+				Surface::Forward => {
+					let _ = win.unminimize();
+					let _ = win.show();
+					let _ = win.set_focus();
+				}
+				// Game first-stream: make it visible (un-minimize + show) WITHOUT focus, so
+				// the host sees the active-connection list without losing the game.
+				Surface::Reveal => {
+					let _ = win.unminimize();
+					let _ = win.show();
+				}
+				Surface::Background => {}
 			}
 			return;
 		}
@@ -43,22 +65,24 @@ pub(crate) fn open_or_update(app: &AppHandle, bring_forward: bool) {
 			.min_inner_size(300.0, 240.0)
 			.resizable(true)
 			// Always real (in the taskbar + alt-tab so the host can find it), never
-			// `visible(false)` (that hides it from both). `focused(false)` for Game so it
-			// doesn't steal focus; it's then minimized below so it doesn't cover the game.
+			// `visible(false)`. Only a Forward surface takes focus on build.
 			.visible(true)
-			.focused(bring_forward)
+			.focused(surface == Surface::Forward)
 			.build()
 		{
-			Ok(win) => {
-				if bring_forward {
-					// Remote: bring it forward, like the approval popup.
+			Ok(win) => match surface {
+				// Remote: bring it forward, like the approval popup.
+				Surface::Forward => {
 					let _ = win.set_focus();
-				} else {
-					// Game: send it to the taskbar (minimized, unfocused) — present but not
-					// covering the streamed game / stealing focus.
+				}
+				// Game first-stream: leave it visible+unfocused as built (a present indication).
+				Surface::Reveal => {}
+				// Accept time (mode unknown): send it to the taskbar so it doesn't cover the
+				// streamed game / steal focus until the first stream upgrades it.
+				Surface::Background => {
 					let _ = win.minimize();
 				}
-			}
+			},
 			Err(e) => tracing::warn!(%e, "connections window failed to open"),
 		}
 	});
@@ -125,6 +149,6 @@ pub(crate) async fn set_view_only(
 /// Sidebar "Bağlantılar" button → reveal/focus the (possibly hidden) window.
 #[tauri::command]
 pub(crate) async fn show_connections(app: AppHandle) -> Result<(), String> {
-	open_or_update(&app, true);
+	open_or_update(&app, Surface::Forward);
 	Ok(())
 }

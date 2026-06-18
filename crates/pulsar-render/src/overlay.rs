@@ -124,6 +124,26 @@ pub struct UiState {
 	/// once per overlay open (backends reset it on the open edge), NOT per frame:
 	/// an empty/failed reply must not loop `ov fsls` at frame rate.
 	pub remote_requested: bool,
+	/// Root-menu selection index for controller/keyboard nav. egui's own Tab-focus would
+	/// not stick in this override-redirect overlay (focused() stayed None every frame), so
+	/// the menu is driven by an explicit index instead: the pad's up/down move it, the
+	/// highlighted box is `sel`, and A/Enter activates it.
+	pub sel: usize,
+	/// Selection index WITHIN a sub-view (Stream/Display/Controllers rows), driven by the pad
+	/// up/down; left/right change the selected row's value. Reset to 0 whenever back on Root.
+	pub sub_sel: usize,
+}
+
+/// One frame's controller/keyboard nav input, read once in `draw` and handed to the active
+/// view. Directions are plain egui arrow keys (the renderer relays the pad d-pad/stick as
+/// arrows — Tab is avoided because egui's focus pass swallows it before a view can read it).
+#[derive(Clone, Copy, Default)]
+struct Nav {
+	up: bool,
+	down: bool,
+	left: bool,
+	right: bool,
+	activate: bool,
 }
 
 impl Default for OverlayState {
@@ -326,6 +346,15 @@ pub fn apply_theme(ctx: &egui::Context) {
 	v.window_fill = egui::Color32::from_rgb(18, 20, 28);
 	v.widgets.inactive.bg_fill = egui::Color32::from_rgb(28, 30, 42);
 	v.widgets.hovered.bg_fill = egui::Color32::from_rgb(40, 42, 58);
+	// Controller/keyboard focus indicator: egui paints a focused widget with the `active`
+	// visuals AND a focus ring keyed off `selection.stroke`. The defaults were nearly
+	// invisible on the dark panel, so the Tab-focused control inside sub-views looked dead.
+	// A bold cyan stroke (matching the Root menu's selection border) makes it unmistakable.
+	let focus_stroke = egui::Stroke::new(2.0, CYAN);
+	v.selection.stroke = focus_stroke;
+	v.widgets.active.bg_stroke = focus_stroke;
+	v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(34, 64, 82);
+	v.widgets.active.bg_fill = egui::Color32::from_rgb(34, 64, 82);
 	v.selection.bg_fill = ACCENT;
 	v.override_text_color = Some(egui::Color32::from_rgb(228, 230, 240));
 	ctx.set_visuals(v);
@@ -351,6 +380,19 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 	// skip the fade). Resetting anim_view to a sentinel guarantees the mismatch fires.
 	let open_edge = !ui_state.was_open;
 	ui_state.was_open = true;
+	// Fresh open starts the menu cursor on the first box.
+	if open_edge {
+		ui_state.sel = 0;
+	}
+	// B / Escape steps back one level: a sub-view returns to the Root menu; from Root it
+	// closes the overlay. (The pad's B button is relayed as Escape — see play.rs.)
+	if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+		if ui_state.view != View::Root {
+			ui_state.view = View::Root;
+		} else {
+			cmds.push(OverlayCmd::Close);
+		}
+	}
 	// Dim scrim behind the panel; clicking it closes the overlay.
 	egui::Area::new("scrim".into())
 		.order(egui::Order::Background)
@@ -445,19 +487,37 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 				1.0,
 				0.16,
 			);
+			// One read of the controller/keyboard nav for this frame, handed to the active view.
+			let nav = ui.input(|i| Nav {
+				up: i.key_pressed(egui::Key::ArrowUp),
+				down: i.key_pressed(egui::Key::ArrowDown),
+				left: i.key_pressed(egui::Key::ArrowLeft),
+				right: i.key_pressed(egui::Key::ArrowRight),
+				activate: i.key_pressed(egui::Key::Enter),
+			});
+			// Entering any sub-view always starts its row cursor at the top.
+			if ui_state.view == View::Root {
+				ui_state.sub_sel = 0;
+			}
 			ui.scope(|ui| {
 				ui.set_opacity(fade);
 				ui.add_space((1.0 - fade) * 8.0);
 				match ui_state.view {
-					View::Root => draw_root(ui, st, &mut ui_state.view, &mut cmds),
-					View::Stream => draw_stream(ui, st, &mut cmds),
-					View::Display => draw_display(ui, st, st.mode, &mut cmds),
+					View::Root => {
+						draw_root(ui, st, &mut ui_state.view, &mut ui_state.sel, nav, &mut cmds)
+					}
+					View::Stream => draw_stream(ui, st, &mut ui_state.sub_sel, nav, &mut cmds),
+					View::Display => {
+						draw_display(ui, st, st.mode, &mut ui_state.sub_sel, nav, &mut cmds)
+					}
 					View::Audio => draw_audio(ui, st, &mut cmds),
 					View::Tools => draw_tools(ui, &mut ui_state.view, &mut cmds),
 					View::Chat => draw_chat(ui, st, &mut ui_state.chat_input, &mut cmds),
 					View::Files => draw_files(ui, st, ui_state, &mut cmds),
-					View::Gauges => draw_gauges(ui, st, &mut cmds),
-					View::Controllers => draw_controllers(ui, st, &mut cmds),
+					View::Gauges => draw_gauges(ui, st, &mut ui_state.sub_sel, nav, &mut cmds),
+					View::Controllers => {
+						draw_controllers(ui, st, &mut ui_state.sub_sel, nav, &mut cmds)
+					}
 				}
 			});
 			ui.add_space(6.0);
@@ -471,8 +531,46 @@ pub fn draw(ctx: &egui::Context, st: &OverlayState, ui_state: &mut UiState) -> V
 	cmds
 }
 
+/// Move the Root-menu selection over a 2-column grid of `n` boxes plus an End-session button
+/// at index `n` (its own full-width row below the grid). left/right step within a grid row;
+/// up/down step between rows, with the bottom grid row going to End and End going back up.
+fn move_grid_sel(sel: usize, n: usize, nav: Nav) -> usize {
+	const COLS: usize = 2;
+	let end = n;
+	let mut s = sel.min(end);
+	if nav.right && s < n && s % COLS < COLS - 1 && s + 1 < n {
+		s += 1;
+	}
+	if nav.left && s < n && s % COLS > 0 {
+		s -= 1;
+	}
+	if nav.down {
+		if s < n {
+			let nx = s + COLS;
+			s = if nx < n { nx } else { end };
+		}
+		// From End there is nowhere lower — stay.
+	}
+	if nav.up {
+		if s == end {
+			// Jump back to the first cell of the last grid row.
+			s = if n == 0 { 0 } else { ((n - 1) / COLS) * COLS };
+		} else if s >= COLS {
+			s -= COLS;
+		}
+	}
+	s
+}
+
 /// Root hub: compact stat tiles + the category boxes + end-session.
-fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut Vec<OverlayCmd>) {
+fn draw_root(
+	ui: &mut egui::Ui,
+	st: &OverlayState,
+	view: &mut View,
+	sel: &mut usize,
+	nav: Nav,
+	cmds: &mut Vec<OverlayCmd>,
+) {
 	let (enc_ms, target_mbit) = host_parts(st);
 	let bw = fmt_mbps(st.mbps);
 	// Two compact tile rows: RTT · fps · encode / decode · BITRATE target · bandwidth.
@@ -522,12 +620,24 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 		Mode::Game => game_boxes,
 		Mode::Remote => remote_boxes,
 	};
+	let n = boxes.len();
+	// Selection cycles over the n boxes PLUS the End-session button at index n, so the pad
+	// reaches End too.
+	let total = n + 1;
+	// 2D grid nav (matches the visible 2-column layout): left/right move within a row, up/down
+	// move between rows; the End-session button (index n) sits in its own row below the grid.
+	let activate = nav.activate;
+	if *sel >= total {
+		*sel = 0;
+	}
+	*sel = move_grid_sel(*sel, n, nav);
 	egui::Grid::new("ov_boxes")
 		.num_columns(2)
 		.spacing(egui::vec2(8.0, 8.0))
 		.show(ui, |ui| {
 			for (i, (icon, label, v)) in boxes.iter().enumerate() {
-				if cat_box(ui, icon, label) {
+				let resp = cat_box(ui, icon, label, i == *sel);
+				if resp.clicked() || (activate && i == *sel) {
 					// Files opens the app's dedicated per-session window — the in-overlay
 					// two-pane view was too cramped (kept as code for a potential fallback).
 					if *v == View::Files {
@@ -542,34 +652,33 @@ fn draw_root(ui: &mut egui::Ui, st: &OverlayState, view: &mut View, cmds: &mut V
 			}
 		});
 	ui.add_space(10.0);
-	if ui
-		.add(
-			egui::Button::new(
-				egui::RichText::new(format!("✖  {}", t("end"))).color(egui::Color32::WHITE),
-			)
-				.fill(egui::Color32::from_rgb(200, 60, 70))
-				.min_size(egui::vec2(ui.available_width(), 32.0)),
-		)
-		.clicked()
-	{
+	// End-session button = the last nav item (index n). Cyan stroke when the pad cursor is on
+	// it; A/Enter (activate) ends the session, same as a click.
+	let end_selected = *sel == n;
+	let mut end_btn = egui::Button::new(
+		egui::RichText::new(format!("✖  {}", t("end"))).color(egui::Color32::WHITE),
+	)
+	.fill(egui::Color32::from_rgb(200, 60, 70))
+	.min_size(egui::vec2(ui.available_width(), 32.0));
+	if end_selected {
+		end_btn = end_btn.stroke(egui::Stroke::new(2.5, CYAN));
+	}
+	if ui.add(end_btn).clicked() || (activate && end_selected) {
 		cmds.push(OverlayCmd::End);
 	}
 }
 
-/// Stream section: codec/encoder/decoder + res/fps/bandwidth-limit + quality/pacing.
-fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
-	let parts: Vec<&str> = st.host_active.split(" · ").collect();
-	let act = |i: usize| parts.get(i).copied().unwrap_or("").to_string();
-	let bw = fmt_mbps(st.mbps);
-	let act_bitrate = if parts.len() > 4 {
-		format!("{} {} · {} {bw} Mbps", t("limit"), act(4), t("used"))
-	} else if st.mbps > 0.0 {
-		format!("{} {bw} Mbps", t("used"))
-	} else {
-		String::new()
-	};
-	// Capability gating: only offer what the HOST really has (empty = unknown
-	// host → show everything, it degrades gracefully server-side anyway).
+/// Stream section: codec/encoder/res/fps/bandwidth-limit + quality/pacing, as pad-navigable
+/// rows. up/down move the row cursor; left/right cycle the selected row's value.
+fn draw_stream(
+	ui: &mut egui::Ui,
+	st: &OverlayState,
+	sub_sel: &mut usize,
+	nav: Nav,
+	cmds: &mut Vec<OverlayCmd>,
+) {
+	// Capability gating: only offer what the HOST really has (empty = unknown host → show
+	// everything; it degrades gracefully server-side anyway).
 	let codecs: Vec<(&str, &str)> = codecs_opts()
 		.iter()
 		.filter(|(v, _)| {
@@ -584,130 +693,105 @@ fn draw_stream(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 		})
 		.copied()
 		.collect();
-	egui::Grid::new("ov_stream")
-		.num_columns(2)
-		.spacing(egui::vec2(12.0, 8.0))
-		.show(ui, |ui| {
-			if let Some(v) = combo(ui, "Codec", "codec", &st.codec, &codecs, &act(0)) {
-				cmds.push(OverlayCmd::Set("codec", v));
+	let res = res_opts();
+	let fps = fps_opts();
+	let br = bitrate_opts();
+	let quality = [("latency", t("lowlat")), ("quality", t("quality"))];
+	let pace = [("on", t("on")), ("off", t("off"))];
+	let pace_cur = if st.pace { "on" } else { "off" };
+
+	const ROWS: usize = 7;
+	if nav.down {
+		*sub_sel = (*sub_sel + 1).min(ROWS - 1);
+	}
+	if nav.up {
+		*sub_sel = sub_sel.saturating_sub(1);
+	}
+	let s = (*sub_sel).min(ROWS - 1);
+	ui.spacing_mut().item_spacing.y = 6.0;
+	if let Some(v) = choice_row(ui, s == 0, nav, "Codec", &st.codec, &codecs) {
+		cmds.push(OverlayCmd::Set("codec", v));
+	}
+	if let Some(v) = choice_row(ui, s == 1, nav, "Encoder", &st.encoder, &encoders) {
+		cmds.push(OverlayCmd::Set("encoder", v));
+	}
+	if let Some(v) = choice_row(ui, s == 2, nav, t("res"), &st.res, &res) {
+		cmds.push(OverlayCmd::Set("res", v));
+	}
+	if let Some(v) = choice_row(ui, s == 3, nav, "FPS", &st.fps_sel, &fps) {
+		cmds.push(OverlayCmd::Set("fps", v));
+	}
+	if let Some(v) = choice_row(ui, s == 4, nav, t("bwlimit"), &st.bitrate, &br) {
+		cmds.push(OverlayCmd::Set("bitrate", v));
+	}
+	if let Some(v) = choice_row(ui, s == 5, nav, t("quality"), &st.quality, &quality) {
+		cmds.push(OverlayCmd::Set("quality", v));
+	}
+	if let Some(v) = choice_row(ui, s == 6, nav, t("pacing"), pace_cur, &pace) {
+		cmds.push(OverlayCmd::Set("pace", v));
+	}
+	// Decoder is auto-selected by this renderer — display only.
+	ui.add_space(4.0);
+	ui.label(
+		egui::RichText::new(format!(
+			"Decoder · {}",
+			if st.decoder.is_empty() {
+				t("auto")
+			} else {
+				st.decoder.as_str()
 			}
-			if let Some(v) = combo(ui, "Encoder", "encoder", &st.encoder, &encoders, &act(1)) {
-				cmds.push(OverlayCmd::Set("encoder", v));
-			}
-			ui.end_row();
-			// The decoder is auto-selected by this renderer — display only.
-			ui.label(
-				egui::RichText::new("Decoder")
-					.size(12.0)
-					.color(egui::Color32::from_gray(160)),
-			);
-			ui.label(
-				egui::RichText::new(if st.decoder.is_empty() {
-					t("auto").to_string()
-				} else {
-					st.decoder.clone()
-				})
-				.size(12.0),
-			);
-			ui.end_row();
-			if let Some(v) = combo(ui, t("res"), "res", &st.res, &res_opts(), &act(2)) {
-				cmds.push(OverlayCmd::Set("res", v));
-			}
-			if let Some(v) = combo(ui, "FPS", "fps", &st.fps_sel, &fps_opts(), &act(3)) {
-				cmds.push(OverlayCmd::Set("fps", v));
-			}
-			ui.end_row();
-			if let Some(v) = combo(
-				ui,
-				t("bwlimit"),
-				"bitrate",
-				&st.bitrate,
-				&bitrate_opts(),
-				&act_bitrate,
-			) {
-				cmds.push(OverlayCmd::Set("bitrate", v));
-			}
-			ui.end_row();
-		});
-	ui.add_space(8.0);
-	ui.horizontal(|ui| {
-		ui.label(t("quality"));
-		info(ui, t("info.quality"));
-		if seg(ui, st.quality == "latency", t("lowlat")) {
-			cmds.push(OverlayCmd::Set("quality", "latency".into()));
-		}
-		if seg(ui, st.quality == "quality", t("quality")) {
-			cmds.push(OverlayCmd::Set("quality", "quality".into()));
-		}
-	});
-	ui.horizontal(|ui| {
-		ui.label(t("pacing"));
-		info(ui, t("info.pacing"));
-		if seg(ui, st.pace, t("on")) {
-			cmds.push(OverlayCmd::Set("pace", "on".into()));
-		}
-		if seg(ui, !st.pace, t("off")) {
-			cmds.push(OverlayCmd::Set("pace", "off".into()));
-		}
-	});
+		))
+		.size(11.0)
+		.color(egui::Color32::from_gray(150)),
+	);
 }
 
-/// Display section: host monitor picker (when the host has >1, remote mode only) +
+/// Display section: host monitor picker (when the host has >1 display, BOTH modes) +
 /// AnyDesk-style view-fit modes (renderer-local, instant).
-fn draw_display(ui: &mut egui::Ui, st: &OverlayState, mode: Mode, cmds: &mut Vec<OverlayCmd>) {
-	// Host monitor picker — remote mode only (multi-monitor is irrelevant in-game)
-	// and only meaningful when the host exposes more than one display.
-	if mode == Mode::Remote && st.displays.len() > 1 {
-		ui.label(
-			egui::RichText::new(format!("🖵 {}", t("monitor.title")))
-				.small()
-				.color(egui::Color32::GRAY),
-		);
-		ui.add_space(4.0);
-		ui.horizontal_wrapped(|ui| {
-			for (idx, label) in &st.displays {
-				let selected = *idx == st.display_idx;
-				let fill = if selected {
-					ACCENT
-				} else {
-					egui::Color32::from_rgb(40, 44, 54)
-				};
-				// A monitor glyph over the screen's label (name + WxH) — a square-ish tile.
-				let text = egui::RichText::new(format!("🖥\n{label}"))
-					.size(12.0)
-					.color(egui::Color32::WHITE);
-				if ui
-					.add(
-						egui::Button::new(text)
-							.fill(fill)
-							.min_size(egui::vec2(120.0, 56.0)),
-					)
-					.clicked()
-					&& !selected
-				{
-					cmds.push(OverlayCmd::Set("display", idx.to_string()));
-				}
-			}
-		});
-		ui.add_space(8.0);
+fn draw_display(
+	ui: &mut egui::Ui,
+	st: &OverlayState,
+	_mode: Mode,
+	sub_sel: &mut usize,
+	nav: Nav,
+	cmds: &mut Vec<OverlayCmd>,
+) {
+	// Rows: the host monitor picker (only when the host exposes >1 display) then the
+	// view-fit mode. up/down move the cursor; left/right change the selected row.
+	let multi = st.displays.len() > 1;
+	let rows = if multi { 2 } else { 1 };
+	if nav.down {
+		*sub_sel = (*sub_sel + 1).min(rows - 1);
 	}
-	ui.label(
-		egui::RichText::new(format!("🖥 {}", t("fit.title")))
-			.small()
-			.color(egui::Color32::GRAY),
-	);
-	ui.horizontal(|ui| {
-		if seg(ui, st.fit == "fit", t("fit.fit")) {
-			cmds.push(OverlayCmd::Set("fit", "fit".into()));
+	if nav.up {
+		*sub_sel = sub_sel.saturating_sub(1);
+	}
+	let s = (*sub_sel).min(rows - 1);
+	ui.spacing_mut().item_spacing.y = 6.0;
+	let mut row = 0;
+	if multi {
+		let idx_strs: Vec<String> = st.displays.iter().map(|(i, _)| i.to_string()).collect();
+		let opts: Vec<(&str, &str)> = st
+			.displays
+			.iter()
+			.enumerate()
+			.map(|(k, (_, label))| (idx_strs[k].as_str(), label.as_str()))
+			.collect();
+		let cur = st.display_idx.to_string();
+		if let Some(v) = choice_row(ui, s == row, nav, t("monitor.title"), &cur, &opts) {
+			cmds.push(OverlayCmd::Set("display", v));
 		}
-		if seg(ui, st.fit == "stretch", t("fit.stretch")) {
-			cmds.push(OverlayCmd::Set("fit", "stretch".into()));
-		}
-		if seg(ui, st.fit == "original", t("fit.original")) {
-			cmds.push(OverlayCmd::Set("fit", "original".into()));
-		}
-	});
-	ui.add_space(4.0);
+		row += 1;
+	}
+	let fit = [
+		("fit", t("fit.fit")),
+		("stretch", t("fit.stretch")),
+		("original", t("fit.original")),
+	];
+	if let Some(v) = choice_row(ui, s == row, nav, t("fit.title"), &st.fit, &fit) {
+		cmds.push(OverlayCmd::Set("fit", v));
+	}
+	ui.add_space(6.0);
 	ui.label(
 		egui::RichText::new(t("fit.help"))
 			.size(10.0)
@@ -1053,27 +1137,31 @@ fn load_local(us: &mut UiState) {
 }
 
 /// Gauges section: the always-on HUD + the Parsec-style open button toggles.
-fn draw_gauges(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
-	ui.horizontal(|ui| {
-		ui.label(t("gauges.statshud"));
-		info(ui, t("info.statshud"));
-		if seg(ui, st.stats_hud, t("on")) {
-			cmds.push(OverlayCmd::Set("statshud", "on".into()));
-		}
-		if seg(ui, !st.stats_hud, t("off")) {
-			cmds.push(OverlayCmd::Set("statshud", "off".into()));
-		}
-	});
-	ui.horizontal(|ui| {
-		ui.label(t("gauges.ovbtn"));
-		info(ui, t("info.ovbtn"));
-		if seg(ui, st.overlay_btn, t("on")) {
-			cmds.push(OverlayCmd::Set("ovbtn", "on".into()));
-		}
-		if seg(ui, !st.overlay_btn, t("off")) {
-			cmds.push(OverlayCmd::Set("ovbtn", "off".into()));
-		}
-	});
+fn draw_gauges(
+	ui: &mut egui::Ui,
+	st: &OverlayState,
+	sub_sel: &mut usize,
+	nav: Nav,
+	cmds: &mut Vec<OverlayCmd>,
+) {
+	let onoff = [("on", t("on")), ("off", t("off"))];
+	const ROWS: usize = 2;
+	if nav.down {
+		*sub_sel = (*sub_sel + 1).min(ROWS - 1);
+	}
+	if nav.up {
+		*sub_sel = sub_sel.saturating_sub(1);
+	}
+	let s = (*sub_sel).min(ROWS - 1);
+	ui.spacing_mut().item_spacing.y = 6.0;
+	let hud = if st.stats_hud { "on" } else { "off" };
+	if let Some(v) = choice_row(ui, s == 0, nav, t("gauges.statshud"), hud, &onoff) {
+		cmds.push(OverlayCmd::Set("statshud", v));
+	}
+	let ovb = if st.overlay_btn { "on" } else { "off" };
+	if let Some(v) = choice_row(ui, s == 1, nav, t("gauges.ovbtn"), ovb, &onoff) {
+		cmds.push(OverlayCmd::Set("ovbtn", v));
+	}
 }
 
 /// Controllers section: ordered player-slot list with ▲/▼ swap buttons and a
@@ -1084,7 +1172,13 @@ fn draw_gauges(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>)
 /// Emulation picker pushes `OverlayCmd::Set("ctrlemu", "{uuid},{target}")`.
 /// The bundled egui font lacks ▲/▼ glyphs — both arrows are painted with
 /// `line_segment`, matching the back-arrow style used in the header.
-fn draw_controllers(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<OverlayCmd>) {
+fn draw_controllers(
+	ui: &mut egui::Ui,
+	st: &OverlayState,
+	sub_sel: &mut usize,
+	nav: Nav,
+	cmds: &mut Vec<OverlayCmd>,
+) {
 	if st.controllers.is_empty() {
 		ui.add_space(20.0);
 		ui.vertical_centered(|ui| {
@@ -1096,6 +1190,25 @@ fn draw_controllers(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<Overlay
 		return;
 	}
 	let n = st.controllers.len();
+	// Pad nav: up/down pick a controller (cyan ▸ marker on its row), left/right cycle that
+	// controller's emulation target — the seg buttons below still work for the mouse.
+	if nav.down {
+		*sub_sel = (*sub_sel + 1).min(n - 1);
+	}
+	if nav.up {
+		*sub_sel = sub_sel.saturating_sub(1);
+	}
+	let s = (*sub_sel).min(n - 1);
+	if nav.left || nav.right {
+		if let Some((_, _, _, uuid, target)) = st.controllers.get(s) {
+			if !uuid.is_empty() {
+				let order = ["auto", "xbox360", "ds4"];
+				let cur = order.iter().position(|o| o == target).unwrap_or(0);
+				let ni = if nav.right { (cur + 1) % 3 } else { (cur + 2) % 3 };
+				cmds.push(OverlayCmd::Set("ctrlemu", format!("{uuid},{}", order[ni])));
+			}
+		}
+	}
 	for (i, (slot, kind, name, uuid, target)) in st.controllers.iter().enumerate() {
 		// Row label: "Oyuncu 1 · Xbox · Controller name"
 		let label = format!(
@@ -1105,11 +1218,16 @@ fn draw_controllers(ui: &mut egui::Ui, st: &OverlayState, cmds: &mut Vec<Overlay
 			kind,
 			name,
 		);
+		let row_sel = i == s;
 		ui.horizontal(|ui| {
 			ui.label(
-				egui::RichText::new(&label)
+				egui::RichText::new(format!("{}{}", if row_sel { "▸ " } else { "  " }, label))
 					.size(12.5)
-					.color(egui::Color32::from_rgb(228, 230, 240)),
+					.color(if row_sel {
+						CYAN
+					} else {
+						egui::Color32::from_rgb(228, 230, 240)
+					}),
 			);
 		});
 		// Emulation picker row (indented, smaller): Otomatik / Xbox 360 / DualShock 4.
@@ -1221,10 +1339,20 @@ fn fmt_mbps(mbps: f32) -> String {
 }
 
 /// A clickable category box (the root hub's grid cells).
-fn cat_box(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
+fn cat_box(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool) -> egui::Response {
 	let size = egui::vec2((ui.available_width() / 2.0 - 6.0).max(140.0), 40.0);
 	let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-	let fill = if resp.hovered() {
+	// `selected` = the controller-nav cursor (UiState.sel, moved by the pad up/down) is on
+	// this box. Draw a bright cyan BORDER + brighter fill so it's unmistakable; A/Enter
+	// activates it. Driven purely by sel (not egui has_focus) so egui's invisible Tab-focus
+	// traversal can't paint a second highlight on a different box.
+	let focused = selected;
+	if focused {
+		ui.painter().rect_filled(rect.expand(2.5), 9.0, CYAN);
+	}
+	let fill = if focused {
+		egui::Color32::from_rgb(18, 70, 92)
+	} else if resp.hovered() {
 		egui::Color32::from_rgb(40, 42, 58)
 	} else {
 		egui::Color32::from_rgb(28, 30, 42)
@@ -1246,7 +1374,89 @@ fn cat_box(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
 		egui::FontId::proportional(13.0),
 		egui::Color32::from_rgb(228, 230, 240),
 	);
-	resp.clicked()
+	resp
+}
+
+/// One pad-navigable settings row inside a sub-view: `label` left, the current option's display
+/// right (framed by ◂ ▸ when selected). A cyan border marks the selected row; when selected,
+/// the pad's left/right cycle the option and the NEW value is returned (else None).
+fn choice_row(
+	ui: &mut egui::Ui,
+	selected: bool,
+	nav: Nav,
+	label: &str,
+	current: &str,
+	options: &[(&str, &str)],
+) -> Option<String> {
+	let cur = options.iter().position(|(v, _)| *v == current).unwrap_or(0);
+	let mut changed = None;
+	if selected && !options.is_empty() {
+		if nav.right {
+			changed = Some(options[(cur + 1) % options.len()].0.to_string());
+		} else if nav.left {
+			changed = Some(options[(cur + options.len() - 1) % options.len()].0.to_string());
+		}
+	}
+	let disp = options.get(cur).map(|(_, d)| *d).unwrap_or(current);
+	let (rect, _) =
+		ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+	if selected {
+		ui.painter().rect_filled(rect.expand(2.0), 8.0, CYAN);
+		ui.painter().rect_filled(rect, 7.0, egui::Color32::from_rgb(20, 54, 70));
+	} else {
+		ui.painter()
+			.rect_filled(rect, 7.0, egui::Color32::from_rgb(26, 28, 38));
+	}
+	ui.painter().text(
+		egui::pos2(rect.left() + 12.0, rect.center().y),
+		egui::Align2::LEFT_CENTER,
+		label,
+		egui::FontId::proportional(13.0),
+		egui::Color32::from_gray(205),
+	);
+	// Value (right-aligned), flanked by PAINTED ◂ ▸ triangles when selected — the unicode
+	// arrow glyphs are absent from egui's bundled font (they render as empty tofu boxes), so
+	// they are drawn as shapes, matching the header back-arrow / reorder-chevron style.
+	let color = if selected { CYAN } else { egui::Color32::from_gray(225) };
+	let font = egui::FontId::proportional(13.0);
+	let vw = ui
+		.painter()
+		.layout_no_wrap(disp.to_string(), font.clone(), color)
+		.size()
+		.x;
+	let cy = rect.center().y;
+	let tri = 4.5;
+	let gap = 8.0;
+	let val_right = if selected {
+		rect.right() - 12.0 - tri * 2.0 - gap
+	} else {
+		rect.right() - 12.0
+	};
+	ui.painter().text(
+		egui::pos2(val_right, cy),
+		egui::Align2::RIGHT_CENTER,
+		disp,
+		font,
+		color,
+	);
+	if selected {
+		let p = ui.painter();
+		paint_tri(&p, egui::pos2(rect.right() - 12.0 - tri, cy), tri, true, CYAN);
+		paint_tri(&p, egui::pos2(val_right - vw - gap - tri, cy), tri, false, CYAN);
+	}
+	changed
+}
+
+/// Paint a small filled triangle marker (the ◂/▸ value arrows — the unicode glyphs are missing
+/// from the bundled egui font). `right` = pointing right, otherwise pointing left.
+fn paint_tri(painter: &egui::Painter, center: egui::Pos2, half: f32, right: bool, color: egui::Color32) {
+	let dx = if right { half } else { -half };
+	let pts = vec![
+		egui::pos2(center.x - dx, center.y - half),
+		egui::pos2(center.x - dx, center.y + half),
+		egui::pos2(center.x + dx, center.y),
+	];
+	painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
 fn stat_tile(ui: &mut egui::Ui, value: &str, icon: &str, label: &str) {
@@ -1403,6 +1613,9 @@ pub fn draw_hint(ctx: &egui::Context, text: &str, alpha: f32) {
 		});
 }
 
+// Retained for the mouse/remote-mode menus and as a fallback; the game-mode sub-views now use
+// pad-navigable `choice_row`s instead.
+#[allow(dead_code)]
 fn combo(
 	ui: &mut egui::Ui,
 	label: &str,
@@ -1474,4 +1687,51 @@ fn info(ui: &mut egui::Ui, text: &str) {
 		egui::Stroke::new(1.5, col),
 	);
 	resp.on_hover_text(egui::RichText::new(text).size(12.0));
+}
+
+#[cfg(test)]
+mod focus_tests {
+	use super::*;
+
+	// The pad-nav overlay (G6) moves focus with egui Tab/Shift-Tab events fed from the
+	// controller reader (up→shifttab, down→tab). This proves the menu boxes are actually
+	// keyboard-focusable and that Tab walks them — the necessary condition for pad nav to
+	// work. If this fails, no amount of pad input will move the overlay selection.
+	#[test]
+	fn tab_walks_the_menu_boxes() {
+		let ctx = egui::Context::default();
+		let run = |events: Vec<egui::Event>| {
+			ctx.run(
+				egui::RawInput {
+					events,
+					screen_rect: Some(egui::Rect::from_min_size(
+						egui::pos2(0.0, 0.0),
+						egui::vec2(400.0, 600.0),
+					)),
+					..Default::default()
+				},
+				|ctx| {
+					egui::CentralPanel::default().show(ctx, |ui| {
+						cat_box(ui, "📡", "one", false);
+						cat_box(ui, "🖥", "two", false);
+						cat_box(ui, "📊", "three", false);
+					});
+				},
+			);
+		};
+		let tab = || egui::Event::Key {
+			key: egui::Key::Tab,
+			physical_key: None,
+			pressed: true,
+			repeat: false,
+			modifiers: egui::Modifiers::default(),
+		};
+		run(vec![]); // first frame: register the widgets
+		run(vec![tab()]);
+		let f1 = ctx.memory(|m| m.focused());
+		run(vec![tab()]);
+		let f2 = ctx.memory(|m| m.focused());
+		assert!(f1.is_some(), "Tab focused nothing — cat_box is not keyboard-focusable");
+		assert_ne!(f1, f2, "second Tab did not advance focus to the next box");
+	}
 }

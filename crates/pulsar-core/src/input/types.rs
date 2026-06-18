@@ -167,11 +167,26 @@ pub fn trigger_to_u8(v: f32) -> u8 {
 	(v.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8
 }
 
+/// A blocking source of rumble (force-feedback) the consuming app sent to a virtual pad,
+/// so the host can forward it back to the client's physical controller. Runs on its own
+/// thread (the `next` call blocks until the next command).
+pub trait RumbleReader: Send {
+	/// Block until the next rumble command; returns `(large_motor, small_motor)` magnitudes
+	/// (0–255), or `None` when the source ends (target unplugged) — caller stops the loop.
+	fn next(&mut self) -> Option<(u8, u8)>;
+}
+
 /// A host-side virtual controller that replays [`GamepadState`]s.
 pub trait VirtualGamepad: Send {
 	fn kind(&self) -> GamepadKind;
 	/// Apply the latest input state to the emulated device.
 	fn apply(&mut self, state: &GamepadState);
+	/// A blocking rumble reader for forwarding the game's force-feedback back to the
+	/// client's physical pad, if this backend supports it (ViGEm DS4 on Windows). `None`
+	/// otherwise. Taken once right after the pad is created.
+	fn rumble_reader(&self) -> Option<Box<dyn RumbleReader>> {
+		None
+	}
 }
 
 /// A test/no-op backend that just records what it was told to apply. The real
@@ -256,9 +271,9 @@ pub fn xinput_buttons(state: &GamepadState) -> u16 {
 ///
 /// `special: u8`: bit 0 = PS (our GUIDE), bit 1 = touchpad click (not in our state → 0).
 ///
-/// Sticks: `i16 → u8` with 0x80 as center (i16 0 → 128). Y is left as-is (down-positive
-/// convention matches the Xbox path — no inversion on either axis). Pure so it can be
-/// unit-tested without the driver.
+/// Sticks: `i16 → u8` with 0x80 as center (i16 0 → 128). `GamepadState` Y is UP-positive
+/// (see `hub.rs`); the DS4 HID report is DOWN-positive (0x00 = up, 0xFF = down), so Y is
+/// INVERTED here (X passes through). Pure so it can be unit-tested without the driver.
 pub fn ds4_report_fields(state: &GamepadState) -> (u16, u8, u8, u8, u8, u8) {
 	// DPAD HAT encoding.
 	let up = state.is_pressed(button::DPAD_UP);
@@ -300,12 +315,13 @@ pub fn ds4_report_fields(state: &GamepadState) -> (u16, u8, u8, u8, u8, u8) {
 	// Special: PS button in bit 0; touchpad click (bit 1) is not tracked → 0.
 	let special: u8 = if state.is_pressed(button::GUIDE) { 1 } else { 0 };
 
-	// Stick conversion: i16 → u8, 0x80 = center.
+	// Stick conversion: i16 → u8, 0x80 = center. Y inverted (up-positive GamepadState →
+	// down-positive DS4); saturating_neg avoids i16::MIN overflow.
 	let conv = |v: i16| ((v as i32 >> 8) + 128).clamp(0, 255) as u8;
 	let lx = conv(state.left_x);
-	let ly = conv(state.left_y);
+	let ly = conv(state.left_y.saturating_neg());
 	let rx = conv(state.right_x);
-	let ry = conv(state.right_y);
+	let ry = conv(state.right_y.saturating_neg());
 
 	(buttons, special, lx, ly, rx, ry)
 }

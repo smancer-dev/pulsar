@@ -84,6 +84,10 @@ pub struct CaptureHandle {
 	/// detect a host-side resolution change and re-resolve the monitor geometry via
 	/// `display_rect()` / `set_monitor()` even when the monitor INDEX is unchanged (C8).
 	build_gen: std::sync::Arc<std::sync::atomic::AtomicU32>,
+	/// EWMA of per-frame encode wall-time in microseconds (G2): the capture thread stores it
+	/// around each `enc.submit`; the host reads it (`encode_us_arc`) to push the overlay's
+	/// "kodlama" stat, which the native NVENC path otherwise lacked (only ffmpeg metered it).
+	encode_us: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl CaptureHandle {
@@ -132,6 +136,12 @@ impl CaptureHandle {
 	/// geometry even though the monitor INDEX has not changed.
 	pub fn build_gen_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
 		self.build_gen.clone()
+	}
+
+	/// A clone of the encode-time EWMA atom (microseconds). The host reads it ~2 Hz to push
+	/// the overlay's encode-ms stat for the native NVENC path (G2). 0 = no frame timed yet.
+	pub fn encode_us_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+		self.encode_us.clone()
 	}
 
 	/// Signal the thread, join it (releases the NVENC session + DXGI duplication), return.
@@ -227,6 +237,9 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 	// via CaptureHandle::switch_output; the capture thread re-points DXGI in place (see run).
 	let requested_output = Arc::new(AtomicU32::new(u32::MAX));
 	let req_out_t = requested_output.clone();
+	// G2: per-frame encode wall-time EWMA (µs), written by the capture thread around submit.
+	let encode_us = Arc::new(AtomicU32::new(0));
+	let encode_us_t = encode_us.clone();
 	// Actual output the thread is streaming — written after each confirmed build (including
 	// reverts). The host reads this via CaptureHandle::current_output() to reconcile its
 	// input-mapping and fast-path baseline after a failed switch revert.
@@ -406,13 +419,18 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 						if frame.force_idr {
 							enc.request_idr();
 						}
-						if let Err(e) = enc.submit(frame, pts) {
+						let enc_t0 = std::time::Instant::now();
+							if let Err(e) = enc.submit(frame, pts) {
 							submit_errs += 1;
 							if submit_errs <= 3 || submit_errs % 240 == 0 {
 								cap_log(&format!("build #{build_no} submit err #{submit_errs}: {e}"));
 							}
 						} else {
 							frames_sent += 1;
+								// G2: smooth per-frame encode wall-time (µs) into the EWMA atom.
+								let us = enc_t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+								let prev = encode_us_t.load(Ordering::Relaxed);
+								encode_us_t.store(if prev == 0 { us } else { prev / 8 * 7 + us / 8 }, Ordering::Relaxed);
 						}
 						pts += 1;
 					},
@@ -445,6 +463,7 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 			requested_output,
 			current_output,
 			build_gen,
+			encode_us,
 		}),
 		Ok(Err(msg)) => {
 			// Thread reported an init error and is returning; join to reap it.

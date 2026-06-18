@@ -327,6 +327,7 @@ enum DataMsgWire {
 		rgba_png: Vec<u8>,
 	},
 	CursorHidden,
+	Rumble { slot: u8, large: u8, small: u8 },
 }
 
 impl From<DataMsgWire> for DataMsg {
@@ -355,6 +356,7 @@ impl From<DataMsgWire> for DataMsg {
 				DataMsg::CursorShape { w, h, hot_x, hot_y, rgba_png }
 			}
 			DataMsgWire::CursorHidden => DataMsg::CursorHidden,
+			DataMsgWire::Rumble { slot, large, small } => DataMsg::Rumble { slot, large, small },
 		}
 	}
 }
@@ -492,6 +494,11 @@ pub enum DataMsg {
 	/// hid it, or it left the captured screen). The client stops drawing the
 	/// side-channel cursor until the next [`DataMsg::CursorPos`]. Appended for wire compat.
 	CursorHidden,
+	/// Host → client: a rumble (force-feedback) command the game sent to the emulated
+	/// gamepad — `slot` is the player index, `large`/`small` are the heavy/light motor
+	/// magnitudes (0–255). The client replays it on the physical controller at that slot
+	/// via gilrs force-feedback. Appended for additive wire compat (old peers ignore it).
+	Rumble { slot: u8, large: u8, small: u8 },
 }
 
 impl<'de> Deserialize<'de> for DataMsg {
@@ -823,6 +830,7 @@ mod tests {
 				rgba_png: vec![0x89, b'P', b'N', b'G'],
 			},
 			DataMsg::CursorHidden,
+			DataMsg::Rumble { slot: 0, large: 200, small: 80 },
 		];
 
 		for msg in cases {

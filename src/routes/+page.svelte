@@ -18,7 +18,7 @@
 	} from '$lib/api';
 	import { setPeerIdentity } from '$lib/peers.svelte';
 	import { gameStore } from '$lib/games.svelte';
-	import { ui, configTick } from '$lib/settings.svelte';
+	import { ui, configTick, saveUi } from '$lib/settings.svelte';
 	import { initCaps } from '$lib/caps.svelte';
 	import { t, i18n } from '$lib/i18n.svelte';
 	import { theme, toggleTheme } from '$lib/theme.svelte';
@@ -76,7 +76,18 @@
 	];
 
 	let view = $state<View>('home');
-	let mode = $state<'remote' | 'game'>('remote');
+	// App-level personality, persisted in `ui.appMode`. 'remote' = the general
+	// remote-desktop app (left sidebar, host capability); 'game' = the controller-first
+	// game-streaming client shell (bottom dock, centered ID, no hosting). Toggled from
+	// the top bar; the CLI `--mode game` overrides it on launch (set in onMount).
+	let mode = $state<'remote' | 'game'>(ui.appMode);
+
+	// Flip the personality and persist the choice so the app reopens in the last mode.
+	function toggleMode() {
+		mode = mode === 'game' ? 'remote' : 'game';
+		ui.appMode = mode;
+		saveUi();
+	}
 	let selfId = $state('—');
 	let selfPw = $state('');
 	let online = $state(false);
@@ -470,6 +481,10 @@
 			});
 			if (ac.pw) autoPw = { id: ac.id, pw: ac.pw };
 			const m = ac.mode === 'game' ? 'game' : 'remote';
+			// A CLI `--mode game` kiosk launches into the gaming personality (transient —
+			// not persisted to ui.appMode, since it's a launch-time override). So when the
+			// session ends the user lands on the gaming home, and hosting is refused.
+			mode = m;
 			const gameId = m === 'game' ? (ac.app || '') : '';
 			// Headless --connect: show the splash, THEN the Connecting screen. The session is
 			// created now (so the splash fades onto the Connecting screen, not the home view),
@@ -528,11 +543,27 @@
 		document.documentElement.toggleAttribute('data-occluded', occluded);
 	});
 
-	// Give the whole app a gaming look (cyan accent) while a game-stream session is
-	// the active tab; revert as soon as it's left.
+	// Give the whole app a gaming look (cyan accent) while the app is in gaming mode OR
+	// a game-stream session is the active tab; revert as soon as both are false.
 	$effect(() => {
 		const s = sm.sessions.find((x) => x.tabId === sm.activeTab);
-		document.documentElement.toggleAttribute('data-gaming', !!s && s.mode === 'game');
+		document.documentElement.toggleAttribute(
+			'data-gaming',
+			mode === 'game' || (!!s && s.mode === 'game')
+		);
+	});
+
+	// Gaming mode is a pure client: this device may NOT be a host. Tell the core to
+	// refuse inbound (the Rust serve loop denies at auth, before any popup), and kick
+	// any sessions that are already connected so "nobody is connected in gaming mode"
+	// holds. Leaving gaming mode re-enables hosting. The Rust default is "serving", so
+	// this only ever needs to flip it off/on.
+	$effect(() => {
+		if (isPopup || !isTauri) return;
+		api.setHostServing(mode !== 'game').catch(() => {});
+		if (mode === 'game') {
+			for (const s of hostSessions) kickPeer(s.peer);
+		}
 	});
 
 	// Suppress the webview's native right-click menu (the browser-like context menu
@@ -596,9 +627,11 @@
 		{/if}
 		{#if !sm.fullscreen}
 			<Chrome
-				title={sm.activeTab === 'home' ? t('nav.' + view) : ''}
+				title={sm.activeTab === 'home' && mode !== 'game' ? t('nav.' + view) : ''}
 				dark={theme.dark}
 				onToggleTheme={toggleTheme}
+				gaming={mode === 'game'}
+				onToggleMode={toggleMode}
 			/>
 			{#if sm.sessions.length}
 				<Tabs
@@ -626,9 +659,11 @@
 				connectErr={sm.connectErr}
 				{hostSessions}
 				{activity}
+				active={sm.activeTab === 'home'}
+				fullscreen={sm.fullscreen}
+				onToggleFullscreen={sm.toggleFullscreen}
 				onView={(v) => (view = v)}
 				onGoOnline={goOnline}
-				onMode={(m) => (mode = m)}
 				onRefreshPw={refreshPw}
 				onDisconnect={kickPeer}
 				onConnect={sm.startConnect}

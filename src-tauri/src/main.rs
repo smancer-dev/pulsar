@@ -52,5 +52,10 @@ fn main() {
 		pulsar_tauri::run_relay(&args);
 		return;
 	}
+	// Diagnostic: exercise the SDL3 client rumble path standalone (no host session).
+	if std::env::var_os("PULSAR_RUMBLE_TEST").is_some() {
+		pulsar_tauri::rumble_selftest();
+		return;
+	}
 	pulsar_tauri::run()
 }

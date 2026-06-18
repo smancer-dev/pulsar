@@ -136,7 +136,12 @@
 	$effect(() => {
 		if (!native || playId < 0 || !active) return;
 		captureOwner = playId;
-		api.kbdCaptureStart(playId, true).catch(() => {}); // true = also capture mouse
+		// true = also capture mouse. Game mode = Moonlight/Parsec-style "control immediately
+			// on connect": engage right after the watcher is armed (remote stays click-to-engage
+			// so a manual remote connect never grabs the local desktop unasked).
+			api.kbdCaptureStart(playId, true)
+				.then(() => (mode === 'game' ? api.kbdEngage() : undefined))
+				.catch(() => {});
 		return () => {
 			if (captureOwner !== playId) return; // another tab re-armed it for itself
 			captureOwner = -1;

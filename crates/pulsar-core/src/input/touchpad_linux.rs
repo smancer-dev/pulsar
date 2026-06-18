@@ -117,6 +117,10 @@ pub fn spawn_touchpad_reader(
 	tx: tokio::sync::mpsc::Sender<InputEvent>,
 	running: Arc<AtomicBool>,
 	sens: Option<f64>,
+	// Live capture gate: only forward pointer events while this returns true (the same
+	// engage+focus+overlay gate the evdev keyboard/mouse capture uses). Injected as a
+	// closure so pulsar-core stays free of the app's kbdhook.
+	is_active: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
 	let sens = sens.unwrap_or(DEFAULT_SENS);
 	// Try to find the device upfront; if none is available, no-op silently.
@@ -140,6 +144,10 @@ pub fn spawn_touchpad_reader(
 		let mut cur_y: Option<i32> = None;
 		// Whether a finger is currently touching the pad.
 		let mut finger_down = false;
+		// Touchpad left-click currently held (so we can release it on a capture-gate edge,
+		// avoiding a stuck host drag), and the last capture-active state (to detect edges).
+		let mut held_left = false;
+		let mut was_active = false;
 
 		'outer: while running.load(Ordering::SeqCst) {
 			// `fetch_events` blocks until at least one event is available.
@@ -151,6 +159,18 @@ pub fn spawn_touchpad_reader(
 					break 'outer;
 				}
 			};
+			// Consult the capture gate once per batch. On any active<->inactive edge, release
+			// a held click (so the host doesn't keep a drag) and drop the motion seed so the
+			// cursor doesn't jump by the delta accumulated while gated off.
+			let active = (is_active)();
+			if active != was_active {
+				if !active && held_left {
+					let _ = tx.blocking_send(InputEvent::PointerButton { button: 0, down: false });
+					held_left = false;
+				}
+				prev = None;
+				was_active = active;
+			}
 			for ev in events {
 				if !running.load(Ordering::SeqCst) {
 					break 'outer;
@@ -183,6 +203,10 @@ pub fn spawn_touchpad_reader(
 					// BTN_LEFT (physical click pad) → left mouse button.
 					InputEventKind::Key(Key::BTN_LEFT) => {
 						let down = ev.value() != 0;
+							held_left = down;
+							if !active {
+								continue; // gated off → don't forward the click (held_left tracked for release)
+							}
 						let _ = tx.blocking_send(InputEvent::PointerButton {
 							button: 0,
 							down,
@@ -192,7 +216,8 @@ pub fn spawn_touchpad_reader(
 					InputEventKind::Synchronization(_) => {
 						if finger_down {
 							if let (Some(x), Some(y)) = (cur_x, cur_y) {
-								if let Some(p) = prev {
+								if active {
+									if let Some(p) = prev {
 									let (dx, dy) = touch_to_delta(p, (x, y), sens);
 									if dx != 0.0 || dy != 0.0 {
 										let _ = tx.blocking_send(
@@ -200,7 +225,8 @@ pub fn spawn_touchpad_reader(
 										);
 									}
 								}
-								prev = Some((x, y));
+								}
+									prev = Some((x, y));
 							}
 						}
 						// Reset per-SYN accumulators; keep prev for next delta.

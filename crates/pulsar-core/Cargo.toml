@@ -25,7 +25,7 @@ tracing.workspace = true
 x25519-dalek = { workspace = true, features = ["static_secrets"] }
 chacha20poly1305.workspace = true
 sha2.workspace = true
-gilrs.workspace = true
+# gilrs removed: controller reading + rumble are via SDL3 (sdl3-sys) in the app crate.
 
 # Host-side virtual gamepad injection on Linux (uinput) + Wayland screen capture
 # via the XDG ScreenCast desktop portal (x11grab can't see a Wayland desktop).

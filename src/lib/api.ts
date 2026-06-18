@@ -22,10 +22,13 @@ export type {
 
 export { isTauri } from './api.invoke';
 
+export type { NavInput } from './api.events';
+
 export { api } from './api.commands';
 
 export {
 	onLocalCaps,
+	onGamepadNav,
 	onChatMsg,
 	onHostChat,
 	onClipboardIn,

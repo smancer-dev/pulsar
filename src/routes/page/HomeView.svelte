@@ -7,6 +7,7 @@
 	import Settings from '$lib/screens/Settings.svelte';
 	import Games from '$lib/screens/Games.svelte';
 	import Sidebar from './Sidebar.svelte';
+	import GamingShell from './GamingShell.svelte';
 	import type { Game } from '$lib/games.svelte';
 	import type { Target } from './sessions.svelte';
 
@@ -25,9 +26,13 @@
 		connectErr: string;
 		hostSessions: { peer: string; since: number }[];
 		activity: string[];
+		/** Whether the home view is the active tab (gates the gaming pad-nav bridge). */
+		active: boolean;
+		/** Window fullscreen state + toggle (gaming mode can go immersive). */
+		fullscreen: boolean;
+		onToggleFullscreen: () => void;
 		onView: (v: View) => void;
 		onGoOnline: () => void;
-		onMode: (m: 'remote' | 'game') => void;
 		onRefreshPw: () => void;
 		onDisconnect: (peer: string) => void;
 		onConnect: (target: Target, m?: 'remote' | 'game', gameId?: string) => void;
@@ -49,9 +54,11 @@
 		connectErr,
 		hostSessions,
 		activity,
+		active,
+		fullscreen,
+		onToggleFullscreen,
 		onView,
 		onGoOnline,
-		onMode,
 		onRefreshPw,
 		onDisconnect,
 		onConnect,
@@ -61,6 +68,22 @@
 	}: Props = $props();
 </script>
 
+{#if mode === 'game'}
+	<!-- Gaming mode: a controller-first pure-client shell (bottom dock, centered ID +
+	     numpad, game recents). No host UI — devices/connections are hidden because this
+	     device refuses inbound while gaming. -->
+	<GamingShell
+		{active}
+		{online}
+		{connecting}
+		{connError}
+		{fullscreen}
+		{onToggleFullscreen}
+		{onGoOnline}
+		{onConnect}
+		{onAuthDone}
+	/>
+{:else}
 <div class="body">
 	<Sidebar {nav} {view} {online} {connecting} {connError} hostCount={hostSessions.length} {onView} {onGoOnline} />
 
@@ -82,15 +105,12 @@
 				{online}
 				{connecting}
 				{unattended}
-				{mode}
 				{hostSessions}
 				{activity}
 				debug={ui.debug}
-				{onMode}
 				{onRefreshPw}
 				{onDisconnect}
 				{onConnect}
-				{onAuthDone}
 			/>
 		{:else if view === 'devices'}
 			<Devices {onConnect} />
@@ -101,6 +121,7 @@
 		{/if}
 	</main>
 </div>
+{/if}
 
 <style>
 	.body {

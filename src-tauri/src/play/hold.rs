@@ -61,6 +61,9 @@ pub(super) async fn hold_session(
 	cursor_external: bool,
 	req_hdr: bool,
 	init_quality: QualityPref,
+	// Host → client rumble: each DataMsg::Rumble is forwarded here for the gilrs reader
+	// thread to replay on the physical pad (force-feedback).
+	rumble_tx: tokio::sync::mpsc::Sender<(u8, u8, u8)>,
 ) {
 	let mut keep = tokio::time::interval(std::time::Duration::from_secs(2));
 	keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -351,6 +354,12 @@ pub(super) async fn hold_session(
 								if let Some(si) = render_stdin.lock().unwrap().as_mut() {
 									let _ = writeln!(si, "cursorhide");
 								}
+							}
+							DataMsg::Rumble { slot, large, small } => {
+								// The host forwarded the game's force-feedback — hand it to the
+								// gilrs reader thread to replay on the physical pad at `slot`.
+								tracing::info!(slot, large, small, "rumble: client received → reader");
+								let _ = rumble_tx.try_send((slot, large, small));
 							}
 							DataMsg::FsEntries { path, entries } => {
 								// A host directory listing for the file panel's remote pane.

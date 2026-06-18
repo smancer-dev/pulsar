@@ -8,6 +8,8 @@ import {
 	addPeer,
 	clearHistory,
 	removeFromHistory,
+	gameHistoryPeers,
+	removeFromGameHistory,
 	normalizeId,
 	fmtPeerId,
 	setPeerIdentity,
@@ -113,6 +115,34 @@ describe('peers store', () => {
 		expect(historyPeers().find((p) => p.id === '444555666')?.name).toBe('444 555 666');
 		recordConnection('444 555 666', 'Oyun Rig’i');
 		expect(historyPeers().find((p) => p.id === '444555666')?.name).toBe('Oyun Rig’i');
+	});
+
+	it('game connects go to a SEPARATE game history, not the remote recents', () => {
+		recordConnection('111 222 333', 'Remote PC', 'pc', 'remote');
+		recordConnection('444 555 666', 'Oyun Rig’i', 'console', 'game');
+		// Remote recents: only the remote connect.
+		expect(historyPeers().map((p) => p.id)).toEqual(['111222333']);
+		// Game history: only the game connect.
+		expect(gameHistoryPeers().map((p) => p.id)).toEqual(['444555666']);
+	});
+
+	it('a host connected in BOTH modes appears in both timelines', () => {
+		recordConnection('444 555 666', 'Rig', 'pc', 'remote');
+		recordConnection('444 555 666', 'Rig', 'console', 'game');
+		expect(historyPeers().some((p) => p.id === '444555666')).toBe(true);
+		expect(gameHistoryPeers().some((p) => p.id === '444555666')).toBe(true);
+	});
+
+	it('removeFromGameHistory clears only the game stamp; a remote stamp keeps the entry', () => {
+		recordConnection('444 555 666', 'Rig', 'pc', 'remote');
+		recordConnection('444 555 666', 'Rig', 'console', 'game');
+		removeFromGameHistory('444 555 666');
+		expect(gameHistoryPeers().length).toBe(0);
+		expect(historyPeers().some((p) => p.id === '444555666')).toBe(true); // remote stamp survives
+		// A game-only entry is fully removed when its game stamp is dropped.
+		recordConnection('777 888 999', 'Solo', 'console', 'game');
+		removeFromGameHistory('777 888 999');
+		expect(allPeers().some((p) => p.id === '777888999')).toBe(false);
 	});
 
 	it('setPeerIdentity keeps a saved device’s user-chosen name (avatar still updates)', () => {

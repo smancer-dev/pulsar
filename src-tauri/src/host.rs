@@ -9,6 +9,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pulsar_core::input::{create_virtual_pad_target, EmulationTarget, GamepadKind, ResolvedTarget, VirtualGamepad};
+
+/// Spawn a thread that forwards the game's rumble from a virtual pad back to the client's
+/// physical controller (as [`DataMsg::Rumble`]). No-op when the backend has no rumble
+/// reader (non-DS4). The thread exits when the pad is unplugged (`next()` → `None`) or the
+/// outbound channel closes (session ended).
+fn spawn_rumble_forward(
+	pad: &dyn VirtualGamepad,
+	slot: u8,
+	tx: tokio::sync::mpsc::Sender<pulsar_core::service::DataMsg>,
+) {
+	use pulsar_core::service::DataMsg;
+	if let Some(mut reader) = pad.rumble_reader() {
+		tracing::info!(slot, "rumble: DS4 notifier thread started (host)");
+		std::thread::spawn(move || {
+			while let Some((large, small)) = reader.next() {
+				tracing::info!(slot, large, small, "rumble: host got from game → forwarding");
+				if tx.blocking_send(DataMsg::Rumble { slot, large, small }).is_err() {
+					break;
+				}
+			}
+			tracing::info!(slot, "rumble: DS4 notifier thread ended (host)");
+		});
+	} else {
+		tracing::info!("rumble: pad has NO rumble_reader (not DS4 backend?)");
+	}
+}
 use pulsar_core::pipeline::{self, CaptureMethod, HwEncoder, StreamPlan};
 use pulsar_core::proto::DeviceId;
 use pulsar_core::service::{
@@ -186,20 +212,23 @@ impl Drop for SessionCleanupGuard {
 			crate::connections::close(&self.app_handle);
 		}
 		// Emit the `disconnected` SessionEvent so both the Connections window and
-		// +page.svelte's `hostSessions` drop this peer. Without this event:
-		//   - Connections.svelte:44 never removes the row → phantom peer shown forever
-		//   - +page.svelte:369 never drains the entry → hostSessions.length stays > 0
-		//     → isBusy() returns true → boot + idle auto-update checks are suppressed
-		// We always emit (not gated on was_mine) so the UI is guaranteed a cleanup
-		// signal even if active was already cleared by the normal teardown path.
-		let _ = self.app_handle.emit(
-			"session",
-			crate::events::SessionEvent {
-				kind: "disconnected".into(),
-				peer,
-				detail: String::new(),
-			},
-		);
+		// +page.svelte's `hostSessions` drop this peer. GATED on `was_mine`: a same-peer
+		// reconnect (game mode connects twice — a caps-probe session then the streaming one,
+		// identical peer addr) means this OLD session's Drop runs AFTER the new one already
+		// took the `active` slot (mine=false). Emitting unconditionally told the UI the peer
+		// disconnected and the window dropped the row by peer — so the LIVE game connection
+		// vanished from "active connections". The newer session owns
+		// the peer + emits its own cleanup when IT ends, so skipping here is safe.
+		if was_mine {
+			let _ = self.app_handle.emit(
+				"session",
+				crate::events::SessionEvent {
+					kind: "disconnected".into(),
+					peer,
+					detail: String::new(),
+				},
+			);
+		}
 	}
 }
 
@@ -452,7 +481,30 @@ pub(crate) async fn go_online(
 					Ok(Some(p)) => p,
 					_ => return,
 				};
-				// Auth: a correct up-front password is accepted immediately. Otherwise
+				// Gaming mode (pure client): the user put this device into a personality
+					// where it may NOT be a host, so refuse every inbound connection right
+					// here — before any Allow/Deny popup or password race — and tell the UI.
+					// Registration with the relay stays alive (outbound connects still work);
+					// only inbound serving is gated. Active sessions are kicked separately by
+					// the UI when the mode is entered.
+					if app_h
+						.state::<AppState>()
+						.hosting_disabled
+						.load(std::sync::atomic::Ordering::Relaxed)
+					{
+						let _ = reject(&mut session).await;
+						tracing::info!(%peer, "inbound refused — hosting disabled (gaming mode)");
+						let _ = app_h.emit(
+							"session",
+							SessionEvent {
+								kind: "rejected".into(),
+								peer: peer.clone(),
+								detail: String::new(),
+							},
+						);
+						return;
+					}
+					// Auth: a correct up-front password is accepted immediately. Otherwise
 				// the host's Allow/Deny popup AND the client's password prompt appear
 				// at the SAME time; accept on whichever lands first (so the host can
 				// approve passwordlessly). Unattended hosts auto-allow. The persistent
@@ -605,6 +657,9 @@ pub(crate) async fn go_online(
 				let stats_out = out_tx.clone();
 				// A clone for the file-manager handler's replies (FsEntries / file stream).
 				let fs_out = out_tx.clone();
+				// A clone the on_input gamepad path uses to forward the game's rumble back to
+				// the client (one dedicated thread per emulated DS4 pad).
+				let rumble_out = out_tx.clone();
 
 				// C9: Register this session at accept time (not deferred to the first
 				// StartStream) so the host operator can always see and kick any
@@ -647,7 +702,7 @@ pub(crate) async fn go_online(
 						host_out.lock().unwrap().insert(peer.clone(), (sid, out_tx.clone()));
 						// Minimized: mode unknown until first StartStream; make_on_stream
 						// calls open_or_update again with the real mode.
-						crate::connections::open_or_update(&app_h, false);
+						crate::connections::open_or_update(&app_h, crate::connections::Surface::Background);
 						None
 					}
 				};
@@ -983,14 +1038,17 @@ pub(crate) async fn go_online(
 							// resolved target changes, so ViGEm/uinput replug is bounded and rare.
 							InputEvent::GamepadSlot { slot, kind, target, state } => {
 								let want = target.resolve(kind);
-								match pads.get(&slot) {
-									Some((have, _)) if *have != want => {
-										pads.insert(slot, (want, create_virtual_pad_target(kind, target)));
-									}
-									None => {
-										pads.insert(slot, (want, create_virtual_pad_target(kind, target)));
-									}
-									_ => {}
+								let need_create = match pads.get(&slot) {
+									Some((have, _)) => *have != want,
+									None => true,
+								};
+								if need_create {
+									let pad = create_virtual_pad_target(kind, target);
+									// Forward the game's rumble back to the client's physical pad
+									// (DS4 backend only; no-op for others). The thread ends when
+									// this pad is dropped (its notification IOCTL aborts).
+									spawn_rumble_forward(pad.as_ref(), slot, rumble_out.clone());
+									pads.insert(slot, (want, pad));
 								}
 								pads.get_mut(&slot).unwrap().1.apply(&state);
 							}
@@ -1120,7 +1178,7 @@ pub(crate) async fn go_online(
 								log.drain(..excess);
 							}
 						}
-						crate::connections::open_or_update(&app_h, true);
+						crate::connections::open_or_update(&app_h, crate::connections::Surface::Forward);
 						let _ = app_h.emit(
 							"host-chat",
 							DataPayload {
@@ -1446,7 +1504,8 @@ pub(crate) async fn go_online(
 				// the last connection ends.
 				let (was_mine, conns_emptied) = {
 					let mut g = active.lock().unwrap();
-					let mine = g.get(&peer).map(|ci| ci.sid) == Some(sid);
+					let cur = g.get(&peer).map(|ci| ci.sid);
+					let mine = cur == Some(sid);
 					if mine {
 						g.remove(&peer);
 					}
@@ -1474,14 +1533,23 @@ pub(crate) async fn go_online(
 						cap.stop().await;
 					}
 				}
-				let _ = app_h.emit(
-					"session",
-					SessionEvent {
-						kind: "disconnected".into(),
-						peer,
-						detail: String::new(),
-					},
-				);
+				// Only tell the UI "disconnected" if THIS session still owned the peer. A
+				// same-peer reconnect (game mode connects twice: a caps-probe session then the
+				// streaming one, identical peer addr) means the old session's teardown fires here
+				// AFTER the new one already took the `active` slot (sid-guarded above: mine=false,
+				// remaining=1). Emitting unconditionally made the window drop the row by peer and
+				// the LIVE game connection vanished from "active connections". Skip it — the
+				// peer is still connected via the newer session.
+				if was_mine {
+					let _ = app_h.emit(
+						"session",
+						SessionEvent {
+							kind: "disconnected".into(),
+							peer,
+							detail: String::new(),
+						},
+					);
+				}
 			});
 			// Track this session task so the next go_online can abort it (releasing the
 			// strong Arc<Node> it holds). Prune already-finished handles first so the

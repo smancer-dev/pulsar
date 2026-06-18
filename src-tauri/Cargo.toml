@@ -61,6 +61,16 @@ subtle = "2"
 # then streams the chosen file straight via the session data channel (no roundtrip
 # through the webview). Uses Win32 IFileOpenDialog on Windows; GTK3/portal on Linux.
 rfd = "0.14"
+# Client-side controller RUMBLE via SDL3's gamepad HID drivers — raw FFI to the SDL3 C
+# API (the same SDL_RumbleGamepad Moonlight calls), NOT a higher-level wrapper crate.
+# SDL3 drives force-feedback over its own HIDAPI drivers (DualSense/DS4/Switch/Xbox),
+# which works where the kernel evdev node exposes no EV_FF (notably BT-connected
+# DualSense and the RK3588 BSP kernel) — exactly Moonlight's path. `build-from-source`
+# compiles SDL3 from the vendored C source and `link-static` links it into the binary,
+# so there's NO runtime libSDL3 to install or bundle. Needs CMake + a C compiler at build
+# time (CI runners + the Pi have them). Lives in the app crate only, so `cargo test
+# -p pulsar-core` (the fast headless loop) never compiles SDL.
+sdl3-sys = { version = "0.6", default-features = false, features = ["build-from-source", "link-static"] }
 
 # Raw Win32 for true taskbar-covering fullscreen (borderless-fullscreen via SetWindowPos).
 [target.'cfg(windows)'.dependencies]

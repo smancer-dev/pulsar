@@ -16,6 +16,8 @@ export const en: Dict = {
 	'chrome.themeToggle': 'Change theme',
 	'chrome.language': 'Language',
 	'chrome.languageToggle': 'Change language',
+	'chrome.gamingMode': 'Gaming mode',
+	'chrome.gamingToggle': 'Enter / leave gaming mode',
 	'tab.home': 'Home',
 	'tab.close': 'Close tab',
 	'tab.rename': 'Rename tab',
@@ -106,6 +108,21 @@ export const en: Dict = {
 	'home.recents': 'Recent connections',
 	'home.noRecents': 'No connections yet. They appear here once you connect to an ID.',
 	'home.remoteDevice': 'Remote device',
+
+	// Gaming mode (the controller-first game-streaming shell)
+	'gaming.eyebrow': 'GAME STREAMING',
+	'gaming.title': 'Connect to a host',
+	'gaming.connect': 'Connect',
+	'gaming.connectCta': 'Connect to a host',
+	'gaming.close': 'Close',
+	'gaming.back': 'Back',
+	'gaming.delete': 'Delete',
+	'gaming.lan': 'Hosts on your network',
+	'gaming.fullscreen': 'Fullscreen',
+	'gaming.desktop': 'Desktop',
+	'gaming.wholeScreen': 'stream the whole screen',
+	'gaming.recents': 'Recently played',
+	'gaming.noRecents': 'No game connections yet. They appear here once you connect to a host.',
 
 	// Devices
 	'devices.title': 'Devices',

@@ -37,6 +37,23 @@ export function listenScope() {
 /** The startup capability probe finished (every launch): platform + validated
  * encoder/decoder lists. The splash waits for this; Settings gates on it. */
 export const onLocalCaps = (cb: (caps: LocalCaps) => void) => listenTo<LocalCaps>('local-caps', cb);
+
+/** Controller-navigation snapshot from the gilrs bridge (gaming-mode menu nav). Booleans
+ * fold the D-pad + left stick into directions; a/b/x = face buttons; lb/rb = bumpers. */
+export type NavInput = {
+	up: boolean;
+	down: boolean;
+	left: boolean;
+	right: boolean;
+	a: boolean;
+	b: boolean;
+	x: boolean;
+	lb: boolean;
+	rb: boolean;
+};
+/** Subscribe to the gilrs→webview controller-nav bridge (started via api.gamepadNavStart).
+ * The only pad-nav input on Linux (no webview Gamepad API), preferred everywhere. */
+export const onGamepadNav = (cb: (s: NavInput) => void) => listenTo<NavInput>('gamepad-nav', cb);
 /** The node (re)bound its UDP socket on `go_online` — the ACTUAL port for direct
  * `ip:port` connects (Home shows it next to the local IP). */
 export const onNodePort = (cb: (port: number) => void) => listenTo<number>('node-port', cb);

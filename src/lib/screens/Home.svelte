@@ -2,8 +2,9 @@
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import { historyPeers, removeFromHistory, fmtPeerId, addPeer, isSaved } from '$lib/peers.svelte';
-	import { api, onNodePort, type GameInfo } from '$lib/api';
+	import { api, onNodePort } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
+	import { canConnectTarget, fmtTarget } from '$lib/connectTarget';
 	import SelfCard from './Home/SelfCard.svelte';
 	import LanDevices from './Home/LanDevices.svelte';
 
@@ -15,18 +16,12 @@
 		connecting?: boolean;
 		/** Host's unattended-access toggle — no one-time password is issued when ON. */
 		unattended?: boolean;
-		mode: 'remote' | 'game';
 		hostSessions: { peer: string; since: number }[];
 		activity: string[];
 		debug?: boolean;
-		onMode: (m: 'remote' | 'game') => void;
 		onRefreshPw?: () => void;
 		onDisconnect?: (peer: string) => void;
 		onConnect: (t: Target, m?: 'remote' | 'game', gameId?: string) => void;
-		/** Called when a games fetch settles (success or fail) so the shell can dismiss
-		 * the password prompt it opened for this target (listRemoteGames authenticates
-		 * like a connect, but never goes through SessionManager.startConnect). */
-		onAuthDone?: (target: string) => void;
 	};
 	let {
 		selfId,
@@ -34,15 +29,12 @@
 		online = false,
 		connecting = false,
 		unattended = false,
-		mode,
 		hostSessions,
 		activity,
 		debug = false,
-		onMode,
 		onRefreshPw = () => {},
 		onDisconnect = () => {},
-		onConnect,
-		onAuthDone = () => {}
+		onConnect
 	}: Props = $props();
 
 	let showAllHistory = $state(false);
@@ -73,59 +65,16 @@
 
 	let target = $state('');
 
-	// client → game mode: fetch the host's published games
-	let hostGames = $state<GameInfo[] | null>(null);
-	let loadingGames = $state(false);
-	let gamesErr = $state('');
-
-	// The fetched list is bound to the target it came from — editing the target
-	// invalidates it (a stale row would connect to B with A's game id).
 	function setTarget(v: string) {
-		const next = fmt(v);
-		if (next !== target) {
-			hostGames = null;
-			gamesErr = '';
-		}
-		target = next;
+		target = fmtTarget(v);
 	}
-
-	// Auth (password / host approval) is handled by the connect flow via events.
-	async function fetchGames() {
-		if (!canConnect) return;
-		const id = fmt(target);
-		loadingGames = true;
-		gamesErr = '';
-		hostGames = null;
-		try {
-			hostGames = await api.listRemoteGames(id);
-		} catch (e) {
-			gamesErr = e instanceof Error ? e.message : String(e);
-		} finally {
-			loadingGames = false;
-			onAuthDone(id); // this fetch's password prompt (if any) is done
-		}
-	}
-	function playGame(g: GameInfo) {
-		onConnect({ name: g.title, id: fmt(target) }, 'game', g.id);
-	}
-
-	// A target is either a 9-digit relay ID (grouped) or an IP / IP:port (has '.'/':').
-	const isAddr = (v: string) => /[.:]/.test(v);
-	const fmt = (v: string) =>
-		isAddr(v)
-			? v.replace(/[^0-9.:]/g, '').slice(0, 21)
-			: v
-					.replace(/\D/g, '')
-					.slice(0, 9)
-					.replace(/(\d{3})(?=\d)/g, '$1 ')
-					.trim();
-	const digits = $derived(target.replace(/\D/g, ''));
-	const ipRe = /^\d{1,3}(\.\d{1,3}){3}(:\d{1,5})?$/;
-	const canConnect = $derived(isAddr(target) ? ipRe.test(target.trim()) : digits.length >= 6);
+	const canConnect = $derived(canConnectTarget(target));
 
 	function go() {
-		// No password up front — startConnect prompts via a popup if the host asks.
-		if (canConnect) onConnect({ name: t('home.remoteDevice'), id: fmt(target) }, mode);
+		// No password up front — startConnect prompts via a popup if the host asks. No
+		// mode argument: the shell's default connect mode is remote (gaming streaming has
+		// its own screen now), so a plain connect here is always remote desktop.
+		if (canConnect) onConnect({ name: t('home.remoteDevice'), id: fmtTarget(target) });
 	}
 	function initials(name: string) {
 		return name
@@ -141,10 +90,6 @@
 	<div>
 		<h1>{t('home.title')}</h1>
 		<p class="sub">{t('home.sub')}</p>
-	</div>
-	<div class="seg">
-		<button class:active={mode === 'remote'} onclick={() => onMode('remote')}>{t('home.modeRemote')}</button>
-		<button class:active={mode === 'game'} onclick={() => onMode('game')}>{t('home.modeGame')}</button>
 	</div>
 </div>
 
@@ -165,46 +110,23 @@
 	/>
 
 	<div class="card col">
-		<span class="eyebrow mono">{mode === 'game' ? t('home.startGameSession') : t('home.connectRemote')}</span>
+		<span class="eyebrow mono">{t('home.connectRemote')}</span>
 		<div class="lab mt">{t('home.deviceId')}</div>
 		<div class="field">
 			<Icon name="connect" size={17} />
 			<input
 				value={target}
 				oninput={(e) => setTarget(e.currentTarget.value)}
-				onkeydown={(e) => e.key === 'Enter' && (mode === 'game' ? fetchGames() : go())}
+				onkeydown={(e) => e.key === 'Enter' && go()}
 				placeholder="000 000 000"
 				aria-label={t('home.targetAria')}
 				style="font-family:var(--font-mono);font-size:19px;letter-spacing:0.06em"
 			/>
 		</div>
 		<div style="font-size:12px;color:var(--text-faint);margin-top:7px">{t('home.idOrIp')}</div>
-		{#if mode === 'game'}
-			<button class="btn btn-primary go" disabled={!canConnect || loadingGames} onclick={() => fetchGames()}>
-				<Icon name="gaming" size={17} />
-				{loadingGames ? t('home.fetching') : t('home.fetchGames')}
-			</button>
-			{#if gamesErr}<div class="ginfo err">{gamesErr}</div>{/if}
-			{#if hostGames}
-				{#if hostGames.length === 0}
-					<div class="ginfo">{t('home.noHostGames')}</div>
-				{:else}
-					<div class="hostgames">
-						{#each hostGames as g (g.id)}
-							<button class="recent-row" onclick={() => playGame(g)}>
-								<span class="ravatar">{initials(g.title)}</span>
-								<span class="rmeta"><span class="rname">{g.title}</span><span class="rid mono">{g.kind}</span></span>
-								<Icon name="gaming" size={15} class="push" />
-							</button>
-						{/each}
-					</div>
-				{/if}
-			{/if}
-		{:else}
-			<button class="btn btn-primary go" disabled={!canConnect} onclick={go}>
-				<Icon name="connect" size={17} />{t('home.connect')}
-			</button>
-		{/if}
+		<button class="btn btn-primary go" disabled={!canConnect} onclick={go}>
+			<Icon name="connect" size={17} />{t('home.connect')}
+		</button>
 
 		<div class="recents">
 			<div class="rlab" style="display:flex;align-items:center;gap:8px">
@@ -224,7 +146,7 @@
 			{:else}
 				{#each recents as r (r.id)}
 				<div class="rrow">
-					<button class="recent-row" onclick={() => onConnect({ name: r.name, id: r.id }, mode)}>
+					<button class="recent-row" onclick={() => onConnect({ name: r.name, id: r.id })}>
 						<span class="ravatar">
 							{#if r.avatar}<img class="rimg" src={r.avatar} alt="" />{:else}{initials(r.name)}{/if}
 						</span>
@@ -256,7 +178,7 @@
 	</div>
 </div>
 
-<LanDevices {mode} {onConnect} />
+<LanDevices {onConnect} />
 
 <style>
 	.head {
@@ -321,22 +243,6 @@
 		padding: 10px 12px;
 		border: 1px dashed var(--border);
 		border-radius: var(--r-sm);
-	}
-	.ginfo {
-		font-size: 12.5px;
-		color: var(--text-faint);
-		margin-top: 10px;
-		line-height: 1.5;
-	}
-	.ginfo.err {
-		color: var(--danger);
-		word-break: break-word;
-	}
-	.hostgames {
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-		margin-top: 12px;
 	}
 	.recents .recent-row {
 		margin-bottom: 6px;

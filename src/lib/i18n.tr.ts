@@ -16,6 +16,8 @@ export const tr: Dict = {
 	'chrome.themeToggle': 'Temayı değiştir',
 	'chrome.language': 'Dil',
 	'chrome.languageToggle': 'Dili değiştir',
+	'chrome.gamingMode': 'Oyun modu',
+	'chrome.gamingToggle': 'Oyun moduna geç / çık',
 	'tab.home': 'Ana Sayfa',
 	'tab.close': 'Sekmeyi kapat',
 	'tab.rename': 'Sekmeyi yeniden adlandır',
@@ -106,6 +108,21 @@ export const tr: Dict = {
 	'home.recents': 'Son bağlantılar',
 	'home.noRecents': 'Henüz bağlantı yok. Bir kimliğe bağlandığında burada görünür.',
 	'home.remoteDevice': 'Uzak Cihaz',
+
+	// Gaming mode (the controller-first game-streaming shell)
+	'gaming.eyebrow': 'OYUN AKIŞI',
+	'gaming.title': 'Bir host’a bağlan',
+	'gaming.connect': 'Bağlan',
+	'gaming.connectCta': 'Host’a Bağlan',
+	'gaming.close': 'Kapat',
+	'gaming.back': 'Geri',
+	'gaming.delete': 'Sil',
+	'gaming.lan': 'Yerel ağdaki hostlar',
+	'gaming.fullscreen': 'Tam ekran',
+	'gaming.desktop': 'Masaüstü',
+	'gaming.wholeScreen': 'tüm ekranı yayınla',
+	'gaming.recents': 'Son oynananlar',
+	'gaming.noRecents': 'Henüz oyun bağlantısı yok. Bir host’a bağlandığında burada görünür.',
 
 	// Devices
 	'devices.title': 'Cihazlar',

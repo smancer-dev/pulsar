@@ -12,8 +12,14 @@ export interface Peer {
 	/** True only if the user explicitly SAVED this device (address book / Devices).
 	 * A plain connection records history but does NOT save the device. */
 	saved: boolean;
-	/** epoch ms of the last successful connect, or null if never connected. */
+	/** epoch ms of the last successful REMOTE-desktop connect, or null if never. Drives
+	 * the remote Home recents. */
 	lastConnected: number | null;
+	/** epoch ms of the last successful GAME-streaming connect, or null if never. A
+	 * SEPARATE timeline from `lastConnected` so the gaming-mode home shows its own
+	 * recents without mixing in remote-desktop connections (the maintainer wants the
+	 * gaming list distinct from Devices / remote recents). */
+	gameConnected?: number | null;
 	/** The peer's LAST-SEEN identity image (data URL, pushed over the session) —
 	 * cached so recents / LAN rows / devices show a face without a live session. */
 	avatar?: string;
@@ -72,6 +78,9 @@ function load(): Peer[] {
 			}
 			prev.saved = prev.saved || p.saved;
 			prev.fav = prev.fav || p.fav;
+			// Keep the most recent of EACH timeline independently when merging duplicate
+			// ids (a peer connected in both modes carries both stamps).
+			prev.gameConnected = Math.max(prev.gameConnected ?? 0, p.gameConnected ?? 0) || null;
 			if ((p.lastConnected ?? 0) > (prev.lastConnected ?? 0)) {
 				prev.lastConnected = p.lastConnected;
 				if (p.name) prev.name = p.name;
@@ -105,12 +114,23 @@ export function savedPeers(): Peer[] {
 	return peers.filter((p) => p.saved);
 }
 
-/** Connection history — every peer ever connected to, most-recent first. Separate
- * from the saved Devices list (a connection alone never saves a device). */
+/** REMOTE connection history — every peer ever connected to in remote-desktop mode,
+ * most-recent first. Separate from the saved Devices list (a connection alone never
+ * saves a device) and from the GAME history (`gameHistoryPeers`). */
 export function historyPeers(n?: number): Peer[] {
 	const sorted = peers
 		.filter((p) => p.lastConnected != null)
 		.sort((a, b) => (b.lastConnected ?? 0) - (a.lastConnected ?? 0));
+	return n == null ? sorted : sorted.slice(0, n);
+}
+
+/** GAME connection history — every host ever connected to in game-streaming mode,
+ * most-recent first. Drives the gaming-mode home's recents (kept distinct from the
+ * remote recents and the Devices address book). */
+export function gameHistoryPeers(n?: number): Peer[] {
+	const sorted = peers
+		.filter((p) => p.gameConnected != null)
+		.sort((a, b) => (b.gameConnected ?? 0) - (a.gameConnected ?? 0));
 	return n == null ? sorted : sorted.slice(0, n);
 }
 
@@ -122,33 +142,64 @@ export function recentPeers(n = 3): Peer[] {
  * address book (Devices); call `addPeer` for that. History is capped at
  * `HISTORY_MAX`: beyond it the oldest entries fall out (saved devices stay in the
  * address book, only their history stamp is cleared). */
-export function recordConnection(id: string, name: string, cat: PeerCategory = 'pc') {
+export function recordConnection(
+	id: string,
+	name: string,
+	cat: PeerCategory = 'pc',
+	kind: 'remote' | 'game' = 'remote'
+) {
 	id = normalizeId(id);
+	const now = Date.now();
 	const existing = peers.find((p) => p.id === id);
 	if (existing) {
-		existing.lastConnected = Date.now();
+		if (kind === 'game') existing.gameConnected = now;
+		else existing.lastConnected = now;
 		// The caller's name is just the tab label — a generic "Uzak Cihaz" for manual
 		// connects, the GAME title for game connects. Only fill in a real name when
 		// all we have is the id-derived placeholder; never rename a known peer.
 		if (name && (!existing.name || existing.name === fmtPeerId(existing.id))) existing.name = name;
 	} else {
-		peers.push({ id, name: name || fmtPeerId(id), cat, fav: false, saved: false, lastConnected: Date.now() });
+		peers.push({
+			id,
+			name: name || fmtPeerId(id),
+			cat,
+			fav: false,
+			saved: false,
+			lastConnected: kind === 'game' ? null : now,
+			gameConnected: kind === 'game' ? now : null
+		});
 	}
-	const over = historyPeers().slice(HISTORY_MAX);
-	for (const p of over) {
-		if (p.saved) p.lastConnected = null;
-		else peers.splice(peers.indexOf(p), 1);
+	// Cap each timeline independently so neither history grows without bound. An
+	// over-cap entry loses only the relevant stamp; it is spliced only when it is
+	// unsaved AND has no remaining stamp on the OTHER timeline.
+	const capList = kind === 'game' ? gameHistoryPeers() : historyPeers();
+	for (const p of capList.slice(HISTORY_MAX)) {
+		if (kind === 'game') p.gameConnected = null;
+		else p.lastConnected = null;
+		if (!p.saved && p.lastConnected == null && p.gameConnected == null)
+			peers.splice(peers.indexOf(p), 1);
 	}
 	persist();
 }
 
-/** Drop one entry from the connection history (the recents ×): a saved device keeps
- * its address-book entry and only loses the history stamp. */
+/** Drop one entry from the REMOTE connection history (the recents ×): a saved device
+ * keeps its address-book entry; an entry still in the game history keeps that stamp.
+ * Only fully-orphaned unsaved entries are removed. */
 export function removeFromHistory(id: string) {
 	const i = peers.findIndex((p) => p.id === normalizeId(id));
 	if (i < 0) return;
-	if (peers[i].saved) peers[i].lastConnected = null;
-	else peers.splice(i, 1);
+	peers[i].lastConnected = null;
+	if (!peers[i].saved && peers[i].gameConnected == null) peers.splice(i, 1);
+	persist();
+}
+
+/** Drop one entry from the GAME connection history (gaming-mode recents ×). Mirror of
+ * `removeFromHistory` for the game timeline. */
+export function removeFromGameHistory(id: string) {
+	const i = peers.findIndex((p) => p.id === normalizeId(id));
+	if (i < 0) return;
+	peers[i].gameConnected = null;
+	if (!peers[i].saved && peers[i].lastConnected == null) peers.splice(i, 1);
 	persist();
 }
 
@@ -211,11 +262,15 @@ export function isSaved(id: string): boolean {
 	return peers.some((p) => p.id === nid && p.saved);
 }
 
-/** Clear connection history (drops history-only entries; keeps saved devices). */
+/** Clear ALL connection history, both timelines (drops history-only entries; keeps
+ * saved devices, only clearing their stamps). */
 export function clearHistory() {
 	for (let i = peers.length - 1; i >= 0; i--) {
 		if (!peers[i].saved) peers.splice(i, 1);
-		else peers[i].lastConnected = null;
+		else {
+			peers[i].lastConnected = null;
+			peers[i].gameConnected = null;
+		}
 	}
 	persist();
 }

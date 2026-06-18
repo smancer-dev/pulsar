@@ -15,7 +15,8 @@ mod types;
 pub use types::{
 	axis_to_i16, button, create_virtual_pad, create_virtual_pad_target, ds4_report_fields,
 	touch_to_delta, trigger_to_u8, vid_pid_from_sdl_guid, xinput_buttons, ControllerInfo,
-	EmulationTarget, GamepadKind, GamepadState, RecordingPad, ResolvedTarget, VirtualGamepad,
+	EmulationTarget, GamepadKind, GamepadState, RecordingPad, ResolvedTarget, RumbleReader,
+	VirtualGamepad,
 };
 
 /// Windows host-side virtual gamepad via **ViGEmBus** — see [`vigem::ViGEmGamepad`].
@@ -62,8 +63,7 @@ pub use macos::DesktopInput;
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub use desktop_stub::DesktopInput;
 
-pub use hub::ControllerHub;
-
-/// Live controller reading via `gilrs`. Always compiled (the dep is small), but
-/// only useful where physical controllers exist.
-pub mod hub;
+// Controller reading + rumble now live in the app crate via SDL3 (sdl3-sys) —
+// see desktop-app/src-tauri/src/controllers.rs. gilrs is gone (one library, the
+// Moonlight model, and it rumbles pads with no evdev EV_FF). pulsar-core keeps only
+// the shared data types (GamepadState/Kind, the VirtualGamepad host trait, helpers).

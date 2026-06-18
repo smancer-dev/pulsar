@@ -1258,7 +1258,16 @@ pub(super) fn make_on_stream(
 			// Open or update the connections window: bring forward for Remote, leave
 			// minimized for Game. If the window was already opened minimized at accept
 			// time, this upgrades it to the correct focus/visibility for the real mode.
-			crate::connections::open_or_update(&app_h, !req.game_mode);
+			// Remote first-stream brings the window forward; GAME reveals it WITHOUT stealing
+			// focus (so a gaming connection is visibly listed on the host too — G1).
+			crate::connections::open_or_update(
+				&app_h,
+				if req.game_mode {
+					crate::connections::Surface::Reveal
+				} else {
+					crate::connections::Surface::Forward
+				},
+			);
 			// Identity push (host → client) is ALSO deferred to here: at accept time
 			// the client is still inside query_stream_caps' wait loop, which discards
 			// every non-StreamCaps frame — a PeerName/Avatar queued there never
@@ -1824,6 +1833,10 @@ pub(super) fn make_on_stream(
 		// unless PULSAR_FFMPEG_CAPTURE=1. Init happens inside the capture thread
 		// and is reported back synchronously — Ok ⇒ streaming started; Err ⇒ fall
 		// back to ffmpeg with zero behaviour change.
+		// G2: holds the native NVENC encode-us atom (set in the Windows Ok(h) arm below) so the
+		// post-resolve `if native_started` branch can spawn the encode-stat reporter thread.
+		#[allow(unused_mut)]
+		let mut native_enc_us: Option<std::sync::Arc<std::sync::atomic::AtomicU32>> = None;
 		#[cfg(windows)]
 		let native_started = if encoder == HwEncoder::Nvenc
 			&& capture == CaptureMethod::Ddagrab
@@ -1881,6 +1894,7 @@ pub(super) fn make_on_stream(
 					// Expose the build-generation Arc so on_input can detect same-index resolution
 					// changes and re-resolve display_rect/set_monitor even when the index is unchanged (C8).
 					*native_gen_arc.lock().unwrap() = Some(h.build_gen_arc());
+					native_enc_us = Some(h.encode_us_arc()); // G2: before h is moved into the slot
 					*native_slot.lock().unwrap() = Some(h);
 					true
 				}
@@ -1961,6 +1975,30 @@ pub(super) fn make_on_stream(
 		// encode_command always yields ("ffmpeg", args); run the bundled
 		// ffmpeg binary directly rather than relying on a system ffmpeg.
 		let started = if native_started {
+			// G2: native NVENC has no ffmpeg meter — spawn a ~2 Hz reporter that reads the
+			// capture thread's encode-us EWMA + re-pushes the Stats label with the encode part
+			// (the same 6th `· {ms} kodlama` field the ffmpeg path appends in the else branch).
+			if let Some(enc_us) = native_enc_us.clone() {
+				let stats_enc = stats_out.clone();
+				let label_enc = base_label.clone();
+				std::thread::spawn(move || loop {
+					std::thread::sleep(std::time::Duration::from_millis(500));
+					let us = enc_us.load(std::sync::atomic::Ordering::Relaxed);
+					if us == 0 {
+						continue;
+					}
+					if stats_enc
+						.try_send(DataMsg::Stats(format!(
+							"{label_enc} · {:.1} {}",
+							us as f32 / 1000.0,
+							crate::i18n::t("stream.msEncode")
+						)))
+						.is_err()
+					{
+						break; // session torn down (channel closed)
+					}
+				});
+			}
 			true
 		} else {
 			let (_, args) = pipeline::encode_command(&plan);

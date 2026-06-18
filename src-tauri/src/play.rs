@@ -8,7 +8,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pulsar_core::input::{ControllerHub, EmulationTarget};
+use pulsar_core::input::EmulationTarget;
 use pulsar_core::service::{
 	request_launch, request_stream, DataMsg, InputEvent, QualityPref, StreamReq,
 };
@@ -1083,6 +1083,10 @@ pub(crate) async fn start_remote_play(
 	// Register this play session (one per connected-host tab). `id` was allocated above.
 	let running = Arc::new(AtomicBool::new(true));
 	let (input_tx, input_rx) = tokio::sync::mpsc::channel::<InputEvent>(256);
+	// Host → client rumble: the session hold loop forwards DataMsg::Rumble onto this
+	// channel; the gilrs reader thread drains it and replays the force-feedback on the
+	// physical pad. Unused (sender drops) when controllers aren't being forwarded.
+	let (rumble_tx, mut rumble_rx) = tokio::sync::mpsc::channel::<(u8, u8, u8)>(64);
 
 	if gamepad {
 		// Read controllers on a blocking thread (gilrs isn't async/Send-friendly).
@@ -1095,11 +1099,21 @@ pub(crate) async fn start_remote_play(
 		// Clone the overlay stdin so the reader can emit `ctrls` lines (game mode only).
 		let ctrls_stdin = overlay_stdin.clone();
 		let _ctrls_game_mode = game_mode;
+		// While the overlay is OPEN the pad drives the menu (not the host): clone the
+		// overlay-open set + this play id so the reader can detect it (G6).
+		let ov_open = state.overlay_open.clone();
+		let play_id = id;
+		// App handle so the reader can OPEN/close the overlay from a controller button
+		// (the GUIDE/PS button — pad equivalent of the keyboard Ctrl+Shift+M).
+		let ov_app = app.clone();
 		tokio::task::spawn_blocking(move || {
-			let Ok(mut hub) = ControllerHub::new() else {
+			let Some(mgr) = crate::controllers::manager() else {
 				return;
 			};
-			// Track which uuids were connected last tick so we can detect disconnects.
+			// Subscribe to pad-change wakeups so this reader is event-driven (wakes per
+				// controller event = native rate up to 1000Hz, 0 CPU idle) instead of polling.
+				let wake = mgr.subscribe();
+				// Track which uuids were connected last tick so we can detect disconnects.
 			let mut prev_uuids: std::collections::HashSet<String> =
 				std::collections::HashSet::new();
 			// Remember each uuid → slot mapping from last tick for disconnect events.
@@ -1109,11 +1123,121 @@ pub(crate) async fn start_remote_play(
 			// order change). Also throttled to ~1 Hz (every 60 ticks × 16 ms) so a
 			// stale renderer that missed the initial line eventually gets it.
 			let mut prev_ctrls_line = String::new();
-			let mut ctrls_tick: u32 = 0;
+			// ~1 Hz WALL-CLOCK keepalive. The loop is now event-driven (iterates at the pad's
+				// event rate, not a fixed tick), so a tick-modulo cadence would swing from ~0.25 Hz
+				// idle to >4 Hz at 1000 Hz — wrong for both the GamepadSlot resync (host holds the
+				// last state stickily, so a dropped UDP packet needs a steady ~1 s refresh) and the
+				// ctrls overlay line. Seeded 1 s in the past so the first pass sends a keepalive.
+				let mut last_keepalive = std::time::Instant::now() - std::time::Duration::from_secs(1);
+				// Previous overlay-nav button state (up,down,left,right,a,b) for rising-edge
+				// detection while the overlay is open (one menu step per press).
+				let mut prev_nav = [false; 6];
+					// Previous overlay-combo (Select+L1+R1+X) state for rising-edge toggling.
+					let mut prev_overlay_combo = false;
+					// Previous quit-combo (Start+Select+L1+R1) state for rising-edge detection.
+					let mut prev_quit_combo = false;
+				// Last GamepadState forwarded per pad (uuid) — send-on-change so the 250 Hz
+				// poll doesn't flood the session while a pad sits idle.
+				let mut last_sent: std::collections::HashMap<String, pulsar_core::input::GamepadState> =
+					std::collections::HashMap::new();
+				// Client-side rumble engine (SDL3 HID drivers — actuates force-feedback
+				// where gilrs/evdev can't, e.g. a Bluetooth DualSense / the RK3588 kernel).
+				// None if SDL is unavailable; then host rumble is dropped (never fatal). It
+				// The manager is process-global (one SDL owner of the pads).
+				// rumble + input both flow through `mgr` (the shared SDL controller manager).
 			while reader_flag.load(Ordering::SeqCst) {
-				let pads = hub.snapshot_with_keys();
+				let pads = mgr.snapshot();
+					// Is this pass a ~1 Hz keepalive cycle? (Resets the timer once per cycle.)
+					let keepalive = last_keepalive.elapsed() >= std::time::Duration::from_secs(1);
+					if keepalive {
+						last_keepalive = std::time::Instant::now();
+					}
 				// Snapshot the current order Vec (cheap clone of the Vec).
 				let order: Vec<String> = order_arc.lock().unwrap().clone();
+					let overlay_open = ov_open.lock().unwrap().contains(&play_id);
+						// Controller overlay toggle: Moonlight's Select+L1+R1+X combo (all four held)
+						// opens/closes the overlay — the pad equivalent of the keyboard Ctrl+Shift+M
+						// (Moonlight uses this exact combo for its stats overlay). Rising edge of the
+						// full combo; the frontend's `overlay-toggle` handler does the open/close.
+						let ov_combo = pads
+							.first()
+							.map(|p| {
+								use pulsar_core::input::button as bt;
+								let s = &p.state;
+								s.is_pressed(bt::BACK)
+									&& s.is_pressed(bt::LB)
+									&& s.is_pressed(bt::RB)
+									&& s.is_pressed(bt::X)
+							})
+							.unwrap_or(false);
+						if ov_combo && !prev_overlay_combo {
+							let _ = ov_app.emit("overlay-toggle", ());
+						}
+						prev_overlay_combo = ov_combo;
+						// Controller quit: Moonlight's Start+Select+L1+R1 combo ENDS the session —
+						// the pad equivalent of the keyboard Ctrl+Shift+Q (emits the same `kbd-leave`,
+						// which the frontend turns into an end-session). Distinct from the overlay
+						// combo by START-vs-X, so only one fires. Rising edge.
+						let quit_combo = pads
+							.first()
+							.map(|p| {
+								use pulsar_core::input::button as bt;
+								let s = &p.state;
+								s.is_pressed(bt::START)
+									&& s.is_pressed(bt::BACK)
+									&& s.is_pressed(bt::LB)
+									&& s.is_pressed(bt::RB)
+							})
+							.unwrap_or(false);
+						if quit_combo && !prev_quit_combo {
+							let _ = ov_app.emit("kbd-leave", ());
+						}
+						prev_quit_combo = quit_combo;
+					// G6: while the overlay is OPEN the pad drives the native egui menu (the host
+					// gets NO pad input meanwhile). Emit a key line on each rising edge (one menu
+					// step per press): up→prev widget, down→next, left/right→within, A→activate,
+					// B→back/close. The renderer's `k` handler turns these into egui key events.
+					if overlay_open {
+						use pulsar_core::input::button as b;
+						const NAVT: i16 = 16000;
+						let nav = pads
+							.first()
+							.map(|p| {
+								let st = &p.state;
+								[
+									st.is_pressed(b::DPAD_UP) || st.left_y > NAVT,
+									st.is_pressed(b::DPAD_DOWN) || st.left_y < -NAVT,
+									st.is_pressed(b::DPAD_LEFT) || st.left_x < -NAVT,
+									st.is_pressed(b::DPAD_RIGHT) || st.left_x > NAVT,
+									st.is_pressed(b::A),
+									st.is_pressed(b::B),
+								]
+							})
+							.unwrap_or([false; 6]);
+						// Directions relayed raw; the renderer translates view-aware (Root menu
+						// selection vs sub-view widget focus). A → activate (Enter), B → back (Esc).
+						let keys = ["up", "down", "left", "right", "go", "escape"];
+						if let Some(si) = ctrls_stdin.lock().unwrap().as_mut() {
+							use std::io::Write as _;
+							for i in 0..6 {
+								if nav[i] && !prev_nav[i] {
+									// `k <key>` = a relayed nav keypress for the overlay (renderer
+									// top-level arm). One egui key event per pad rising edge.
+									let _ = writeln!(si, "k {}", keys[i]);
+								}
+							}
+							let _ = si.flush();
+						}
+													prev_nav = nav;
+					} else {
+						prev_nav = [false; 6];
+					}
+				// Replay any pending host rumble on the physical pads (force-feedback).
+				while let Ok((slot, large, small)) = rumble_rx.try_recv() {
+					{
+							mgr.rumble(order.get(slot as usize).cloned(), slot, large, small);
+						}
+				}
 				// Snapshot the per-uuid emulation target map (cheap clone each tick).
 				let emul: std::collections::HashMap<String, String> =
 					emul_arc.lock().unwrap().clone();
@@ -1124,7 +1248,10 @@ pub(crate) async fn start_remote_play(
 				// Each entry: (slot, kind, uuid, target_str) where target_str is 'auto'/'xbox360'/'ds4'.
 				let mut ctrls_entries: Vec<(u8, pulsar_core::input::GamepadKind, String, String)> =
 					Vec::new();
-				for (uuid, kind, state) in &pads {
+				for p in &pads {
+						let uuid = &p.uuid;
+						let kind = &p.kind;
+						let state = &p.state;
 					// Compute slot: position in order Vec, or next append slot (capped at 3).
 					let slot = order
 						.iter()
@@ -1149,13 +1276,17 @@ pub(crate) async fn start_remote_play(
 					};
 					cur_uuids.insert(uuid.clone());
 					prev_slot.insert(uuid.clone(), slot);
-					let _ = gtx.blocking_send(InputEvent::GamepadSlot {
+					// Send-on-change (+ ~1 Hz keepalive): 250 Hz poll, instant on movement, no flood idle.
+						if !overlay_open && (last_sent.get(uuid) != Some(state) || keepalive) {
+						let _ = gtx.blocking_send(InputEvent::GamepadSlot {
 						slot,
 						kind: *kind,
 						target,
 						state: *state,
 					});
-					ctrls_entries.push((slot, *kind, uuid.clone(), target_str.to_string()));
+					last_sent.insert(uuid.clone(), *state);
+						}
+						ctrls_entries.push((slot, *kind, uuid.clone(), target_str.to_string()));
 				}
 				// Emit GamepadDisconnect for any uuid that was present last tick but is gone now.
 				for uuid in &prev_uuids {
@@ -1171,11 +1302,11 @@ pub(crate) async fn start_remote_play(
 				// the set changes or every ~1 Hz (so a late-spawned renderer gets the list).
 				// Format: NO spaces in the payload; name spaces become underscores. Kind is
 				// the GamepadKind label() string with spaces replaced by underscores.
-				ctrls_tick = ctrls_tick.wrapping_add(1);
-				// Fetch names from hub.list() (cheap: same gilrs context, no extra alloc
+				// (keepalive cadence is wall-clock now — see `keepalive` above; no tick counter)
+				// Names come straight from the SDL snapshot (PadView carries each pad's name).
 				// beyond the list itself; called ~1Hz or on change, not every 16 ms tick).
 				let name_map: std::collections::HashMap<String, String> = if !ctrls_entries.is_empty() {
-					hub.list()
+					pads.iter().map(|p| pulsar_core::input::ControllerInfo { index: 0, uuid: p.uuid.clone(), name: p.name.clone(), kind: p.kind, connected: true }).collect::<Vec<_>>()
 						.into_iter()
 						.filter(|c| c.connected)
 						.map(|c| (c.uuid, c.name))
@@ -1204,7 +1335,7 @@ pub(crate) async fn start_remote_play(
 				// Emit `ctrls` in BOTH modes — the controller overlay view (🎮 Kollar)
 				// is available in remote mode too, so it needs the live list there.
 				let changed = ctrls_payload != prev_ctrls_line;
-				let periodic = ctrls_tick % 60 == 0;
+				let periodic = keepalive;
 				if changed || periodic {
 					use std::io::Write as _;
 					if let Some(si) = ctrls_stdin.lock().unwrap().as_mut() {
@@ -1215,7 +1346,19 @@ pub(crate) async fn start_remote_play(
 						prev_ctrls_line = ctrls_payload;
 					}
 				}
-				std::thread::sleep(std::time::Duration::from_millis(16));
+				// Event-driven: block until the SDL manager signals a pad change (wakes at the
+					// pad's native rate, up to 1000Hz — no fixed cap), else every 16 ms to
+					// service the rumble channel. 0 CPU while the pad is idle.
+					match wake.rx.recv_timeout(std::time::Duration::from_millis(16)) {
+						// Pad change (native rate) or idle timeout (service rumble) — keep looping.
+						Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+						// Our single-slot wake was replaced by a newer gamepad session → this
+						// reader is superseded. STOP, don't hot-loop: recv_timeout on a
+						// disconnected channel returns Err immediately (not after 16 ms), so
+						// discarding it would spin this whole loop at 100% CPU. Safe to break —
+						// WakeSub::drop is generation-guarded and won't clear the newer sub.
+						Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+					}
 			}
 		});
 	}
@@ -1230,6 +1373,9 @@ pub(crate) async fn start_remote_play(
 			input_tx.clone(),
 			running.clone(),
 			None,
+			// Same capture gate as the evdev keyboard/mouse: only forward touchpad-mouse
+			// while the session is engaged + focused + not overlay-suspended.
+			std::sync::Arc::new(|| crate::kbdhook::input_active()),
 		);
 	}
 	#[cfg(not(target_os = "linux"))]
@@ -1299,6 +1445,7 @@ pub(crate) async fn start_remote_play(
 		req.cursor_external,
 		req_hdr,
 		req_quality,
+		rumble_tx,
 	));
 
 	let audio_is_native = audio_native.is_some();
