@@ -54,6 +54,13 @@ const DS5_PIDS: &[u16] = &[0x0CE6, 0x0DF2];
 ///    `0x054C` (Sony).
 /// 2. USB VID/PID matches any known DS4 or DS5 PID regardless of the name.
 ///
+/// In addition, the node **must** advertise both `ABS_MT_POSITION_X` (multitouch
+/// X axis) **and** `BTN_TOUCH` (finger contact). The DS4/DS5 main gamepad node
+/// shares the same VID/PID and carries `ABS_X` (left stick), but it lacks
+/// `ABS_MT_POSITION_X` and `BTN_TOUCH`, so it is excluded. Requiring both axes
+/// prevents the gamepad node from winning the enumeration and silently starving
+/// the touchpad reader (which needs `BTN_TOUCH` to set `finger_down`).
+///
 /// Returns `None` if no matching device is found or if `/dev/input` is
 /// unreadable (e.g. missing `input` group membership).
 fn find_touchpad() -> Option<Device> {
@@ -84,14 +91,20 @@ fn find_touchpad() -> Option<Device> {
 		let name_is_touchpad = name.contains("touchpad");
 
 		if (name_is_touchpad && is_sony) || (is_sony && is_ds4_ds5_pid) {
-			// Extra guard: the device must support ABS_MT_POSITION_X or ABS_X
-			// (not every Sony event node is the touchpad — DS4 exposes several).
-			let abs = dev.supported_absolute_axes();
-			let has_touch = abs.map_or(false, |a| {
-				a.contains(AbsoluteAxisType::ABS_MT_POSITION_X)
-					|| a.contains(AbsoluteAxisType::ABS_X)
-			});
-			if has_touch {
+			// Strict touchpad-node guard: require ABS_MT_POSITION_X (multitouch
+			// X axis, present on the real touchpad node) AND BTN_TOUCH (finger
+			// contact, also present on the touchpad node). The main gamepad node
+			// has ABS_X (left stick) but NOT ABS_MT_POSITION_X + BTN_TOUCH, so
+			// it is correctly excluded. Bare ABS_X acceptance was the bug:
+			// enumeration order is arbitrary and the gamepad node often wins,
+			// causing finger_down to never be set (no BTN_TOUCH events).
+			let is_touchpad_node = dev
+				.supported_absolute_axes()
+				.map_or(false, |a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_X))
+				&& dev
+					.supported_keys()
+					.map_or(false, |k| k.contains(Key::BTN_TOUCH));
+			if is_touchpad_node {
 				return Some(dev);
 			}
 		}

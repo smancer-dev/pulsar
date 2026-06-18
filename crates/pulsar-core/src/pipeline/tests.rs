@@ -14,9 +14,200 @@ fn plan(enc: HwEncoder) -> StreamPlan {
 		dest: "rtp://10.0.0.5:9000".into(),
 		low_latency: true,
 		gpu_zerocopy: false,
+		output_idx: 0,
 		hdr: false,
 		yuv444: false,
 	}
+}
+
+/// Extract the trailing `format=<fmt>` token from a ddagrab filter string.
+/// Returns `None` if there is no `format=` suffix in the filter value.
+fn ddagrab_filter_fmt(args: &[String]) -> Option<String> {
+	// ddagrab passes its filter via -filter_complex <value>
+	let fc_pos = args.iter().position(|a| a == "-filter_complex")?;
+	let filter = args.get(fc_pos + 1)?;
+	// The trailing format step looks like "...,format=nv12" or "...:format=nv12"
+	// For scale_cuda and scale_qsv the format is a colon-separated key=value.
+	// For the CPU-bounce path and AMF it is a comma-separated filter.
+	// We extract the last `format=<token>` occurrence.
+	filter
+		.split([',', ':'])
+		.filter_map(|seg| seg.strip_prefix("format="))
+		.last()
+		.map(|s| s.to_string())
+}
+
+/// Extract `-pix_fmt <value>` from an arg list; returns `None` when absent.
+fn cmd_pix_fmt(args: &[String]) -> Option<String> {
+	let pos = args.iter().position(|a| a == "-pix_fmt")?;
+	args.get(pos + 1).cloned()
+}
+
+/// For ddagrab GPU paths (NVENC/QSV) the filter format and -pix_fmt must agree
+/// (or -pix_fmt must be absent, meaning the encoder receives whatever the filter
+/// outputs and ffmpeg does not try to convert).
+///
+/// The core contract: if command.rs emits `-pix_fmt X`, the ddagrab filter MUST
+/// end in `format=X` (or a compatible alias).  If no `-pix_fmt` is emitted, the
+/// filter format is the encoder's native input and no conversion is needed.
+#[test]
+fn ddagrab_filter_format_matches_command_pixfmt_for_all_encoders() {
+	// Helper: build a ddagrab plan for a given encoder + hdr/yuv444 combo.
+	let ddagrab_plan = |enc: HwEncoder, hdr: bool, yuv444: bool, zerocopy: bool| -> StreamPlan {
+		StreamPlan {
+			encoder: enc,
+			codec: VCodec::H265, // H265 exercises the most profile/pix_fmt branches
+			capture: CaptureMethod::Ddagrab,
+			hdr,
+			yuv444,
+			gpu_zerocopy: zerocopy,
+			..plan(enc)
+		}
+	};
+
+	// Cases: (encoder, hdr, yuv444, zerocopy)
+	let cases: &[(HwEncoder, bool, bool, bool)] = &[
+		// NVENC zero-copy: GPU path, must degrade to SDR 4:2:0 (no -pix_fmt emitted,
+		// filter ends with format=nv12 — nv12 is the native NVENC input).
+		(HwEncoder::Nvenc, true, false, true),
+		(HwEncoder::Nvenc, false, true, true),
+		(HwEncoder::Nvenc, true, true, true),
+		(HwEncoder::Nvenc, false, false, true),
+		// NVENC hybrid: no trailing format= in filter (direct D3D11→NVENC), no -pix_fmt.
+		(HwEncoder::Nvenc, true, false, false),
+		(HwEncoder::Nvenc, false, true, false),
+		(HwEncoder::Nvenc, true, true, false),
+		(HwEncoder::Nvenc, false, false, false),
+		// QSV: GPU path, must degrade to SDR 4:2:0 (scale_qsv format=nv12, no -pix_fmt).
+		(HwEncoder::Qsv, true, false, false),
+		(HwEncoder::Qsv, false, true, false),
+		(HwEncoder::Qsv, true, true, false),
+		(HwEncoder::Qsv, false, false, false),
+		// AMF: CPU-bounce path, honors hdr/yuv444 — filter fmt must equal -pix_fmt.
+		(HwEncoder::Amf, true, false, false),
+		(HwEncoder::Amf, false, true, false),
+		(HwEncoder::Amf, true, true, false),
+		(HwEncoder::Amf, false, false, false),
+		// Software: CPU-bounce, honors hdr/yuv444.
+		(HwEncoder::Software, true, false, false),
+		(HwEncoder::Software, false, false, false),
+	];
+
+	for &(enc, hdr, yuv444, zerocopy) in cases {
+		let p = ddagrab_plan(enc, hdr, yuv444, zerocopy);
+		let (_, args) = encode_command(&p);
+		let filter_fmt = ddagrab_filter_fmt(&args);
+		let pix_fmt = cmd_pix_fmt(&args);
+
+		let label = format!("{enc:?} hdr={hdr} yuv444={yuv444} zerocopy={zerocopy}");
+
+		match pix_fmt {
+			Some(ref pf) => {
+				// -pix_fmt is present: the filter MUST end in a matching format=.
+				let ff = filter_fmt.as_deref().unwrap_or("<none>");
+				assert_eq!(
+					ff, pf.as_str(),
+					"[{label}] filter format `{ff}` != -pix_fmt `{pf}`"
+				);
+			}
+			None => {
+				// No -pix_fmt: the filter format is the encoder's native input; that
+				// is fine as long as the encoder can accept it (nv12 for NVENC/QSV).
+				// No further assertion needed — the absence of -pix_fmt means ffmpeg
+				// will accept whatever the filter emits.
+			}
+		}
+	}
+}
+
+/// NVENC/QSV ddagrab: even when plan.hdr=true or plan.yuv444=true, the effective
+/// values must be clamped and no HDR signaling or 10-bit -pix_fmt may appear.
+#[test]
+fn ddagrab_nvenc_qsv_degrade_hdr_yuv444_to_sdr_420() {
+	for enc in [HwEncoder::Nvenc, HwEncoder::Qsv] {
+		for (hdr, yuv444) in [(true, false), (false, true), (true, true)] {
+			let p = StreamPlan {
+				encoder: enc,
+				codec: VCodec::H265,
+				capture: CaptureMethod::Ddagrab,
+				hdr,
+				yuv444,
+				gpu_zerocopy: matches!(enc, HwEncoder::Nvenc), // exercise zerocopy too
+				..plan(enc)
+			};
+			let (_, args) = encode_command(&p);
+			let joined = args.join(" ");
+			assert!(
+				!joined.contains("p010le"),
+				"[{enc:?} hdr={hdr} yuv444={yuv444}] must not emit p010le (degrades to SDR)"
+			);
+			assert!(
+				!joined.contains("yuv444"),
+				"[{enc:?} hdr={hdr} yuv444={yuv444}] must not emit yuv444 (degrades to 4:2:0)"
+			);
+			assert!(
+				!joined.contains("smpte2084"),
+				"[{enc:?} hdr={hdr} yuv444={yuv444}] must not emit HDR colorspace signaling"
+			);
+			assert!(
+				!joined.contains("bt2020"),
+				"[{enc:?} hdr={hdr} yuv444={yuv444}] must not emit BT2020 primaries"
+			);
+			// Check effective_hdr_yuv444 directly.
+			assert_eq!(
+				p.effective_hdr_yuv444(),
+				(false, false),
+				"[{enc:?} hdr={hdr} yuv444={yuv444}] effective_hdr_yuv444 must be (false,false)"
+			);
+		}
+	}
+}
+
+/// AMF/Software ddagrab: hdr/yuv444 are NOT degraded — they flow through to both
+/// the filter format and -pix_fmt, and they must agree.
+#[test]
+fn ddagrab_cpu_bounce_encoders_honor_hdr_yuv444() {
+	// AMF + HDR: filter must end in format=p010le, command must have -pix_fmt p010le.
+	let p = StreamPlan {
+		encoder: HwEncoder::Amf,
+		codec: VCodec::H265,
+		capture: CaptureMethod::Ddagrab,
+		hdr: true,
+		yuv444: false,
+		..plan(HwEncoder::Amf)
+	};
+	assert_eq!(p.effective_hdr_yuv444(), (true, false));
+	let (_, args) = encode_command(&p);
+	let joined = args.join(" ");
+	assert!(
+		joined.contains("format=p010le"),
+		"AMF ddagrab HDR: filter must end in format=p010le"
+	);
+	assert!(
+		joined.contains("-pix_fmt p010le"),
+		"AMF ddagrab HDR: command must have -pix_fmt p010le"
+	);
+
+	// Software + yuv444: filter must end in format=yuv444p, command -pix_fmt yuv444p.
+	let q = StreamPlan {
+		encoder: HwEncoder::Software,
+		codec: VCodec::H264,
+		capture: CaptureMethod::Ddagrab,
+		hdr: false,
+		yuv444: true,
+		..plan(HwEncoder::Software)
+	};
+	assert_eq!(q.effective_hdr_yuv444(), (false, true));
+	let (_, args) = encode_command(&q);
+	let joined = args.join(" ");
+	assert!(
+		joined.contains("format=yuv444p"),
+		"Software ddagrab yuv444: filter must end in format=yuv444p"
+	);
+	assert!(
+		joined.contains("-pix_fmt yuv444p"),
+		"Software ddagrab yuv444: command must have -pix_fmt yuv444p"
+	);
 }
 
 #[test]

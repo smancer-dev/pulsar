@@ -42,7 +42,7 @@ impl Depacketizer {
 		Self {
 			codec,
 			last_seq: None,
-			awaiting_idr: false,
+			awaiting_idr: true,
 			cur_ts: 0,
 			nals: Vec::new(),
 			fu: None,
@@ -79,15 +79,22 @@ impl Depacketizer {
 		// Sequence-gap detection: forward distance only (ignore reorder/dupes). On a gap drop
 		// partial state and wait for the next keyframe.
 		if let Some(last) = self.last_seq {
-			if seq != last.wrapping_add(1) {
-				let gap = seq.wrapping_sub(last).wrapping_sub(1);
-				if gap > 0 && gap < 0x8000 {
+			let fwd = seq.wrapping_sub(last);
+			// fwd==1: consecutive (normal). fwd==0: duplicate. fwd>=0x8000: backward/reorder.
+			// Only trigger a gap and advance last_seq for a genuine forward packet.
+			if fwd < 0x8000 {
+				// Forward packet (newer than last seen).
+				if fwd != 1 && fwd != 0 {
+					// Gap: one or more sequence numbers were skipped.
 					self.awaiting_idr = true;
 					self.drop_partial();
 				}
+				self.last_seq = Some(seq);
 			}
+			// else: reordered / duplicate — leave last_seq unchanged, no gap triggered.
+		} else {
+			self.last_seq = Some(seq);
 		}
-		self.last_seq = Some(seq);
 
 		// Skip the CSRC list and (if present) the RTP header extension.
 		let mut off = 12 + cc * 4;
@@ -398,6 +405,9 @@ fn inspect_av1_tu(tu: &[u8]) -> (bool, bool) {
 		if has_ext {
 			q += 1; // obu_extension_header
 		}
+		if q > tu.len() {
+			break; // truncated OBU header — bail safely
+		}
 		let payload_len: usize = if has_size {
 			let (val, len) = read_leb128(tu, q);
 			q += len;
@@ -683,7 +693,11 @@ mod tests {
 	#[test]
 	fn seq_gap_awaits_keyframe() {
 		let mut d = Depacketizer::new(Codec::H264);
-		// First a clean delta AU (type 1) so last_seq is established.
+		// Prime the depacketizer with a keyframe so awaiting_idr is cleared and last_seq is
+		// established (rtp-3: new depacketizer starts with awaiting_idr=true).
+		let idr0 = [0x65u8, 0xff]; // type=5 (IDR) → key
+		assert!(d.push(&rtp(99, 0, true, &idr0)).is_some(), "initial IDR clears awaiting_idr");
+		// Now a clean delta AU (type 1) so last_seq advances.
 		let delta = [0x41u8, 1, 2, 3]; // nri=2, type=1
 		let au = d.push(&rtp(100, 1, true, &delta)).expect("first AU");
 		assert!(!au.key);

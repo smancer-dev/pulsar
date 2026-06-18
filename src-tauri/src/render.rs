@@ -304,27 +304,51 @@ pub(crate) fn install_single_surface(
 	let x11_usize = x11_display as usize; // carry into the 'static realize closure
 
 	let handle = MpvGl::new()?;
-	let handle_usize = handle as usize;
+	// Track the raw handle in a Cell so both the realize closure and the
+	// teardown path can see whether ownership has been moved into an MpvGl.
+	// 0 means "already consumed or destroyed — do not touch".
+	let handle_cell: std::rc::Rc<std::cell::Cell<usize>> =
+		std::rc::Rc::new(std::cell::Cell::new(handle as usize));
 	let shared: SharedMpv = std::rc::Rc::new(std::cell::RefCell::new(None));
 
 	{
 		let shared = shared.clone();
+		let handle_cell = handle_cell.clone();
 		let sdp = sdp_path.clone();
 		gl.connect_realize(move |a| {
 			a.make_current();
 			if a.error().is_some() {
+				// GL context error: destroy the orphaned mpv core and zero the cell
+				// so a subsequent re-realize (if GTK ever fires one) is a no-op.
+				let ptr = handle_cell.get();
+				if ptr != 0 {
+					handle_cell.set(0);
+					unsafe { crate::native_view::mpvgl::destroy_handle(ptr as *mut _) };
+				}
+				return;
+			}
+			let ptr = handle_cell.get();
+			if ptr == 0 {
+				// Handle was already destroyed on a previous realize attempt.
 				return;
 			}
 			match MpvGl::attach(
-				handle_usize as *mut _,
+				ptr as *mut _,
 				a,
 				x11_usize as *mut std::ffi::c_void,
 			) {
 				Ok(r) => {
+					// Ownership of the raw handle has moved into MpvGl; MpvGl::teardown
+					// will call mpv_terminate_destroy — zero the cell so we don't touch it.
+					handle_cell.set(0);
 					r.load_sdp(&sdp);
 					*shared.borrow_mut() = Some(r);
 				}
-				Err(_) => {}
+				Err(_) => {
+					// attach failed (render-context creation error): destroy + zero.
+					handle_cell.set(0);
+					unsafe { crate::native_view::mpvgl::destroy_handle(ptr as *mut _) };
+				}
 			}
 		});
 	}

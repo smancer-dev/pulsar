@@ -518,33 +518,42 @@ pub(super) async fn hold_session(
 										&& (e == 0 || r.chunks.contains_key(&0) && r.chunks.contains_key(&(e - 1)))
 										&& (0..e).all(|i| r.chunks.contains_key(&i))
 								});
-								// Write chunks directly to disk without building a contiguous
-								// intermediate Vec — avoids ~2x peak memory at the MAX_XFER_BYTES
-								// ceiling (C24 fix).
-								let saved = if complete {
-									crate::files::save_received_file_chunks(
-										&r.name,
-										r.chunks.values(),
-										r.received,
-									)
-								} else {
-									None
-								};
-								let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
-								// Use the actual on-disk filename (may have a dedup suffix like
-								// " (1)") so the UI flash names the file the user can actually open.
-								let saved_name = saved
-									.as_ref()
-									.and_then(|(p, _)| p.file_name())
-									.and_then(|n| n.to_str())
-									.unwrap_or(&r.name)
-									.to_string();
-								let _ = app_ev.emit("file-recv", FilePayload {
-									peer: id.to_string(),
-									name: saved_name,
-									bytes: written,
-									ok: saved.is_some(),
-									xfer_id: xfer,
+								// Offload the blocking disk write to a thread-pool thread so the
+								// session loop (video RTP forwarding + input) is never stalled by a
+								// multi-GiB file flush. Move the reassembly state into the closure;
+								// clone the Tauri handles before spawning.
+								let app_ev_file = app_ev.clone();
+								let peer_str = id.to_string();
+								let name_fallback = r.name.clone();
+								tokio::task::spawn_blocking(move || {
+									// Write chunks directly to disk without building a contiguous
+									// intermediate Vec — avoids ~2x peak memory at the MAX_XFER_BYTES
+									// ceiling (C24 fix).
+									let saved = if complete {
+										crate::files::save_received_file_chunks(
+											&r.name,
+											r.chunks.values(),
+											r.received,
+										)
+									} else {
+										None
+									};
+									let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
+									// Use the actual on-disk filename (may have a dedup suffix like
+									// " (1)") so the UI flash names the file the user can actually open.
+									let saved_name = saved
+										.as_ref()
+										.and_then(|(p, _)| p.file_name())
+										.and_then(|n| n.to_str())
+										.unwrap_or(&name_fallback)
+										.to_string();
+									let _ = app_ev_file.emit("file-recv", FilePayload {
+										peer: peer_str,
+										name: saved_name,
+										bytes: written,
+										ok: saved.is_some(),
+										xfer_id: xfer,
+									});
 								});
 							}
 							_ => {}

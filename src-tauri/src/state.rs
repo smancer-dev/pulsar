@@ -110,6 +110,11 @@ pub(crate) struct AppState {
 	/// so the webview Gamepad API is absent), and the preferred one everywhere (gilrs gives
 	/// clean SDL-mapped buttons + D-pad). Toggled by `gamepad_nav_start` / `_stop`.
 	pub(crate) nav_gamepad_on: Arc<AtomicBool>,
+	/// Generation epoch for the gamepad-nav reader thread. Incremented on every start and
+	/// stop so a stale/leaked reader thread from a previous start→stop→start cycle can
+	/// detect that it no longer owns the nav slot and exit cleanly (prevents double-emit
+	/// and thread leak when stop+start happen faster than the 16 ms poll interval).
+	pub(crate) nav_gamepad_gen: Arc<AtomicU64>,
 	/// When `true` this device REFUSES to act as a host: every inbound connection is
 	/// rejected at auth time, before any Allow/Deny popup. Set by `set_host_serving`
 	/// (the UI flips it on whenever the app enters gaming mode — a pure-client

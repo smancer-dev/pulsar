@@ -1119,6 +1119,23 @@ pub(crate) async fn start_remote_play(
 			// Remember each uuid → slot mapping from last tick for disconnect events.
 			let mut prev_slot: std::collections::HashMap<String, u8> =
 				std::collections::HashMap::new();
+			// Sticky uuid→slot assignment for pads not covered by `controller_order`.
+			// Allocated once per pad-lifetime (lowest free slot in 0..MAX_PADS), freed on
+			// disconnect.  This prevents survivor pads from shifting slots when another pad
+			// disconnects — the bug where player-2 (slot 1) would remap to slot 0 after
+			// player-1 (slot 0) disconnected, leaving the host's original slot-1 virtual pad
+			// stuck in its last state indefinitely.
+			const MAX_PADS: u8 = 4;
+			let mut sticky_slots: std::collections::HashMap<String, u8> =
+				std::collections::HashMap::new();
+			// Set of uuids that have been live at least once THIS SESSION.
+			// Used for order-based slot ranking so that stale (never-live) UUIDs
+			// persisted in `controller_order` from a previous session don't push
+			// live pads to index >= MAX_PADS, WITHOUT demoting a surviving pad
+			// when an earlier-order pad disconnects (the R16 regression).
+			// Never cleared on disconnect — only populated on first live appearance.
+			let mut ever_live: std::collections::HashSet<String> =
+				std::collections::HashSet::new();
 			// Last-emitted `ctrls` payload — only re-send when it changes (hotplug /
 			// order change). Also throttled to ~1 Hz (every 60 ticks × 16 ms) so a
 			// stale renderer that missed the initial line eventually gets it.
@@ -1154,13 +1171,15 @@ pub(crate) async fn start_remote_play(
 					}
 				// Snapshot the current order Vec (cheap clone of the Vec).
 				let order: Vec<String> = order_arc.lock().unwrap().clone();
+					// Resolve player-1 pad: first entry in the user-reordered `order` list,
+					// falling back to pads.first() when order is empty (default / single pad).
+					let p1 = order.first().and_then(|u0| pads.iter().find(|p| &p.uuid == u0)).or_else(|| pads.first());
 					let overlay_open = ov_open.lock().unwrap().contains(&play_id);
 						// Controller overlay toggle: Moonlight's Select+L1+R1+X combo (all four held)
 						// opens/closes the overlay — the pad equivalent of the keyboard Ctrl+Shift+M
 						// (Moonlight uses this exact combo for its stats overlay). Rising edge of the
 						// full combo; the frontend's `overlay-toggle` handler does the open/close.
-						let ov_combo = pads
-							.first()
+						let ov_combo = p1
 							.map(|p| {
 								use pulsar_core::input::button as bt;
 								let s = &p.state;
@@ -1178,8 +1197,7 @@ pub(crate) async fn start_remote_play(
 						// the pad equivalent of the keyboard Ctrl+Shift+Q (emits the same `kbd-leave`,
 						// which the frontend turns into an end-session). Distinct from the overlay
 						// combo by START-vs-X, so only one fires. Rising edge.
-						let quit_combo = pads
-							.first()
+						let quit_combo = p1
 							.map(|p| {
 								use pulsar_core::input::button as bt;
 								let s = &p.state;
@@ -1200,8 +1218,7 @@ pub(crate) async fn start_remote_play(
 					if overlay_open {
 						use pulsar_core::input::button as b;
 						const NAVT: i16 = 16000;
-						let nav = pads
-							.first()
+						let nav = p1
 							.map(|p| {
 								let st = &p.state;
 								[
@@ -1232,36 +1249,75 @@ pub(crate) async fn start_remote_play(
 					} else {
 						prev_nav = [false; 6];
 					}
-				// Replay any pending host rumble on the physical pads (force-feedback).
-				while let Ok((slot, large, small)) = rumble_rx.try_recv() {
-					{
-							mgr.rumble(order.get(slot as usize).cloned(), slot, large, small);
-						}
-				}
 				// Snapshot the per-uuid emulation target map (cheap clone each tick).
 				let emul: std::collections::HashMap<String, String> =
 					emul_arc.lock().unwrap().clone();
 				let mut cur_uuids: std::collections::HashSet<String> =
 					std::collections::HashSet::new();
-				let mut append_idx = order.len() as u8;
 				// Build the ctrls payload while computing slots (avoids a second pass).
 				// Each entry: (slot, kind, uuid, target_str) where target_str is 'auto'/'xbox360'/'ds4'.
 				let mut ctrls_entries: Vec<(u8, pulsar_core::input::GamepadKind, String, String)> =
 					Vec::new();
+				// Collect the set of uuids present this tick (used for free-slot search below).
+				let live_uuids: std::collections::HashSet<&String> = pads.iter().map(|p| &p.uuid).collect();
+				// Mark every currently-live uuid as ever_live (grows monotonically; never shrinks).
+				for p in &pads {
+					ever_live.insert(p.uuid.clone());
+				}
+				// Authoritative slot→uuid map built by the forward loop below.
+				// Used for rumble routing (replaces the pre-loop duplicate that caused
+				// first-tick slot collisions when sticky_slots was not yet populated).
+				let mut slot_to_uuid: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
 				for p in &pads {
 						let uuid = &p.uuid;
 						let kind = &p.kind;
 						let state = &p.state;
-					// Compute slot: position in order Vec, or next append slot (capped at 3).
-					let slot = order
-						.iter()
-						.position(|k| k == uuid)
-						.map(|i| i as u8)
-						.unwrap_or_else(|| {
-							let s = append_idx.min(3);
-							append_idx += 1;
-							s
-						});
+					// Compute slot:
+					//   1. If controller_order is non-empty and contains this uuid → use its
+					//      position (unchanged from original behavior).
+					//   2. Otherwise use the sticky map (allocated on first appearance as the
+					//      lowest free slot in 0..MAX_PADS not currently held by any live uuid,
+					//      kept for the pad's lifetime, freed on disconnect).
+					let slot = if !order.is_empty() {
+						// Rank this uuid among ORDER entries that have been live at least
+						// once this session (ever_live). This filters out stale UUIDs
+						// persisted from a previous session (they're never in ever_live,
+						// so they don't consume rank slots and push live pads beyond
+						// MAX_PADS). Crucially, disconnected-but-previously-live pads
+						// REMAIN in ever_live, so a surviving pad's rank (= its slot)
+						// never changes when an earlier pad disconnects — the R16 regression
+						// where p2 shifted from slot 1 to slot 0 on p1's disconnect is fixed.
+						if let Some(rank) = order.iter().filter(|k| ever_live.contains(k.as_str())).position(|k| k == uuid) {
+							(rank as u8).min(MAX_PADS - 1)
+						} else {
+							// uuid not in order list — fall through to sticky path.
+							// (Rare: a pad connected after the order was set.)
+							if !sticky_slots.contains_key(uuid) {
+								// Pre-compute used set before mutably borrowing sticky_slots.
+								let used: std::collections::HashSet<u8> = sticky_slots
+									.iter()
+									.filter(|(u, _)| live_uuids.contains(*u))
+									.map(|(_, &s)| s)
+									.chain(order.iter().enumerate().map(|(i, _)| i as u8))
+									.collect();
+								let free = (0..MAX_PADS).find(|s| !used.contains(s)).unwrap_or(MAX_PADS - 1);
+								sticky_slots.insert(uuid.clone(), free);
+							}
+							sticky_slots[uuid]
+						}
+					} else {
+						if !sticky_slots.contains_key(uuid) {
+							// Pre-compute used set before mutably borrowing sticky_slots.
+							let used: std::collections::HashSet<u8> = sticky_slots
+								.iter()
+								.filter(|(u, _)| live_uuids.contains(*u))
+								.map(|(_, &s)| s)
+								.collect();
+							let free = (0..MAX_PADS).find(|s| !used.contains(s)).unwrap_or(MAX_PADS - 1);
+							sticky_slots.insert(uuid.clone(), free);
+						}
+						sticky_slots[uuid]
+					};
 					// Resolve emulation target from the per-uuid map ("xbox"/"ds4"/absent→Auto).
 					let target = match emul.get(uuid).map(|s| s.as_str()) {
 						Some("xbox") => EmulationTarget::Xbox360,
@@ -1276,6 +1332,8 @@ pub(crate) async fn start_remote_play(
 					};
 					cur_uuids.insert(uuid.clone());
 					prev_slot.insert(uuid.clone(), slot);
+					// Record in the authoritative reverse map for rumble routing.
+					slot_to_uuid.insert(slot, uuid.clone());
 					// Send-on-change (+ ~1 Hz keepalive): 250 Hz poll, instant on movement, no flood idle.
 						if !overlay_open && (last_sent.get(uuid) != Some(state) || keepalive) {
 						let _ = gtx.blocking_send(InputEvent::GamepadSlot {
@@ -1295,9 +1353,17 @@ pub(crate) async fn start_remote_play(
 							let _ = gtx.blocking_send(InputEvent::GamepadDisconnect { slot });
 						}
 						prev_slot.remove(uuid);
+						// Free the sticky slot so a future pad can reuse it.
+						sticky_slots.remove(uuid);
 					}
 				}
 				prev_uuids = cur_uuids;
+				// Replay any pending host rumble on the physical pads (force-feedback).
+				// Runs AFTER the forward loop so slot_to_uuid is fully and correctly
+				// populated — avoids first-tick collisions from the old pre-loop approach.
+				while let Ok((slot, large, small)) = rumble_rx.try_recv() {
+					mgr.rumble(slot_to_uuid.get(&slot).cloned(), slot, large, small);
+				}
 				// Build `ctrls slot:kind:name,...` line and push it to the overlay whenever
 				// the set changes or every ~1 Hz (so a late-spawned renderer gets the list).
 				// Format: NO spaces in the payload; name spaces become underscores. Kind is
@@ -1359,6 +1425,40 @@ pub(crate) async fn start_remote_play(
 						// WakeSub::drop is generation-guarded and won't clear the newer sub.
 						Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
 					}
+			}
+			// Flush all rumble motors to neutral on a genuine session teardown
+			// (reader_flag==false). The Disconnected break path means a newer gamepad
+			// session superseded this one — that session owns the pads and will
+			// re-actuate as needed, so we must NOT zero it out there.
+			if !reader_flag.load(Ordering::SeqCst) {
+				// Build a teardown slot→uuid map so stop commands route to the
+				// correct physical pad (mirrors the per-tick map above).
+				let teardown_order: Vec<String> = order_arc.lock().unwrap().clone();
+				let teardown_pads = mgr.snapshot();
+				let teardown_slot_to_uuid: std::collections::HashMap<u8, String> = {
+					let teardown_live: std::collections::HashSet<&String> =
+						teardown_pads.iter().map(|p| &p.uuid).collect();
+					let mut map = std::collections::HashMap::new();
+					for p in &teardown_pads {
+						let uuid = &p.uuid;
+						// Mirror the forward-loop rank-among-live-pads logic so teardown
+						// slots match what the host was told during the session.
+						let slot: u8 = if !teardown_order.is_empty() {
+							if let Some(rank) = teardown_order.iter().filter(|k| teardown_live.contains(*k)).position(|k| k == uuid) {
+								(rank as u8).min(MAX_PADS - 1)
+							} else {
+								sticky_slots.get(uuid).copied().unwrap_or(MAX_PADS - 1)
+							}
+						} else {
+							sticky_slots.get(uuid).copied().unwrap_or(MAX_PADS - 1)
+						};
+						map.insert(slot, uuid.clone());
+					}
+					map
+				};
+				for slot in 0..MAX_PADS {
+					mgr.rumble(teardown_slot_to_uuid.get(&slot).cloned(), slot, 0, 0);
+				}
 			}
 		});
 	}

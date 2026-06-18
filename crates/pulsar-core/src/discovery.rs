@@ -221,6 +221,12 @@ impl Discovery {
 		if a.magic != MAGIC || a.version != ANNOUNCE_VERSION {
 			return;
 		}
+		// SECURITY: reject oversized names before acquiring any lock — an on-LAN
+		// attacker can craft datagrams with arbitrary name lengths; cap them here.
+		const MAX_NAME_LEN: usize = 64;
+		if a.name.len() > MAX_NAME_LEN {
+			return;
+		}
 		// Ignore our own multicast echo.
 		if a.nonce == self.inner.lock().await.announce.nonce {
 			return;
@@ -243,7 +249,24 @@ impl Discovery {
 			platform: a.platform,
 			last_seen: Instant::now(),
 		};
-		self.inner.lock().await.peers.insert(a.nonce, peer);
+		// SECURITY: hard cap on the peers map to prevent unbounded memory growth from
+		// an attacker flooding fresh nonces. Prune stale entries first (same predicate
+		// as peers()); if the map is still at capacity, evict the oldest entry before
+		// inserting the new one.
+		const MAX_PEERS: usize = 256;
+		let now = Instant::now();
+		let mut g = self.inner.lock().await;
+		g.peers.retain(|_, p| now.duration_since(p.last_seen) < PEER_TTL);
+		if !g.peers.contains_key(&a.nonce) && g.peers.len() >= MAX_PEERS {
+			if let Some(oldest) = g.peers
+				.iter()
+				.min_by_key(|(_, p)| p.last_seen)
+				.map(|(k, _)| *k)
+			{
+				g.peers.remove(&oldest);
+			}
+		}
+		g.peers.insert(a.nonce, peer);
 	}
 }
 

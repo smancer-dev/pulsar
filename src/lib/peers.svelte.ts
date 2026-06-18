@@ -288,7 +288,7 @@ export function setPeerIdentity(id: string, patch: { name?: string; avatar?: str
 		// insertion order) so inbound clients can't grow the store unboundedly.
 		// Exclude the just-pushed entry from the cap so it can never be the one
 		// spliced out at the IDENTITY_MAX boundary (its name/avatar set below).
-		const ghosts = peers.filter((x) => x !== p && !x.saved && x.lastConnected == null);
+		const ghosts = peers.filter((x) => x !== p && !x.saved && x.lastConnected == null && x.gameConnected == null);
 		for (const g of ghosts.slice(0, Math.max(0, ghosts.length - (IDENTITY_MAX - 1)))) {
 			peers.splice(peers.indexOf(g), 1);
 		}

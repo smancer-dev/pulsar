@@ -305,10 +305,8 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 				let sink_id = REDIRECT_SINK_ID.lock().unwrap().clone();
 				if let Some(ref id) = sink_id {
 					tracing::info!(sid, ?layout, ?installed, "host-silent: widening virtual sink format for already-armed redirect");
-					// Drop the owners lock BEFORE the blocking COM call (IPolicyConfig::SetDeviceFormat)
-					// so concurrent release_redirect / reset_redirect_all callers are not serialised
-					// behind this driver round-trip (mirrors the arm/restore branches at line 319).
-					drop(owners);
+					// Keep the owners lock held across the COM call so the boundary decision
+					// and the sink-layout write are atomic against concurrent arm/disarm.
 					if let Err(e) = pulsar_core::audio::set_render_device_format(id, layout) {
 						tracing::warn!(?layout, "set virtual sink device format (widen) failed: {e} — keeping existing sink format");
 					} else {
@@ -321,7 +319,10 @@ fn set_redirect_request(sid: u64, want: bool, layout: pulsar_core::audio::Channe
 		return false;
 	}
 	tracing::info!(sid, want, ?layout, owners = ?owners, "host-silent (sink-redirect) request");
-	drop(owners);
+	// Keep owners locked across the entire arm/disarm body so the boundary decision
+	// and the guard/sink-id/layout writes are atomic against concurrent sessions.
+	// There is no lock-order cycle: the body only acquires REDIRECT_GUARD/SINK_ID/LAYOUT,
+	// none of which re-acquire REDIRECT_OWNERS.
 	if now {
 		// Going silent: locate a virtual sink and redirect the default to it.
 		match locate_virtual_sink() {
@@ -586,7 +587,10 @@ fn set_unix_silent_request(
 		return false;
 	}
 	tracing::info!(sid, want, owners = ?owners, "host-silent (unix sink-redirect) request");
-	drop(owners);
+	// Keep owners locked across the entire arm/disarm body so the boundary decision
+	// and the guard/source writes are atomic against concurrent sessions.
+	// There is no lock-order cycle: the body only acquires UNIX_SILENT_GUARD/SOURCE/AUDIO_INPUT,
+	// none of which re-acquire UNIX_SILENT_OWNERS.
 	if now {
 		// Going silent: arm the platform redirect (Linux null sink / macOS virtual out).
 		// Pass the negotiated layout so the Linux null sink is created at the right
@@ -736,6 +740,23 @@ pub(super) fn restore_stale_redirect() {
 	pulsar_core::audio::restore_stale_redirect();
 }
 
+/// Startup crash-restore for the Linux/macOS host-silent null-sink / output redirect.
+///
+/// Linux: unloads any stranded `pulsar_silent` null sink (always; idempotent) and
+/// restores the saved PulseAudio default sink from the crash-recovery marker if
+/// present (so a crash/SIGKILL doesn't leave the user's speakers permanently silent).
+///
+/// macOS: restores the saved system default output from the crash-recovery marker if
+/// the marker holds a non-virtual device name (guards against a double-redirect that
+/// could permanently leave the user on a virtual audio device).
+///
+/// No-op on Windows (the Windows path is handled by `restore_stale_redirect` above).
+/// Best-effort: never panics, never blocks the stream.
+pub(super) fn restore_stale_host_silent() {
+	#[cfg(not(windows))]
+	pulsar_core::audio::restore_stale_host_silent();
+}
+
 /// Startup crash-restore for the endpoint-mute fallback. If the previous process
 /// applied the deferred mute fallback (no virtual sink / null sink present) and then
 /// died abnormally before the session ended, unmute the host's default output now.
@@ -785,6 +806,14 @@ fn start_audio_and_mute(
 	} else {
 		host_layout
 	};
+	// Resolve host audio policy (game-mode override: forces transmit ON).
+	// mute_host: OR — either the client's host-silent request (game mode) OR the host
+	// owner's explicit config can arm host-silent; neither side can prevent the other
+	// from requesting silence.
+	// transmit: AND — either side can opt out of audio transmission.
+	let pol = acfg.audio_settings().policy(req.game_mode);
+	let transmit = pol.transmit && req.transmit_audio;
+	let mute_host = pol.mute_host || req.mute_host;
 	// Host-silent (Windows): set the virtual sink's device format to the negotiated
 	// channel count and redirect the default render endpoint to it BEFORE opening the
 	// loopback capture below, so the capture taps the (never-muted) virtual sink at the
@@ -794,7 +823,7 @@ fn start_audio_and_mute(
 	// fallback — which we DEFER until after the loopback capture is spawned (muting at
 	// capture-open latches silence into the WASAPI loopback on post-mute codecs).
 	#[cfg(windows)]
-	let want_mute_fallback = set_redirect_request(sid, req.mute_host, neg_layout);
+	let want_mute_fallback = set_redirect_request(sid, mute_host, neg_layout);
 	// Host-silent (Linux/macOS): arm the capture-source redirect BEFORE building the
 	// capture command below, so the audio ffmpeg taps the redirected monitor (a null
 	// sink on Linux) instead of the real default — the client gets audio while the
@@ -805,8 +834,8 @@ fn start_audio_and_mute(
 	// to after the capture is spawned (a muted `@DEFAULT_SINK@` silences its `.monitor`
 	// too, so opening the capture into the mute would latch silence).
 	#[cfg(not(windows))]
-	let want_mute_fallback = set_unix_silent_request(sid, req.mute_host, ffmpeg, neg_layout);
-	if req.transmit_audio && audio_dest.port() > 0 {
+	let want_mute_fallback = set_unix_silent_request(sid, mute_host, ffmpeg, neg_layout);
+	if transmit && audio_dest.port() > 0 {
 		let dest = format!("rtp://{audio_dest}");
 		// Windows: prefer WASAPI loopback — it taps whatever is playing on the
 		// (possibly just-redirected) default output, so it works with NO
@@ -1539,6 +1568,41 @@ pub(super) fn make_on_stream(
 		// HEVC/AV1 request on a build lacking it falls back instead of failing.
 		let enc_text = crate::process::encoders_text(&ffmpeg);
 		let encoder = pipeline::resolve(encoder_from_str(&enc_pref), &pipeline::detect(&enc_text));
+		// [vk-ddagrab-1] Windows + Ddagrab: Vulkan and VAAPI encoders are incompatible with
+		// the ddagrab capture path. ddagrab uses `-filter_complex` (complex filtergraph) while
+		// command.rs unconditionally appends `-vf format=...,hwupload` for Vulkan — ffmpeg refuses
+		// to combine simple and complex filtergraphs on the same stream. VAAPI similarly has no
+		// D3D11→VAAPI mapping on Windows. Degrade both to a working encoder (re-resolve without
+		// them) so the ffmpeg fallback path produces a live stream rather than dying silently.
+		// (Only applies to the ffmpeg fallback path; the native DXGI+NVENC path doesn't go through
+		// command.rs at all and is separately gated on encoder==Nvenc below.)
+		#[cfg(windows)]
+		let encoder = {
+			let is_ddagrab =
+				capture_from_str(&cfg.capture) == pipeline::CaptureMethod::Ddagrab;
+			if is_ddagrab
+				&& matches!(
+					encoder,
+					pipeline::HwEncoder::Vulkan | pipeline::HwEncoder::Vaapi
+				) {
+				let available_without_compat_issue: Vec<_> = pipeline::detect(&enc_text)
+					.into_iter()
+					.filter(|e| {
+						!matches!(e, pipeline::HwEncoder::Vulkan | pipeline::HwEncoder::Vaapi)
+					})
+					.collect();
+				let degraded =
+					pipeline::resolve(pipeline::HwEncoder::Auto, &available_without_compat_issue);
+				tracing::warn!(
+					original = ?encoder,
+					resolved = ?degraded,
+					"ddagrab+Vulkan/VAAPI incompatible on Windows — degrading encoder"
+				);
+				degraded
+			} else {
+				encoder
+			}
+		};
 		// Off-Windows, ffmpeg is the ONLY encode path, so an encoder ffmpeg merely *lists* (a generic
 		// build lists h264_nvenc even with no NVIDIA GPU) but can't initialize here must be dropped,
 		// not used — else it fails at spawn and sends no video (the Orange-Pi-as-host case:
@@ -1595,7 +1659,7 @@ pub(super) fn make_on_stream(
 					.filter(|_| displays.len() > 1)
 					.map(|(_, x, y, w, h, _)| (*x, *y, *w, *h))
 			};
-			let want_gst = enc_pref == "rkmpp" || encoder == HwEncoder::Software;
+			let want_gst = enc_pref == "rkmpp" || (encoder == HwEncoder::Software && enc_pref != "software");
 			if want_gst {
 				let hw: Vec<_> = crate::process::validated_gst_encoders()
 					.into_iter()
@@ -1631,9 +1695,17 @@ pub(super) fn make_on_stream(
 							Ok("1") => true,
 							_ => req.game_mode || req.cursor_external,
 						};
+						// [kms-multimon-1] KMS captures the WHOLE scanout of the primary CRTC and
+						// cannot crop to a specific monitor region. When a non-primary monitor is
+						// selected (`region` has a non-zero origin) downgrade to x11_pipeline which
+						// crops via ximagesrc startx/starty/endx/endy, honoring `region`. Single-
+						// monitor and primary-at-(0,0) stay on the fast zero-copy KMS path.
+						let kms_region_safe =
+							region.map_or(true, |(x, y, _, _)| x == 0 && y == 0);
 						let kms = kms_mode
 							&& genc == pipeline::gst::GstEncoder::Mpp
-							&& crate::process::kms_encode_ok(genc, gcodec);
+							&& crate::process::kms_encode_ok(genc, gcodec)
+							&& kms_region_safe;
 						// Cursor side-channel: the KMS scan-out frame has NO hardware cursor
 						// (own DRM plane), so when the client asked to draw it itself
 						// (`cursor_external`) start the X pointer poller that streams the cursor
@@ -1806,6 +1878,48 @@ pub(super) fn make_on_stream(
 		} else {
 			false
 		};
+		// Linux / ffmpeg path (non-gst): when a second monitor is selected, x11grab must
+		// use the `DISPLAY+x,y` origin form to grab the right monitor instead of the root
+		// origin. Also clamp eff_w/eff_h to the SELECTED monitor (not the root screen) so
+		// the capture region never overflows that monitor's bounds. Single-monitor / primary
+		// at (0,0) keeps the plain display string (no change in behavior).
+		#[cfg(not(target_os = "linux"))]
+		let cap_display = cfg.display.clone();
+		#[cfg(target_os = "linux")]
+		let (cap_display, eff_w, eff_h) = {
+			let displays = crate::process::linux_displays();
+			if let Some((_, x, y, w, h, _)) = displays
+				.get(req.display_idx as usize)
+				.filter(|_| displays.len() > 1)
+			{
+				let display_str = if *x == 0 && *y == 0 {
+					cfg.display.clone()
+				} else {
+					format!("{}+{},{}", cfg.display, x, y)
+				};
+				// Clamp eff_w/eff_h to the selected monitor's dimensions.
+				let cw = if eff_w > *w { *w } else { eff_w };
+				let ch = if eff_h > *h { *h } else { eff_h };
+				(display_str, cw, ch)
+			} else {
+				(cfg.display.clone(), eff_w, eff_h)
+			}
+		};
+		// [ddagrab-outputidx-1] Windows ffmpeg fallback: clamp the client-requested monitor
+		// index and pass it to StreamPlan so ddagrab captures the SELECTED monitor, not always
+		// output_idx=0 (primary). Uses the same clamping logic as the native DXGI path above.
+		// Non-Windows: output_idx is unused (ddagrab is Windows-only); default to 0.
+		#[cfg(windows)]
+		let ffmpeg_display_idx = {
+			let display_count = pulsar_capture::list_displays().len() as u32;
+			if display_count > 0 {
+				req.display_idx.min(display_count - 1)
+			} else {
+				0
+			}
+		};
+		#[cfg(not(windows))]
+		let ffmpeg_display_idx: u32 = 0;
 		let plan = StreamPlan {
 			encoder,
 			codec,
@@ -1814,7 +1928,7 @@ pub(super) fn make_on_stream(
 			fps: eff_fps,
 			bitrate_kbps: eff_bitrate,
 			capture,
-			display: cfg.display.clone(),
+			display: cap_display,
 			vaapi_device: cfg.vaapi_device.clone(),
 			dest: format!("rtp://{vdest}"),
 			// Quality bias: explicit client preference wins; `Balanced` defers to
@@ -1825,6 +1939,7 @@ pub(super) fn make_on_stream(
 				QualityPref::Balanced => req.game_mode,
 			},
 			gpu_zerocopy,
+			output_idx: ffmpeg_display_idx,
 			hdr: req.hdr,
 			yuv444: req.yuv444,
 		};
@@ -1914,15 +2029,15 @@ pub(super) fn make_on_stream(
 			last_native_req = if native_started { Some(req.clone()) } else { None };
 		}
 		// C19: When the native path was NOT taken (native_started=false) the ffmpeg fallback
-		// always captures the PRIMARY monitor (gdigrab/ddagrab via StreamPlan has no output_idx).
+		// captures whichever monitor plan.output_idx (= ffmpeg_display_idx, clamped) points to.
 		// native_out_arc was already cleared above so on_input falls back to cur_display — but
 		// cur_display still holds the previously-confirmed native monitor index (e.g. monitor B
 		// from a prior native session), causing absolute-pointer events to be mapped onto the wrong
-		// screen for the rest of the session. Reset cur_display to 0 (primary) so the input
-		// mapping matches what is actually being streamed.
+		// screen for the rest of the session. Update cur_display to the CLAMPED ffmpeg display idx
+		// so the input mapping matches what is actually being streamed. [ddagrab-outputidx-1]
 		#[cfg(windows)]
 		if !native_started {
-			cur_display.store(0, std::sync::atomic::Ordering::Relaxed);
+			cur_display.store(ffmpeg_display_idx, std::sync::atomic::Ordering::Relaxed);
 		}
 
 		// Remember the latest request so the host-side display-mode watcher can re-issue it
@@ -2414,45 +2529,61 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 					&& (e == 0 || r.chunks.contains_key(&0) && r.chunks.contains_key(&(e - 1)))
 					&& (0..e).all(|i| r.chunks.contains_key(&i))
 			});
-			// Write chunks directly to disk (in index order via BTreeMap) without
-			// building a second contiguous Vec — avoids ~2x peak memory at the
-			// MAX_XFER_BYTES ceiling (C24 fix).
-			let saved = if complete {
-				save_received_file_chunks(&r.name, r.chunks.values(), r.received)
+			// Offload the potentially multi-GiB blocking write to a thread-pool thread so
+			// the async serve loop (input forwarding, keepalive) is not stalled during
+			// reassembly. Collect chunks into a Vec (BTreeMap already returns them in key
+			// order, preserving file byte order) and move all owned data into the closure.
+			let name_owned = r.name.clone();
+			let chunks_owned: Vec<Vec<u8>> = if complete {
+				r.chunks.into_values().collect()
 			} else {
-				None
+				Vec::new()
 			};
-			let ok = saved.is_some();
-			let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
-			// Use the actual on-disk filename (may have a dedup suffix like " (1)")
-			// instead of r.name so the UI flash and session log name the file the
-			// user can actually open.
-			let saved_name = saved
-				.as_ref()
-				.and_then(|(p, _)| p.file_name())
-				.and_then(|n| n.to_str())
-				.unwrap_or(&r.name)
-				.to_string();
-			let _ = app_h.emit(
-				"file-recv",
-				FilePayload {
-					peer: peer.clone(),
-					name: saved_name.clone(),
-					bytes: written,
-					ok,
-					xfer_id: id,
-				},
-			);
-			if ok {
-				let _ = app_h.emit(
-					"session",
-					SessionEvent {
-						kind: "file".into(),
-						peer: peer.clone(),
-						detail: format!("{} · {} B", saved_name, written),
+			let received = r.received;
+			let peer_owned = peer.clone();
+			let app_h_owned = app_h.clone();
+			tokio::task::spawn_blocking(move || {
+				// Write chunks directly to disk (in index order via the collected Vec,
+				// which BTreeMap yielded in sorted key order) without building a second
+				// contiguous Vec — avoids ~2x peak memory at the MAX_XFER_BYTES ceiling
+				// (C24 fix).
+				let saved = if complete {
+					save_received_file_chunks(&name_owned, chunks_owned.iter(), received)
+				} else {
+					None
+				};
+				let ok = saved.is_some();
+				let written = saved.as_ref().map(|(_, b)| *b).unwrap_or(0);
+				// Use the actual on-disk filename (may have a dedup suffix like " (1)")
+				// instead of name_owned so the UI flash and session log name the file the
+				// user can actually open.
+				let saved_name = saved
+					.as_ref()
+					.and_then(|(p, _)| p.file_name())
+					.and_then(|n| n.to_str())
+					.unwrap_or(&name_owned)
+					.to_string();
+				let _ = app_h_owned.emit(
+					"file-recv",
+					FilePayload {
+						peer: peer_owned.clone(),
+						name: saved_name.clone(),
+						bytes: written,
+						ok,
+						xfer_id: id,
 					},
 				);
-			}
+				if ok {
+					let _ = app_h_owned.emit(
+						"session",
+						SessionEvent {
+							kind: "file".into(),
+							peer: peer_owned.clone(),
+							detail: format!("{} · {} B", saved_name, written),
+						},
+					);
+				}
+			});
 		}
 		_ => {}
 	}

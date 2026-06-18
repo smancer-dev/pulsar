@@ -105,13 +105,35 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 			s("1"),
 		]),
 		// Software: zerolatency both ways; ultrafast for games, veryfast (sharper) for
-		// the desktop.
-		(HwEncoder::Software, true) => {
-			a.extend([s("-preset"), s("ultrafast"), s("-tune"), s("zerolatency")])
-		}
-		(HwEncoder::Software, false) => {
-			a.extend([s("-preset"), s("veryfast"), s("-tune"), s("zerolatency")])
-		}
+		// the desktop.  libsvtav1 (AV1) takes -preset as an INTEGER (0-13) and has NO
+		// -tune flag — libx264/libx265 string presets cause "Unable to parse preset
+		// option value ultrafast" / exit 127 → dead video.  Branch on the codec so each
+		// encoder gets its own vocabulary.
+		(HwEncoder::Software, true) => match plan.codec {
+			VCodec::Av1 => {
+				// libsvtav1 low-latency game: preset 8 (fast) + low-power thread params.
+				a.extend([
+					s("-preset"),
+					s("8"),
+					s("-svtav1-params"),
+					s("lp=0:fast-decode=1"),
+				])
+			}
+			_ => {
+				// libx264 / libx265: string preset + zerolatency tune.
+				a.extend([s("-preset"), s("ultrafast"), s("-tune"), s("zerolatency")])
+			}
+		},
+		(HwEncoder::Software, false) => match plan.codec {
+			VCodec::Av1 => {
+				// libsvtav1 quality mode: preset 6 (balanced quality/speed), no tune.
+				a.extend([s("-preset"), s("6")])
+			}
+			_ => {
+				// libx264 / libx265: string preset + zerolatency tune.
+				a.extend([s("-preset"), s("veryfast"), s("-tune"), s("zerolatency")])
+			}
+		},
 		(HwEncoder::Qsv, true) => a.extend([s("-preset"), s("veryfast"), s("-low_power"), s("1")]),
 		(HwEncoder::Qsv, false) => a.extend([s("-preset"), s("medium")]),
 		// AMD AMF: low-latency CBR for games, quality "transcoding" for desktop.
@@ -149,9 +171,14 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 	// For CPU-fed encoders (software / x11grab / the ddagrab CPU-bounce branches) swscale
 	// honors `-pix_fmt` directly; the ddagrab filter also emits the matching format so the
 	// frame reaches the encoder in the requested depth/chroma (see CaptureMethod::input_args).
-	if plan.hdr || plan.yuv444 {
+	//
+	// Use effective_hdr_yuv444() — NOT plan.hdr/plan.yuv444 directly — so that GPU-filter
+	// paths (NVENC/QSV ddagrab) that are clamped to SDR 4:2:0 in the filter are also clamped
+	// here.  The filter and -pix_fmt MUST derive from the same source; this call is that source.
+	let (eff_hdr, eff_yuv444) = plan.effective_hdr_yuv444();
+	if eff_hdr || eff_yuv444 {
 		// Profile bumps required for 10-bit / 4:4:4. AV1 `main` already spans 8/10-bit 4:2:0.
-		let profile = match (plan.codec, plan.hdr, plan.yuv444) {
+		let profile = match (plan.codec, eff_hdr, eff_yuv444) {
 			(VCodec::H265, _, true) => Some("rext"), // HEVC Range Extensions = 4:4:4
 			(VCodec::H265, true, false) => Some("main10"),
 			(VCodec::H264, _, true) => Some("high444p"),
@@ -161,7 +188,7 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		if let Some(p) = profile {
 			a.extend([s("-profile:v"), s(p)]);
 		}
-		let pix = match (plan.yuv444, plan.hdr) {
+		let pix = match (eff_yuv444, eff_hdr) {
 			(true, true) => "yuv444p10le",
 			(true, false) => "yuv444p",
 			(false, true) => "p010le",
@@ -170,7 +197,7 @@ pub fn encode_command(plan: &StreamPlan) -> (String, Vec<String>) {
 		a.extend([s("-pix_fmt"), s(pix)]);
 		// HDR10 signaling: BT.2020 primaries + SMPTE-2084 (PQ) transfer + non-constant
 		// luminance matrix. The client carries these through to its display.
-		if plan.hdr {
+		if eff_hdr {
 			a.extend([
 				s("-color_primaries"),
 				s("bt2020"),
@@ -260,6 +287,17 @@ pub fn probe_command(
 
 	a.extend([s("-c:v"), s(name)]);
 
+	// Mirror the encoder-specific options from encode_command so the probe exercises the
+	// same init path the real spawn uses.  Without this, a Software+AV1 probe passes
+	// (no options → libsvtav1 defaults are fine) while the real encode_command would have
+	// previously failed with an x264-style string preset.  Now that encode_command emits
+	// the correct integer preset for libsvtav1, the probe must match.
+	if encoder == HwEncoder::Software && codec == VCodec::Av1 {
+		// Use the low-latency preset for the probe (fastest init; same preset string the
+		// real encode uses so the probe catches any preset-parse failure).
+		a.extend([s("-preset"), s("8"), s("-svtav1-params"), s("lp=0:fast-decode=1")]);
+	}
+
 	// AV1: probe through the REAL RTP muxer, not just `-f null`. Current ffmpeg gates AV1
 	// packetization behind `-strict experimental` (header write fails outright), and the
 	// Software arms emit x264-style presets libsvtav1 rejects — so a null-mux probe passes
@@ -304,4 +342,121 @@ pub fn decode_command(listen: &str) -> (String, Vec<String>) {
 			s(listen),
 		],
 	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Minimal StreamPlan for unit tests.  Only the fields that encode_command reads
+	/// need to be filled in; the rest are inert defaults.
+	fn sw_av1_plan(low_latency: bool) -> StreamPlan {
+		StreamPlan {
+			encoder: HwEncoder::Software,
+			codec: VCodec::Av1,
+			width: 1920,
+			height: 1080,
+			fps: 60,
+			bitrate_kbps: 8000,
+			capture: CaptureMethod::X11grab,
+			display: ":0.0".to_string(),
+			vaapi_device: String::new(),
+			dest: "rtp://127.0.0.1:9000".to_string(),
+			low_latency,
+			gpu_zerocopy: false,
+			output_idx: 0,
+			hdr: false,
+			yuv444: false,
+		}
+	}
+
+	/// [sw-av1-preset-probe-divergence] Software+AV1 must NOT emit libx264/libx265
+	/// preset vocabulary — libsvtav1 rejects the string preset with exit 127 ("Unable
+	/// to parse preset option value ultrafast").  It must also NOT emit "-tune" (which
+	/// libsvtav1 does not accept), and MUST include an integer -preset.
+	#[test]
+	fn software_av1_low_latency_uses_integer_preset() {
+		let (_prog, args) = encode_command(&sw_av1_plan(true));
+		let args_str = args.join(" ");
+		// Must not contain x264/x265 string presets.
+		assert!(
+			!args_str.contains("ultrafast"),
+			"Software+AV1 low_latency must not emit 'ultrafast': {args_str}"
+		);
+		assert!(
+			!args_str.contains("veryfast"),
+			"Software+AV1 low_latency must not emit 'veryfast': {args_str}"
+		);
+		// Must not contain the zerolatency tune flag (not valid for libsvtav1).
+		assert!(
+			!args_str.contains("zerolatency"),
+			"Software+AV1 low_latency must not emit 'zerolatency': {args_str}"
+		);
+		// Must contain an integer -preset value (specifically "8" for low_latency).
+		let preset_idx = args.iter().position(|a| a == "-preset");
+		assert!(
+			preset_idx.is_some(),
+			"Software+AV1 low_latency must emit -preset: {args_str}"
+		);
+		let preset_val = &args[preset_idx.unwrap() + 1];
+		assert!(
+			preset_val.parse::<u32>().is_ok(),
+			"Software+AV1 low_latency -preset value must be an integer, got '{preset_val}'"
+		);
+		assert_eq!(preset_val, "8", "Software+AV1 low_latency preset should be 8");
+		// Must include the svtav1 low-latency params.
+		assert!(
+			args_str.contains("svtav1-params"),
+			"Software+AV1 low_latency must emit -svtav1-params: {args_str}"
+		);
+	}
+
+	#[test]
+	fn software_av1_quality_uses_integer_preset() {
+		let (_prog, args) = encode_command(&sw_av1_plan(false));
+		let args_str = args.join(" ");
+		assert!(
+			!args_str.contains("ultrafast"),
+			"Software+AV1 quality must not emit 'ultrafast': {args_str}"
+		);
+		assert!(
+			!args_str.contains("veryfast"),
+			"Software+AV1 quality must not emit 'veryfast': {args_str}"
+		);
+		assert!(
+			!args_str.contains("zerolatency"),
+			"Software+AV1 quality must not emit 'zerolatency': {args_str}"
+		);
+		let preset_idx = args.iter().position(|a| a == "-preset");
+		assert!(
+			preset_idx.is_some(),
+			"Software+AV1 quality must emit -preset: {args_str}"
+		);
+		let preset_val = &args[preset_idx.unwrap() + 1];
+		assert!(
+			preset_val.parse::<u32>().is_ok(),
+			"Software+AV1 quality -preset value must be an integer, got '{preset_val}'"
+		);
+		assert_eq!(preset_val, "6", "Software+AV1 quality preset should be 6");
+	}
+
+	/// Ensure the H.264 software path is NOT broken by the AV1 branch — it must still
+	/// emit the string preset and zerolatency tune.
+	#[test]
+	fn software_h264_still_uses_string_preset() {
+		let plan = StreamPlan {
+			codec: VCodec::H264,
+			..sw_av1_plan(true)
+		};
+		let (_prog, args) = encode_command(&plan);
+		let args_str = args.join(" ");
+		assert!(
+			args_str.contains("ultrafast"),
+			"Software+H264 low_latency must still emit 'ultrafast': {args_str}"
+		);
+		assert!(
+			args_str.contains("zerolatency"),
+			"Software+H264 low_latency must still emit 'zerolatency': {args_str}"
+		);
+	}
 }

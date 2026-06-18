@@ -322,6 +322,13 @@ pub(crate) async fn go_online(
 	// guard dropped left the host on the sinkless sink (real speakers silent). Restore
 	// the saved default from the on-disk marker (no-op for a clean previous exit).
 	handlers::restore_stale_redirect();
+	// Crash-restore for the Linux/macOS host-silent null-sink / output redirect: a
+	// prior process that crashed/SIGKILL'd before the HostSilentGuard::drop ran left
+	// PulseAudio (Linux) pointing at the `pulsar_silent` null sink as the default
+	// (real speakers silent) or macOS pointing at a virtual output device. Restore the
+	// saved default from the on-disk marker and (Linux) unload the stranded null sink.
+	// No-op for a clean previous exit or on Windows (Windows uses restore_stale_redirect).
+	handlers::restore_stale_host_silent();
 	// Crash-restore for the endpoint-mute fallback (no-virtual-sink / no-null-sink
 	// case): a prior process that fell back to endpoint-mute and died before the
 	// session ended left the host output muted. Unmute iff our marker says we set it
@@ -553,7 +560,7 @@ pub(crate) async fn go_online(
 							.unwrap()
 							.connect_password
 							.clone();
-						let accepted: Vec<String> = [host_pw.clone(), custom_pw]
+						let accepted: Vec<String> = [host_pw.clone(), custom_pw.clone()]
 							.into_iter()
 							.filter(|p| !p.is_empty())
 							.collect();
@@ -561,16 +568,14 @@ pub(crate) async fn go_online(
 						// is single-use and must be rotated the moment it authenticates a
 						// connection, so the same code never unlocks a second one. The
 						// persistent connect password (Settings → Güvenlik) is intentionally
-						// reusable and is NEVER rotated. `matched_otp` is true only when the
-						// provided secret equals the (non-empty) OTP.
-						let matched_otp =
-							|p: &str| !host_pw.is_empty() && crate::auth::secret_eq(p, &host_pw);
-						if !accepted.is_empty()
-							&& accepted.iter().any(|a| crate::auth::secret_eq(&provided, a))
-						{
-							if matched_otp(&provided) {
-								crate::commands::rotate_session_password(&app_h);
-							}
+						// reusable and is NEVER rotated.
+						// For the OTP, use try_consume_otp which atomically matches AND
+						// rotates under one lock, eliminating the read→compare→rotate TOCTOU
+						// race where two concurrent tasks could both match the same live OTP.
+						let otp_accepted = crate::commands::try_consume_otp(&app_h, &provided);
+						let custom_accepted = !custom_pw.is_empty()
+							&& crate::auth::secret_eq(&provided, &custom_pw);
+						if !accepted.is_empty() && (otp_accepted || custom_accepted) {
 							true
 						} else {
 							// Count a NON-EMPTY wrong up-front guess here: otherwise an
@@ -1024,6 +1029,10 @@ pub(crate) async fn go_online(
 							return;
 						}
 						was_view_only = false;
+						// Maximum virtual gamepads per session: matches the client's play.rs
+						// append_idx.min(3) ceiling so an authenticated peer cannot create more
+						// than 4 virtual gamepads or storm plug/unplug by cycling the target field.
+						const MAX_PADS: u8 = 4;
 						match ev {
 							// Legacy single-pad variant → Player 1 (slot 0), Xbox emulation.
 							InputEvent::Gamepad(state) => {
@@ -1037,12 +1046,24 @@ pub(crate) async fn go_online(
 							// Xbox360 (or Auto+Xbox) gives Xbox360. The pad is recreated only when the
 							// resolved target changes, so ViGEm/uinput replug is bounded and rare.
 							InputEvent::GamepadSlot { slot, kind, target, state } => {
+								if slot >= MAX_PADS {
+									return;
+								}
 								let want = target.resolve(kind);
 								let need_create = match pads.get(&slot) {
 									Some((have, _)) => *have != want,
 									None => true,
 								};
 								if need_create {
+									if pads.len() >= MAX_PADS as usize && !pads.contains_key(&slot) {
+										// At the cap: refuse to create a BRAND-NEW slot's
+										// virtual device. An in-place recreate of an EXISTING
+										// slot (its emulation target changed) does NOT grow the
+										// map (insert replaces), so it must proceed — otherwise
+										// that pad returns before apply() every tick and goes
+										// permanently input-dead after a target switch.
+										return;
+									}
 									let pad = create_virtual_pad_target(kind, target);
 									// Forward the game's rumble back to the client's physical pad
 									// (DS4 backend only; no-op for others). The thread ends when
@@ -1056,6 +1077,9 @@ pub(crate) async fn go_online(
 							// Box alive so the emulated device stays registered on the host —
 							// avoids reconnect churn when the client briefly re-enumerates pads.
 							InputEvent::GamepadDisconnect { slot } => {
+								if slot >= MAX_PADS {
+									return;
+								}
 								if let Some((_, p)) = pads.get_mut(&slot) {
 									p.apply(&pulsar_core::input::GamepadState::default());
 								}

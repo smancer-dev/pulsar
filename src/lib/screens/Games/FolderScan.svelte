@@ -10,6 +10,7 @@
 	let scanResults = $state<ScannedApp[]>([]);
 	let scanMsg = $state('');
 	let cancelScan = false;
+	let scanGen = 0;
 	let autoTimer: ReturnType<typeof setInterval> | null = null;
 
 	async function scanAll(autoAdd = false) {
@@ -20,12 +21,13 @@
 		}
 		scanning = true;
 		cancelScan = false;
+		const gen = ++scanGen;
 		scanResults = [];
 		scanMsg = autoAdd ? t('games.scanningAuto') : t('games.scanning');
 		const seen = new Set(gameStore.games.map((g) => g.path));
 		const found: ScannedApp[] = [];
 		for (const folder of gameStore.scan.folders) {
-			if (cancelScan) break;
+			if (cancelScan || gen !== scanGen) break;
 			try {
 				for (const a of await api.scanFolder(folder)) {
 					if (!seen.has(a.path) && !found.some((f) => f.path === a.path)) found.push(a);
@@ -34,6 +36,7 @@
 				/* skip unreadable folder */
 			}
 		}
+		if (gen !== scanGen) return;
 		if (autoAdd) {
 			// Automatic scan: add everything new straight to the library.
 			for (const a of found) addScanned(a.name, a.path);
@@ -46,6 +49,7 @@
 		scanning = false;
 	}
 	function stopScan() {
+		scanGen++;
 		cancelScan = true;
 		scanning = false;
 	}

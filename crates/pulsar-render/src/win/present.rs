@@ -104,22 +104,7 @@ impl Present {
 		let ctx = device.GetImmediateContext()?;
 		let vctx: ID3D11VideoContext = ctx.cast()?;
 		let (vp_enum, vproc) = Self::build(&vdevice, in_w, in_h, out_w, out_h)?;
-		// Black bars for letterboxing.
-		vctx.VideoProcessorSetOutputBackgroundColor(
-			&vproc,
-			false,
-			&windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR {
-				Anonymous: windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR_0 {
-					RGBA: windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR_RGBA {
-						R: 0.0,
-						G: 0.0,
-						B: 0.0,
-						A: 1.0,
-					},
-				},
-			},
-		);
-		Ok(Self {
+		let s = Self {
 			vdevice,
 			vctx,
 			vp_enum,
@@ -128,7 +113,10 @@ impl Present {
 			in_h,
 			out_w,
 			out_h,
-		})
+		};
+		// Black bars for letterboxing.
+		s.set_black_background();
+		Ok(s)
 	}
 
 	unsafe fn build(
@@ -159,6 +147,26 @@ impl Present {
 		Ok((vp_enum, vproc))
 	}
 
+	/// Set the video processor's output background color to opaque black (for letterbox bars).
+	/// Must be called on `self` (uses `self.vctx` + `self.vproc`) — not inside `build()` which
+	/// has no access to `vctx`.
+	unsafe fn set_black_background(&self) {
+		self.vctx.VideoProcessorSetOutputBackgroundColor(
+			&self.vproc,
+			false,
+			&windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR {
+				Anonymous: windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR_0 {
+					RGBA: windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR_RGBA {
+						R: 0.0,
+						G: 0.0,
+						B: 0.0,
+						A: 1.0,
+					},
+				},
+			},
+		);
+	}
+
 	/// Rebuild the processor if the input (decoded) or output (window) size changed.
 	pub unsafe fn resize(&mut self, in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> Result<()> {
 		if in_w == self.in_w && in_h == self.in_h && out_w == self.out_w && out_h == self.out_h {
@@ -167,6 +175,10 @@ impl Present {
 		let (e, p) = Self::build(&self.vdevice, in_w, in_h, out_w, out_h)?;
 		self.vp_enum = e;
 		self.vproc = p;
+		// Re-apply the black background color: build() creates a fresh ID3D11VideoProcessor
+		// which resets all state, so the letterbox bars would show swapchain garbage
+		// (FLIP_DISCARD = back buffer undefined) without this call.
+		self.set_black_background();
 		self.in_w = in_w;
 		self.in_h = in_h;
 		self.out_w = out_w;

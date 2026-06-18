@@ -58,7 +58,14 @@ pub(crate) async fn host_send_chat(
 		.map_err(|_| crate::i18n::t("err.message").to_string())?;
 	// Into the backlog too: sent lines have no broadcast event of their own, so a
 	// re-opened connections window rebuilds the full conversation from here.
-	state.chat_log.lock().unwrap().push((peer, text, true));
+	{
+		let mut log = state.chat_log.lock().unwrap();
+		log.push((peer, text, true));
+		let excess = log.len().saturating_sub(500);
+		if excess > 0 {
+			log.drain(..excess);
+		}
+	}
 	Ok(())
 }
 

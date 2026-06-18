@@ -39,6 +39,17 @@ struct Globals {
 	/// like Ctrl+Shift+M leaves Ctrl+Shift stuck on the host (their up-strokes arrive
 	/// after the gate closed and are never forwarded).
 	held: std::collections::HashSet<u32>,
+	/// Tracks which combo trigger keys (overlay/end/fullscreen/detach: evdev 50, 16, 88,
+	/// 44) are currently physically held. Used to detect the DOWN EDGE so autorepeat
+	/// does not re-fire each action on every repeated key event while the chord is held.
+	/// insert() returns true only on the first press (false on subsequent autorepeats),
+	/// making this a precise rising-edge detector. Cleared on the key-up event.
+	combo_held: std::collections::HashSet<u32>,
+	/// Combo trigger keys whose CURRENT physical press was the real chord (the
+	/// modifiers were held at the down-edge). Used to suppress only chord
+	/// autorepeats, never a bare M/Q/Z repeat the user is typing into the remote.
+	/// Cleared on the key-up and on re-arm.
+	combo_active: std::collections::HashSet<u32>,
 	/// Every mouse BUTTON currently held DOWN on the host (0=left/1=right/2=middle).
 	/// Same guarantee as `held` for buttons: a press-and-hold (drag) followed by a
 	/// disengage edge (click-outside implicit release, 3×RightCtrl, Ctrl+Alt+Z,
@@ -91,6 +102,8 @@ fn globals() -> &'static Mutex<Globals> {
 			rctrl_presses: Vec::new(),
 			held: std::collections::HashSet::new(),
 			held_buttons: std::collections::HashSet::new(),
+			combo_held: std::collections::HashSet::new(),
+			combo_active: std::collections::HashSet::new(),
 		})
 	})
 }
@@ -457,10 +470,76 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 		42 | 54 => g.shift_down = down, // L/R Shift
 		_ => {}
 	}
+	// Rising-edge detection for combo trigger keys: insert() returns true only on the
+	// FIRST press (autorepeat finds the key already in the set → returns false). The
+	// else branch clears on key-up, which runs before the ENGAGED gate below, so the
+	// set is always cleaned up even when the gate is not taken (e.g. disengaged state
+	// where the combos still fire via APP_FOCUSED). Keeping this separate from `held`
+	// avoids the dead-lock the combo branches would create: they return early BEFORE
+	// the g.held update at the bottom, so a combo_edge check on `held` would never see
+	// the first press (held lacks the key at combo-fire time for the same reason).
+	let combo_key = matches!(evdev, 50 | 16 | 88 | 44);
+	let combo_edge = if combo_key {
+		if down {
+			let edge = g.combo_held.insert(evdev);
+			if edge {
+				// Record whether this DOWN-edge is the real chord (modifiers held
+				// now), so the key's autorepeat can be suppressed even after a combo's
+				// flush_held_wh resets the modifier booleans — WITHOUT eating a BARE
+				// M/Q/Z repeat meant for the remote (bare press → chord=false → not
+				// recorded → its repeats forward). Mirrors linux.rs keeping the chord
+				// test so a bare m/q/z still repeats.
+				let chord = ((evdev == 50 || evdev == 16 || evdev == 88)
+					&& g.ctrl_down
+					&& g.shift_down)
+					|| (evdev == 44 && g.ctrl_down && g.alt_down);
+				if chord {
+					g.combo_active.insert(evdev);
+				}
+			}
+			edge
+		} else {
+			g.combo_held.remove(&evdev);
+			g.combo_active.remove(&evdev);
+			false
+		}
+	} else {
+		false
+	};
+	// Suppress autorepeat of a combo trigger key while its chord is still held.
+	// The down-edge already fired the action; subsequent OS autorepeat events have
+	// combo_edge=false (insert() found the key already in combo_held). Without this
+	// guard: F12 repeats forward to the host (ENGAGED stays true after fullscreen
+	// toggle), and M repeats leak to the local desktop after ENGAGED is cleared.
+	// Mirrors linux.rs:716-732 (ev.value()==2 while chord held → continue).
+	if combo_key && down && !combo_edge
+		&& g.combo_active.contains(&evdev)
+		&& (ENGAGED.load(Ordering::SeqCst) || APP_FOCUSED.load(Ordering::SeqCst))
+	{
+		// Trigger key physically held and already fired its edge → suppress its
+		// autorepeat. Two bugs this replaces:
+		// (r17-kbd-autorepeat-suppress-unfocused) The old guard read modifier
+		// booleans (ctrl_down && shift_down / ctrl_down && alt_down) but carried
+		// no ENGAGED||APP_FOCUSED ownership condition, so when Pulsar was
+		// disengaged AND another app had focus the hook still swallowed combo-key
+		// (M/Q/F12/Z) autorepeats that belonged to the other app.
+		// (r17-win-combo-autorepeat-leak) flush_held_wh (called synchronously in
+		// the overlay/detach combo blocks) resets ctrl_down/shift_down/alt_down
+		// to false; since modifier keys don't autorepeat, those booleans stayed
+		// false after the combo fired, so the old 'chord' test was false → the
+		// still-held M/Z autorepeats leaked to the local desktop.
+		// FIX: combo_active (set only when the down-edge had the chord modifiers) is
+		// the discriminator, NOT the modifier booleans (which flush_held_wh resets)
+		// and NOT bare combo_held membership. So a BARE M/Q/Z repeat is never in
+		// combo_active and forwards to the host normally — the host injects one
+		// keydown per event and generates NO repeat of its own, so eating bare
+		// repeats would drop remote characters (the r18 regression this fixes).
+		return true;
+	}
 	// Overlay-toggle combo: Ctrl+Shift+M — must work BOTH engaged and merely
 	// app-focused (disengaged): the user released control but still wants the menu.
 	// Never fires while another app has focus (the hook is global).
-	if down
+	if combo_edge
 		&& evdev == 50
 		&& g.ctrl_down
 		&& g.shift_down
@@ -497,7 +576,7 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 	}
 	// End combo: Ctrl+Shift+Q — ends the session. Like the overlay combo it must work
 	// BOTH engaged and merely app-focused (the user released control, video still up).
-	if down
+	if combo_edge
 		&& evdev == 16
 		&& g.ctrl_down
 		&& g.shift_down
@@ -515,7 +594,7 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 	}
 	// Fullscreen combo: Ctrl+Shift+F12 — toggles the window's fullscreen state; the
 	// session AND control state stay as they are (this is NOT the leave combo).
-	if down
+	if combo_edge
 		&& evdev == 88
 		&& g.ctrl_down
 		&& g.shift_down
@@ -533,7 +612,11 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 	}
 	// Release combo (matches the on-screen hint): 3×RightCtrl within 1 s DISENGAGES
 	// capture (session stays alive; click the video to take control again).
-	if down && evdev == 97 {
+	// Guard: only count true key-down edges (first press), NOT OS autorepeat.
+	// g.held was populated by the forwarding path at the bottom for prior key-down events,
+	// so on the FIRST physical press g.held lacks 97; every autorepeat finds it present
+	// (it was inserted on the first press). This mirrors Linux linux.rs 'ev.value()==1'.
+	if down && evdev == 97 && !g.held.contains(&97) {
 		let now = std::time::Instant::now();
 		g.rctrl_presses
 			.retain(|t| now.duration_since(*t).as_millis() < 1000);
@@ -558,7 +641,7 @@ fn handle_key(evdev: u32, down: bool) -> bool {
 	}
 	// Release combo #2 (the one the engage hint advertises): Ctrl+Alt+Z (evdev 44)
 	// — Parsec's detach shortcut, same behavior as 3×RightCtrl above.
-	if down && evdev == 44 && g.ctrl_down && g.alt_down {
+	if combo_edge && evdev == 44 && g.ctrl_down && g.alt_down {
 		ENGAGED.store(false, Ordering::SeqCst);
 		// Un-stick everything held on the host (the chord's up-strokes won't be forwarded).
 		// C16 fix: collect flush events + app handle under lock, drop guard BEFORE sending.
@@ -639,8 +722,11 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 				tracing::info!("click outside Pulsar while engaged → implicit release, click passes through");
 				ENGAGED.store(false, Ordering::SeqCst);
 				clear_confine();
-				flush_held(&mut g);
-				if let Some(app) = &g.app {
+				let (flush_tx, flush_evs) = flush_held_wh(&mut g);
+				let app_handle = g.app.clone();
+				drop(g);
+				send_flush_events(flush_tx, flush_evs);
+				if let Some(app) = &app_handle {
 					let _ = app.emit("kbd-released", ());
 				}
 				return false; // the click acts locally (activates the other app)
@@ -727,6 +813,8 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, _sta
 		g.alt_down = false;
 		g.shift_down = false;
 		g.rctrl_presses.clear();
+		g.combo_held.clear();
+		g.combo_active.clear();
 	}
 	// Sessions start DISENGAGED (click-to-engage) — except a kiosk `--connect` start,
 	// which engages immediately like the Linux evdev path. KIOSK_ENGAGE is LATCHED

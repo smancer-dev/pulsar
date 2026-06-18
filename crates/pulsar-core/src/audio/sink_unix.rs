@@ -135,6 +135,25 @@ pub fn arm(
 	}
 }
 
+/// Startup crash-restore for the host-silent redirect on Linux/macOS.
+///
+/// Linux: unconditionally unloads any stranded `pulsar_silent` null sink (cheap +
+/// idempotent), then reads the crash-recovery marker and restores the saved
+/// PulseAudio default sink if the marker is present.
+///
+/// macOS: reads the crash-recovery marker and restores the saved system default
+/// output if it holds a non-virtual device name.
+///
+/// No-op when there is no stale redirect (clean previous exit). Best-effort:
+/// warnings are emitted on failure; never panics, never blocks the stream.
+/// On platforms other than Linux/macOS this function compiles to nothing.
+pub fn restore_stale_host_silent() {
+	#[cfg(target_os = "linux")]
+	linux::restore_stale_host_silent();
+	#[cfg(target_os = "macos")]
+	macos::restore_stale_host_silent();
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
 	//! PulseAudio null-sink redirect via the `pactl` CLI (no libpulse link needed —
@@ -150,6 +169,63 @@ mod linux {
 	/// monitor reader requests. A stable name lets a crashed-then-restarted host
 	/// detect and reuse/unload a leftover one.
 	const SINK_NAME: &str = "pulsar_silent";
+
+	/// Path of the crash-recovery marker for the host-silent null-sink redirect.
+	/// Written at arm time holding the saved previous default sink name; deleted on
+	/// clean teardown. On the next launch [`restore_stale_host_silent`] reads it and
+	/// restores the saved default + unloads any stranded null sink. Uses
+	/// `$XDG_RUNTIME_DIR` when available (preferred; per-user, tmpfs-backed), else
+	/// falls back to `/tmp`. The filename is per-uid so concurrent users on the same
+	/// machine get separate markers (mirrors the per-uid pattern in `mute.rs`).
+	fn host_silent_marker_path() -> std::path::PathBuf {
+		let uid = unsafe { libc::getuid() };
+		let name = format!("pulsar-host-silent-{uid}.marker");
+		if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+			std::path::PathBuf::from(dir).join(&name)
+		} else {
+			std::path::Path::new("/tmp").join(&name)
+		}
+	}
+
+	/// Startup crash-restore for the host-silent null-sink redirect (Linux).
+	///
+	/// Always calls [`unload_stale`] first (cheap + idempotent: clears any stranded
+	/// `pulsar_silent` null sink that a crashed prior run left loaded). Then, if the
+	/// crash-recovery marker holds a non-empty saved sink name, restores that as the
+	/// PulseAudio default sink and removes the marker. Best-effort: warns on any
+	/// error, never panics, never blocks the stream.
+	pub(super) fn restore_stale_host_silent() {
+		// Always clear any stranded null sink first — even if the marker is absent (it
+		// might have been deleted by another code path or lost across a reboot on a
+		// non-tmpfs /tmp) a leftover module is always safe to unload.
+		unload_stale();
+
+		let path = host_silent_marker_path();
+		let contents = match std::fs::read_to_string(&path) {
+			Ok(s) => s,
+			Err(_) => return, // no marker → clean previous exit
+		};
+		// Consume the marker before issuing the restore so a failure can't leave us
+		// looping on the next launch.
+		let _ = std::fs::remove_file(&path);
+		let saved = contents.trim();
+		if saved.is_empty() {
+			// Marker written with no previous default (rare) — nothing to restore.
+			return;
+		}
+		if let Err(e) = pactl(&["set-default-sink", saved]) {
+			tracing::warn!(
+				saved,
+				error = %e,
+				"pulsar host-silent crash-restore: failed to restore default sink"
+			);
+		} else {
+			tracing::info!(
+				saved,
+				"pulsar host-silent crash-restore: restored default sink after abnormal exit"
+			);
+		}
+	}
 
 	/// A live PulseAudio null-sink redirect. Holds the loaded module's id and the
 	/// previous default sink so [`Self::teardown`] can restore exactly. Created by
@@ -246,6 +322,20 @@ mod linux {
 
 			let prev_default = get_default_sink();
 
+			// Write the crash-recovery marker BEFORE applying the redirect: the host
+			// can only end up with a silent default after this marker exists, so a
+			// crash/SIGKILL in the arm window always leaves a recoverable state.
+			// The marker holds the saved previous default sink name (empty string when
+			// there was none — restore_stale_host_silent skips the set-default call).
+			let marker_path = host_silent_marker_path();
+			let marker_content = prev_default.as_deref().unwrap_or("");
+			if let Err(e) = std::fs::write(&marker_path, marker_content.as_bytes()) {
+				tracing::warn!(
+					error = %e,
+					"pulsar host-silent: failed to write crash-recovery marker (non-fatal)"
+				);
+			}
+
 			// Build the channel_map string for this layout. PulseAudio channel-map
 			// names mirror Sunshine's `platf::speaker` constants.
 			let channel_map = match layout {
@@ -281,7 +371,9 @@ mod linux {
 					Err(_) => {
 						// pactl printed something non-numeric (or nothing) — treat as
 						// "couldn't load" so the caller falls back rather than tracking a
-						// bogus id we can never unload.
+						// bogus id we can never unload. Remove the marker (the redirect
+						// never went live, so there's nothing to restore on next launch).
+						let _ = std::fs::remove_file(&marker_path);
 						return Ok(None);
 					}
 				},
@@ -289,6 +381,7 @@ mod linux {
 					// No pactl / module-null-sink unavailable → no redirect; the caller
 					// falls back to the mute path. This is an expected, non-fatal outcome.
 					tracing::warn!("pulsar host-silent: null-sink load failed: {e}");
+					let _ = std::fs::remove_file(&marker_path);
 					return Ok(None);
 				}
 			};
@@ -297,6 +390,9 @@ mod linux {
 			if let Err(e) = pactl(&["set-default-sink", SINK_NAME]) {
 				tracing::warn!("pulsar host-silent: set-default-sink failed: {e} — unloading null sink");
 				let _ = pactl(&["unload-module", &module_id.to_string()]);
+				// The default was never changed, so the marker content is irrelevant;
+				// remove it so the next launch doesn't issue a spurious set-default.
+				let _ = std::fs::remove_file(&marker_path);
 				return Ok(None);
 			}
 
@@ -346,6 +442,10 @@ mod linux {
 			} else {
 				tracing::info!("pulsar host-silent: restored host audio (Linux)");
 			}
+			// Clean teardown: delete the crash-recovery marker so the next launch
+			// doesn't attempt a spurious restore. Best-effort; the file may already
+			// be absent (e.g. on tmpfs across a reboot — harmless).
+			let _ = std::fs::remove_file(host_silent_marker_path());
 		}
 	}
 }
@@ -375,6 +475,63 @@ mod macos {
 	/// Names we consider "virtual/sinkless-ish" output devices to redirect to. Matched
 	/// case-insensitively as a substring of a device name from `SwitchAudioSource`.
 	const VIRTUAL_OUTPUT_CANDIDATES: &[&str] = &["BlackHole", "Loopback", "Pulsar", "Soundflower"];
+
+	/// Return `true` if `name` matches any of the `VIRTUAL_OUTPUT_CANDIDATES` (i.e.
+	/// it is a virtual / aggregate / sinkless output device we would redirect to).
+	fn is_virtual_output(name: &str) -> bool {
+		let lc = name.to_lowercase();
+		VIRTUAL_OUTPUT_CANDIDATES
+			.iter()
+			.any(|c| lc.contains(&c.to_lowercase()))
+	}
+
+	/// Path of the crash-recovery marker for the macOS host-silent output redirect.
+	/// Written at create() time holding the saved previous default output device name;
+	/// deleted on clean restore(). On the next launch [`restore_stale_host_silent`]
+	/// reads it and restores the saved output + deletes the marker.
+	fn host_silent_marker_path() -> std::path::PathBuf {
+		std::env::temp_dir().join("pulsar-host-silent-macos.marker")
+	}
+
+	/// Startup crash-restore for the host-silent output redirect (macOS).
+	///
+	/// If the crash-recovery marker holds a non-empty saved output device name that
+	/// is NOT itself a virtual device (protecting against a double-redirect scenario),
+	/// restores that as the default output and removes the marker. Best-effort.
+	pub(super) fn restore_stale_host_silent() {
+		let path = host_silent_marker_path();
+		let contents = match std::fs::read_to_string(&path) {
+			Ok(s) => s,
+			Err(_) => return, // no marker → clean previous exit
+		};
+		// Consume the marker before issuing the restore.
+		let _ = std::fs::remove_file(&path);
+		let saved = contents.trim();
+		if saved.is_empty() || is_virtual_output(saved) {
+			// Either no previous default was saved, or it was itself a virtual device
+			// (shouldn't happen with the guard below, but be safe). Skip restore to
+			// avoid leaving the user stuck on a virtual device permanently.
+			if !saved.is_empty() {
+				tracing::warn!(
+					saved,
+					"pulsar host-silent crash-restore (macOS): saved output is a virtual device; \
+					 skipping restore to avoid permanent redirect"
+				);
+			}
+			return;
+		}
+		if switch_audio(&["-s", saved, "-t", "output"]).is_none() {
+			tracing::warn!(
+				saved,
+				"pulsar host-silent crash-restore (macOS): SwitchAudioSource restore failed"
+			);
+		} else {
+			tracing::info!(
+				saved,
+				"pulsar host-silent crash-restore (macOS): restored default output after abnormal exit"
+			);
+		}
+	}
 
 	/// A live macOS default-output redirect: the device we switched away from, so
 	/// [`Self::restore`] can switch back. The device we switched TO is the capture
@@ -438,8 +595,42 @@ mod macos {
 				return Ok(None);
 			};
 
-			let prev_output = current_output();
+			// Guard the prev_output capture: if the current default output is itself a
+			// virtual device (a crashed prior run left the default pointing at it), do
+			// NOT save it as prev_output — restoring to a virtual device would leave
+			// the user permanently silent. Instead try to find the first non-virtual
+			// real output to save; if none is found, leave prev_output=None (no
+			// restore on teardown, which is safer than restoring to a virtual device).
+			let raw_prev = current_output();
+			let prev_output = match raw_prev.as_deref() {
+				Some(name) if is_virtual_output(name) => {
+					tracing::warn!(
+						current = name,
+						"pulsar host-silent (macOS): current default output is a virtual device \
+						 (prior crash?); searching for a real output to save as restore target"
+					);
+					// Pick the first non-virtual output from the enumerated list as the
+					// restore target, or None if none is found.
+					list_outputs().into_iter().find(|n| !is_virtual_output(n))
+				}
+				other => other.map(|s| s.to_string()),
+			};
+
+			// Write the crash-recovery marker BEFORE switching so a crash/SIGKILL
+			// after the switch always leaves a recoverable state.
+			let marker_path = host_silent_marker_path();
+			let marker_content = prev_output.as_deref().unwrap_or("");
+			if let Err(e) = std::fs::write(&marker_path, marker_content.as_bytes()) {
+				tracing::warn!(
+					error = %e,
+					"pulsar host-silent (macOS): failed to write crash-recovery marker (non-fatal)"
+				);
+			}
+
 			if switch_audio(&["-s", &virtual_name, "-t", "output"]).is_none() {
+				// Switch failed — clean up the marker we just wrote (the default was
+				// never moved, so there is nothing to recover on the next launch).
+				let _ = std::fs::remove_file(&marker_path);
 				return Err(format!(
 					"SwitchAudioSource -s {virtual_name} -t output failed"
 				));
@@ -473,6 +664,9 @@ mod macos {
 					tracing::info!("pulsar host-silent: restored host audio (macOS)");
 				}
 			}
+			// Clean teardown: delete the crash-recovery marker so the next launch
+			// doesn't attempt a spurious restore. Best-effort.
+			let _ = std::fs::remove_file(host_silent_marker_path());
 		}
 	}
 }

@@ -263,6 +263,27 @@ pub(crate) fn rotate_session_password(app: &AppHandle) {
 	let _ = app.emit("session-password", fresh);
 }
 
+/// Atomically compare-and-consume the one-time password: if `provided` matches
+/// the live OTP, rotate it under the same lock so that a concurrent task cannot
+/// also match the same value (eliminating the read→compare→rotate TOCTOU race).
+/// Returns `true` only for the one caller that actually performed the swap.
+/// The persistent connect password is NOT handled here — only the rotating OTP.
+pub(crate) fn try_consume_otp(app: &AppHandle, provided: &str) -> bool {
+	use tauri::{Emitter, Manager};
+	let state = app.state::<AppState>();
+	let fresh = {
+		let mut g = state.password.lock().unwrap();
+		if g.is_empty() || !crate::auth::secret_eq(provided, &g) {
+			return false;
+		}
+		let pw = gen_password();
+		*g = pw.clone();
+		pw
+	};
+	let _ = app.emit("session-password", fresh);
+	true
+}
+
 /// Publish the host's games so connecting clients can list/launch them.
 #[tauri::command]
 pub(crate) async fn publish_games(
@@ -642,10 +663,17 @@ struct NavInput {
 #[tauri::command]
 pub(crate) fn gamepad_nav_start(app: AppHandle, state: State<'_, AppState>) {
 	use std::sync::atomic::Ordering;
+	// Bump the generation epoch BEFORE the swap so any thread from the previous
+	// start that is mid-sleep wakes to a mismatched epoch and exits.
+	let my_gen = state
+		.nav_gamepad_gen
+		.fetch_add(1, Ordering::SeqCst)
+		.wrapping_add(1);
 	if state.nav_gamepad_on.swap(true, Ordering::SeqCst) {
 		return; // already running
 	}
 	let flag = state.nav_gamepad_on.clone();
+	let gen = state.nav_gamepad_gen.clone();
 	std::thread::spawn(move || {
 		let Some(mgr) = crate::controllers::manager() else {
 			flag.store(false, Ordering::SeqCst);
@@ -655,7 +683,7 @@ pub(crate) fn gamepad_nav_start(app: AppHandle, state: State<'_, AppState>) {
 		const T: i16 = 16_000; // ~0.5 stick deflection
 		let mut prev: Option<NavInput> = None;
 		let mut beat: u32 = 0;
-		while flag.load(Ordering::SeqCst) {
+		while flag.load(Ordering::SeqCst) && gen.load(Ordering::SeqCst) == my_gen {
 			// Mimic the old (kind, state) snapshot shape so the nav mapping below is unchanged.
 			let pads: Vec<(pulsar_core::input::GamepadKind, pulsar_core::input::GamepadState)> =
 				mgr.snapshot().into_iter().map(|p| (p.kind, p.state)).collect();
@@ -688,9 +716,12 @@ pub(crate) fn gamepad_nav_start(app: AppHandle, state: State<'_, AppState>) {
 /// Stop the gilrs→webview controller-nav bridge (the reader thread exits on the next tick).
 #[tauri::command]
 pub(crate) fn gamepad_nav_stop(state: State<'_, AppState>) {
-	state
-		.nav_gamepad_on
-		.store(false, std::sync::atomic::Ordering::SeqCst);
+	use std::sync::atomic::Ordering;
+	// Bump the generation epoch first so a thread mid-sleep exits on wake (even if
+	// a concurrent start races in and sets nav_gamepad_on back to true before the
+	// thread checks flag — the epoch mismatch is the authoritative exit signal).
+	state.nav_gamepad_gen.fetch_add(1, Ordering::SeqCst);
+	state.nav_gamepad_on.store(false, Ordering::SeqCst);
 }
 
 /// Persist the controller slot permutation from the UI. `order[n]` is the gilrs uuid

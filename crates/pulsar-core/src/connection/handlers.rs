@@ -295,7 +295,19 @@ impl Node {
 			.session(key, Role::Responder, session, our_salt, peer_salt);
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
 
+		// Read self_id + token BEFORE inserting the session so we never leak a
+		// dangling SessionState + mpsc channel when the node is unregistered.
+		// (An attacker-chosen session id on an unregistered node would otherwise
+		// leave one SessionState per packet, growing unboundedly — conn-r15-2.)
 		let (id, token) = {
+			let g = self.inner.lock().await;
+			(g.self_id, g.token)
+		};
+		let (Some(id), Some(token)) = (id, token) else {
+			return;
+		};
+
+		{
 			let mut g = self.inner.lock().await;
 			g.sessions.insert(
 				session,
@@ -311,11 +323,7 @@ impl Node {
 					our_salt,
 				},
 			);
-			(g.self_id, g.token)
-		};
-		let (Some(id), Some(token)) = (id, token) else {
-			return;
-		};
+		}
 
 		// Accept: send back our pubkey(32) || our salt(32) || optional LAN candidate
 		// as the answer, then punch.
@@ -381,16 +389,25 @@ impl Node {
 				if self.mode != NetworkMode::RelayOnly {
 					let mut g = self.inner.lock().await;
 					if let Some(s) = g.sessions.get_mut(&session) {
-						// PREFER THE PRIVATE PATH: with both the LAN route and the
-						// router-hairpin route alive, punch retransmits would otherwise
-						// flap `peer_addr` between them — and the hairpin route is the
-						// lossy one. Once a private source is locked in, a public
-						// arrival no longer overwrites it.
-						if !(s.direct_ok && is_private_v4(s.peer_addr)) || is_private_v4(from) {
-							s.peer_addr = from;
+						// SECURITY: only adopt the data path if `from` is one of this
+						// session's known punch candidates (the relay-observed public addr
+						// or the LAN candidate we were given during rendezvous). Without
+						// this gate, any party that learns the SessionId (a compromised
+						// relay, an on-LAN sniff) can redirect the victim's data path to
+						// itself and suppress relay fallback. Mirrors the PunchAck guard
+						// at the PunchAck arm below.
+						if from == s.peer_addr || Some(from) == s.peer_lan {
+							// PREFER THE PRIVATE PATH: with both the LAN route and the
+							// router-hairpin route alive, punch retransmits would otherwise
+							// flap `peer_addr` between them — and the hairpin route is the
+							// lossy one. Once a private source is locked in, a public
+							// arrival no longer overwrites it.
+							if !(s.direct_ok && is_private_v4(s.peer_addr)) || is_private_v4(from) {
+								s.peer_addr = from;
+							}
+							s.direct_ok = true;
+							s.transport = Transport::Direct;
 						}
-						s.direct_ok = true;
-						s.transport = Transport::Direct;
 					}
 				}
 			}
@@ -440,6 +457,23 @@ impl Node {
 				// Inbound direct-IP connect (no relay): derive crypto as Responder,
 				// reply with our key + salt, punch, and emit a Session via next_incoming.
 				let mut g = self.inner.lock().await;
+				// SECURITY (conn-r15-1): reject a Hello whose session id matches one of
+				// OUR in-flight outbound connect_direct attempts.  An on-LAN attacker
+				// that snoops (or receives) our Hello{session, our_pk, our_salt} knows
+				// the random session id and can race us with its own Hello{session,
+				// attacker_pk, ...}; without this gate our Hello handler would derive
+				// Responder crypto against the attacker's key, insert a session, and
+				// emit a Session — completing a full MITM before any pin check runs.
+				// `pending_salt` and `hello_done` together uniquely identify a session
+				// id we own as the initiator; a legitimate inbound initiator from a
+				// different machine cannot have either entry for a freshly-random id.
+				if g.pending_salt.contains_key(&session) || g.hello_done.contains_key(&session) {
+					tracing::warn!(
+						session,
+						"inbound Hello for an in-flight outbound connect_direct — dropping (possible MITM)"
+					);
+					return;
+				}
 				if let Some(s) = g.sessions.get(&session) {
 					// Hello retransmit — re-ack with the SAME salt we already committed
 					// to (a different salt would derive a mismatched key), so a lost
@@ -560,6 +594,28 @@ impl Node {
 							our_salt,
 						},
 					);
+				} else {
+					// SECURITY (conn-r15-1, defense-in-depth): the session already
+					// exists — meaning the inbound Hello path raced the HelloAck and
+					// the MITM guard above (Part 1) didn't fire (e.g. timing edge).
+					// If this was a pinned connect, verify the existing session's
+					// peer_pubkey matches the pin; on mismatch evict the session so
+					// connect_direct returns IdentityChanged instead of handing the
+					// caller a session keyed to the attacker.
+					if let Some(&expected) = g.expected_pubkey.get(&session) {
+						let actual = g.sessions.get(&session).map(|s| s.peer_pubkey);
+						if actual != Some(expected) {
+							tracing::warn!(
+								session,
+								"HelloAck: existing session peer_pubkey != pinned expected key — evicting (possible MITM)"
+							);
+							g.sessions.remove(&session);
+							if let Some(flag) = g.identity_mismatch.get(&session) {
+								flag.store(true, std::sync::atomic::Ordering::Release);
+							}
+							return;
+						}
+					}
 				}
 				if let Some(n) = g.hello_done.get(&session).cloned() {
 					n.notify_one();
@@ -730,6 +786,87 @@ mod tests {
 			let s = g.sessions.get(&SESSION).unwrap();
 			assert_eq!(s.peer_addr, lan);
 			assert!(s.direct_ok);
+		}
+	}
+
+	/// A Punch from a foreign address (not a known session candidate) must NOT
+	/// mutate peer_addr, direct_ok, or transport — closing the session-hijack /
+	/// relay-suppression vector (security regression test for conn-1).
+	#[tokio::test]
+	async fn punch_from_foreign_addr_does_not_adopt_data_path() {
+		let node = test_node().await;
+		let public = addr("203.0.113.7:21118"); // relay-observed peer addr
+		let lan = addr("192.168.77.5:21118"); // peer's LAN candidate
+		let foreign = addr("10.0.0.77:21118"); // attacker / unrelated device
+
+		// Session is in relay-fallback state (direct_ok==false, transport==Relay).
+		rendezvous(&node, public, lan).await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).expect("session after PeerFound");
+			assert_eq!(s.peer_addr, public);
+			assert!(!s.direct_ok);
+			assert_eq!(s.transport, Transport::Relay);
+		}
+
+		// Punch arriving from a foreign address: must be ACKed (the send fires)
+		// but MUST NOT redirect the data path.
+		node.handle_peer(
+			PeerMsg::Punch {
+				session: SESSION,
+				seq: 0,
+			},
+			foreign,
+		)
+		.await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).unwrap();
+			assert_eq!(
+				s.peer_addr, public,
+				"foreign Punch must not overwrite peer_addr"
+			);
+			assert!(!s.direct_ok, "foreign Punch must not set direct_ok");
+			assert_eq!(
+				s.transport,
+				Transport::Relay,
+				"foreign Punch must not flip transport to Direct"
+			);
+		}
+
+		// A legitimate Punch from the relay-observed public addr IS allowed.
+		node.handle_peer(
+			PeerMsg::Punch {
+				session: SESSION,
+				seq: 1,
+			},
+			public,
+		)
+		.await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).unwrap();
+			assert!(s.direct_ok, "legitimate Punch (public) must set direct_ok");
+			assert_eq!(s.transport, Transport::Direct);
+			assert_eq!(s.peer_addr, public);
+		}
+
+		// And a Punch from the LAN candidate is also legitimate.
+		node.handle_peer(
+			PeerMsg::Punch {
+				session: SESSION,
+				seq: 2,
+			},
+			lan,
+		)
+		.await;
+		{
+			let g = node.inner.lock().await;
+			let s = g.sessions.get(&SESSION).unwrap();
+			assert_eq!(
+				s.peer_addr, lan,
+				"Punch from LAN candidate should prefer private path"
+			);
 		}
 	}
 

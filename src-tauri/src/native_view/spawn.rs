@@ -398,7 +398,8 @@ fn spawn_sdl_audio_player(mut out: std::process::ChildStdout, channels: u16) {
 			let target_ms: usize = std::env::var("PULSAR_AUDIO_TARGETMS")
 				.ok()
 				.and_then(|s| s.parse().ok())
-				.unwrap_or(30);
+				.unwrap_or(30)
+				.max(1); // guard against 0 → target_bytes=0 → 0/0=NaN ratio
 			tracing::info!(channels = ch, target_ms, "audio: SDL3 player up (drift-resampled, click-free)");
 			let bytes_per_ms = 48 * ch as usize * 4; // f32 @ 48 kHz
 			let target_bytes = (bytes_per_ms * target_ms) as i32;
@@ -431,6 +432,7 @@ fn spawn_sdl_audio_player(mut out: std::process::ChildStdout, channels: u16) {
 				} else {
 					let err = (q - target_bytes) as f32 / target_bytes as f32;
 					let ratio = (1.0 + 0.5 * err).clamp(0.97, 1.03);
+					let ratio = if ratio.is_finite() { ratio } else { 1.0 };
 					SDL_SetAudioStreamFrequencyRatio(stream, ratio);
 				}
 			}

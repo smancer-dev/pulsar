@@ -244,11 +244,19 @@ fn wallpaper_image() -> Option<image::DynamicImage> {
 /// directly (scale+crop in-filter).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn wallpaper_via_ffmpeg(app: &tauri::AppHandle) -> Option<Vec<u8>> {
+	// Unique scratch file per call so concurrent callers (self_avatar UI, host
+	// per-peer push, client connect push) don't collide on the same path.
+	static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let tmp = std::env::temp_dir().join(format!(
+		"pulsar-avatar-{}-{}.jpg",
+		std::process::id(),
+		N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+	));
+
 	let ffmpeg = crate::process::ffmpeg_bin(app);
 	for p in wallpaper_candidates() {
 		// JPEG output (mjpeg) so a photographic wallpaper fits the wire budget; try
 		// two quality steps (lower q number = higher quality in mjpeg's 2–31 scale).
-		let tmp = std::env::temp_dir().join("pulsar-avatar.jpg");
 		for q in ["6", "14"] {
 			let mut cmd = std::process::Command::new(&ffmpeg);
 			cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
@@ -268,14 +276,18 @@ fn wallpaper_via_ffmpeg(app: &tauri::AppHandle) -> Option<Vec<u8>> {
 			let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
 			if ok {
 				if let Ok(jpg) = std::fs::read(&tmp) {
-					let _ = std::fs::remove_file(&tmp);
 					if jpg.len() <= MAX_AVATAR_BYTES {
+						let _ = std::fs::remove_file(&tmp);
 						return Some(jpg);
 					}
+					// Oversize — try the next quality step; ffmpeg will overwrite
+					// with -y, so no removal needed here.
 				}
 			}
 		}
 	}
+	// No candidate produced a small-enough result; clean up any leftover scratch file.
+	let _ = std::fs::remove_file(&tmp);
 	None
 }
 

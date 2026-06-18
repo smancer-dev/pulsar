@@ -336,5 +336,21 @@ impl MpvGl {
 	}
 }
 
+/// Destroy an mpv handle that was created by `MpvGl::new` but never passed to
+/// `MpvGl::attach` (i.e. never wrapped in a `MpvGl`). Calling this on a handle
+/// that IS already owned by an `MpvGl` is a double-free — the caller must zero
+/// the tracked pointer afterwards (see the `Rc<Cell<usize>>` idiom in render.rs).
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by `mpv_create`/`mpv_initialize`,
+/// and must not have been passed to `mpv_terminate_destroy` before.
+pub unsafe fn destroy_handle(handle: *mut mpv::mpv_handle) {
+    if !handle.is_null() {
+        unsafe {
+            mpv::mpv_terminate_destroy(handle);
+        }
+    }
+}
+
 /// Main-thread-only handle to the live renderer (it is `!Send`).
 pub type SharedMpv = Rc<RefCell<Option<MpvGl>>>;

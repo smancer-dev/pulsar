@@ -97,9 +97,15 @@ impl CaptureMethod {
 			// scale → yuv420p → re-upload" round trip pinned a CPU core + both GPUs.
 			Self::Ddagrab => {
 				let (fps, w, h) = (plan.fps, plan.width, plan.height);
+				let oi = plan.output_idx;
 				// CPU-bounce target format honors HDR (10-bit) / YUV444 — the encoder's
 				// `-pix_fmt` (set in encode_command) must match what the filter produces.
-				let cpu_fmt = match (plan.yuv444, plan.hdr) {
+				// NOTE: uses plan.effective_hdr() / plan.effective_yuv444() (not the raw
+				// fields) so GPU-path branches that cannot produce 10-bit/444 are already
+				// clamped to SDR 4:2:0 here, and encode_command sees the same clamped
+				// values when it appends -pix_fmt (via the same helpers).
+				let (eff_hdr, eff_yuv444) = plan.effective_hdr_yuv444();
+				let cpu_fmt = match (eff_yuv444, eff_hdr) {
 					(true, true) => "yuv444p10le",
 					(true, false) => "yuv444p",
 					(false, true) => "p010le",
@@ -107,8 +113,11 @@ impl CaptureMethod {
 				};
 				let filter = match plan.encoder {
 					// NVENC + display on the NVIDIA GPU: fully zero-copy (D3D11→CUDA→NVENC).
+					// HDR/YUV444 on the CUDA path would require scale_cuda to produce
+					// p010le/yuv444p10le — risky driver/format compat; degraded to SDR 4:2:0
+					// (eff_hdr/eff_yuv444 are false for this branch, matching encode_command).
 					HwEncoder::Nvenc if plan.gpu_zerocopy => format!(
-						"ddagrab=output_idx=0:framerate={fps}:draw_mouse=1,hwmap=derive_device=cuda,scale_cuda={w}:{h}:format=nv12"
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwmap=derive_device=cuda,scale_cuda={w}:{h}:format=nv12"
 					),
 					// NVENC where the zero-copy CUDA map isn't available (hybrid laptop: the
 					// display is on the iGPU, so ffmpeg's `hwmap=derive_device=cuda` fails with
@@ -118,6 +127,7 @@ impl CaptureMethod {
 					// trip (which pinned ~3 CPU cores and capped ~51 fps). No on-GPU scaler is
 					// available without the CUDA map, so we stream the capture's native resolution
 					// and let the client scale (`{w}`/`{h}` intentionally unused here).
+					// HDR/YUV444 degraded to SDR 4:2:0 for the same reason as zero-copy above.
 					HwEncoder::Nvenc => {
 						let _ = (w, h);
 						// `fps={fps}` forces CONSTANT-frame-rate output (even-interval timestamps).
@@ -126,23 +136,26 @@ impl CaptureMethod {
 						// cursor/typing feel hitchy even though input is instant. The fps filter
 						// duplicates the last frame to pace delivery to a steady {fps} (Sunshine does
 						// the same), so the client presents smoothly.
-						format!("ddagrab=output_idx=0:framerate={fps}:draw_mouse=1,fps={fps}")
+						format!("ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,fps={fps}")
 					}
 					// AMD AMF: on-GPU scale is unreliable on iGPUs; do the minimal CPU work
 					// (download + BGRA→NV12 + scale) — far lighter than the old yuv420p path.
+					// AMF goes through cpu_fmt (eff_hdr/eff_yuv444 honored; AMF supports 10-bit).
 					HwEncoder::Amf => format!(
-						"ddagrab=output_idx=0:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format={f}",
-						f = if plan.hdr || plan.yuv444 { cpu_fmt } else { "nv12" }
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format={f}",
+						f = if eff_hdr || eff_yuv444 { cpu_fmt } else { "nv12" }
 					),
-					// Intel QSV: fully on-GPU (needs the device globals emitted in
-					// encode_command).
+					// Intel QSV: fully on-GPU. scale_qsv only supports nv12 and p010 (QSV
+					// internal 10-bit); yuv444 via QSV on ddagrab is not reliably supported.
+					// HDR/YUV444 degraded to SDR 4:2:0 (eff_hdr/eff_yuv444 false for QSV
+					// ddagrab, matching encode_command).
 					HwEncoder::Qsv => format!(
-						"ddagrab=output_idx=0:framerate={fps}:draw_mouse=1,hwmap=derive_device=qsv,format=qsv,scale_qsv=w={w}:h={h}:format=nv12"
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwmap=derive_device=qsv,format=qsv,scale_qsv=w={w}:h={h}:format=nv12"
 					),
 					// Software / VAAPI / VideoToolbox / Auto: CPU frame (yuv420p, or the HDR/444
 					// format when requested) as before.
 					_ => format!(
-						"ddagrab=output_idx=0:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format={cpu_fmt}"
+						"ddagrab=output_idx={oi}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,scale={w}:{h},format={cpu_fmt}"
 					),
 				};
 				vec![s("-filter_complex"), filter]
@@ -330,10 +343,43 @@ pub struct StreamPlan {
 	/// probe; false on hybrid boxes (iGPU display + dGPU encode), where we use the
 	/// GPU-scale-with-CPU-bounce path instead. Ignored by non-NVENC encoders.
 	pub gpu_zerocopy: bool,
+	/// (Windows/ddagrab) DXGI output index to capture. 0 = primary monitor (default).
+	/// Passed directly to `ddagrab=output_idx=N` in the ffmpeg filter graph so the
+	/// ffmpeg fallback path captures the same monitor the client selected.
+	pub output_idx: u32,
 	/// Encode 10-bit **HDR** (P010 + BT2020 primaries / SMPTE2084 PQ transfer). Requires an
 	/// HDR-capable encoder+codec (HEVC main10 / AV1 main / H.264 high10); SDR otherwise.
 	pub hdr: bool,
 	/// Encode **4:4:4** chroma (no subsampling — sharper text/lines for remote desktop).
 	/// Only a few encoders support it (NVENC, QSV, software); ignored elsewhere.
 	pub yuv444: bool,
+}
+
+impl StreamPlan {
+	/// Returns the `(hdr, yuv444)` values that are **actually achievable** for the
+	/// current encoder + capture combination, after clamping paths that cannot produce
+	/// 10-bit or 4:4:4 frames in the GPU filter.
+	///
+	/// NVENC (both zero-copy and hybrid) and QSV with `Ddagrab` use GPU-side filters
+	/// (`scale_cuda` / `scale_qsv`) that only reliably output `nv12` (8-bit 4:2:0) on
+	/// current ffmpeg builds.  Allowing `hdr` or `yuv444` for those paths would cause
+	/// the filter to emit `nv12` while `-pix_fmt` requests `p010le`/`yuv444p…` →
+	/// ffmpeg errors or silently encodes SDR while signaling HDR.  We degrade both
+	/// flags to `false` for those paths so the filter format and `-pix_fmt` always
+	/// agree.  All other encoders (AMF, Software, VAAPI, catch-all) use a CPU-bounce
+	/// path whose `format=` step can produce any pixel format, so they respect the
+	/// user's request.
+	///
+	/// **Both `CaptureMethod::input_args` (filter) and `encode_command` (-pix_fmt /
+	/// -profile:v) call this method**, so the two can never disagree.
+	pub fn effective_hdr_yuv444(&self) -> (bool, bool) {
+		// NVENC/QSV Ddagrab GPU paths: clamp to SDR 4:2:0.
+		let is_gpu_ddagrab = self.capture == CaptureMethod::Ddagrab
+			&& matches!(self.encoder, HwEncoder::Nvenc | HwEncoder::Qsv);
+		if is_gpu_ddagrab {
+			(false, false)
+		} else {
+			(self.hdr, self.yuv444)
+		}
+	}
 }

@@ -56,5 +56,6 @@ pub use sink::{
 };
 // Linux/macOS host-silent: `arm()` redirects program audio to a sinkless device and
 // returns the capture source name + an RAII teardown guard (Windows uses `sink`).
+// `restore_stale_host_silent()` is the crash-recovery entry point called at startup.
 #[cfg(not(windows))]
-pub use sink_unix::{arm as arm_host_silent, HostSilent, HostSilentGuard};
+pub use sink_unix::{arm as arm_host_silent, restore_stale_host_silent, HostSilent, HostSilentGuard};

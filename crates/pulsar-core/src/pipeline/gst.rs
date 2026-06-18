@@ -103,7 +103,7 @@ pub fn encoder_fragment(
 		// Verified live on an Orange Pi 5 (gst 1.20): bps / gop / header-mode all apply.
 		GstEncoder::Mpp => format!(
 			"{element} bps={bps} gop={key_int} header-mode=each-idr",
-			bps = bitrate_kbps.max(1) * 1000
+			bps = (bitrate_kbps.max(1) as u64 * 1000).min(u32::MAX as u64) as u32
 		),
 		// vaapih26Xenc: bitrate in kbit/s; CBR; keyframe-period analog of key-int.
 		GstEncoder::Vaapi => format!(

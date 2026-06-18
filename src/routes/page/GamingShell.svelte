@@ -103,12 +103,14 @@
 	// The gilrs→webview controller-nav bridge: the ONLY pad-nav input on Linux (WebKitGTK
 	// has no Gamepad API) and the preferred one everywhere. Feed each snapshot into the nav.
 	let unlistenNav: (() => void) | null = null;
+	let dead = false;
 
 	onMount(() => {
 		window.addEventListener('keydown', onKey);
-		onGamepadNav((s) => nav.ingestBridge(s)).then((off) => (unlistenNav = off));
+		onGamepadNav((s) => nav.ingestBridge(s)).then((off) => { if (dead) off(); else unlistenNav = off; });
 	});
 	onDestroy(() => {
+		dead = true;
 		nav.stop();
 		api.gamepadNavStop().catch(() => {});
 		window.removeEventListener('keydown', onKey);

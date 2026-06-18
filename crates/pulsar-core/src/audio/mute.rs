@@ -8,7 +8,11 @@
 /// [`restore_stale_mute_fallback`] reads it and issues the unmute so a crashed process
 /// can't leave the host output muted indefinitely.
 pub fn mute_fallback_marker_path() -> std::path::PathBuf {
-	std::env::temp_dir().join("pulsar-mute-fallback.active")
+	#[cfg(target_os = "linux")]
+	let name = format!("pulsar-mute-fallback-{}.active", unsafe { libc::getuid() });
+	#[cfg(not(target_os = "linux"))]
+	let name = "pulsar-mute-fallback.active".to_string();
+	std::env::temp_dir().join(name)
 }
 
 /// Startup crash-restore for the endpoint-mute fallback. If the previous process wrote

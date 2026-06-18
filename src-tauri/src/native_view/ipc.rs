@@ -42,6 +42,8 @@ pub fn mpv_ipc_get_f64(sock: &Path, prop: &str) -> Option<f64> {
 	use std::io::{BufRead, BufReader, Write};
 	use std::os::unix::net::UnixStream;
 	let mut stream = UnixStream::connect(sock).ok()?;
+	let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+	let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(200)));
 	let cmd = format!("{{\"command\":[\"get_property\",\"{prop}\"]}}\n");
 	stream.write_all(cmd.as_bytes()).ok()?;
 	// mpv replies with one JSON object per line. The first line is the reply to our request
@@ -61,6 +63,8 @@ pub fn mpv_ipc_get_bool(sock: &Path, prop: &str) -> Option<bool> {
 	use std::io::{BufRead, BufReader, Write};
 	use std::os::unix::net::UnixStream;
 	let mut stream = UnixStream::connect(sock).ok()?;
+	let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+	let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(200)));
 	let cmd = format!("{{\"command\":[\"get_property\",\"{prop}\"]}}\n");
 	stream.write_all(cmd.as_bytes()).ok()?;
 	let mut reader = BufReader::new(&stream);

@@ -505,8 +505,40 @@ fn paint_side_cursor(ctx: &egui::Context, draw: Option<(egui::Pos2, egui::Textur
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
 	use windows::Win32::UI::WindowsAndMessaging::{
-		WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+		WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+		WM_RBUTTONDOWN, WM_RBUTTONUP,
 	};
+	// ---- Capture-leak guard (races the OPEN flag) ----------------------------------
+	// If OPEN flips false→true between WM_LBUTTONDOWN (SetCapture in closed state) and
+	// the matching WM_LBUTTONUP, the up-edge handler below is skipped (it lives inside
+	// the `!OPEN` block), so the mouse capture leaks and BTN_DRAG stays armed.
+	// Fix: unconditional handlers placed BEFORE the OPEN gate.
+	//
+	// WM_CAPTURECHANGED — system or another window stole capture; just disarm.
+	// (Do NOT call ReleaseCapture here — we no longer hold capture.)
+	if msg == WM_CAPTURECHANGED {
+		// Use try_lock so that if the lock is already held (e.g. ReleaseCapture was called
+		// from inside the WM_LBUTTONUP handler while the guard was still live) this
+		// re-entrant call skips instead of deadlocking the render thread.
+		if let Ok(mut g) = BTN_DRAG.try_lock() {
+			*g = None;
+		}
+		return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+	}
+	// WM_LBUTTONUP while OPEN is true — release a capture that was set while CLOSED
+	// but not yet released (the OPEN gate flipped between DOWN and UP).
+	// Drop the event so it is not injected into egui as a phantom click.
+	if msg == WM_LBUTTONUP && OPEN.load(Ordering::SeqCst) {
+		if BTN_DRAG.lock().unwrap().take().is_some() {
+			use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+			unsafe {
+				let _ = ReleaseCapture();
+			}
+			return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+		}
+	}
+	// ---- end capture-leak guard ----------------------------------------------------
+
 	// Overlay CLOSED: hide the cursor while input is captured (engage state from the
 	// app), and treat a left-click as either the overlay-open button (hit-test — the
 	// webview hotspot is buried under this child on Windows) or click-to-engage.
@@ -570,7 +602,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 			}
 		}
 		if msg == WM_LBUTTONUP {
-			if let Some((_, _, _, _, moved)) = BTN_DRAG.lock().unwrap().take() {
+			// DEADLOCK FIX: bind-and-drop the MutexGuard in a let-statement so it is
+			// released at the trailing ';' BEFORE ReleaseCapture() fires.  If we kept
+			// the guard alive inside an `if let` scrutinee the Mutex would still be
+			// locked when ReleaseCapture() synchronously sends WM_CAPTURECHANGED back
+			// into this same thread, hitting the handler above and trying to re-lock
+			// the non-reentrant Mutex → deadlock (render thread frozen permanently).
+			let taken = BTN_DRAG.lock().unwrap().take(); // guard dropped here at ';'
+			if let Some((_, _, _, _, moved)) = taken {
 				use std::io::Write as _;
 				use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 				unsafe {

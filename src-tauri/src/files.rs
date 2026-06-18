@@ -96,6 +96,7 @@ pub fn received_dir() -> PathBuf {
 /// Write received bytes to the received-files dir, avoiding clobbering an existing
 /// file by suffixing ` (n)`. Returns the final path on success.
 pub fn save_received_file(name: &str, data: &[u8]) -> Option<PathBuf> {
+	use std::io::{ErrorKind, Write as _};
 	let dir = received_dir();
 	let mut path = dir.join(name);
 	let (stem, ext) = match name.rsplit_once('.') {
@@ -103,11 +104,27 @@ pub fn save_received_file(name: &str, data: &[u8]) -> Option<PathBuf> {
 		_ => (name.to_string(), String::new()),
 	};
 	let mut n = 1;
-	while path.exists() {
-		path = dir.join(format!("{stem} ({n}){ext}"));
-		n += 1;
+	// Atomically reserve the destination path with create_new to eliminate the
+	// TOCTOU race that exists()+write has: two concurrent same-basename transfers
+	// would both see "file absent" and the second would silently clobber the first.
+	let mut file = loop {
+		match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+			Ok(f) => break f,
+			Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+				path = dir.join(format!("{stem} ({n}){ext}"));
+				n += 1;
+			}
+			Err(_) => return None,
+		}
+	};
+	if file.write_all(data).is_err() {
+		drop(file);
+		// Roll back the create_new reservation so a failed write leaves no stub
+		// under the real name and the dedup counter stays accurate on retry.
+		let _ = std::fs::remove_file(&path);
+		return None;
 	}
-	std::fs::write(&path, data).ok().map(|_| path)
+	Some(path)
 }
 
 /// Write reassembled file chunks directly to disk without building a contiguous
@@ -127,7 +144,7 @@ pub fn save_received_file_chunks<'a>(
 	chunks: impl Iterator<Item = &'a Vec<u8>>,
 	total_bytes: u64,
 ) -> Option<(PathBuf, u64)> {
-	use std::io::Write as _;
+	use std::io::{ErrorKind, Write as _};
 	let dir = received_dir();
 	let mut path = dir.join(name);
 	let (stem, ext) = match name.rsplit_once('.') {
@@ -135,9 +152,20 @@ pub fn save_received_file_chunks<'a>(
 		_ => (name.to_string(), String::new()),
 	};
 	let mut n = 1;
-	while path.exists() {
-		path = dir.join(format!("{stem} ({n}){ext}"));
-		n += 1;
+	// Atomically reserve the destination path with create_new to eliminate the
+	// TOCTOU race that exists()+rename has: two concurrent same-basename transfers
+	// would both pick the same candidate and the second rename would clobber the first.
+	// The zero-byte reservation file is then atomically replaced by the rename from
+	// the .part temp file.
+	loop {
+		match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+			Ok(_) => break, // reservation created; drop the handle, rename will replace it
+			Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+				path = dir.join(format!("{stem} ({n}){ext}"));
+				n += 1;
+			}
+			Err(_) => return None,
+		}
 	}
 	// Write to a sibling `.part` temp file so that a mid-stream failure never
 	// leaves a partial file under the real name and never poisons the dedup
@@ -152,10 +180,15 @@ pub fn save_received_file_chunks<'a>(
 	})();
 	if write_result.is_none() {
 		let _ = std::fs::remove_file(&tmp_path);
+		// Roll back the create_new reservation at `path`: otherwise a failed
+		// .part write leaves a zero-byte stub under the real name and poisons
+		// the dedup counter for a subsequent retry of the same transfer.
+		let _ = std::fs::remove_file(&path);
 		return None;
 	}
 	if std::fs::rename(&tmp_path, &path).is_err() {
 		let _ = std::fs::remove_file(&tmp_path);
+		let _ = std::fs::remove_file(&path); // roll back the reservation on rename failure too
 		return None;
 	}
 	Some((path, total_bytes))

@@ -46,6 +46,10 @@ impl WaylandCapture {
 	/// killing gst / dropping the fd is not enough — the portal session lingers.
 	pub async fn stop(mut self) {
 		let _ = self.child.kill();
+		// Reap the child so the SIGKILLed gst-launch does not linger as a
+		// <defunct> zombie until the whole app exits.  wait() on an already-dead
+		// process returns immediately (the kernel already holds the exit status).
+		let _ = self.child.wait();
 		let _ = self.session.close().await;
 	}
 }

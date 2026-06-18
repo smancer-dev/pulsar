@@ -110,7 +110,12 @@ pub fn host_displays() -> Vec<pulsar_core::service::DisplayInfo> {
 pub fn capture_from_str(s: &str) -> CaptureMethod {
 	match s {
 		"x11grab" => CaptureMethod::X11grab,
-		"kmsgrab" => CaptureMethod::Kmsgrab,
+		// "kmsgrab" is intentionally NOT accepted here: it produces DRM_PRIME
+		// hwframes and the encode_command pipeline has no hwdownload/hwmap stage
+		// to bring those frames into a usable pixel format.  Every encoder would
+		// receive an incompatible hwframe and the stream would be dead.  Fall
+		// through to default_for_os() (x11grab on Linux) until a real
+		// encoder-aware KMS filter chain exists.
 		"gdigrab" => CaptureMethod::Gdigrab,
 		"ddagrab" => CaptureMethod::Ddagrab,
 		"avfoundation" => CaptureMethod::AvFoundation,

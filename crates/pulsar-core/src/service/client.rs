@@ -8,13 +8,19 @@ use super::*;
 pub async fn request_games(session: &mut Session) -> Result<Vec<GameInfo>, ConnError> {
 	session.send(&enc(&Msg::ListGames)).await?;
 	for _ in 0..MAX_WAIT_MSGS {
-		match session.recv().await {
-			Some(bytes) => {
+		match tokio::time::timeout(
+			std::time::Duration::from_secs(3),
+			session.recv(),
+		)
+		.await
+		{
+			Ok(Some(bytes)) => {
 				if let Some(Msg::Games(games)) = dec(&bytes) {
 					return Ok(games);
 				}
 			}
-			None => break,
+			// None = session closed, Err(_) = per-message 3 s deadline exceeded
+			Ok(None) | Err(_) => break,
 		}
 	}
 	Ok(Vec::new())
@@ -27,13 +33,19 @@ pub async fn request_games(session: &mut Session) -> Result<Vec<GameInfo>, ConnE
 pub async fn query_stream_caps(session: &mut Session) -> Result<StreamCaps, ConnError> {
 	session.send(&enc(&Msg::QueryStreamCaps)).await?;
 	for _ in 0..MAX_WAIT_MSGS {
-		match session.recv().await {
-			Some(bytes) => {
+		match tokio::time::timeout(
+			std::time::Duration::from_secs(3),
+			session.recv(),
+		)
+		.await
+		{
+			Ok(Some(bytes)) => {
 				if let Some(Msg::StreamCaps(caps)) = dec(&bytes) {
 					return Ok(caps);
 				}
 			}
-			None => break,
+			// None = session closed, Err(_) = per-message 3 s deadline exceeded
+			Ok(None) | Err(_) => break,
 		}
 	}
 	Ok(StreamCaps::default())

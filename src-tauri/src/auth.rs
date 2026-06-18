@@ -439,11 +439,24 @@ pub(crate) async fn race_host_auth(
 						idle_deadline.as_mut().reset(tokio::time::Instant::now() + IDLE);
 						// Either the rotating one-time password or the persistent
 						// connect password (Settings → Güvenlik) unlocks the session.
-						if accepted_pws.iter().any(|a| !a.is_empty() && secret_eq(&pw, a)) {
-							// correct password → accept; flag if it was the OTP so the
-							// caller rotates it (single-use).
-							let otp = !one_time_pw.is_empty() && secret_eq(&pw, one_time_pw);
-							break (true, otp);
+						// Reusable persistent connect password (Settings → Güvenlik):
+						// a snapshot compare is fine since it is NEVER rotated. Exclude
+						// the OTP snapshot (`one_time_pw`) here — the OTP is consumed
+						// atomically below against the LIVE store.
+						if accepted_pws
+							.iter()
+							.any(|a| !a.is_empty() && a.as_str() != one_time_pw && secret_eq(&pw, a))
+						{
+							break (true, false);
+						}
+						// One-time password: atomically match against the LIVE store and
+						// rotate in a single critical section (try_consume_otp), so two
+						// concurrent race tasks can never both consume the same live code
+						// (closes the read→compare→rotate TOCTOU on the race path too).
+						// It rotates internally on success → report matched_one_time=false
+						// so the caller does NOT rotate again.
+						if crate::commands::try_consume_otp(app, &pw) {
+							break (true, false);
 						}
 						// Wrong: only count non-empty submissions. An empty pw is the
 						// client's automatic "I have no password yet" probe — the same
