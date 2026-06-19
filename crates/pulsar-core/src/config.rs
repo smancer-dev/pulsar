@@ -97,6 +97,13 @@ pub struct Config {
 	/// process startup (sets the WebKitGTK env), so a change needs an app restart to apply.
 	#[serde(default)]
 	pub ui_hardware_accel: Option<bool>,
+	/// (Windows) Re-launch elevated (UAC) on startup so this machine can act as a full host:
+	/// injecting keyboard/mouse into ELEVATED app windows is blocked for a non-elevated process
+	/// (UIPI), so without admin the remote user can't control e.g. Task Manager / an installer /
+	/// any "Run as administrator" window. Default ON; turn it off in Settings → Güvenlik to launch
+	/// without the prompt. Read once at process startup, so a change needs an app restart.
+	#[serde(default = "default_true")]
+	pub request_admin: bool,
 }
 
 fn default_avatar_mode() -> String {
@@ -124,6 +131,7 @@ impl Default for Config {
 			native_player: false,
 			audio_layout: crate::audio::ChannelLayout::Stereo,
 			ui_hardware_accel: None,
+			request_admin: true,
 		}
 	}
 }

@@ -73,7 +73,100 @@ fn main() {
 		pulsar_tauri::rumble_selftest();
 		return;
 	}
+	// Windows: re-launch ELEVATED (UAC) before the GUI starts, so this machine can act as a full
+	// host — injecting keyboard/mouse into elevated app windows (Task Manager, installers, any
+	// "Run as administrator" window) is blocked for a non-elevated process (UIPI). Controlled by
+	// the `request_admin` setting (default ON; user can disable it in Settings → Güvenlik);
+	// `PULSAR_NO_ELEVATE=1` bypasses for dev. Done HERE — before `run()` takes the single-instance
+	// mutex — so the unelevated process exits cleanly and the elevated one acquires the lock.
+	#[cfg(windows)]
+	if std::env::var_os("PULSAR_NO_ELEVATE").is_none()
+		&& !is_elevated()
+		&& request_admin_pref()
+		&& relaunch_elevated(&args)
+	{
+		return;
+	}
+
 	pulsar_tauri::run()
+}
+
+/// (Windows) Read the persisted `request_admin` preference BEFORE Tauri starts. Defaults to `true`
+/// (the Config default) when the file/field is absent, so a fresh install elevates by default.
+#[cfg(windows)]
+fn request_admin_pref() -> bool {
+	let Some(appdata) = std::env::var_os("APPDATA") else {
+		return true;
+	};
+	let path = std::path::PathBuf::from(appdata)
+		.join("dev.pulsar.app")
+		.join("config.json");
+	pulsar_core::config::Config::load(&path).request_admin
+}
+
+/// (Windows) Whether THIS process is already running elevated (admin token).
+#[cfg(windows)]
+fn is_elevated() -> bool {
+	use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+	use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+	use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+	unsafe {
+		let mut token: HANDLE = std::ptr::null_mut();
+		if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+			return false;
+		}
+		let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
+		let mut len = 0u32;
+		let ok = GetTokenInformation(
+			token,
+			TokenElevation,
+			&mut elev as *mut _ as *mut _,
+			std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+			&mut len,
+		);
+		CloseHandle(token);
+		ok != 0 && elev.TokenIsElevated != 0
+	}
+}
+
+/// (Windows) Spawn a fresh, ELEVATED copy of this exe via ShellExecuteW("runas") — pops the UAC
+/// prompt. Re-passes the original args (so `--connect …` kiosk launches keep working). Returns
+/// `true` if the elevated process was launched (the caller then exits); `false` if the user
+/// declined UAC or it errored (the caller keeps running unelevated as a best effort).
+#[cfg(windows)]
+fn relaunch_elevated(args: &[String]) -> bool {
+	use windows_sys::Win32::UI::Shell::ShellExecuteW;
+	use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+	let Ok(exe) = std::env::current_exe() else {
+		return false;
+	};
+	let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+	let verb = wide("runas");
+	let file = wide(&exe.to_string_lossy());
+	// Re-pass argv[1..], quoting each to survive spaces.
+	let params_str = args
+		.iter()
+		.skip(1)
+		.map(|a| format!("\"{a}\""))
+		.collect::<Vec<_>>()
+		.join(" ");
+	let params = wide(&params_str);
+	let h = unsafe {
+		ShellExecuteW(
+			std::ptr::null_mut(),
+			verb.as_ptr(),
+			file.as_ptr(),
+			if params_str.is_empty() {
+				std::ptr::null()
+			} else {
+				params.as_ptr()
+			},
+			std::ptr::null(),
+			SW_SHOWNORMAL,
+		)
+	};
+	// ShellExecuteW returns a value > 32 on success.
+	h as isize > 32
 }
 
 /// Read the persisted `ui_hardware_accel` preference from the app config file BEFORE Tauri starts

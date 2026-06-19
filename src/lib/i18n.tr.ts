@@ -325,6 +325,9 @@ export const tr: Dict = {
 	'settings.connectPwPlaceholder': 'Ayarlanmadı',
 	'settings.record': 'Oturum kaydı',
 	'settings.recordDesc': 'Uzaktan erişim oturumlarını yerel diske kaydet.',
+	'settings.requestAdmin': 'Yönetici olarak çalıştır (UAC)',
+	'settings.requestAdminDesc':
+		'Açılışta yönetici izni iste — host iken yükseltilmiş pencereleri (Görev Yöneticisi, kurulumlar, "Yönetici olarak çalıştır") uzaktan kontrol edebilmek için gerekli. Değişiklik için uygulamayı yeniden başlat.',
 	'settings.tray': 'Sistem tepsisinde çalış',
 	'settings.trayDesc': 'Kapatınca tepside arka planda kalsın.',
 	'settings.debug': 'Geliştirici günlüğü',

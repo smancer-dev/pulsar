@@ -20,7 +20,8 @@ const DEFAULT_CONFIG: Config = {
 	audio_input: '',
 	node_port: 0,
 	avatar_mode: 'user',
-	native_player: false
+	native_player: false,
+	request_admin: true
 };
 
 let mockConfig: Config = { ...DEFAULT_CONFIG };

@@ -16,6 +16,10 @@
 		toggleUnattended?: () => void;
 		saveConfig?: () => void;
 	} = $props();
+
+	// The elevate-on-launch toggle only does anything on a Windows host (UAC), so only show it
+	// there — a non-Windows host has no UAC to request.
+	const IS_WINDOWS = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent);
 </script>
 
 <div class="srow">
@@ -55,6 +59,12 @@
 	<div class="st"><b>{t('settings.record')}</b><span>{t('settings.recordDesc')}</span></div>
 	<button class="toggle" aria-label={t('settings.record')} class:on={ui.record} aria-pressed={ui.record} onclick={() => { ui.record = !ui.record; saveUi(); }}><span class="knob"></span></button>
 </div>
+{#if IS_WINDOWS}
+	<div class="srow">
+		<div class="st"><b>{t('settings.requestAdmin')}</b><span>{t('settings.requestAdminDesc')}</span></div>
+		<button class="toggle" aria-label={t('settings.requestAdmin')} class:on={config?.request_admin ?? true} aria-pressed={config?.request_admin ?? true} onclick={() => { if (config) { config.request_admin = !(config.request_admin ?? true); saveConfig?.(); } }}><span class="knob"></span></button>
+	</div>
+{/if}
 
 <style>
 	.srow {

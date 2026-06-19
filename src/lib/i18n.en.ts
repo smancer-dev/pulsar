@@ -326,6 +326,9 @@ export const en: Dict = {
 	'settings.connectPwPlaceholder': 'Not set',
 	'settings.record': 'Session recording',
 	'settings.recordDesc': 'Save remote-access sessions to local disk.',
+	'settings.requestAdmin': 'Run as administrator (UAC)',
+	'settings.requestAdminDesc':
+		'Ask for admin rights on launch — required so a host can remotely control elevated windows (Task Manager, installers, "Run as administrator"). Restart the app to apply.',
 	'settings.tray': 'Run in system tray',
 	'settings.trayDesc': 'Stay in the tray in the background when closed.',
 	'settings.debug': 'Developer log',

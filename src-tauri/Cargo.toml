@@ -82,6 +82,7 @@ windows-sys = { version = "0.59", features = [
 	"Win32_Graphics_Gdi",
 	"Win32_Graphics_Dwm", # io_cmds: kill the 1px border + rounded corners on the frameless fullscreen cover
 	"Win32_UI_WindowsAndMessaging",
+	"Win32_UI_Shell", # main.rs: ShellExecuteW("runas") to relaunch elevated (request_admin / UAC)
 	"Win32_System_Threading", # also load-bearing for JOBOBJECT_EXTENDED_LIMIT_INFORMATION (IO_COUNTERS)
 	"Win32_System_JobObjects", # job.rs: kill orphaned ffmpeg/ffplay when Pulsar dies (needs Threading + Security)
 	"Win32_System_LibraryLoader",

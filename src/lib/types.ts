@@ -28,6 +28,9 @@ export interface Config {
 	 * NOT the video stream's encode/decode. null = per-device default (off on Orange Pi 5,
 	 * on elsewhere); true/false overrides. Applied at startup → needs an app restart. */
 	ui_hardware_accel?: boolean | null;
+	/** (Windows) Relaunch elevated (UAC) at startup so the host can control elevated app windows.
+	 * Default true; applied at startup → needs an app restart. */
+	request_admin?: boolean;
 }
 
 export type Transport = 'direct' | 'relay';
