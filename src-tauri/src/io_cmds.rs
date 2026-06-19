@@ -612,9 +612,15 @@ fn win_fullscreen(
 
 /// Resize all direct children of `hwnd` to its current client rect (Win32 child
 /// coords are client-relative, so that's (0,0,w,h)).
+/// Snap every DIRECT child window (the WRY_WEBVIEW host + the native video render child) to the
+/// parent's client rect. Used on a fullscreen resize: native `set_fullscreen` resizes the main
+/// window, but the occluded webview's `ResizeObserver` is starved so the frontend's render-child
+/// report can fire with a stale (windowed) rect — leaving the video small with black bars. Snapping
+/// here (driven by the actual `Resized` event) restores the immersive fill synchronously, like the
+/// old `win_fullscreen` path. Only correct WHILE fullscreen (caller gates on it) — windowed leaves
+/// the render child to the frontend, which tracks the video area, not the whole window.
 #[cfg(windows)]
-#[allow(dead_code)] // only used by the now-superseded win_fullscreen
-unsafe fn fill_children_to_client(hwnd: windows_sys::Win32::Foundation::HWND) {
+pub(crate) unsafe fn fill_children_to_client(hwnd: windows_sys::Win32::Foundation::HWND) {
 	use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 	use windows_sys::Win32::UI::WindowsAndMessaging::{
 		EnumChildWindows, GetAncestor, GetClientRect, MoveWindow, GA_PARENT,

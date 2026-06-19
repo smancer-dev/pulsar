@@ -444,6 +444,21 @@ pub fn run() {
 					}
 				}
 			}
+			// A fullscreen RESIZE must re-fill the window's children. Native `set_fullscreen`
+			// resizes the main window, but wry/the frontend don't reliably re-fill the native video
+			// render child on that transition (the occluded webview starves its ResizeObserver, so
+			// the frontend's nativeViewRect report can fire with a stale windowed rect) — which left
+			// the in-session video small with black bars. Snap every direct child to the full client
+			// WHILE fullscreen, driven by the real resize event; windowed resizes are left to the
+			// frontend, which tracks the video AREA, not the whole window.
+			#[cfg(windows)]
+			WindowEvent::Resized(_) => {
+				if window.label() == "main" && window.is_fullscreen().unwrap_or(false) {
+					if let Ok(h) = window.hwnd() {
+						unsafe { crate::io_cmds::fill_children_to_client(h.0 as _) };
+					}
+				}
+			}
 			// While fullscreen, stay above the taskbar/other apps ONLY when focused;
 			// drop topmost when alt-tabbed away so other apps come forward normally.
 			WindowEvent::Focused(focused) => {
