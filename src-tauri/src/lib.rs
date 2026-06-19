@@ -453,6 +453,29 @@ pub fn run() {
 				if window.label() == "main" {
 					let fs = window.state::<AppState>().fs_geom.lock().unwrap().is_some();
 					let _ = window.set_always_on_top(*focused && fs);
+					// Alt+Tab while fullscreen: set_always_on_top(false) re-raises us above ALL
+					// non-topmost windows (HWND_NOTOPMOST), so the app we tabbed to stayed behind.
+					// On blur-while-fullscreen also drop to the BOTTOM so the activated window is on
+					// top (and the taskbar shows); regaining focus re-tops us via the call above.
+					#[cfg(windows)]
+					if fs && !*focused {
+						if let Ok(h) = window.hwnd() {
+							use windows_sys::Win32::UI::WindowsAndMessaging::{
+								SetWindowPos, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+							};
+							unsafe {
+								SetWindowPos(
+									h.0 as _,
+									HWND_BOTTOM,
+									0,
+									0,
+									0,
+									0,
+									SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+								);
+							}
+						}
+					}
 				}
 				// Capture/forward keyboard+mouse + the overlay/leave combos ONLY while
 				// SOME Pulsar window is focused (Linux evdev grab is otherwise global).

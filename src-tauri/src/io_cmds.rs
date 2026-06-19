@@ -550,7 +550,7 @@ fn win_fullscreen(
 		GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 	};
 	use windows_sys::Win32::UI::WindowsAndMessaging::{
-		SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOP, SWP_FRAMECHANGED, SWP_NOMOVE,
+		SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE,
 		SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
 	};
 	use windows_sys::Win32::Graphics::Dwm::{
@@ -584,16 +584,15 @@ fn win_fullscreen(
 			mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
 			if GetMonitorInfoW(mon, &mut mi) != 0 {
 				let r: RECT = mi.rcMonitor;
-				// Cover the monitor EXACTLY (rcMonitor) so the shell's fullscreen detection kicks in:
-				// the taskbar then hides under the window but can still be SUMMONED (Win key / edge
-				// hover) on top. Expanding even 1px breaks that detection (the taskbar stayed pinned
-				// above us). The 1px DWM edge border / rounded corners that would peek through at the
-				// exact rect are killed via DwmSetWindowAttribute above. HWND_TOP (not TOPMOST) keeps
-				// Alt+Tab working — a full-monitor foreground window hides the taskbar without being
-				// pinned always-on-top.
+				// Cover the monitor EXACTLY (rcMonitor) and go HWND_TOPMOST: that's what actually
+				// hides the taskbar on this setup (the shell's non-topmost fullscreen auto-hide
+				// didn't trigger here — likely ASTER). The 1px DWM edge border / rounded corners
+				// that would peek through at the exact rect are killed via DwmSetWindowAttribute
+				// above. Alt+Tab is handled by the `Focused` handler in lib.rs: on blur it drops
+				// topmost AND sends the window to the bottom so the activated app comes forward.
 				SetWindowPos(
 					hwnd,
-					HWND_TOP,
+					HWND_TOPMOST,
 					r.left,
 					r.top,
 					r.right - r.left,
