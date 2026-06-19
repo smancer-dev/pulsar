@@ -550,7 +550,7 @@ fn win_fullscreen(
 		GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 	};
 	use windows_sys::Win32::UI::WindowsAndMessaging::{
-		SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE,
+		SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOP, SWP_FRAMECHANGED, SWP_NOMOVE,
 		SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
 	};
 	let Ok(handle) = window.hwnd() else {
@@ -573,13 +573,19 @@ fn win_fullscreen(
 			mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
 			if GetMonitorInfoW(mon, &mut mi) != 0 {
 				let r: RECT = mi.rcMonitor;
+				// HWND_TOP (not HWND_TOPMOST): cover the monitor + come to the front, but DON'T pin
+				// always-on-top — otherwise Alt+Tabbing to another app left it stuck under this
+				// window. A foreground window that covers the whole monitor still auto-hides the
+				// taskbar (shell fullscreen detection). Expand the cover by 1px on every side so the
+				// frameless window's 1px DWM border sits OFF-screen — at the exact monitor rect that
+				// border showed as a thin desktop sliver down the left/right edges.
 				SetWindowPos(
 					hwnd,
-					HWND_TOPMOST,
-					r.left,
-					r.top,
-					r.right - r.left,
-					r.bottom - r.top,
+					HWND_TOP,
+					r.left - 1,
+					r.top - 1,
+					(r.right - r.left) + 2,
+					(r.bottom - r.top) + 2,
 					SWP_SHOWWINDOW | SWP_FRAMECHANGED,
 				);
 			}
