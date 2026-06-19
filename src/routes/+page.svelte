@@ -38,6 +38,7 @@
 	import FilesWindow from '$lib/screens/FilesWindow.svelte';
 	import HostChat from '$lib/screens/HostChat.svelte';
 	import Chrome from './page/Chrome.svelte';
+	import Icon from '$lib/Icon.svelte';
 	import Tabs from './page/Tabs.svelte';
 	import HomeView from './page/HomeView.svelte';
 	import PasswordModal from './page/PasswordModal.svelte';
@@ -968,17 +969,28 @@
 			/>
 		{/if}
 
-		<!-- Couch co-op: with ≥2 live game panes, offer the per-device → pane assignment (lock each
-		     controller / keyboard / mouse to a pane). Gaming split only. -->
-		{#if sm.splitMode !== 'off' && sm.splitSessionMode === 'game' && assignPanes.length >= 2}
-			<button
-				class="input-assign-btn"
-				title={t('chrome.inputAssign')}
-				aria-label={t('chrome.inputAssign')}
-				onclick={() => (showInputAssign = true)}
-			>
-				🎮 {t('chrome.inputAssign')}
-			</button>
+		<!-- Split bottom bar: in split mode the top chrome is hidden while fullscreen (the kiosk's
+		     default), leaving no way to change layout / exit split / drop fullscreen. Show a slim bar
+		     BELOW the pane grid — a flex sibling AFTER .stage, so it sits in a video-free strip (the
+		     Linux native render fills only the panes above it). Shown only when the top bar is hidden
+		     (split + fullscreen) so the two never appear at once. -->
+		{#if sm.splitMode !== 'off' && sm.fullscreen}
+			<div class="split-bar">
+				<button class="sb-btn danger" onclick={() => sm.exitSplit()}>
+					<Icon name="x" size={15} />{t('split.exit')}
+				</button>
+				<button class="sb-btn" onclick={openSplit}>
+					<Icon name="split" size={15} />{t('chrome.split')}
+				</button>
+				<button class="sb-btn" onclick={sm.toggleFullscreen}>
+					<Icon name="expand" size={15} />{t('gaming.fullscreen')}
+				</button>
+				{#if sm.splitSessionMode === 'game' && assignPanes.length >= 2}
+					<button class="sb-btn" onclick={() => (showInputAssign = true)}>
+						<Icon name="gaming" size={15} />{t('chrome.inputAssign')}
+					</button>
+				{/if}
+			</div>
 		{/if}
 		{#if showInputAssign}
 			<InputAssign panes={assignPanes} onClose={() => (showInputAssign = false)} />
@@ -988,26 +1000,44 @@
 {/if}
 
 <style>
-	.input-assign-btn {
-		position: absolute;
-		top: 52px;
-		right: 16px;
-		z-index: 25;
+	/* Split bottom bar — a flex strip BELOW the pane grid (so it never overlaps the panes' native
+	   video on Linux), shown only when the top chrome is hidden (split + fullscreen). */
+	.split-bar {
+		flex: none;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 10px;
+		height: 46px;
+		padding: 0 14px;
+		border-top: 1px solid var(--border);
+		background: var(--surface);
+		z-index: 2;
+	}
+	.sb-btn {
 		display: inline-flex;
 		align-items: center;
-		gap: 6px;
-		padding: 8px 12px;
-		font-size: 12.5px;
+		gap: 7px;
+		height: 32px;
+		padding: 0 14px;
+		font-size: 13px;
 		font-weight: 600;
 		border: 1px solid var(--border);
 		border-radius: var(--r-sm);
 		background: var(--surface-2);
 		color: var(--text);
 		cursor: pointer;
-		box-shadow: var(--shadow);
+		transition:
+			background var(--dur) var(--ease),
+			color var(--dur) var(--ease);
 	}
-	.input-assign-btn:hover {
+	.sb-btn:hover {
 		background: var(--surface-3);
+	}
+	.sb-btn.danger:hover {
+		background: #e81123;
+		border-color: #e81123;
+		color: #fff;
 	}
 	.stage {
 		position: relative;
