@@ -232,21 +232,43 @@ pub(crate) mod throttle {
 pub(crate) mod preauth {
 	use std::collections::HashMap;
 	use std::sync::{LazyLock, Mutex};
+	use std::time::{Duration, Instant};
 
 	/// pubkey → number of live authorized sessions for that device.
 	static PREAUTHED: LazyLock<Mutex<HashMap<[u8; 32], usize>>> =
 		LazyLock::new(|| Mutex::new(HashMap::new()));
 
-	/// Is a session from this pubkey already authorized (≥1 live session)? Called at
-	/// auth time to decide whether to skip the OTP consume + Allow/Deny popup.
+	/// pubkey → last successful-auth time. A games-FETCH authorizes a short-lived session that
+	/// closes (refcount → 0) BEFORE the user picks a game and the LAUNCH opens a second session —
+	/// so the launch would re-prompt for the OTP even though the same device just authed. Remember
+	/// the device for a short window so the connect→fetch→launch flow auths only ONCE.
+	static RECENT: LazyLock<Mutex<HashMap<[u8; 32], Instant>>> =
+		LazyLock::new(|| Mutex::new(HashMap::new()));
+
+	/// How long a successful auth pre-authorizes the SAME device for a follow-up connection.
+	/// Covers the user reading the game list + picking one between the fetch and the launch.
+	const RECENT_TTL: Duration = Duration::from_secs(90);
+
+	/// Is a session from this pubkey already authorized — either ≥1 live session (same-host co-op)
+	/// OR a successful auth within [`RECENT_TTL`] (the fetch→launch gap)? Called at auth time to
+	/// decide whether to skip the OTP consume + Allow/Deny popup.
 	pub(crate) fn is_authorized(pubkey: &[u8; 32]) -> bool {
-		PREAUTHED.lock().unwrap().get(pubkey).is_some_and(|n| *n > 0)
+		if PREAUTHED.lock().unwrap().get(pubkey).is_some_and(|n| *n > 0) {
+			return true;
+		}
+		RECENT
+			.lock()
+			.unwrap()
+			.get(pubkey)
+			.is_some_and(|t| t.elapsed() < RECENT_TTL)
 	}
 
-	/// Record that a session for this device became authorized (increment its refcount).
+	/// Record that a session for this device became authorized (increment its refcount + stamp
+	/// the recent-auth time so a follow-up connect within [`RECENT_TTL`] skips re-auth).
 	/// Call once per accepted session, AFTER approval.
 	pub(crate) fn add(pubkey: [u8; 32]) {
 		*PREAUTHED.lock().unwrap().entry(pubkey).or_insert(0) += 1;
+		RECENT.lock().unwrap().insert(pubkey, Instant::now());
 	}
 
 	/// Drop one authorized session for this device (decrement; remove the entry at 0).
@@ -267,6 +289,7 @@ pub(crate) mod preauth {
 	/// whose teardown was skipped by an abort surviving across reconnects.
 	pub(crate) fn clear_all() {
 		PREAUTHED.lock().unwrap().clear();
+		RECENT.lock().unwrap().clear();
 	}
 }
 
