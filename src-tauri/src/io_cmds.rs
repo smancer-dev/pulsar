@@ -500,19 +500,16 @@ pub(crate) fn set_window_fullscreen(
 	} else {
 		state.fs_geom.lock().unwrap().take()
 	};
-	// Hide the OS title bar / frame while fullscreen and restore on exit. WINDOWS does
-	// this synchronously inside `win_fullscreen` (style strip in the same closure as the
-	// SetWindowPos) — calling tauri's async set_decorations/set_resizable here too RACED
-	// the strip and intermittently left the 8px WS_THICKFRAME inset back in (the "bazen
-	// 8px boşluk"). So the tauri calls are non-Windows only.
-	#[cfg(not(windows))]
-	let _ = window.set_decorations(!on);
+	// The window is FRAMELESS on every platform now (decorations:false — the app draws its own
+	// title bar), so there's no native frame to toggle on/off here. Windows still strips the
+	// resize border synchronously in `win_fullscreen` (below) for a clean borderless cover; the
+	// other platforms rely on `set_fullscreen` to hide the panel/dock.
 	#[cfg(windows)]
 	{
 		let w = window.clone();
 		// Drive Win32 on the UI thread so SetWindowPos targets the window correctly.
-		// win_fullscreen strips WS_THICKFRAME|WS_CAPTION + covers the monitor + snaps the
-		// children to the client rect, all synchronously (no async tauri style races).
+		// win_fullscreen strips the resize border + covers the monitor + snaps the children to
+		// the client rect, all synchronously (no async tauri style races).
 		let _ = window.run_on_main_thread(move || win_fullscreen(&w, on, saved));
 	}
 	#[cfg(not(windows))]
@@ -561,7 +558,7 @@ fn win_fullscreen(
 	};
 	let hwnd: HWND = handle.0 as _;
 	use windows_sys::Win32::UI::WindowsAndMessaging::{
-		GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_CAPTION, WS_THICKFRAME,
+		GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_THICKFRAME,
 	};
 	unsafe {
 		// Tauri's set_decorations/set_resizable are queued through the event loop and can
@@ -570,8 +567,12 @@ fn win_fullscreen(
 		// window (transparent gutter → desktop visible around the video). Toggle the
 		// styles synchronously here instead.
 		let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-		let strip = (WS_THICKFRAME | WS_CAPTION) as isize;
-		let new_style = if on { style & !strip } else { style | (WS_THICKFRAME as isize) };
+		// The window is FRAMELESS (decorations:false — the app draws its own title bar), so there
+		// is no WS_CAPTION to manage; only strip the resize border (WS_THICKFRAME) for the
+		// borderless-fullscreen cover and restore it on exit. (Restoring WS_CAPTION here would
+		// wrongly graft a native title bar back on when leaving fullscreen.)
+		let strip = WS_THICKFRAME as isize;
+		let new_style = if on { style & !strip } else { style | strip };
 		SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
 		if on {
 			// Clear any maximize/minimize first, else SetWindowPos is clamped to the

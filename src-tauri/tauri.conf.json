@@ -20,7 +20,7 @@
 				"center": true,
 				"minWidth": 1200,
 				"minHeight": 780,
-				"decorations": true,
+				"decorations": false,
 				"transparent": false,
 				"resizable": true,
 				"maximizable": true,

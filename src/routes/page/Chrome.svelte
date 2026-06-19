@@ -39,15 +39,48 @@
 
 	// Real app version (from tauri.conf) instead of a hardcoded string. Empty outside Tauri.
 	let ver = $state('');
-	onMount(async () => {
+	// The window is FRAMELESS (decorations:false) — this bar IS the title bar, so it draws its
+	// own minimize / maximize-restore / close controls. `maximized` swaps the max↔restore glyph.
+	let maximized = $state(false);
+	let unlistenResize: (() => void) | undefined;
+	// Sync onMount returning a sync cleanup; the async setup runs in an IIFE (an async onMount's
+	// return value is NOT used as a cleanup by Svelte, which is what tripped the type check).
+	onMount(() => {
+		if (!isTauri) return;
+		(async () => {
+			try {
+				const { getVersion } = await import('@tauri-apps/api/app');
+				ver = await getVersion();
+			} catch {
+				/* keep empty → shows plain "Pulsar" */
+			}
+			try {
+				const { getCurrentWindow } = await import('@tauri-apps/api/window');
+				const w = getCurrentWindow();
+				maximized = await w.isMaximized();
+				unlistenResize = await w.onResized(async () => {
+					maximized = await w.isMaximized();
+				});
+			} catch {
+				/* not in Tauri / API unavailable */
+			}
+		})();
+		return () => unlistenResize?.();
+	});
+
+	// Frameless window controls — minimize / toggle-maximize / close via the Tauri window API.
+	async function winCtl(action: 'min' | 'max' | 'close') {
 		if (!isTauri) return;
 		try {
-			const { getVersion } = await import('@tauri-apps/api/app');
-			ver = await getVersion();
+			const { getCurrentWindow } = await import('@tauri-apps/api/window');
+			const w = getCurrentWindow();
+			if (action === 'min') await w.minimize();
+			else if (action === 'max') await w.toggleMaximize();
+			else await w.close();
 		} catch {
-			/* keep empty → shows plain "Pulsar" */
+			/* ignore */
 		}
-	});
+	}
 
 	// Register a top-bar button with the gaming nav ONLY while in gaming mode, so the
 	// controller can roam up to it (gaming/language/theme). Reactive: re-applies when the
@@ -124,6 +157,19 @@
 			<Icon name={dark ? 'sun' : 'monitor'} size={16} />
 		</button>
 		<span class="mono ver">{ver ? `Pulsar v${ver}` : 'Pulsar'}</span>
+		{#if isTauri}
+			<div class="winctl">
+				<button class="wc" onclick={() => winCtl('min')} title={t('chrome.minimize')} aria-label={t('chrome.minimize')}>
+					<Icon name="winmin" size={15} />
+				</button>
+				<button class="wc" onclick={() => winCtl('max')} title={t('chrome.maximize')} aria-label={t('chrome.maximize')}>
+					<Icon name={maximized ? 'winrestore' : 'winmax'} size={14} />
+				</button>
+				<button class="wc close" onclick={() => winCtl('close')} title={t('chrome.close')} aria-label={t('chrome.close')}>
+					<Icon name="x" size={15} />
+				</button>
+			</div>
+		{/if}
 	</div>
 </div>
 
@@ -210,5 +256,35 @@
 		font-size: 11px;
 		font-weight: 600;
 		letter-spacing: 0.04em;
+	}
+	/* Frameless window controls: flush to the top-right corner, full bar height, no border —
+	   the standard custom-title-bar look. `margin-right` cancels the bar's right padding so they
+	   reach the window edge; close gets the red hover. Not a drag region (they're buttons). */
+	.winctl {
+		display: flex;
+		align-items: stretch;
+		height: 44px;
+		margin-left: 6px;
+		margin-right: -14px;
+	}
+	.wc {
+		width: 44px;
+		border: none;
+		background: transparent;
+		color: var(--text-muted);
+		cursor: pointer;
+		display: grid;
+		place-items: center;
+		transition:
+			background var(--dur) var(--ease),
+			color var(--dur) var(--ease);
+	}
+	.wc:hover {
+		background: var(--surface-3);
+		color: var(--text);
+	}
+	.wc.close:hover {
+		background: #e81123;
+		color: #fff;
 	}
 </style>
