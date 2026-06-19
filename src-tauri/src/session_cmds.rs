@@ -423,6 +423,13 @@ async fn respawn_render_for_codec(
 			// Mirror set_overlay's open path: SIGUSR1 + pass-through off on Linux, an `open`
 			// stdin line elsewhere (Windows / future native macOS).
 			if state.overlay_open.lock().unwrap().contains(&id) {
+				// Re-assert the INPUT routing too, not just the renderer's draw state — mirror
+				// set_overlay's open path. Without this, after a codec switch the keyboard/mouse hook
+				// resumed forwarding to the HOST even though the overlay was still open, so the user's
+				// keys/clicks landed in the remote session instead of the menu ("oturuma klavye mouse
+				// gidiyor ama overlay açık"). Suspend forwarding + release the grab again.
+				kbdhook::overlay_suspend(true);
+				kbdhook::release(app);
 				#[cfg(all(unix, not(target_os = "macos")))]
 				{
 					crate::render::set_container_pass_through(app, id, false);
