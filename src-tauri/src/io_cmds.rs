@@ -553,11 +553,22 @@ fn win_fullscreen(
 		SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOP, SWP_FRAMECHANGED, SWP_NOMOVE,
 		SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
 	};
+	use windows_sys::Win32::Graphics::Dwm::{
+		DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+	};
 	let Ok(handle) = window.hwnd() else {
 		return;
 	};
 	let hwnd: HWND = handle.0 as _;
 	unsafe {
+		// Frameless fullscreen polish: kill the 1px DWM edge border + the rounded corners while
+		// fullscreen (at the exact monitor rect they'd peek the desktop at the edges/corners);
+		// restore the defaults on exit. DWMWA_COLOR_NONE = 0xFFFF_FFFE, _DEFAULT = 0xFFFF_FFFF;
+		// DWMWCP_DONOTROUND = 1, DWMWCP_DEFAULT = 0.
+		let border: u32 = if on { 0xFFFF_FFFE } else { 0xFFFF_FFFF };
+		let corner: i32 = if on { 1 } else { 0 };
+		DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR as u32, (&border as *const u32).cast(), 4);
+		DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32, (&corner as *const i32).cast(), 4);
 		// The window is already FRAMELESS (decorations:false — the app draws its own title bar):
 		// tao's undecorated WM_NCCALCSIZE keeps the client rect == the FULL window, so we must NOT
 		// touch the window style here. Stripping WS_THICKFRAME (what the old DECORATED path did)
@@ -573,19 +584,20 @@ fn win_fullscreen(
 			mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
 			if GetMonitorInfoW(mon, &mut mi) != 0 {
 				let r: RECT = mi.rcMonitor;
-				// HWND_TOP (not HWND_TOPMOST): cover the monitor + come to the front, but DON'T pin
-				// always-on-top — otherwise Alt+Tabbing to another app left it stuck under this
-				// window. A foreground window that covers the whole monitor still auto-hides the
-				// taskbar (shell fullscreen detection). Expand the cover by 1px on every side so the
-				// frameless window's 1px DWM border sits OFF-screen — at the exact monitor rect that
-				// border showed as a thin desktop sliver down the left/right edges.
+				// Cover the monitor EXACTLY (rcMonitor) so the shell's fullscreen detection kicks in:
+				// the taskbar then hides under the window but can still be SUMMONED (Win key / edge
+				// hover) on top. Expanding even 1px breaks that detection (the taskbar stayed pinned
+				// above us). The 1px DWM edge border / rounded corners that would peek through at the
+				// exact rect are killed via DwmSetWindowAttribute above. HWND_TOP (not TOPMOST) keeps
+				// Alt+Tab working — a full-monitor foreground window hides the taskbar without being
+				// pinned always-on-top.
 				SetWindowPos(
 					hwnd,
 					HWND_TOP,
-					r.left - 1,
-					r.top - 1,
-					(r.right - r.left) + 2,
-					(r.bottom - r.top) + 2,
+					r.left,
+					r.top,
+					r.right - r.left,
+					r.bottom - r.top,
 					SWP_SHOWWINDOW | SWP_FRAMECHANGED,
 				);
 			}
