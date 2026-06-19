@@ -1325,6 +1325,43 @@ pub(crate) async fn go_online(
 											d.pointer(x, y)
 										}
 										InputEvent::PointerRelative { dx, dy } => {
+											// Resolve the captured monitor's geometry HERE too — not only on absolute
+											// PointerMotion. A native-renderer / game client sends ONLY relative motion, so
+											// without this `d.monitor` stays None, pointer_relative's cursor clamp is
+											// skipped, and the host cursor drifts off the streamed monitor onto another one.
+											// Mirrors the PointerMotion resolve above (same C4/C8/C23 reasoning).
+											#[cfg(windows)]
+											{
+												let (idx, gen) = {
+													let out_guard = native_out_arc.lock().unwrap();
+													let gen_guard = native_gen_arc.lock().unwrap();
+													let idx = match out_guard.as_ref() {
+														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
+														None => cur_display.load(std::sync::atomic::Ordering::Relaxed),
+													};
+													let gen = match gen_guard.as_ref() {
+														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
+														None => 0,
+													};
+													(idx, gen)
+												};
+												if idx != applied_display || gen != applied_gen {
+													if let Some(r) = pulsar_capture::display_rect(idx) {
+														applied_display = idx;
+														applied_gen = gen;
+														d.set_monitor(Some(pulsar_core::input::MonitorRect {
+															mon_left: r.mon_left,
+															mon_top: r.mon_top,
+															mon_width: r.mon_width,
+															mon_height: r.mon_height,
+															virt_left: r.virt_left,
+															virt_top: r.virt_top,
+															virt_width: r.virt_width,
+															virt_height: r.virt_height,
+														}));
+													}
+												}
+											}
 											let (rdx, rdy) = (dx, dy);
 											d.pointer_relative(rdx, rdy)
 										}

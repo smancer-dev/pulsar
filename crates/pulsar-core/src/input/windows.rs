@@ -8,6 +8,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 	MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
 	MOUSEINPUT,
 };
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 
 /// Virtual-desktop geometry of the streamed monitor, used to map a normalized (0..1)
 /// absolute pointer onto the correct (possibly non-primary) screen. All in virtual-desktop
@@ -232,6 +234,27 @@ impl DesktopInput {
 	/// ABSOLUTE flag → SendInput treats dx/dy as a relative move.
 	pub fn pointer_relative(&mut self, dx: f64, dy: f64) {
 		send_mouse(dx.round() as i32, dy.round() as i32, 0, MOUSEEVENTF_MOVE);
+		// Confine the cursor to the STREAMED monitor. A relative move spans the whole virtual
+		// desktop, so without this the pointer drifts off the captured screen onto another monitor
+		// (or past its edges) and the remote user "loses" the cursor outside the shared area. Snap
+		// it back inside the monitor's rect after the move. Raw-input games read the delta from the
+		// move itself; SetCursorPos does NOT emit a raw delta, so this stays invisible to them. With
+		// no MonitorRect (single-monitor / unknown geometry) the OS already confines to the one
+		// screen, so the clamp is skipped.
+		if let Some(m) = self.monitor {
+			if m.mon_width > 0 && m.mon_height > 0 {
+				unsafe {
+					let mut p = POINT { x: 0, y: 0 };
+					if GetCursorPos(&mut p) != 0 {
+						let cx = p.x.clamp(m.mon_left, m.mon_left + m.mon_width - 1);
+						let cy = p.y.clamp(m.mon_top, m.mon_top + m.mon_height - 1);
+						if cx != p.x || cy != p.y {
+							SetCursorPos(cx, cy);
+						}
+					}
+				}
+			}
+		}
 	}
 
 	/// Press/release a mouse button (0=left, 1=right, 2=middle).
