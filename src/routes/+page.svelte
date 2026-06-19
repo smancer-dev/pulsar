@@ -31,6 +31,7 @@
 	import SessionView from '$lib/screens/Session.svelte';
 	import Home from '$lib/screens/Home.svelte';
 	import PaneGameConnect from '$lib/screens/Gaming/PaneGameConnect.svelte';
+	import InputAssign from '$lib/screens/Gaming/InputAssign.svelte';
 	import SplitPicker from './page/SplitPicker.svelte';
 	import Approve from '$lib/screens/Approve.svelte';
 	import Connections from '$lib/screens/Connections.svelte';
@@ -107,6 +108,8 @@
 	// chrome split button. The actual split state (layout / panes / focus) lives on the
 	// SessionManager (sm.splitMode / sm.panes / sm.focusedPane).
 	let showSplitPicker = $state(false);
+	// Couch-coop input assignment modal (split + gaming) — `assignPanes` is derived after `sm` below.
+	let showInputAssign = $state(false);
 	// The personality every pane runs in split mode, captured the moment the picker opens.
 	// In SPLIT mode ALL panes are one fixed mode (gaming OR remote) — never a mix. When not
 	// yet split we snapshot the app's current `mode`; once split we keep the established
@@ -131,6 +134,16 @@
 	// Multiple concurrent host connections (tabs), the active tab, fullscreen, and the
 	// connect/disconnect lifecycle live in the session manager.
 	const sm = new SessionManager({ getMode: () => mode, onAuthDone: (target) => closePwFor(target) });
+	// The split panes that have a LIVE session, so each input device can be locked to one (couch
+	// co-op). Drives the input-assign button/modal — shown with ≥2 live game panes.
+	const assignPanes = $derived(
+		sm.panes
+			.map((tabId, i) => ({
+				index: i,
+				playId: tabId != null ? (sm.sessions.find((s) => s.tabId === tabId)?.playId ?? -1) : -1
+			}))
+			.filter((p) => p.playId >= 0)
+	);
 	// Client-side password prompts — driven by the host's `auth-prompt` event, so they
 	// appear at the same time as the host's Allow/Deny popup. Replying with the password
 	// OR the host clicking Allow (whichever first) completes the connect. Multiple tabs
@@ -880,7 +893,7 @@
 						fullscreen={sm.fullscreen}
 						onToggleFullscreen={sm.toggleFullscreen}
 						onPaneFocus={paneIdx >= 0 ? () => sm.focusPane(paneIdx) : undefined}
-						occludeNative={showSplitPicker || modalCount.n > 0 || !!pwPrompt}
+						occludeNative={showSplitPicker || modalCount.n > 0 || !!pwPrompt || showInputAssign}
 						onEnd={() => sm.endSession(s.tabId)}
 					/>
 				{/if}
@@ -954,11 +967,48 @@
 				onClose={() => (showSplitPicker = false)}
 			/>
 		{/if}
+
+		<!-- Couch co-op: with ≥2 live game panes, offer the per-device → pane assignment (lock each
+		     controller / keyboard / mouse to a pane). Gaming split only. -->
+		{#if sm.splitMode !== 'off' && sm.splitSessionMode === 'game' && assignPanes.length >= 2}
+			<button
+				class="input-assign-btn"
+				title={t('chrome.inputAssign')}
+				aria-label={t('chrome.inputAssign')}
+				onclick={() => (showInputAssign = true)}
+			>
+				🎮 {t('chrome.inputAssign')}
+			</button>
+		{/if}
+		{#if showInputAssign}
+			<InputAssign panes={assignPanes} onClose={() => (showInputAssign = false)} />
+		{/if}
 	</div>
 	</div>
 {/if}
 
 <style>
+	.input-assign-btn {
+		position: absolute;
+		top: 52px;
+		right: 16px;
+		z-index: 25;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 8px 12px;
+		font-size: 12.5px;
+		font-weight: 600;
+		border: 1px solid var(--border);
+		border-radius: var(--r-sm);
+		background: var(--surface-2);
+		color: var(--text);
+		cursor: pointer;
+		box-shadow: var(--shadow);
+	}
+	.input-assign-btn:hover {
+		background: var(--surface-3);
+	}
 	.stage {
 		position: relative;
 		flex: 1;

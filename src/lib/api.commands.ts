@@ -252,6 +252,14 @@ export const api = {
 	 * the lock). Mirrors the overlay `ctrllock` "uuid,0|1" wire. */
 	setControllerLock: (uuid: string, playId: number, locked: boolean) =>
 		invoke<void>('set_controller_lock', { uuid, playId, locked }),
+	/** Split couch-coop: lock a physical KEYBOARD/MOUSE (by its stable key from listInputDevices)
+	 * to a pane's session so two players can use separate kb+mouse, or unlock it. Mirrors
+	 * setControllerLock. */
+	setKbmLock: (devKey: string, playId: number, locked: boolean) =>
+		invoke<void>('set_kbm_lock', { devKey, playId, locked }),
+	/** Split: the keyboards/mice the local capture is holding (stable keys), for per-pane
+	 * assignment. Linux-only content; empty elsewhere. */
+	listInputDevices: () => invoke<string[]>('list_input_devices'),
 	/** Ask the controlled host to reverse direction (it connects back to `myId`). */
 	reversePlay: (id: number, myId: string) => invoke<void>('reverse_play', { id, myId }),
 	/** Control: absolute pointer motion, normalized 0..1 over the remote screen. */

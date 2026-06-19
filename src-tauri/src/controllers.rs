@@ -224,11 +224,37 @@ pub fn clear_controller_lock(uuid: &str) {
 /// never leaves a pad orphaned (locked to a dead session, forwarded by no one).
 pub fn clear_session_locks(play_id: u64) {
     lock_map().lock().unwrap().retain(|_, owner| *owner != play_id);
+    kbm_lock_map().lock().unwrap().retain(|_, owner| *owner != play_id);
 }
 
 /// The session/play id that currently owns (has locked) this pad, or `None` if it's unlocked.
 pub fn controller_lock_owner(uuid: &str) -> Option<u64> {
     lock_map().lock().unwrap().get(uuid).copied()
+}
+
+/// Per-session KEYBOARD/MOUSE lock map: a stable evdev device key -> the play/session id that has
+/// claimed that physical keyboard or mouse for one split pane ("couch co-op": player A's kb+mouse
+/// → pane 1, player B's → pane 2). The kbdhook routes a LOCKED device's input to its owner's
+/// session; an UNLOCKED device follows the focused session exactly as before (so single-device /
+/// unassigned behaviour is unchanged). Mirrors `CONTROLLER_SESSION_LOCK`. Empty off split.
+static KBM_SESSION_LOCK: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+fn kbm_lock_map() -> &'static Mutex<HashMap<String, u64>> {
+    KBM_SESSION_LOCK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lock a keyboard/mouse (by stable device key) to a session: only `play_id` receives its input.
+pub fn set_kbm_lock(dev_key: String, play_id: u64) {
+    kbm_lock_map().lock().unwrap().insert(dev_key, play_id);
+}
+
+/// Clear a keyboard/mouse device's lock unconditionally.
+pub fn clear_kbm_lock(dev_key: &str) {
+    kbm_lock_map().lock().unwrap().remove(dev_key);
+}
+
+/// The session that currently owns (has locked) this kb/mouse device, or `None` if unlocked.
+pub fn kbm_lock_owner(dev_key: &str) -> Option<u64> {
+    kbm_lock_map().lock().unwrap().get(dev_key).copied()
 }
 
 /// The vibration level (0..3) for a pad uuid, defaulting to medium (2) when unset.

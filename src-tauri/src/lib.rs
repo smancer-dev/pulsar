@@ -79,7 +79,8 @@ use io_cmds::{
 	chat_log, host_send_chat, input_button, input_char, input_key, input_pointer, input_scroll,
 	kbd_capture_start, kbd_capture_stop, kbd_engage, mic_start, mic_stop, native_view_rect,
 	read_clipboard_text, send_chat, send_clipboard, send_file, send_file_path, set_active_session,
-	set_controller_lock, set_pane_count, set_window_fullscreen, write_clipboard_text,
+	list_input_devices, set_controller_lock, set_kbm_lock, set_pane_count, set_window_fullscreen,
+	write_clipboard_text,
 };
 use play::{start_remote_play, stop_stream};
 use session_cmds::{
@@ -634,6 +635,8 @@ pub fn run() {
 			set_active_session,
 			set_pane_count,
 			set_controller_lock,
+			set_kbm_lock,
+			list_input_devices,
 			send_clipboard,
 			read_clipboard_text,
 			write_clipboard_text,

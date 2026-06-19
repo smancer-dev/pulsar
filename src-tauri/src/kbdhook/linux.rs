@@ -157,6 +157,48 @@ fn fwd(tx: &Sender<InputEvent>, ev: InputEvent) {
 	let _ = tx.try_send(ev);
 }
 
+/// Stable-ish key for a captured evdev device — its kernel name (e.g. "Logitech USB Keyboard").
+/// Used as the per-pane LOCK key (set_kbm_lock) and surfaced to the UI. Two IDENTICAL devices share
+/// a name (a known v1 limit); a physical-port key would disambiguate them later.
+fn dev_key_of(d: &evdev::Device) -> String {
+	d.name().unwrap_or("input").to_string()
+}
+
+/// The input sender for a captured device. In SPLIT mode a kb/mouse LOCKED (set_kbm_lock) to a pane
+/// routes to THAT pane's session; otherwise — unlocked, split off, or the locked session gone — the
+/// default sender (the focused session, exactly as before). Cloned once per device-batch in the
+/// capture loop, so couch-coop routing costs one HashMap lookup per poll per device.
+fn kbm_route(app: &AppHandle, dev_key: &str, default_tx: &Sender<InputEvent>) -> Sender<InputEvent> {
+	use std::sync::atomic::Ordering;
+	let state = app.state::<crate::state::AppState>();
+	if state.split_pane_count.load(Ordering::SeqCst) > 1 {
+		if let Some(owner) = crate::controllers::kbm_lock_owner(dev_key) {
+			if let Some(tx) = state
+				.plays
+				.lock()
+				.unwrap()
+				.get(&owner)
+				.map(|p| p.input_tx.clone())
+			{
+				return tx;
+			}
+		}
+	}
+	default_tx.clone()
+}
+
+/// Names of the kb/mice the capture thread currently holds — republished on every grab/ungrab so
+/// the UI can list them for the per-pane lock (set_kbm_lock). Read by `captured_list`.
+static CAPTURED_DEVICES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+	std::sync::OnceLock::new();
+fn captured_devices() -> &'static std::sync::Mutex<Vec<String>> {
+	CAPTURED_DEVICES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+/// The kb/mouse device names currently captured (for the per-pane assignment UI).
+pub fn captured_list() -> Vec<String> {
+	captured_devices().lock().unwrap().clone()
+}
+
 // evdev keycodes for the leave combo + the modifiers it needs.
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_RIGHTCTRL: u16 = 97;
@@ -457,6 +499,9 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 					}
 				}
 				if purged || grabbed.len() != before {
+					// Republish the captured device names for the per-pane assignment UI.
+					*captured_devices().lock().unwrap() =
+						grabbed.iter().map(dev_key_of).collect();
 					pfds = grabbed
 						.iter()
 						.map(|d| libc::pollfd {
@@ -608,6 +653,11 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 					Ok(e) => e.collect(),
 					Err(_) => continue,
 				};
+				// Per-device routing (split couch-coop): a kb/mouse LOCKED (set_kbm_lock) to a pane
+				// sends its input to THAT pane's session; an unlocked device keeps following the
+				// focused session. Shadow `tx` for THIS device's forwards + flushes below — recomputed
+				// each batch from the live lock map (the borrow on grabbed[i] ended at `collect()`).
+				let tx = kbm_route(&app, &dev_key_of(&grabbed[i]), &tx);
 				for ev in events {
 					diag_events += 1;
 					match ev.kind() {

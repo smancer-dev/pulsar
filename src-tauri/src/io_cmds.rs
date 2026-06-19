@@ -362,6 +362,31 @@ pub(crate) async fn set_controller_lock(
 	Ok(())
 }
 
+/// SPLIT MODE (couch co-op): lock a physical KEYBOARD/MOUSE (by its stable evdev device key) to one
+/// pane so two players can use separate kb+mouse. Mirrors `set_controller_lock`: the kbdhook routes
+/// a locked device's input to its owner; an unlocked device follows the focused pane (unchanged).
+/// `locked=false` only clears the lock if THIS session owns it (a stale unlock can't steal a lock).
+#[tauri::command]
+pub(crate) async fn set_kbm_lock(
+	dev_key: String,
+	play_id: u64,
+	locked: bool,
+) -> Result<(), String> {
+	if locked {
+		crate::controllers::set_kbm_lock(dev_key, play_id);
+	} else if crate::controllers::kbm_lock_owner(&dev_key) == Some(play_id) {
+		crate::controllers::clear_kbm_lock(&dev_key);
+	}
+	Ok(())
+}
+
+/// SPLIT MODE: the keyboards/mice the local capture is holding, by stable key, for the per-pane
+/// assignment UI (each is lockable via `set_kbm_lock`). Linux-only content; empty elsewhere.
+#[tauri::command]
+pub(crate) async fn list_input_devices() -> Result<Vec<String>, String> {
+	Ok(crate::kbdhook::captured_input_devices())
+}
+
 /// SPLIT MODE: the frontend reports the number of panes currently shown (1..=4) here. Stored into
 /// [`AppState::split_pane_count`], which `reap_excess_resident_pool` uses as its cap so up to 4
 /// live per-pane renderers are not SIGTERM'd as "excess". Clamped to at least 1.

@@ -61,6 +61,10 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 			] as unknown as T);
 		case 'controllers':
 			return Promise.resolve([] as unknown as T);
+		case 'list_input_devices':
+			return Promise.resolve([] as unknown as T);
+		case 'set_kbm_lock':
+			return Promise.resolve(undefined as unknown as T);
 		case 'local_ip':
 			return Promise.resolve('192.168.1.42' as unknown as T);
 		case 'node_port':

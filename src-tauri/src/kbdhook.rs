@@ -69,6 +69,18 @@ pub fn arm_kiosk_engage() {
 #[cfg(not(target_os = "linux"))]
 pub fn set_render_focused(_focused: bool) {}
 
+/// The kb/mouse device names the local capture is currently holding — for the split per-pane
+/// assignment UI (each is lockable to a pane via `set_kbm_lock`). Linux-only (the per-device evdev
+/// grab knows each device); empty on Windows/macOS, where capture isn't per-device yet.
+#[cfg(target_os = "linux")]
+pub fn captured_input_devices() -> Vec<String> {
+	linux::captured_list()
+}
+#[cfg(not(target_os = "linux"))]
+pub fn captured_input_devices() -> Vec<String> {
+	Vec::new()
+}
+
 // macOS: no client-side capture — all lifecycle hooks are no-ops.
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn engage(_app: &AppHandle) {}
