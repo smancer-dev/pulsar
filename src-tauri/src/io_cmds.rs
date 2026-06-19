@@ -483,56 +483,26 @@ pub(crate) fn set_window_fullscreen(
 	on: bool,
 ) -> Result<(), String> {
 	tracing::info!(on, "set_window_fullscreen");
-	if on {
-		if let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) {
-			// Save only when ENTERING from windowed state: an on=true while already
-			// fullscreen (the F12 combo and the UI toggle racing out of sync) would
-			// otherwise capture the fullscreen rect, and exiting would "restore" a
-			// fullscreen-sized borderless window instead of the windowed geometry.
-			let mut g = state.fs_geom.lock().unwrap();
-			if g.is_none() {
-				*g = Some((pos, size));
-			}
+	let _ = &state; // no longer needed (native fullscreen tracks the pre-fullscreen geometry)
+	// Use the platform's NATIVE borderless fullscreen (tao/winit). The window is non-transparent
+	// + frameless now, so on Windows the shell treats it as a real fullscreen app: the taskbar
+	// auto-hides but stays summonable, Alt+Tab and the Win key behave normally, and the content
+	// fills the monitor edge-to-edge — none of which the old manual SetWindowPos/topmost hack
+	// (`win_fullscreen`, kept below for reference) could get right all at once.
+	let w = window.clone();
+	// Window ops must run on the UI/event thread (a Tauri command runs off it; calling these
+	// off-thread can silently no-op, esp. on the GTK backend).
+	let _ = window.run_on_main_thread(move || {
+		// Self-heal any stray always-on-top the old fullscreen path could have left set.
+		if !on {
+			let _ = w.set_always_on_top(false);
 		}
-	}
-	let saved = if on {
-		None
-	} else {
-		state.fs_geom.lock().unwrap().take()
-	};
-	// The window is FRAMELESS on every platform now (decorations:false — the app draws its own
-	// title bar), so there's no native frame to toggle on/off here. Windows still strips the
-	// resize border synchronously in `win_fullscreen` (below) for a clean borderless cover; the
-	// other platforms rely on `set_fullscreen` to hide the panel/dock.
-	#[cfg(windows)]
-	{
-		let w = window.clone();
-		// Drive Win32 on the UI thread so SetWindowPos targets the window correctly.
-		// win_fullscreen strips the resize border + covers the monitor + snaps the children to
-		// the client rect, all synchronously (no async tauri style races).
-		let _ = window.run_on_main_thread(move || win_fullscreen(&w, on, saved));
-	}
-	#[cfg(not(windows))]
-	{
-		let _ = saved; // geometry restore is a Windows-only concern here
-				 // GTK window ops must run on the main (GTK) thread; a Tauri command runs off it, so
-				 // dispatch there — calling set_fullscreen directly off-thread can silently no-op.
-		let w = window.clone();
-		let _ = window.run_on_main_thread(move || {
-			// Leaving fullscreen must also drop topmost: the Focused handler in lib.rs only
-			// manages always-on-top while fs_geom is Some, and fs_geom was just cleared above —
-			// without this the window stays above every other app forever (the Windows branch
-			// already does the equivalent via HWND_NOTOPMOST).
-			if !on {
-				let _ = w.set_always_on_top(false);
-			}
-			let _ = w.set_fullscreen(on); // X11/Wayland/macOS hide the panel/dock correctly
-								 // Keep input focus on the GTK toplevel after the toggle — otherwise X moves focus
-								 // to the embedded native-renderer child window, which flips kbdhook's FOCUSED to
-								 // false and silently kills the evdev combos (F12/M/Q) until the user clicks back in.
-			let _ = w.set_focus();
-		});
-	}
+		let _ = w.set_fullscreen(on);
+		// Keep input focus on the toplevel after the toggle — otherwise (Linux) X moves focus to
+		// the embedded native-renderer child window, which flips kbdhook's FOCUSED to false and
+		// silently kills the evdev combos (F12/M/Q) until the user clicks back in.
+		let _ = w.set_focus();
+	});
 	Ok(())
 }
 
@@ -540,6 +510,7 @@ pub(crate) fn set_window_fullscreen(
 /// top-most, which (unlike `set_fullscreen` on a transparent window) reliably hides
 /// the taskbar. Restores the saved windowed rect when turning off.
 #[cfg(windows)]
+#[allow(dead_code)] // superseded by native set_fullscreen; kept for reference / quick revert
 fn win_fullscreen(
 	window: &tauri::WebviewWindow,
 	on: bool,
@@ -642,6 +613,7 @@ fn win_fullscreen(
 /// Resize all direct children of `hwnd` to its current client rect (Win32 child
 /// coords are client-relative, so that's (0,0,w,h)).
 #[cfg(windows)]
+#[allow(dead_code)] // only used by the now-superseded win_fullscreen
 unsafe fn fill_children_to_client(hwnd: windows_sys::Win32::Foundation::HWND) {
 	use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 	use windows_sys::Win32::UI::WindowsAndMessaging::{
