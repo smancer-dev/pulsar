@@ -545,13 +545,13 @@ fn win_fullscreen(
 	on: bool,
 	saved: Option<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>)>,
 ) {
-	use windows_sys::Win32::Foundation::{HWND, RECT};
+	use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 	use windows_sys::Win32::Graphics::Gdi::{
-		GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+		ClientToScreen, GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 	};
 	use windows_sys::Win32::UI::WindowsAndMessaging::{
-		SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE,
-		SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
+		GetClientRect, GetWindowRect, SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST,
+		SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
 	};
 	use windows_sys::Win32::Graphics::Dwm::{
 		DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -584,19 +584,35 @@ fn win_fullscreen(
 			mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
 			if GetMonitorInfoW(mon, &mut mi) != 0 {
 				let r: RECT = mi.rcMonitor;
-				// Cover the monitor EXACTLY (rcMonitor) and go HWND_TOPMOST: that's what actually
-				// hides the taskbar on this setup (the shell's non-topmost fullscreen auto-hide
-				// didn't trigger here — likely ASTER). The 1px DWM edge border / rounded corners
-				// that would peek through at the exact rect are killed via DwmSetWindowAttribute
-				// above. Alt+Tab is handled by the `Focused` handler in lib.rs: on blur it drops
-				// topmost AND sends the window to the bottom so the activated app comes forward.
+				let (mw, mh) = (r.right - r.left, r.bottom - r.top);
+				// HWND_TOPMOST is what actually hides the taskbar on this setup (the shell's
+				// non-topmost fullscreen auto-hide didn't trigger here — likely ASTER). Alt+Tab is
+				// handled by the `Focused` handler in lib.rs (on blur it drops topmost AND sinks the
+				// window to the bottom so the activated app comes forward).
+				//
+				// tao's frameless window keeps an ~8px resize border (left/right/bottom) that
+				// GetClientRect excludes, so the webview — snapped to the client by
+				// fill_children_to_client — would leave that border as a desktop gap down the edges.
+				// Position at the monitor once, MEASURE the per-side client inset, then re-position
+				// EXPANDED by it so the CLIENT (= the webview) covers the monitor exactly with the
+				// NC border off-screen (fine — we're topmost, so the cover needn't be the exact rect).
+				SetWindowPos(hwnd, HWND_TOPMOST, r.left, r.top, mw, mh, SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+				let (mut wr, mut cr) = (std::mem::zeroed::<RECT>(), std::mem::zeroed::<RECT>());
+				let mut tl = POINT { x: 0, y: 0 };
+				GetWindowRect(hwnd, &mut wr);
+				GetClientRect(hwnd, &mut cr);
+				ClientToScreen(hwnd, &mut tl);
+				let il = (tl.x - wr.left).max(0);
+				let it = (tl.y - wr.top).max(0);
+				let ir = (wr.right - (tl.x + cr.right)).max(0);
+				let ib = (wr.bottom - (tl.y + cr.bottom)).max(0);
 				SetWindowPos(
 					hwnd,
 					HWND_TOPMOST,
-					r.left,
-					r.top,
-					r.right - r.left,
-					r.bottom - r.top,
+					r.left - il,
+					r.top - it,
+					mw + il + ir,
+					mh + it + ib,
 					SWP_SHOWWINDOW | SWP_FRAMECHANGED,
 				);
 			}
