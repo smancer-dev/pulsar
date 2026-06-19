@@ -43,6 +43,10 @@ pub(super) struct Inner {
 	/// relay-path requester (`connect` → `PeerFound`) and the direct-IP initiator
 	/// (`connect_direct` → `HelloAck`). Removed once the key is derived.
 	pub(super) pending_salt: HashMap<SessionId, [u8; 32]>,
+	/// The relay's per-session forwarding rate cap (kbit/s, 0 = uncapped) parsed from a
+	/// `PeerFound`, held until `connect` builds the [`Session`] and copies it in. Only set on
+	/// the relay-fallback rendezvous path; consumed when the session is returned.
+	pub(super) pending_rate_cap: HashMap<SessionId, u32>,
 	/// The peer's EXPECTED X25519 public key for direct-IP connects where the caller
 	/// already knows it (`connect_direct(_, Some(pk))`). The `HelloAck` handler rejects
 	/// (drops) an ack whose `pubkey` doesn't match this, so a MITM that terminates the

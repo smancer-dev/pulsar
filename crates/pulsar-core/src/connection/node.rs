@@ -345,9 +345,11 @@ impl Node {
 
 		// Wire up an inbound data channel for the caller.
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
-		let transport = {
+		let (transport, rate_cap_kbps) = {
 			let mut g = self.inner.lock().await;
-			match g.sessions.get_mut(&session) {
+			// The relay's per-session cap stashed by the PeerFound handler (0 if none/direct).
+			let cap = g.pending_rate_cap.remove(&session).unwrap_or(0);
+			let transport = match g.sessions.get_mut(&session) {
 				Some(s) => {
 					// The punch handlers may have proven the direct path while
 					// our PunchAck waiter timed out — never downgrade such a
@@ -362,7 +364,8 @@ impl Node {
 					s.transport
 				}
 				None => transport,
-			}
+			};
+			(transport, cap)
 		};
 		Ok(Session {
 			id: session,
@@ -370,6 +373,7 @@ impl Node {
 			transport,
 			node: self.clone(),
 			data_rx,
+			rate_cap_kbps,
 		})
 	}
 
@@ -482,6 +486,7 @@ impl Node {
 			transport: Transport::Direct,
 			node: self.clone(),
 			data_rx,
+			rate_cap_kbps: 0, // direct/typed-IP path: no relay, no cap
 		})
 	}
 

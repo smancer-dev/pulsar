@@ -959,6 +959,26 @@ pub(crate) async fn start_remote_play(
 	} else {
 		(0, 0, 0, 0) // defer to the host config
 	};
+	// Relay per-session rate cap (kbit/s, 0 = uncapped): when this session is RELAYED the relay
+	// forwards the media, so its per-session forwarding cap (advertised in PeerFound) applies.
+	// Clamp the requested bitrate to ~90% of it (headroom for audio + RTP/IP overhead) so the
+	// encoder STARTS within the pipe instead of overshooting and waiting for the loss-driven ABR
+	// to ramp down (the bad first ~20 s the maintainer flagged). Direct/P2P sessions (cap 0 or
+	// non-relay transport) are untouched — full quality immediately. `0` requested = host default,
+	// which under a cap would overshoot, so we pin it to the cap instead.
+	let cap_kbps = if matches!(sess.transport(), Transport::Relay) && sess.rate_cap_kbps() > 0 {
+		(sess.rate_cap_kbps() * 9 / 10).max(2_000)
+	} else {
+		0
+	};
+	let req_kbps = if cap_kbps > 0 {
+		if req_kbps == 0 { cap_kbps } else { req_kbps.min(cap_kbps) }
+	} else {
+		req_kbps
+	};
+	if cap_kbps > 0 {
+		tracing::info!(cap_kbps, req_kbps, "relayed session: clamped stream bitrate to per-session cap");
+	}
 	let req = StreamReq {
 		port: video_port,
 		codec,
@@ -1729,6 +1749,7 @@ pub(crate) async fn start_remote_play(
 		req_h,
 		req_fps,
 		req_kbps,
+		cap_kbps,
 		req.cursor_external,
 		req_hdr,
 		req_quality,

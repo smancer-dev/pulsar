@@ -9,6 +9,11 @@ pub struct Session {
 	pub(super) transport: Transport,
 	pub(super) node: Arc<Node>,
 	pub(super) data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+	/// The relay's per-session forwarding rate cap (kbit/s; `0` = uncapped). Set from the
+	/// `PeerFound` on the relay-fallback rendezvous path, `0` on direct/host-accept paths.
+	/// Meaningful only when [`transport`](Self::transport) is `Relay` (then the media rides
+	/// the relay and its cap applies) — the caller clamps its stream bitrate accordingly.
+	pub(super) rate_cap_kbps: u32,
 }
 
 impl Drop for Session {
@@ -35,6 +40,11 @@ impl Session {
 	}
 	pub fn transport(&self) -> Transport {
 		self.transport
+	}
+	/// The relay's per-session forwarding rate cap in kbit/s (`0` = uncapped). Apply it as a
+	/// stream-bitrate ceiling only when [`transport`](Self::transport) is `Relay`.
+	pub fn rate_cap_kbps(&self) -> u32 {
+		self.rate_cap_kbps
 	}
 
 	/// Encrypt and send a payload over whichever transport this session uses.

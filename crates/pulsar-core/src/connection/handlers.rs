@@ -112,6 +112,7 @@ impl Node {
 				target_addr,
 				session,
 				answer,
+				rate_cap_kbps,
 			} => {
 				// answer = peer pubkey(32) || peer salt(32) || optional LAN candidate.
 				// Reject a malformed blob rather than index-slicing past the end.
@@ -169,6 +170,10 @@ impl Node {
 						our_salt,
 					},
 				);
+				// Stash the relay's per-session cap (kbit/s, 0 = uncapped) so `connect` can copy
+				// it onto the returned Session — used to clamp the encoder when this session ends
+				// up relayed (the relay forwards the media, so its per-session cap applies).
+				g.pending_rate_cap.insert(session, rate_cap_kbps);
 				if let Some(n) = g.peer_found.get(&session).cloned() {
 					n.notify_one();
 				}
@@ -373,6 +378,7 @@ impl Node {
 			transport: Transport::Relay,
 			node: self.clone(),
 			data_rx,
+			rate_cap_kbps: 0, // host side accepts; the client is the one that requests bitrate
 		});
 	}
 
@@ -536,6 +542,7 @@ impl Node {
 					transport: Transport::Direct,
 					node: self.clone(),
 					data_rx,
+					rate_cap_kbps: 0, // direct-IP host accept: no relay, no cap
 				});
 			}
 			PeerMsg::HelloAck {
@@ -689,6 +696,7 @@ mod tests {
 			target_addr: public,
 			session: SESSION,
 			answer: answer_with_lan(lan),
+			rate_cap_kbps: 0,
 		})
 		.await;
 	}

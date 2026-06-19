@@ -27,6 +27,10 @@ use crate::state::Restream;
 const ADAPT_MIN_KBPS: u32 = 2_000;
 /// Sustained-loss threshold that triggers a step DOWN (per 2 s keepalive window).
 const ADAPT_LOSS_DOWN: f32 = 0.03;
+/// SEVERE loss (the current bitrate badly overruns the pipe — e.g. overshooting an unknown
+/// bottleneck or a relay drop cap). Above this we HALVE immediately and skip the cooldown so the
+/// stream converges in a few seconds instead of ~20 s of artifacts.
+const ADAPT_LOSS_SEVERE: f32 = 0.15;
 /// "Clean" threshold; this many consecutive clean windows step back UP.
 const ADAPT_LOSS_CLEAN: f32 = 0.005;
 const ADAPT_CLEAN_WINDOWS: u32 = 10; // ×2 s = 20 s stable before raising
@@ -58,6 +62,10 @@ pub(super) async fn hold_session(
 	req_h: u32,
 	req_fps: u32,
 	base_kbps: u32,
+	// Relay per-session bitrate cap (kbit/s, 0 = uncapped), already headroom-discounted by
+	// play.rs. Caps the adaptive controller's ceiling AND any user-picked manual bitrate so a
+	// relayed session never re-overshoots the relay's drop limit after a menu change / ramp-up.
+	cap_kbps: u32,
 	cursor_external: bool,
 	req_hdr: bool,
 	init_quality: QualityPref,
@@ -611,7 +619,15 @@ pub(super) async fn hold_session(
 					let total = win_recv + win_lost;
 					let loss = if total > 0 { win_lost as f32 / total as f32 } else { 0.0 };
 					let mut new_kbps = None;
-					if total > 100
+					if total > 100 && loss > ADAPT_LOSS_SEVERE && cur_bitrate > ADAPT_MIN_KBPS {
+						// SEVERE loss = the current bitrate badly overruns the pipe (e.g. starting
+						// above an unknown bottleneck, or a sudden drop below the relay's per-session
+						// cap). HALVE immediately, BYPASSING the cooldown, so it converges in a couple
+						// of 2 s windows (~4 s) instead of ~20 s of garbage with the gentle 0.7× step.
+						new_kbps = Some((cur_bitrate / 2).max(ADAPT_MIN_KBPS));
+						clean_windows = 0;
+						last_step = std::time::Instant::now();
+					} else if total > 100
 						&& loss > ADAPT_LOSS_DOWN
 						&& last_step.elapsed().as_secs() >= ADAPT_COOLDOWN_S
 						&& cur_bitrate > ADAPT_MIN_KBPS
@@ -678,7 +694,13 @@ pub(super) async fn hold_session(
 						// controller; "Otomatik" (0) hands control back to it.
 						Restream::Bitrate(b) => {
 							manual_bitrate = b > 0;
-							cur_bitrate = if b > 0 { b } else { base_kbps };
+							// A relayed session clamps even a user-picked bitrate to the relay's
+							// per-session cap, so a manual pick can't re-overshoot the drop limit.
+							cur_bitrate = if b > 0 {
+								if cap_kbps > 0 { b.min(cap_kbps) } else { b }
+							} else {
+								base_kbps
+							};
 						}
 						Restream::Quality(q) => { cur_quality = q; }
 						Restream::Audio(t, m) => {

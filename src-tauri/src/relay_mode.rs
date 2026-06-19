@@ -45,6 +45,8 @@ pub fn run_relay(args: &[String]) {
 		per_user_total: size("--user-data", "PULSAR_RELAY_USER_DATA"),
 		per_ip_bps: rate("--ip-rate", "PULSAR_RELAY_IP_RATE"),
 		per_ip_total: size("--ip-data", "PULSAR_RELAY_IP_DATA"),
+		per_session_bps: rate("--session-rate", "PULSAR_RELAY_SESSION_RATE"),
+		per_session_total: size("--session-data", "PULSAR_RELAY_SESSION_DATA"),
 	};
 	tracing_subscriber::fmt()
 		.with_env_filter(
