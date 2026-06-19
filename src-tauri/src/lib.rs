@@ -460,19 +460,21 @@ pub fn run() {
 					#[cfg(windows)]
 					if fs && !*focused {
 						if let Ok(h) = window.hwnd() {
+							use windows_sys::Win32::Foundation::HWND;
 							use windows_sys::Win32::UI::WindowsAndMessaging::{
-								SetWindowPos, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+								GetForegroundWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE,
+								SWP_NOSIZE,
 							};
 							unsafe {
-								SetWindowPos(
-									h.0 as _,
-									HWND_BOTTOM,
-									0,
-									0,
-									0,
-									0,
-									SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-								);
+								let me: HWND = h.0 as _;
+								let fg = GetForegroundWindow();
+								// Drop just BELOW whatever took focus — NOT to HWND_BOTTOM, which made
+								// the whole app vanish when you merely pressed the Win key. Below the
+								// new foreground window: an Alt+Tab target shows above us; the Start
+								// menu (topmost) simply overlays us and we stay visible behind it.
+								if !fg.is_null() && fg != me {
+									SetWindowPos(me, fg, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+								}
 							}
 						}
 					}
