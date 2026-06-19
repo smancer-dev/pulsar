@@ -170,6 +170,7 @@ fn dev_key_of(d: &evdev::Device) -> String {
 /// capture loop, so couch-coop routing costs one HashMap lookup per poll per device.
 fn kbm_route(app: &AppHandle, dev_key: &str, default_tx: &Sender<InputEvent>) -> Sender<InputEvent> {
 	use std::sync::atomic::Ordering;
+	use tauri::Manager; // app.state()
 	let state = app.state::<crate::state::AppState>();
 	if state.split_pane_count.load(Ordering::SeqCst) > 1 {
 		if let Some(owner) = crate::controllers::kbm_lock_owner(dev_key) {
