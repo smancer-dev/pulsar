@@ -25,11 +25,17 @@
 		<p class="pwlead">{@html t('pw.lead')}</p>
 		{#if pwError}<div class="pwerr">{pwError}</div>{/if}
 		<!-- svelte-ignore a11y_autofocus -->
+		<!-- Raw value: the persistent connect password can be any string (case/symbols/length), so the
+		     field must NOT reformat it. The one-time password is matched case- and dash-insensitively
+		     host-side (try_consume_otp), so `uk66-379t` / `UK66379T` / dash-less all still work. -->
 		<input
 			class="pwfield mono"
 			type="text"
 			bind:value={pwInput}
 			disabled={pwChecking}
+			autocapitalize="off"
+			autocomplete="off"
+			spellcheck="false"
 			onkeydown={(e) => e.key === 'Enter' && onSubmit()}
 			placeholder={t('pw.placeholder')}
 			aria-label={t('pw.aria')}

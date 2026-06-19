@@ -263,6 +263,17 @@ pub(crate) fn rotate_session_password(app: &AppHandle) {
 	let _ = app.emit("session-password", fresh);
 }
 
+/// Canonical form of a one-time password for matching: drop the dash separator and
+/// lowercase. Lets the user type the displayed `uk66-379t` as `UK66379T` / `uk66379t` /
+/// with the dash, all equivalently. ONLY for the OTP (a fixed-format generated code) —
+/// never apply this to the user-set persistent connect password.
+fn norm_otp(s: &str) -> String {
+	s.chars()
+		.filter(|c| *c != '-')
+		.flat_map(|c| c.to_lowercase())
+		.collect()
+}
+
 /// Atomically compare-and-consume the one-time password: if `provided` matches
 /// the live OTP, rotate it under the same lock so that a concurrent task cannot
 /// also match the same value (eliminating the read→compare→rotate TOCTOU race).
@@ -273,7 +284,12 @@ pub(crate) fn try_consume_otp(app: &AppHandle, provided: &str) -> bool {
 	let state = app.state::<AppState>();
 	let fresh = {
 		let mut g = state.password.lock().unwrap();
-		if g.is_empty() || !crate::auth::secret_eq(provided, &g) {
+		// The ONE-TIME password is shown as `uk66-379t` (lowercase, dash after the 4th char). Match
+		// it case- and dash-insensitively so the user can type `UK66379T` / `uk66 379t` / no dash and
+		// still get in — the dash is at a fixed position and the alphabet is all-lowercase, so this
+		// adds no new valid codes (no entropy loss) and the per-peer/global throttle still applies.
+		// The PERSISTENT connect password is compared EXACTLY elsewhere (auth.rs) and is untouched.
+		if g.is_empty() || !crate::auth::secret_eq(&norm_otp(provided), &norm_otp(&g)) {
 			return false;
 		}
 		let pw = gen_password();
