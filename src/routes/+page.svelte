@@ -212,6 +212,19 @@
 		return pwQueue.some((q) => peerMatchesTarget(q.peer, targetId));
 	}
 
+	// Split GAMING mode drives the controller-nav bridge here: GamingShell (which normally
+	// starts/stops the gilrs→webview `gamepad-nav` bridge) is NOT rendered in split, so without
+	// this the panes' PaneGameConnect nav gets no controller input — pad nav looked dead in split.
+	// Gaming split only (remote split has no pad nav).
+	$effect(() => {
+		if (sm.splitMode !== 'off' && sm.splitSessionMode === 'game') {
+			api.gamepadNavStart().catch(() => {});
+			return () => {
+				api.gamepadNavStop().catch(() => {});
+			};
+		}
+	});
+
 	// Host-side activity: who's connected + a recent event log. Keyed by SESSION id (a
 	// device can hold several concurrent sessions — couch co-op / split panes), with the
 	// peer kept for the label + kick routing.
@@ -867,7 +880,7 @@
 						fullscreen={sm.fullscreen}
 						onToggleFullscreen={sm.toggleFullscreen}
 						onPaneFocus={paneIdx >= 0 ? () => sm.focusPane(paneIdx) : undefined}
-						occludeNative={showSplitPicker || modalCount.n > 0}
+						occludeNative={showSplitPicker || modalCount.n > 0 || !!pwPrompt}
 						onEnd={() => sm.endSession(s.tabId)}
 					/>
 				{/if}
@@ -897,6 +910,7 @@
 									index={i}
 									focused={i === sm.focusedPane}
 									onConnect={sm.connectIntoPane}
+									onFetched={closePwFor}
 								/>
 							{:else}
 								<Home

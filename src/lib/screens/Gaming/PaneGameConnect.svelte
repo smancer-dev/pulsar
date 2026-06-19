@@ -25,8 +25,12 @@
 		/** Connect into THIS pane (runs startConnect + assigns the tabId). The mode arg is
 		 * advisory — connectIntoPane FORCES the split's fixed personality (game). */
 		onConnect: (i: number, target: Target, mode: 'remote' | 'game', gameId?: string) => void;
+		/** The games-fetch authenticates against the host (the host may prompt) but is NOT a
+		 * session, so the password modal otherwise stays up after the host accepts. Signal the
+		 * parent when the fetch SUCCEEDS so it can dismiss the (now-stale) prompt for this host. */
+		onFetched?: (id: string) => void;
 	};
-	let { index, focused = false, onConnect }: Props = $props();
+	let { index, focused = false, onConnect, onFetched }: Props = $props();
 
 	// This pane's own roving-focus controller (one per pane — never the shell singleton).
 	const nav = new GamepadNav();
@@ -49,6 +53,9 @@
 		step = 'games';
 		try {
 			const fetched = await api.listRemoteGames(id);
+			// Auth succeeded (host accepted / OTP matched) — dismiss any still-open password
+			// prompt for this host (the fetch isn't a session, so onAuthDone never fired).
+			onFetched?.(id);
 			// The host always publishes a built-in "desktop" entry (with a live screenshot).
 			desktopImg = fetched.find((g) => g.id === 'desktop')?.image ?? '';
 			hostGames = fetched.filter((g) => g.id !== 'desktop');
