@@ -25,12 +25,13 @@ pub use auth::{
 	send_auth, AuthOutcome, ClientAuth, HostAuth,
 };
 pub use client::{
-	decode_data, is_pong, query_stream_caps, request_games, request_launch, request_stream,
-	send_bye, send_data, send_input, send_keepalive,
+	decode_data, is_pong, query_stream_caps, query_windows, request_games, request_launch,
+	request_stream, send_bye, send_data, send_input, send_keepalive,
 };
 pub use host::{serve, serve_with, DataHandlers};
 pub use wire::{
 	DataMsg, DisplayInfo, FsEntry, GameInfo, InputEvent, QualityPref, StreamCaps, StreamReq,
+	WindowInfo,
 };
 
 /// If a connected peer sends nothing (not even a keepalive) for this long, treat
@@ -72,6 +73,15 @@ enum Msg {
 	/// preference-ordered. An old host never replies (unknown message) — the client
 	/// times out and falls back to H.264.
 	StreamCaps(wire::StreamCaps),
+	/// Client → host: list the host's visible top-level windows the client can pick as
+	/// a per-window capture target (Phase 2b co-op). Cheap, on-demand (the "window"
+	/// capture-mode picker queries it). An old host never replies (unknown message) →
+	/// the client times out and shows no window picker.
+	QueryWindows,
+	/// Host → client reply to `QueryWindows`: the host's visible, titled top-level
+	/// windows (`hwnd` + `title`). Empty on a non-Windows host (no WGC per-window
+	/// source) or when enumeration fails.
+	Windows(Vec<wire::WindowInfo>),
 }
 
 /// A short, human-typable one-time password like `7yf2-qk9p` (no ambiguous chars).

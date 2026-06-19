@@ -41,6 +41,20 @@
 		config.device_name = (e.currentTarget as HTMLInputElement).value.trim();
 		saveConfig();
 	}
+
+	// App-UI hardware acceleration (webview GPU compositing) — distinct from video encode/decode.
+	// The toggle shows the effective state (the per-device default when no explicit pref is set);
+	// changing it persists a preference that applies after an app restart.
+	let defaultHwaccel = $state(true);
+	let hwaccelChanged = $state(false);
+	if (isTauri) api.defaultUiHwaccel().then((v) => (defaultHwaccel = v)).catch(() => {});
+	const hwaccelOn = $derived(config?.ui_hardware_accel ?? defaultHwaccel);
+	function toggleHwaccel() {
+		if (!config) return;
+		config.ui_hardware_accel = !hwaccelOn;
+		saveConfig();
+		hwaccelChanged = true;
+	}
 </script>
 
 <div class="srow">
@@ -74,6 +88,13 @@
 	<button class="toggle" aria-label={t('settings.debug')} class:on={ui.debug} aria-pressed={ui.debug} onclick={() => { ui.debug = !ui.debug; saveUi(); }}><span class="knob"></span></button>
 </div>
 <div class="srow">
+	<div class="st">
+		<b>{t('settings.uiHwaccel')}</b>
+		<span>{t('settings.uiHwaccelDesc')}{#if hwaccelChanged} <strong class="restart">· {t('settings.restartRequired')}</strong>{/if}</span>
+	</div>
+	<button class="toggle" aria-label={t('settings.uiHwaccel')} class:on={hwaccelOn} aria-pressed={hwaccelOn} onclick={toggleHwaccel}><span class="knob"></span></button>
+</div>
+<div class="srow">
 	<div class="st"><b>{t('settings.version')}</b><span>{t('settings.versionDesc')}</span></div>
 	<span class="mono ver">Pulsar v{version}</span>
 </div>
@@ -105,5 +126,9 @@
 	.ver {
 		font-size: 13px;
 		color: var(--text-muted);
+	}
+	.restart {
+		color: var(--accent);
+		font-weight: 600;
 	}
 </style>

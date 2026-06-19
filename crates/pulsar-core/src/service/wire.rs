@@ -12,6 +12,12 @@ pub struct GameInfo {
 	pub id: String,
 	pub title: String,
 	pub kind: String,
+	/// Optional cover image as a `data:` URL (or http URL) the client renders on the game
+	/// card: a user-set cover, the bundled Steam logo, or — for the built-in `desktop`
+	/// entry — a freshly-grabbed live thumbnail of the host's screen. `#[serde(default)]`
+	/// (empty) keeps wire compat: an old host omits it, a new client shows an icon instead.
+	#[serde(default)]
+	pub image: String,
 }
 
 /// One control event a client sends to drive the host (mouse / keyboard / pad).
@@ -119,6 +125,30 @@ pub struct DisplayInfo {
 	pub height: u32,
 	#[serde(default)]
 	pub primary: bool,
+	/// Available display MODES (distinct `(width, height)` resolutions, deduped, largest
+	/// first) the host can switch this monitor to — populated on Windows from
+	/// `EnumDisplaySettings`. Feeds the session menu's resolution list AND the
+	/// "screen adaptation" feature (the host picks the best-fit mode for a split pane).
+	/// `#[serde(default)]` (empty) — an old host / non-Windows omits it and the client
+	/// shows only its fixed resolution presets, no adaptation. See [`StreamReq::adapt`].
+	#[serde(default)]
+	pub modes: Vec<(u32, u32)>,
+}
+
+/// One host top-level WINDOW the client can pick as a per-window capture target
+/// (Phase 2b co-op). The host enumerates its visible, titled, non-tool windows and
+/// replies with this list to a `QueryWindows` request; the client shows it in a
+/// "window" capture picker and echoes the chosen [`hwnd`](Self::hwnd) back in
+/// [`StreamReq::window_hwnd`]. Mirrors [`DisplayInfo`] for the window case.
+///
+/// `hwnd` is the raw Win32 `HWND` as an `i64` (stable for the window's lifetime;
+/// the client treats it as an opaque token). `title` is the window caption shown to
+/// the user (`GetWindowTextW`). Windows-only — a non-Windows host replies with an
+/// empty list (it has no per-window WGC source).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowInfo {
+	pub hwnd: i64,
+	pub title: String,
 }
 
 /// A client's request to start receiving a video stream.
@@ -200,8 +230,37 @@ pub struct StreamReq {
 	/// (`0` = the host's primary/default monitor). The client picks it from the
 	/// session menu and changes it live by re-requesting the stream — exactly like
 	/// resolution/fps. `#[serde(default)]` (0) keeps the primary for old clients.
+	///
+	/// Ignored when [`window_hwnd`](Self::window_hwnd) is `Some` (per-window capture
+	/// targets a window, not a monitor).
 	#[serde(default)]
 	pub display_idx: u32,
+	/// Per-WINDOW capture target (Phase 2b co-op): when `Some(hwnd)`, the host
+	/// captures that single top-level window via **Windows Graphics Capture** (WGC)
+	/// instead of duplicating a whole monitor — letting two panes share one monitor
+	/// or target two different app windows (the same-monitor couch-co-op case). The
+	/// value is a raw Win32 `HWND` as an `i64` (the host casts it back to `isize`);
+	/// the client gets it from the host's window list (`QueryWindows`) or — in game
+	/// mode — the host resolves it itself from the launched app's process. `None`
+	/// (default) ⇒ the existing full-monitor DXGI/`display_idx` path, unchanged.
+	///
+	/// `#[serde(default)]` (None) keeps full back-compat: an old client omits it and
+	/// the host streams the selected monitor exactly as before. Windows-only on the
+	/// host (the native WGC source is Windows-only); a `Some` value reaching a
+	/// non-Windows host is ignored and it falls back to its display path.
+	#[serde(default)]
+	pub window_hwnd: Option<i64>,
+	/// **Screen adaptation** (Parsec-style): when `Some((w, h))`, ask the host to switch
+	/// the captured monitor ([`display_idx`](Self::display_idx)) to the available display
+	/// mode that best fits a `w × h` pane (closest aspect ratio, preferring ≥ 1080 lines),
+	/// so a split pane gets a host resolution matching its shape instead of a stretched/
+	/// letterboxed full-screen capture. The host records the monitor's ORIGINAL mode and
+	/// **reverts it on session teardown** (or when a later `StreamReq` sends `None`). `None`
+	/// (default) ⇒ no mode change; an old/non-Windows host ignores it. The `w × h` is the
+	/// client pane's pixel size (the renderer's own window). Ignored when
+	/// [`window_hwnd`](Self::window_hwnd) is `Some` (per-window capture has no monitor mode).
+	#[serde(default)]
+	pub adapt: Option<(u32, u32)>,
 	/// The audio **channel layout** the client requests (Stereo / 5.1 / 7.1). The host
 	/// negotiates it against its own configured/capturable layout (it never emits more
 	/// channels than it actually captures) and echoes the resolved layout back via the
@@ -318,6 +377,7 @@ enum DataMsgWire {
 	FsEntries { path: String, entries: Vec<FsEntry> },
 	FsGet { path: String },
 	PeerName(String),
+	PeerId(String),
 	CursorPos { x: f32, y: f32 },
 	CursorShape {
 		w: u32,
@@ -351,6 +411,7 @@ impl From<DataMsgWire> for DataMsg {
 			DataMsgWire::FsEntries { path, entries } => DataMsg::FsEntries { path, entries },
 			DataMsgWire::FsGet { path } => DataMsg::FsGet { path },
 			DataMsgWire::PeerName(s) => DataMsg::PeerName(s),
+			DataMsgWire::PeerId(s) => DataMsg::PeerId(s),
 			DataMsgWire::CursorPos { x, y } => DataMsg::CursorPos { x, y },
 			DataMsgWire::CursorShape { w, h, hot_x, hot_y, rgba_png } => {
 				DataMsg::CursorShape { w, h, hot_x, hot_y, rgba_png }
@@ -471,6 +532,12 @@ pub enum DataMsg {
 	/// its connections list / session UI and caches it for recents. Appended for
 	/// additive wire compat (old peers ignore it).
 	PeerName(String),
+	/// The sender's own relay-assigned device ID, grouped ("641 724 395"), pushed once
+	/// right after a session is up (client → host). Lets the host's connections list show
+	/// the connecting client's ID even on a DIRECT (relay-less / same-LAN fast-path)
+	/// connect, where the host otherwise only knows the peer's `ip:port`. Appended for
+	/// additive wire compat (old peers ignore the unknown variant; absent = show ip:port).
+	PeerId(String),
 	/// Host → client: the host pointer position, normalized 0..1 within the streamed
 	/// screen (Moonlight-style cursor side-channel). Sent at ~60 Hz when the host's
 	/// captured framebuffer does NOT carry the hardware cursor (the KMS zero-copy path
@@ -565,10 +632,30 @@ mod tests {
 		);
 		assert_eq!(req.display_idx, 0, "missing display_idx defaults to 0 (host primary)");
 		assert_eq!(
+			req.window_hwnd, None,
+			"missing window_hwnd defaults to None (full-monitor DXGI path)"
+		);
+		assert_eq!(
 			req.audio_layout,
 			ChannelLayout::Stereo,
 			"missing audio_layout defaults to Stereo (the universally-decodable layout)"
 		);
+	}
+
+	#[test]
+	fn streamreq_window_hwnd_roundtrips() {
+		// Locks the additive wire contract for the per-window capture target: a request
+		// with a window HWND serializes and deserializes intact, and a request without
+		// it (old client) decodes to None (full-monitor path).
+		let mut req: StreamReq = serde_json::from_str(
+			r#"{"port":5000,"codec":"h265","encoder":"auto","width":0,"height":0}"#,
+		)
+		.expect("base StreamReq must deserialize");
+		assert_eq!(req.window_hwnd, None, "omitted window_hwnd → None");
+		req.window_hwnd = Some(0x000A_BCDE);
+		let json = serde_json::to_string(&req).unwrap();
+		let back: StreamReq = serde_json::from_str(&json).unwrap();
+		assert_eq!(back.window_hwnd, Some(0x000A_BCDE), "window_hwnd must roundtrip");
 	}
 
 	#[test]
@@ -583,6 +670,7 @@ mod tests {
 				width: 2560,
 				height: 1440,
 				primary: true,
+				modes: vec![(2560, 1440), (1920, 1080)],
 			}],
 		};
 		let json = serde_json::to_string(&caps).unwrap();
@@ -593,6 +681,18 @@ mod tests {
 		let caps: StreamCaps = serde_json::from_str(old).unwrap();
 		assert!(caps.features.is_empty());
 		assert!(caps.displays.is_empty());
+	}
+
+	#[test]
+	fn window_info_roundtrip() {
+		// The per-window capture-target list entry survives the JSON roundtrip (Unicode
+		// title + raw HWND token).
+		let w = WindowInfo {
+			hwnd: 0x0001_2345,
+			title: "Not Defteri — günlük.txt".into(),
+		};
+		let json = serde_json::to_string(&w).unwrap();
+		assert_eq!(serde_json::from_str::<WindowInfo>(&json).unwrap(), w);
 	}
 
 	#[test]
@@ -821,6 +921,7 @@ mod tests {
 			},
 			DataMsg::FsGet { path: "Belgeler/a.txt".into() },
 			DataMsg::PeerName("Ahmet".into()),
+			DataMsg::PeerId("641 724 395".into()),
 			DataMsg::CursorPos { x: 0.5, y: 0.25 },
 			DataMsg::CursorShape {
 				w: 32,

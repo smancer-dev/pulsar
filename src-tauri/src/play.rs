@@ -145,6 +145,18 @@ pub(crate) async fn start_remote_play(
 	game_mode: bool,
 	quality: Option<String>,
 	touchpad_as_mouse: bool,
+	// Initial host monitor to capture (0 = primary; back-compat default when None). The
+	// client picks a FREE display when a second pane connects to a host that already has a
+	// live session, so two same-host panes capture DIFFERENT monitors and dodge the DXGI
+	// Desktop-Duplication single-owner collision. The session menu still switches it live.
+	display_idx: Option<u32>,
+	// Initial per-WINDOW capture target (Phase 2b co-op). `Some(hwnd)` makes the host
+	// capture that single window via WGC (a raw Win32 HWND as i64, from the host's
+	// `host_window_list` reply) instead of the whole monitor — so two panes can share one
+	// monitor / target two app windows. `None` (default) = the `display_idx` monitor path.
+	// Wins over `display_idx` on the host when set. The session menu changes it live via
+	// `Restream::Window`. The launched-game (game-mode) case is resolved host-side, not here.
+	window_hwnd: Option<i64>,
 ) -> Result<PlayInfo, String> {
 	let node = state
 		.node
@@ -850,8 +862,8 @@ pub(crate) async fn start_remote_play(
 					live_id,
 					game_mode,
 				});
-				// Cap the pool at 1 — reap any excess idle residents now that we pushed.
-				reap_excess_resident_pool(&app, &*state, 1);
+				// Reap idle residents beyond the live pane count (split_pane_count, min 1) now that we pushed.
+				reap_excess_resident_pool(&app, &*state, state.split_pane_count.load(Ordering::SeqCst).max(1));
 				tracing::info!(
 					session_id = id,
 					was_resident = render_child_is_resident,
@@ -982,9 +994,20 @@ pub(crate) async fn start_remote_play(
 		// the Pi; default OFF keeps the embedded-cursor behavior. The webview client
 		// never sets it (no native overlay to draw the pointer into).
 		cursor_external: cursor_external_enabled(),
-		// First stream always targets the host's primary monitor; the session menu's
+		// The initial monitor to capture: the client passes the FREE host display when a
+		// second same-host pane connects (so two panes capture DIFFERENT monitors and dodge
+		// the DXGI same-monitor collision); a lone pane gets 0 (primary). The session menu's
 		// monitor picker changes it live via Restream::Display (see hold.rs).
-		display_idx: 0,
+		display_idx: display_idx.unwrap_or(0),
+		// Per-window capture target (Phase 2b co-op). When the client picked a host window
+		// (or, in a future flow, a launched game it resolved client-side), the host captures
+		// that single window via WGC instead of the monitor — letting two panes share one
+		// monitor. `None` (the common case) = the `display_idx` monitor path, unchanged. The
+		// game-mode launched-app window is resolved on the HOST (it owns the PID), not here.
+		window_hwnd,
+		// Screen adaptation starts OFF (None) — the overlay's "Ekran uyarlama" toggle turns it on
+		// live (Restream::Adapt), and hold.rs preserves it across re-requests.
+		adapt: None,
 		// Requested audio channel layout. Default Stereo — the universally-decodable
 		// layout the native/webview audio paths expect (the client's SDP is opus/48000/2
 		// per RFC 7587 and ffmpeg auto-detects multichannel from the bitstream). The host
@@ -1015,8 +1038,8 @@ pub(crate) async fn start_remote_play(
 				live_id,
 				game_mode,
 			});
-			// Cap the pool at 1 — reap any excess idle residents now that we pushed.
-			reap_excess_resident_pool(&app, &*state, 1);
+			// Reap idle residents beyond the live pane count (split_pane_count, min 1) now that we pushed.
+			reap_excess_resident_pool(&app, &*state, state.split_pane_count.load(Ordering::SeqCst).max(1));
 			tracing::info!(
 				session_id = id,
 				was_resident = render_child_is_resident,
@@ -1103,6 +1126,16 @@ pub(crate) async fn start_remote_play(
 		// overlay-open set + this play id so the reader can detect it (G6).
 		let ov_open = state.overlay_open.clone();
 		let play_id = id;
+		// SPLIT MODE: the live FOCUSED-pane id, so an UNLOCKED pad forwards only from the
+		// focused session and a pad LOCKED to a session (CONTROLLER_SESSION_LOCK) forwards only
+		// from its owner. With split mode off there is one session and `focused_session` equals
+		// `play_id` (or 0 before the first set_active_session), so the gate is transparent there
+		// — see the gate at the per-pad forward below.
+		let focused_session = state.focused_session.clone();
+		// Whether split mode is active (>1 pane). When it isn't, the focused-session forward gate
+		// is bypassed so single-session behavior is byte-for-byte unchanged (the frontend never
+		// calls set_active_session in the non-split flow, so focused_session would be 0).
+		let split_pane_count = state.split_pane_count.clone();
 		// App handle so the reader can OPEN/close the overlay from a controller button
 		// (the GUIDE/PS button — pad equivalent of the keyboard Ctrl+Shift+M).
 		let ov_app = app.clone();
@@ -1162,6 +1195,18 @@ pub(crate) async fn start_remote_play(
 				// None if SDL is unavailable; then host rumble is dropped (never fatal). It
 				// The manager is process-global (one SDL owner of the pads).
 				// rumble + input both flow through `mgr` (the shared SDL controller manager).
+			// Per-pad forward record built in pass 1 of the controller-forward loop and consumed
+			// in pass 2 (slot renumber). `orig_slot` is the GLOBAL rank; pass 2 maps it to the
+			// per-session host-emulated slot (split-mode determinism). `route_here` = this session
+			// forwards this pad (owns/focuses it). See the loop below.
+			struct FwdRec {
+				uuid: String,
+				orig_slot: u8,
+				kind: pulsar_core::input::GamepadKind,
+				target: EmulationTarget,
+				eff_state: pulsar_core::input::GamepadState,
+				route_here: bool,
+			}
 			while reader_flag.load(Ordering::SeqCst) {
 				let pads = mgr.snapshot();
 					// Is this pass a ~1 Hz keepalive cycle? (Resets the timer once per cycle.)
@@ -1255,8 +1300,9 @@ pub(crate) async fn start_remote_play(
 				let mut cur_uuids: std::collections::HashSet<String> =
 					std::collections::HashSet::new();
 				// Build the ctrls payload while computing slots (avoids a second pass).
-				// Each entry: (slot, kind, uuid, target_str) where target_str is 'auto'/'xbox360'/'ds4'.
-				let mut ctrls_entries: Vec<(u8, pulsar_core::input::GamepadKind, String, String)> =
+				// Each entry: (slot, kind, uuid, target_str, locked) -- target_str is 'auto'/'xbox360'/'ds4';
+				// `locked` is 1 when the pad is locked to THIS session (split-mode overlay toggle).
+				let mut ctrls_entries: Vec<(u8, pulsar_core::input::GamepadKind, String, String, u8)> =
 					Vec::new();
 				// Collect the set of uuids present this tick (used for free-slot search below).
 				let live_uuids: std::collections::HashSet<&String> = pads.iter().map(|p| &p.uuid).collect();
@@ -1268,6 +1314,11 @@ pub(crate) async fn start_remote_play(
 				// Used for rumble routing (replaces the pre-loop duplicate that caused
 				// first-tick slot collisions when sticky_slots was not yet populated).
 				let mut slot_to_uuid: std::collections::HashMap<u8, String> = std::collections::HashMap::new();
+				// Per-tick forward records: pass 1 (the loop) computes each pad's GLOBAL-rank slot +
+				// routing decision and pushes a record; pass 2 (after the loop) renumbers the forwarded
+				// slots per-session (split mode) and emits the actual GamepadSlot frames. Outside split
+				// mode this is the identity remap, so single-session behavior is unchanged.
+				let mut fwd_records: Vec<FwdRec> = Vec::with_capacity(pads.len());
 				for p in &pads {
 						let uuid = &p.uuid;
 						let kind = &p.kind;
@@ -1331,20 +1382,123 @@ pub(crate) async fn start_remote_play(
 						EmulationTarget::Auto => "auto",
 					};
 					cur_uuids.insert(uuid.clone());
-					prev_slot.insert(uuid.clone(), slot);
-					// Record in the authoritative reverse map for rumble routing.
-					slot_to_uuid.insert(slot, uuid.clone());
+						// SPLIT MODE forward gate. Decide whether THIS session forwards this pad:
+						//   * split off (<=1 pane): always (single-session behavior, unchanged).
+						//   * pad LOCKED to a session: only its owner forwards it.
+						//   * pad UNLOCKED: only the FOCUSED session forwards it.
+						// `lock_owner` is reused for the ctrls line's lock field below.
+						let lock_owner = crate::controllers::controller_lock_owner(uuid);
+						let route_here = if split_pane_count.load(Ordering::SeqCst) <= 1 {
+							true
+						} else if let Some(owner) = lock_owner {
+							owner == play_id
+						} else {
+							focused_session.load(Ordering::SeqCst) == play_id
+						};
+						// 1 if this pad is locked specifically to THIS session (overlay toggle
+						// checked-state -- appended to the ctrls line below).
+						let locked_here = lock_owner == Some(play_id);
+						// DISABLED pad (user toggled it off): forward a NEUTRAL state instead of the
+						// real input so held buttons/sticks reach the host as released; the
+						// send-on-change gate then suppresses further sends until re-enabled.
+						let eff_state = if crate::controllers::is_controller_disabled(uuid) {
+							pulsar_core::input::GamepadState::default()
+						} else {
+							*state
+						};
+						// Defer the host-facing forward to a SECOND pass so SPLIT mode can renumber the
+						// forwarded slots to a per-session 0-based sequence (see `fwd_records` below).
+						// `slot` here is the GLOBAL rank (overlay display); the host emulates the REMAPPED
+						// slot so each pane's first forwarded pad is that game's "player 1". We record the
+						// routing decision now and emit GamepadSlot/Disconnect + populate slot_to_uuid after
+						// the loop, once the per-session renumber is known.
+						fwd_records.push(FwdRec {
+							uuid: uuid.clone(),
+							orig_slot: slot,
+							kind: *kind,
+							target,
+							eff_state,
+							route_here,
+						});
+						ctrls_entries.push((slot, *kind, uuid.clone(), target_str.to_string(), if locked_here { 1u8 } else { 0u8 }));
+				}
+				// SPLIT-MODE SLOT RENUMBER (Phase 3A -- per-app controller determinism).
+				// In split mode each pane forwards only the pads it owns/focuses (`route_here`); two
+				// co-op games each expect THEIR pane's pad to be the first XInput pad ("player 1" =
+				// slot 0). So renumber the pads THIS session forwards to a per-session 0-based
+				// sequence, ordered by global rank so it is stable tick-to-tick (a held pad keeps its
+				// forwarded slot). With split OFF there is exactly one session, every live pad is
+				// route_here, and the renumber is the IDENTITY map (global rank == forwarded slot) --
+				// single-session behavior is byte-for-byte unchanged. Controllers are already device-
+				// isolated host-side (each session opens its own ViGEm/uinput pad); this only fixes
+				// the slot NUMBER each session's host emulates so games assign players correctly.
+				// NOTE: robust pinning for ARBITRARY titles (those that bind a SPECIFIC XInput user
+				// index, not "first available") needs HidHide to hide the other pane's pad from that
+				// process -- out of scope here (future). This MVP works for co-op titles that take the
+				// first free pad or let the player pick a controller.
+				let split_renumber = split_pane_count.load(Ordering::SeqCst) > 1;
+				// uuid -> forwarded (host-emulated) slot. Built only over route_here pads.
+				let mut fwd_slot_of: std::collections::HashMap<String, u8> =
+					std::collections::HashMap::new();
+				if split_renumber {
+					// Stable 0-based renumber: order this session's forwarded pads by global rank,
+					// then assign 0,1,2,... Capped at MAX_PADS-1 so we never emit an OOB slot.
+					let mut owned: Vec<(&String, u8)> = fwd_records
+						.iter()
+						.filter(|r| r.route_here)
+						.map(|r| (&r.uuid, r.orig_slot))
+						.collect();
+					owned.sort_by_key(|(_, s)| *s);
+					for (i, (uuid, _)) in owned.iter().enumerate() {
+						fwd_slot_of.insert((*uuid).clone(), (i as u8).min(MAX_PADS - 1));
+					}
+				} else {
+					// Identity: forwarded slot == global rank (single-session, unchanged).
+					for r in &fwd_records {
+						fwd_slot_of.insert(r.uuid.clone(), r.orig_slot);
+					}
+				}
+				// Second pass: forward each pad at its (possibly remapped) host-facing slot.
+				for r in &fwd_records {
+					let uuid = &r.uuid;
+					// Host-facing slot: remapped in split mode, global rank otherwise. A non-route_here
+					// pad has no fwd_slot_of entry under split; fall back to its global rank for the
+					// prev_slot/last_sent bookkeeping below (it is never forwarded with real input).
+					let fwd_slot = fwd_slot_of.get(uuid).copied().unwrap_or(r.orig_slot);
+					prev_slot.insert(uuid.clone(), fwd_slot);
+					// Authoritative reverse map for rumble routing: keyed by the HOST-EMULATED
+					// (forwarded) slot, since host rumble comes back tagged with that slot.
+					if r.route_here {
+						slot_to_uuid.insert(fwd_slot, uuid.clone());
+					}
 					// Send-on-change (+ ~1 Hz keepalive): 250 Hz poll, instant on movement, no flood idle.
-						if !overlay_open && (last_sent.get(uuid) != Some(state) || keepalive) {
+					// Gated by `route_here` (split mode): a pad not owned by / focused on this session
+					// isn't forwarded here, so its input reaches only the pane it belongs to.
+					if r.route_here && !overlay_open && (last_sent.get(uuid) != Some(&r.eff_state) || keepalive) {
 						let _ = gtx.blocking_send(InputEvent::GamepadSlot {
-						slot,
-						kind: *kind,
-						target,
-						state: *state,
-					});
-					last_sent.insert(uuid.clone(), *state);
+							slot: fwd_slot,
+							kind: r.kind,
+							target: r.target,
+							state: r.eff_state,
+						});
+						last_sent.insert(uuid.clone(), r.eff_state);
+					}
+					// Routing moved AWAY from this session mid-hold (focus/lock changed): re-send a
+					// NEUTRAL frame once so a button held while this pane was focused doesn't stick on
+					// the host this session forwards to. (The owning pane forwards the real state.)
+					if !r.route_here {
+						if let Some(prev) = last_sent.get(uuid).copied() {
+							if prev != pulsar_core::input::GamepadState::default() {
+								let _ = gtx.blocking_send(InputEvent::GamepadSlot {
+									slot: fwd_slot,
+									kind: r.kind,
+									target: r.target,
+									state: pulsar_core::input::GamepadState::default(),
+								});
+								last_sent.insert(uuid.clone(), pulsar_core::input::GamepadState::default());
+							}
 						}
-						ctrls_entries.push((slot, *kind, uuid.clone(), target_str.to_string()));
+					}
 				}
 				// Emit GamepadDisconnect for any uuid that was present last tick but is gone now.
 				for uuid in &prev_uuids {
@@ -1380,20 +1534,32 @@ pub(crate) async fn start_remote_play(
 				} else {
 					std::collections::HashMap::new()
 				};
+				// Whether split mode is active — gates the 8th `:locked` ctrls field (below) so the
+				// 7-field line stays identical when split mode is off (unchanged platform parsing).
+				let split_on = split_pane_count.load(Ordering::SeqCst) > 1;
 				let ctrls_payload: String = {
 					let mut entries = ctrls_entries.clone();
-					entries.sort_by_key(|(s, _, _, _)| *s);
+					entries.sort_by_key(|(s, _, _, _, _)| *s);
 					entries
 						.iter()
-						.map(|(slot, kind, uuid, target_str)| {
+						.map(|(slot, kind, uuid, target_str, locked)| {
 							let kind_tag = kind.label().replace(' ', "_");
 							let name = name_map
 								.get(uuid)
 								.map(|n| n.replace(' ', "_"))
 								.unwrap_or_else(|| uuid.clone());
-							// 5-field form: slot:kind_tag:name:uuid:target
-							// Stale renderers (3-field parsers) tolerate the extra tokens via splitn(3).
-							format!("{slot}:{kind_tag}:{name}:{uuid}:{target_str}")
+							// 7-field form (split OFF): slot:kind_tag:name:uuid:target:rumble:disabled — byte-for-byte
+							// the established protocol, so the platform `splitn(7)` parsers are unaffected when split
+							// mode is off. With split mode ON we append an 8th field `:locked` (1 = locked to THIS
+							// session) for the overlay's "Bu oturuma kilitle" toggle; the platform parsers must then
+							// bump to splitn(8) (see the reviewer note). Same ':' delimiter as the existing fields.
+							let rumble = crate::controllers::rumble_token_for(uuid);
+							let dis = if crate::controllers::is_controller_disabled(uuid) { 1 } else { 0 };
+							if split_on {
+								format!("{slot}:{kind_tag}:{name}:{uuid}:{target_str}:{rumble}:{dis}:{locked}")
+							} else {
+								format!("{slot}:{kind_tag}:{name}:{uuid}:{target_str}:{rumble}:{dis}")
+							}
 						})
 						.collect::<Vec<_>>()
 						.join(",")
@@ -1489,6 +1655,17 @@ pub(crate) async fn start_remote_play(
 	// out right after the session is up. On a blocking thread — resolving the
 	// avatar may decode a full-size wallpaper, too slow for this async fn. Honors
 	// the avatar_mode setting (anonymous = nothing sent); best-effort, no error path.
+	// Our own relay device ID (if registered) — pushed to the host so its
+	// connections list can show OUR id even on a direct / same-LAN fast-path
+	// connect, where the host only observed our ip:port. Cloned out of the node
+	// mutex so the std guard is never held across the await.
+	let self_dev_id = {
+		let node = state.node.lock().unwrap().clone();
+		match node {
+			Some(n) => n.self_id().await,
+			None => None,
+		}
+	};
 	{
 		let tx = data_tx.clone();
 		let app_av = app.clone();
@@ -1504,6 +1681,10 @@ pub(crate) async fn start_remote_play(
 		};
 		// Name first (tiny, instant); the avatar may take a blocking decode.
 		let _ = tx.try_send(DataMsg::PeerName(name));
+		// Then our device ID, so a direct-connect host shows "641 724 395", not ip:port.
+		if let Some(id) = self_dev_id {
+			let _ = tx.try_send(DataMsg::PeerId(id.grouped()));
+		}
 		tokio::task::spawn_blocking(move || {
 			if let Some(png) = crate::avatar::avatar_png(&app_av, &mode) {
 				let _ = tx.try_send(DataMsg::Avatar(png));
@@ -1512,6 +1693,12 @@ pub(crate) async fn start_remote_play(
 	}
 	// Live stream changes from the session menu (resolution / encoder) → re-request.
 	let (restream_tx, restream_rx) = tokio::sync::mpsc::channel::<Restream>(8);
+	// On-demand host-window-list queries (Phase 2b co-op "window" capture picker): the
+	// `host_window_list` command sends a oneshot reply-sender here; the hold loop (which owns
+	// the control session) services it with a `query_windows` round-trip.
+	let (windows_query_tx, windows_query_rx) = tokio::sync::mpsc::channel::<
+		tokio::sync::oneshot::Sender<Vec<pulsar_core::service::WindowInfo>>,
+	>(4);
 	let mic = Arc::new(Mutex::new(None));
 
 	// Hold the control session open full-duplex: forward input + side-channel data,
@@ -1545,6 +1732,9 @@ pub(crate) async fn start_remote_play(
 		req.cursor_external,
 		req_hdr,
 		req_quality,
+		req.display_idx,
+		req.window_hwnd,
+		windows_query_rx,
 		rumble_tx,
 	));
 
@@ -1574,6 +1764,7 @@ pub(crate) async fn start_remote_play(
 			render_seed,
 			render_live_id,
 			respawn_lock: Arc::new(tokio::sync::Mutex::new(())),
+			windows_query_tx,
 		},
 	);
 	Ok(PlayInfo {
@@ -1692,6 +1883,17 @@ pub(crate) async fn stop_stream(
 	// Drop this session's per-id monitor-picker debounce entry so the map doesn't
 	// accumulate stale entries across reconnects.
 	crate::session_cmds::forget_monitor_debounce(id);
+	// SPLIT MODE: release every controller this session had locked (so a torn-down pane never
+	// leaves a pad orphaned — locked to a dead session, forwarded by no one). And if this was the
+	// focused pane, clear the focus (compare_exchange so we don't stomp a focus that already
+	// moved to a surviving pane). With split mode off these are no-ops on empty/0 state.
+	crate::controllers::clear_session_locks(id);
+	let _ = state.focused_session.compare_exchange(
+		id,
+		0,
+		Ordering::SeqCst,
+		Ordering::SeqCst,
+	);
 	// A session torn down with its overlay still open must release the global
 	// SUSPENDED latch (see AppState::overlay_open) — otherwise the next session
 	// starts permanently un-engageable.
@@ -1798,8 +2000,8 @@ pub(crate) async fn stop_stream(
 					live_id,
 					game_mode: play.game_mode,
 				});
-				// Reap excess idle residents beyond the cap of 1.
-				reap_excess_resident_pool(&app, &*state, 1);
+				// Reap idle residents beyond the live pane count (split_pane_count, min 1).
+				reap_excess_resident_pool(&app, &*state, state.split_pane_count.load(Ordering::SeqCst).max(1));
 				resident_container_kept = true; // container must NOT be destroyed — kept for next session
 			}
 			// If the child was dead, resident_container_kept stays false → the container is

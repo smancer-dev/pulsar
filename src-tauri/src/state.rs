@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
 use pulsar_core::config::Config;
@@ -58,14 +58,15 @@ pub(crate) struct AppState {
 	pub(crate) pw_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>>,
 	/// Monotonic id for client password prompts.
 	pub(crate) next_auth: Arc<AtomicU64>,
-	/// Incoming (host-side) sessions, keyed by the connected peer's id → its session
-	/// id + a signal to kick them. The session id lets a stale session's teardown
-	/// avoid evicting a same-peer reconnection that already replaced this entry.
-	pub(crate) incoming: Arc<Mutex<HashMap<String, (u64, oneshot::Sender<()>)>>>,
-	/// Host → client side-channel senders, keyed by the connected peer's id (paired
-	/// with the session id, as above). Lets the host push chat replies / clipboard to
-	/// a connected client from the UI.
-	pub(crate) host_out: Arc<Mutex<HashMap<String, (u64, tokio::sync::mpsc::Sender<DataMsg>)>>>,
+	/// Incoming (host-side) sessions, keyed by SESSION id → the connected peer's id +
+	/// a signal to kick them. Keying by sid (not peer) lets a single client DEVICE hold
+	/// several concurrent sessions to this host (couch co-op / split panes) without the
+	/// 2nd evicting the 1st; the stored peer groups a device's sessions for the UI.
+	pub(crate) incoming: Arc<Mutex<HashMap<u64, (String, oneshot::Sender<()>)>>>,
+	/// Host → client side-channel senders, keyed by SESSION id → (peer id, sender). Lets
+	/// the host push chat replies / clipboard / files to a specific connected SESSION from
+	/// the UI (the UI passes the row's sid, so two panes from one device route correctly).
+	pub(crate) host_out: Arc<Mutex<HashMap<u64, (String, tokio::sync::mpsc::Sender<DataMsg>)>>>,
 	/// Restore token for the Wayland ScreenCast portal, so the "share your screen"
 	/// dialog only appears the first time.
 	#[cfg(target_os = "linux")]
@@ -81,17 +82,28 @@ pub(crate) struct AppState {
 	/// its relay heartbeat keeps pinging. `go_online` aborts these before dropping
 	/// `state.node` so the old node reaches strong-count 0 and its loops exit.
 	pub(crate) session_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-	/// Active inbound connections, keyed by the connected peer's id. Drives the
-	/// dedicated "connections" management window (`connections.rs`): the window lists
-	/// these, and the per-connection `mode` decides whether a new connection brings the
-	/// window forward (Remote) or opens it hidden (Game — don't disrupt the streamed
-	/// fullscreen game / leak into its stream). `sid` is the session id, used so a stale
-	/// session's teardown doesn't evict a same-peer reconnection's newer entry.
-	pub(crate) active: Arc<Mutex<HashMap<String, ConnInfo>>>,
+	/// Active inbound connections, keyed by SESSION id. Drives the dedicated
+	/// "connections" management window (`connections.rs`): the window lists these (one
+	/// ROW per session, grouped by `ConnInfo.peer` for display), and the per-connection
+	/// `mode` decides whether a new connection brings the window forward (Remote) or
+	/// opens it hidden (Game — don't disrupt the streamed fullscreen game / leak into its
+	/// stream). Keyed by sid so one client device can hold several concurrent sessions
+	/// without the 2nd evicting the 1st (couch co-op / split panes).
+	pub(crate) active: Arc<Mutex<HashMap<u64, ConnInfo>>>,
 	/// Peer identity decorations pushed over sessions (`DataMsg::PeerName`/`Avatar`),
 	/// keyed by peer id: (display name, avatar data-URL). The connections window's
 	/// snapshot reads this so rows opened AFTER the push still show who connected.
+	/// Identity is per-DEVICE (shared across that device's concurrent sessions), so this
+	/// stays keyed by peer — but removal is refcounted: a peer's entry is dropped only
+	/// when its LAST live `active` session tears down (else co-op session B's teardown
+	/// would blank session A's still-live avatar).
 	pub(crate) peer_meta: Arc<Mutex<HashMap<String, (Option<String>, Option<String>)>>>,
+	/// The connecting client's OWN relay device ID, pushed over the session
+	/// (`DataMsg::PeerId`) and keyed by this connection's `peer` map-key. On a direct /
+	/// same-LAN fast-path connect the `peer` key is the client's `ip:port` (the host has
+	/// no relay id for it); this map lets the connections UI show the client's real ID
+	/// instead. Absent → the UI falls back to the `peer` key (ip:port).
+	pub(crate) peer_ids: Arc<Mutex<HashMap<String, String>>>,
 	/// Host-side chat log (peer id, text, me?) for the connections window's message
 	/// modal: events broadcast only to LIVE windows, so a message arriving while the
 	/// window is closed would otherwise vanish — the modal seeds from this backlog.
@@ -149,6 +161,34 @@ pub(crate) struct AppState {
 	/// Empty on every platform except Linux (`#[cfg(…)]` unavailable on struct fields, so we
 	/// use a Vec that is always empty on non-Linux builds).
 	pub(crate) resident_render: Mutex<Vec<crate::play::ResidentRender>>,
+	/// SPLIT MODE: the play/session id of the currently FOCUSED pane (0 = none). Set by the
+	/// `set_active_session` Tauri command on every pane-focus change. Drives default input
+	/// routing — keyboard/mouse + UNLOCKED controllers forward only from the focused session
+	/// (a controller explicitly locked in the overlay forwards from its owner regardless). With
+	/// split mode OFF there is one session and it is always the focused one, so this is a no-op.
+	/// An `Arc<AtomicU64>` so the per-session controller-forward reader thread (play.rs) can hold
+	/// a clone and read the live focus each tick without locking the whole `AppState`.
+	pub(crate) focused_session: Arc<AtomicU64>,
+	/// SPLIT MODE: the number of panes currently shown (1..=4). Set by the `set_pane_count`
+	/// Tauri command. Used as the cap for `reap_excess_resident_pool` so up to 4 live renderers
+	/// (one per pane) are NOT reaped as "excess". Defaults to 1 (set at construction — the
+	/// `#[derive(Default)]` zero would wrongly reap all but zero renderers); read with `.max(1)`
+	/// at the call sites as a belt-and-suspenders guard. `Arc<AtomicUsize>` so the per-session
+	/// controller-forward reader thread can clone it and tell whether split mode is active (when
+	/// it's 1, the focused-session forward gate is bypassed and behavior is exactly as before).
+	pub(crate) split_pane_count: Arc<AtomicUsize>,
+}
+
+impl AppState {
+	/// Default `AppState`, but with `split_pane_count` seeded to 1 (the no-split baseline — a
+	/// raw `Default` zero would make `reap_excess_resident_pool` cap at 0 and SIGTERM every
+	/// parked renderer). Used by the Tauri builder's `.manage(...)`.
+	pub(crate) fn new() -> Self {
+		let s = Self::default();
+		s.split_pane_count
+			.store(1, std::sync::atomic::Ordering::Relaxed);
+		s
+	}
 }
 
 /// Whether an inbound connection is a remote-desktop or a game-streaming session.
@@ -160,10 +200,15 @@ pub(crate) enum ConnMode {
 	Game,
 }
 
-/// Per-connection bookkeeping for the connections window.
+/// Per-connection bookkeeping for the connections window. `active` is keyed by the
+/// session id now, so a per-session id field would just duplicate the map key — the
+/// peer is stored instead, for grouping a device's concurrent sessions.
 pub(crate) struct ConnInfo {
-	/// This session's id (matches the `incoming`/`host_out` sid) for teardown guarding.
-	pub(crate) sid: u64,
+	/// The connected peer's grouping key (relay id or direct ip:port). `active` is keyed
+	/// by sid, so this is how the UI groups a single device's multiple concurrent sessions
+	/// together — and how refcounted `peer_meta`/`peer_ids` removal finds the other live
+	/// sessions sharing this peer.
+	pub(crate) peer: String,
 	/// Connection start, epoch milliseconds (host clock == the window's `Date.now()`).
 	pub(crate) since_ms: u64,
 	pub(crate) mode: ConnMode,
@@ -191,6 +236,15 @@ pub(crate) enum Restream {
 	Audio(bool, bool),
 	/// New host monitor to capture (index into `StreamCaps::displays`, 0 = primary).
 	Display(u32),
+	/// New per-WINDOW capture target (Phase 2b co-op): `Some(hwnd)` makes the host
+	/// capture that single window via WGC (overriding the monitor); `None` reverts to
+	/// the whole-monitor path. The HWND is a raw Win32 handle as an `i64`, from the
+	/// host's `host_window_list` reply.
+	Window(Option<i64>),
+	/// Screen-ADAPTATION (Parsec-style) target: `Some((w,h))` asks the host to switch the
+	/// captured monitor to the display mode best fitting a `w×h` pane and revert on teardown;
+	/// `None` turns it off (revert now). Flipped by the overlay's "Ekran uyarlama" toggle.
+	Adapt(Option<(u32, u32)>),
 }
 
 /// Stdin-only renderer state re-pushed after a codec-switch renderer respawn: a
@@ -316,6 +370,15 @@ pub(crate) struct PlaySession {
 	/// lock BEFORE taking `render_child` ensures the second respawn waits for the first
 	/// to restore `render_child`, then applies the correct params in sequence.
 	pub(crate) respawn_lock: Arc<tokio::sync::Mutex<()>>,
+	/// On-demand host-window-list query (Phase 2b co-op "window" capture picker). The
+	/// `host_window_list` Tauri command sends a oneshot reply-sender here; the hold loop
+	/// (which owns the control `Session`) services it with a `query_windows` round-trip and
+	/// answers on the oneshot. Cheap + on demand — only queried when the user opens the
+	/// window picker. The whole session's control traffic is single-threaded through the
+	/// hold loop, so routing the query through it (rather than sharing the `Session`) keeps
+	/// the held session single-owner.
+	pub(crate) windows_query_tx:
+		tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Vec<pulsar_core::service::WindowInfo>>>,
 }
 
 /// Host-side stream settings pushed from the UI.

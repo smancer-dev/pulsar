@@ -77,12 +77,12 @@ impl Drop for HiResTimer {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-pub(super) struct Qpc {
+pub(crate) struct Qpc {
 	freq: i64,
 }
 
 impl Qpc {
-	pub(super) unsafe fn new() -> Self {
+	pub(crate) unsafe fn new() -> Self {
 		let mut freq = 0i64;
 		// QueryPerformanceFrequency never fails on XP+; default to 1 to avoid div-by-0.
 		let _ = QueryPerformanceFrequency(&mut freq);
@@ -92,7 +92,7 @@ impl Qpc {
 		Qpc { freq }
 	}
 
-	pub(super) unsafe fn now_ns(&self) -> i64 {
+	pub(crate) unsafe fn now_ns(&self) -> i64 {
 		let mut c = 0i64;
 		let _ = QueryPerformanceCounter(&mut c);
 		// Multiply before divide; do it in i128 so a multi-hour counter can't overflow.

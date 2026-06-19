@@ -34,9 +34,19 @@ evdev = "0.12"
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 libc = "0.2"
 
-# Host-side mouse + keyboard injection on Windows via the Win32 SendInput API.
+# Host-side mouse + keyboard injection on Windows via the Win32 SendInput API
+# (global desktop), plus PostMessage-based per-WINDOW input (Phase 3B co-op:
+# Win32_Foundation = HWND/WPARAM/LPARAM, Win32_UI_WindowsAndMessaging =
+# PostMessageW + the WM_* window-message constants).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.59", features = [
+	"Win32_UI_Input_KeyboardAndMouse",
+	"Win32_UI_WindowsAndMessaging",
+	"Win32_Foundation",
+	# ClientToScreen (maps the cached client point → screen coords for WM_MOUSEWHEEL,
+	# whose lParam is documented as screen-relative).
+	"Win32_Graphics_Gdi",
+] }
 # Host-side virtual gamepad on Windows: emulates an Xbox 360 pad through the
 # ViGEmBus driver (pure-Rust client; the driver itself is bundled like Interception).
 vigem-client = { version = "0.1", features = ["unstable_ds4"] }
@@ -51,7 +61,23 @@ windows = { version = "0.59", features = [
 	"Win32_System_Variant",
 	"Win32_Media_Audio",
 	"Win32_Media_Audio_Endpoints",
+	# Per-process WASAPI loopback (Phase 4 same-host co-op): ActivateAudioInterfaceAsync
+	# + the async completion event (CreateEventW/SetEvent/WaitForSingleObject) and
+	# RtlGetVersion to gate it to Win10 20H1+ (build 19041) at runtime.
+	"Win32_System_Threading",
+	"Win32_System_SystemInformation",
+	# CreateEventW's signature references SECURITY_ATTRIBUTES, so it is gated behind this.
+	"Win32_Security",
+	# RtlGetVersion (ntdll) — the UN-shimmed OS build query (GetVersionExW lies without a
+	# compatibility manifest). Lives under Wdk in windows-rs; OSVERSIONINFOW comes from
+	# Win32_System_SystemInformation above.
+	"Wdk_System_SystemServices",
 ] }
+# The IActivateAudioInterfaceCompletionHandler COM object is built with
+# `#[windows::core::implement]`, whose generated code references the `windows_core` crate by
+# its absolute path (`::windows_core::…`), so it must be a DIRECT dependency. Pinned to the
+# same 0.59 line as `windows` (which re-exports it as `windows::core`).
+windows-core = "0.59"
 
 # Host-side mouse + keyboard injection on macOS via CoreGraphics CGEvent — the
 # standard user-mode synthetic-input path (same as Parsec/VNC/RustDesk). Requires

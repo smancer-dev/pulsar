@@ -7,11 +7,21 @@
 	let { open = $bindable() }: Props = $props();
 
 	const typeLabel = (ty: GameType) => t('type.' + ty);
-	const TYPES: GameType[] = ['program', 'command', 'image'];
+	const TYPES: GameType[] = ['program', 'command'];
 
 	let showForm = $state(false);
 	let editingId = $state<string | null>(null);
 	let form = $state<Omit<Game, 'id'>>(blank());
+	let coverInput = $state<HTMLInputElement>();
+
+	// Cover image: either a URL typed into the field, or a local file read as a data URL.
+	function onCoverFile(e: Event) {
+		const f = (e.target as HTMLInputElement).files?.[0];
+		if (!f) return;
+		const reader = new FileReader();
+		reader.onload = () => (form.image = String(reader.result));
+		reader.readAsDataURL(f);
+	}
 
 	function blank(): Omit<Game, 'id'> {
 		return { title: '', type: 'program', path: '', args: '', command: '', image: '', cmdStart: '', cmdStop: '' };
@@ -62,7 +72,14 @@
 			{/if}
 
 			<span class="fl">{t('games.fCover')}</span>
-			<div class="field"><input bind:value={form.image} placeholder={t('games.fCoverPlaceholder')} aria-label={t('games.fCover')} /></div>
+			<div class="cover-row">
+				<div class="field cover-url"><input bind:value={form.image} placeholder={t('games.fCoverPlaceholder')} aria-label={t('games.fCover')} /></div>
+				<button type="button" class="btn btn-ghost upload" onclick={() => coverInput?.click()}>{t('games.fCoverUpload')}</button>
+				<input bind:this={coverInput} type="file" accept="image/*" class="hidden-file" onchange={onCoverFile} />
+			</div>
+			{#if form.image}
+				<div class="cover-prev"><img src={form.image} alt="" /><button type="button" class="clear" onclick={() => (form.image = '')} aria-label={t('games.fCoverClear')}>×</button></div>
+			{/if}
 
 			<span class="fl">{t('games.fCmdStart')}</span>
 			<div class="field"><input bind:value={form.cmdStart} placeholder={t('games.fCmdStartPlaceholder')} aria-label={t('games.fCmdStartAria')} style="font-family:var(--font-mono)" /></div>
@@ -95,5 +112,53 @@
 		justify-content: flex-end;
 		gap: 10px;
 		margin-top: 18px;
+	}
+	.cover-row {
+		display: flex;
+		gap: 8px;
+		align-items: stretch;
+	}
+	.cover-url {
+		flex: 1;
+		min-width: 0;
+	}
+	.upload {
+		flex: none;
+		white-space: nowrap;
+	}
+	.hidden-file {
+		display: none;
+	}
+	.cover-prev {
+		position: relative;
+		margin-top: 8px;
+		width: 160px;
+		height: 90px;
+		border: 1px solid var(--border);
+		border-radius: var(--r-sm);
+		overflow: hidden;
+		background: var(--surface-2);
+	}
+	.cover-prev img {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+		display: block;
+	}
+	.cover-prev .clear {
+		position: absolute;
+		top: 4px;
+		right: 4px;
+		width: 20px;
+		height: 20px;
+		border: none;
+		border-radius: 50%;
+		background: oklch(0.2 0.02 265 / 0.6);
+		color: #fff;
+		font-size: 14px;
+		line-height: 1;
+		cursor: pointer;
+		display: grid;
+		place-items: center;
 	}
 </style>

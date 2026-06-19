@@ -734,6 +734,136 @@ async fn do_monitor_switch(
 	}
 }
 
+/// Client: list the host's capture-able windows (Phase 2b co-op "window" capture picker).
+/// On demand — the client calls this when the user opens the window picker for a pane.
+/// Returns `[{hwnd, title}]`; the client shows the titles and echoes the chosen `hwnd` back
+/// via [`set_play_window`] (live switch) or passes it at connect (`start_remote_play`'s
+/// `window_hwnd`). Empty when the host is non-Windows / old / has no visible windows. The
+/// query is routed through the session's hold loop (which owns the control `Session`); a
+/// 4 s bound covers the host's own `query_windows` timeout so a dead session can't hang the UI.
+#[tauri::command]
+pub(crate) async fn host_window_list(
+	state: State<'_, AppState>,
+	id: u64,
+) -> Result<Vec<pulsar_core::service::WindowInfo>, String> {
+	let tx = state
+		.plays
+		.lock()
+		.unwrap()
+		.get(&id)
+		.map(|p| p.windows_query_tx.clone())
+		.ok_or_else(|| crate::i18n::t("err.session").to_string())?;
+	let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+	tx.send(reply_tx)
+		.await
+		.map_err(|_| crate::i18n::t("err.session").to_string())?;
+	// Bound the wait: the hold loop's query_windows has its own ~3 s/message timeout, so 5 s
+	// covers a slow-but-live host; a dead session never sends, so don't park the UI forever.
+	match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+		Ok(Ok(list)) => Ok(list),
+		// Hold loop dropped the reply (session ended) or the timeout fired: empty list, not an
+		// error — the picker just shows no windows.
+		_ => Ok(Vec::new()),
+	}
+}
+
+/// Client: switch an active session to per-WINDOW (WGC) capture of host window `hwnd`
+/// (Phase 2b co-op), or back to the whole monitor when `hwnd` is `None`/`0`. Re-requests the
+/// stream (`Restream::Window`) — the host restarts capture on the chosen window via Windows
+/// Graphics Capture — then resyncs the local renderer (its demuxer/decoder were fixed at
+/// spawn and the window's size/SPS differs from the monitor's), reusing the monitor-switch
+/// respawn path. No-op on a host with no WGC source (non-Windows): the host ignores the
+/// window target and keeps streaming the monitor.
+#[tauri::command]
+pub(crate) async fn set_play_window(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	id: u64,
+	hwnd: Option<i64>,
+) -> Result<(), String> {
+	// Treat 0 as "no window" (clear) — a convenience for callers that pass a sentinel.
+	let hwnd = hwnd.filter(|h| *h != 0);
+	let (tx, codec) = {
+		let plays = state.plays.lock().unwrap();
+		let Some(p) = plays.get(&id) else {
+			return Err(crate::i18n::t("err.session").to_string());
+		};
+		let codec = p
+			.caps_line
+			.lock()
+			.unwrap()
+			.split_whitespace()
+			.find_map(|kv| kv.strip_prefix("codec=").map(str::to_string))
+			.unwrap_or_default();
+		(p.restream_tx.clone(), codec)
+	};
+	if tx.send(Restream::Window(hwnd)).await.is_err() {
+		return Err(crate::i18n::t("err.session").to_string());
+	}
+	// The window's dimensions/SPS differ from the monitor's, so the renderer (demuxer +
+	// decoder fixed at spawn) must resync exactly like a monitor switch — reuse that path
+	// with the UNCHANGED codec.
+	if !codec.is_empty() {
+		#[cfg(any(
+			all(unix, not(target_os = "macos"), not(target_arch = "aarch64")),
+			windows
+		))]
+		respawn_render_for_codec(&app, &state, id, &codec).await;
+		#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+		reopen_render_for_codec(&state, id, &codec);
+	}
+	let _ = &app;
+	Ok(())
+}
+
+/// Client: toggle Parsec-style **screen adaptation** for an active session. When `on`, the host
+/// switches the captured monitor to the display mode best fitting a `w × h` pane (this renderer's
+/// window) and reverts it on teardown; when off it reverts now. Re-requests the stream
+/// (`Restream::Adapt`) — the host's captured resolution changes, so its new frame size/SPS differ
+/// and the local renderer (demuxer/decoder fixed at spawn) must resync, reusing the monitor-switch
+/// respawn path. No-op on a non-Windows host (it ignores the adapt target and keeps streaming).
+#[tauri::command]
+pub(crate) async fn set_play_adapt(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	id: u64,
+	w: u32,
+	h: u32,
+	on: bool,
+) -> Result<(), String> {
+	let target = if on && w > 0 && h > 0 { Some((w, h)) } else { None };
+	let (tx, codec) = {
+		let plays = state.plays.lock().unwrap();
+		let Some(p) = plays.get(&id) else {
+			return Err(crate::i18n::t("err.session").to_string());
+		};
+		let codec = p
+			.caps_line
+			.lock()
+			.unwrap()
+			.split_whitespace()
+			.find_map(|kv| kv.strip_prefix("codec=").map(str::to_string))
+			.unwrap_or_default();
+		(p.restream_tx.clone(), codec)
+	};
+	if tx.send(Restream::Adapt(target)).await.is_err() {
+		return Err(crate::i18n::t("err.session").to_string());
+	}
+	// The host's resolution change emits a stream with new dimensions/SPS — resync the renderer
+	// exactly like a monitor switch (unchanged codec).
+	if !codec.is_empty() {
+		#[cfg(any(
+			all(unix, not(target_os = "macos"), not(target_arch = "aarch64")),
+			windows
+		))]
+		respawn_render_for_codec(&app, &state, id, &codec).await;
+		#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+		reopen_render_for_codec(&state, id, &codec);
+	}
+	let _ = &app;
+	Ok(())
+}
+
 /// Client (Linux native renderer): toggle Moonlight-style frame pacing live. Writes a
 /// `pace 0|1` line to the `pulsar-render` child's stdin (the same channel the HUD `stat`
 /// lines use); the renderer flips its present path between FIFO-drain (smooth) and
@@ -945,6 +1075,32 @@ pub(crate) async fn render_kin(
 			} else {
 				let _ = writeln!(si, "kin k {data}");
 			}
+			let _ = si.flush();
+		}
+	}
+	Ok(())
+}
+
+/// Client: relay one NAV keypress to the overlay (`k <dir>`, the SAME channel the pad uses,
+/// so a physical KEYBOARD drives the overlay menus exactly like a controller). `dir` is one
+/// of up/down/left/right/go/escape. Sent when the overlay is open and the user presses an
+/// arrow / Enter / Escape (the webview captures keydowns while the evdev grab is suspended).
+#[tauri::command]
+pub(crate) async fn render_nav(
+	state: State<'_, AppState>,
+	id: u64,
+	dir: String,
+) -> Result<(), String> {
+	let stdin = state
+		.plays
+		.lock()
+		.unwrap()
+		.get(&id)
+		.map(|p| p.render_stdin.clone());
+	if let Some(stdin) = stdin {
+		use std::io::Write;
+		if let Some(si) = stdin.lock().unwrap().as_mut() {
+			let _ = writeln!(si, "k {dir}");
 			let _ = si.flush();
 		}
 	}

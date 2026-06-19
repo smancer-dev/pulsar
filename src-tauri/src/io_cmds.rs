@@ -39,25 +39,28 @@ pub(crate) async fn send_chat(
 		.map_err(|_| crate::i18n::t("err.message").to_string())
 }
 
-/// Host → client: reply to a connected peer's chat.
+/// Host → client: reply to a connected SESSION's chat. Routed by session id (`sid`),
+/// so two panes from one client device receive the host's replies on the right pane.
 #[tauri::command]
 pub(crate) async fn host_send_chat(
 	state: State<'_, AppState>,
-	peer: String,
+	sid: u64,
 	text: String,
 ) -> Result<(), String> {
-	let tx = state
+	// Look up the session's outbound sender + its peer (for the backlog key) under one lock.
+	let entry = state
 		.host_out
 		.lock()
 		.unwrap()
-		.get(&peer)
-		.map(|(_, tx)| tx.clone());
-	let tx = tx.ok_or_else(|| "cihaz bağlı değil".to_string())?;
+		.get(&sid)
+		.map(|(peer, tx)| (peer.clone(), tx.clone()));
+	let (peer, tx) = entry.ok_or_else(|| "cihaz bağlı değil".to_string())?;
 	tx.send(DataMsg::Chat(text.clone()))
 		.await
 		.map_err(|_| crate::i18n::t("err.message").to_string())?;
 	// Into the backlog too: sent lines have no broadcast event of their own, so a
-	// re-opened connections window rebuilds the full conversation from here.
+	// re-opened connections window rebuilds the full conversation from here. Keyed by
+	// peer (the chat modal groups history per device, matching inbound chat).
 	{
 		let mut log = state.chat_log.lock().unwrap();
 		log.push((peer, text, true));
@@ -305,6 +308,71 @@ pub(crate) async fn input_char(
 		return Ok(());
 	};
 	forward(&state, id, InputEvent::Char(c)).await;
+	Ok(())
+}
+
+/// SPLIT MODE: the frontend calls this whenever the focused pane changes, with that pane's
+/// play/session id (0 = none). It records the focus into [`AppState::focused_session`], which the
+/// controller forward gate (play.rs) reads to route UNLOCKED pads + which kb/mouse routing follows.
+///
+/// On a real focus CHANGE (and only while split mode is active) it also FLUSHES any held keyboard
+/// keys / mouse buttons via `kbdhook::disable()` — that path runs the same internal `flush_held`
+/// (sends an UP for every key/button still held + resets the modifier chord state) as a normal
+/// disengage edge, so a key held down in the old pane can't stay stuck on the old host. The
+/// frontend re-arms capture for the newly-focused pane immediately after (its existing
+/// `kbd_capture_start(newId)` call), exactly like the single-session tab-switch flow
+/// (disable()→enable()). With split mode OFF this is a no-op flush so existing single-session
+/// behavior is unchanged.
+#[tauri::command]
+pub(crate) async fn set_active_session(
+	state: State<'_, AppState>,
+	play_id: u64,
+) -> Result<(), String> {
+	use std::sync::atomic::Ordering;
+	let prev = state.focused_session.swap(play_id, Ordering::SeqCst);
+	let split_on = state.split_pane_count.load(Ordering::SeqCst) > 1;
+	if split_on && prev != play_id {
+		// Release+flush held keys/buttons from the previously-focused pane so nothing sticks on
+		// its host. The frontend re-arms capture for the new pane right after this returns.
+		crate::kbdhook::disable();
+	}
+	Ok(())
+}
+
+/// SPLIT MODE: apply a controller-lock toggle from a session's egui overlay. The overlay emits the
+/// `ctrllock` command with payload `"<uuid>,<0|1>"` (mirroring `ctrldisable` exactly); the renderer
+/// stdout reader tags it with that renderer's own session id (`cur_id`) and the frontend forwards
+/// it here with that `play_id`. This is the backend application of the contract's `ctrllock` wire:
+///   * `locked = true`  → `set_controller_lock(uuid, play_id)`: only this session forwards the pad.
+///   * `locked = false` → `clear_controller_lock(uuid)` IF this session currently owns the lock
+///     (so a stale unlock from another pane can't release a lock it doesn't hold).
+/// The play.rs forward gate reads `CONTROLLER_SESSION_LOCK` live, so the change takes effect on the
+/// next pad tick with no reconnect.
+#[tauri::command]
+pub(crate) async fn set_controller_lock(
+	uuid: String,
+	play_id: u64,
+	locked: bool,
+) -> Result<(), String> {
+	if locked {
+		crate::controllers::set_controller_lock(uuid, play_id);
+	} else if crate::controllers::controller_lock_owner(&uuid) == Some(play_id) {
+		crate::controllers::clear_controller_lock(&uuid);
+	}
+	Ok(())
+}
+
+/// SPLIT MODE: the frontend reports the number of panes currently shown (1..=4) here. Stored into
+/// [`AppState::split_pane_count`], which `reap_excess_resident_pool` uses as its cap so up to 4
+/// live per-pane renderers are not SIGTERM'd as "excess". Clamped to at least 1.
+#[tauri::command]
+pub(crate) async fn set_pane_count(
+	state: State<'_, AppState>,
+	count: usize,
+) -> Result<(), String> {
+	state
+		.split_pane_count
+		.store(count.max(1), std::sync::atomic::Ordering::SeqCst);
 	Ok(())
 }
 

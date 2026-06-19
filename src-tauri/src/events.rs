@@ -36,13 +36,21 @@ pub(crate) struct ControllerInfo {
 	pub(crate) label: String,
 	/// Connected + forwardable right now.
 	pub(crate) connected: bool,
+	/// Battery charge 0..100, or `None` for a wired pad / unknown.
+	pub(crate) battery: Option<u8>,
 }
 
 /// An event about a client session, emitted to the host UI as `session`.
+///
+/// `sid` is the SESSION id (the same key the host's `active`/`incoming` maps use):
+/// the connections window keys its rows by sid so one client DEVICE can hold several
+/// concurrent sessions (couch co-op / split panes) — `peer` groups them for display.
+/// 0 for the pre-accept `rejected` events (no session id assigned yet there).
 #[derive(Clone, Serialize)]
 pub(crate) struct SessionEvent {
 	pub(crate) kind: String,
 	pub(crate) peer: String,
+	pub(crate) sid: u64,
 	pub(crate) detail: String,
 }
 

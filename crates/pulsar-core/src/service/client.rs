@@ -51,6 +51,32 @@ pub async fn query_stream_caps(session: &mut Session) -> Result<StreamCaps, Conn
 	Ok(StreamCaps::default())
 }
 
+/// Client: ask the host for the list of windows it can capture per-window (Phase 2b
+/// co-op "window" capture mode). Empty on timeout / old host (unknown message → no
+/// reply) / non-Windows host — the caller then shows no window picker. Cheap + on
+/// demand (queried when the user opens the window-capture picker), mirroring
+/// [`query_stream_caps`].
+pub async fn query_windows(session: &mut Session) -> Result<Vec<WindowInfo>, ConnError> {
+	session.send(&enc(&Msg::QueryWindows)).await?;
+	for _ in 0..MAX_WAIT_MSGS {
+		match tokio::time::timeout(
+			std::time::Duration::from_secs(3),
+			session.recv(),
+		)
+		.await
+		{
+			Ok(Some(bytes)) => {
+				if let Some(Msg::Windows(list)) = dec(&bytes) {
+					return Ok(list);
+				}
+			}
+			// None = session closed, Err(_) = per-message 3 s deadline exceeded
+			Ok(None) | Err(_) => break,
+		}
+	}
+	Ok(Vec::new())
+}
+
 /// Client: ask the peer to launch a game by id.
 pub async fn request_launch(session: &mut Session, id: &str) -> Result<(), ConnError> {
 	session.send(&enc(&Msg::Launch(id.to_string()))).await

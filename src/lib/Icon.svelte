@@ -32,6 +32,8 @@
 		check: '<path d="M4 12l5 5L20 6"/>',
 		copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/>',
 		arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+		arrowLeft: '<path d="M19 12H5M11 18l-6-6 6-6"/>',
+		split: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/>',
 		wifi: '<path d="M5 12.5a10 10 0 0114 0M8.5 16a5 5 0 017 0M12 19.5h.01"/>',
 		sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/>',
 		speaker: '<path d="M11 5L6 9H3v6h3l5 4z"/><path d="M16 9a4 4 0 010 6M19 6a8 8 0 010 12"/>',

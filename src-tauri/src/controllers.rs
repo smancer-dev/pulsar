@@ -15,7 +15,7 @@
 //! Consumers never touch SDL: they read a shared snapshot ([`SdlPads::snapshot`]), block on
 //! a wake subscription ([`SdlPads::subscribe`]), and post rumble ([`SdlPads::rumble`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_int, c_void, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -40,6 +40,8 @@ use sdl3_sys::stdinc::SDL_free;
 /// The host re-sends on every force-feedback change (and 0/0 to stop), so the motors track
 /// the game; the long fallback only self-stops if a stream of updates is cut off mid-rumble.
 const RUMBLE_MS: u32 = 30_000;
+/// One-shot test-pulse on-time (ms) — long enough to feel, short enough to self-stop.
+const TEST_RUMBLE_MS: u32 = 500;
 
 /// How long the SDL thread blocks waiting for an event before looping to service the rumble
 /// channel. While blocked it uses no CPU; controller events wake it immediately (native
@@ -56,6 +58,8 @@ pub struct PadView {
     pub kind: GamepadKind,
     pub name: String,
     pub state: GamepadState,
+    /// Battery charge 0..100, or `None` for a wired pad / unknown (SDL_GetGamepadPowerInfo).
+    pub battery: Option<u8>,
 }
 
 /// A rumble request routed to the SDL thread: prefer the GUID-matched pad, else slot-Nth.
@@ -64,25 +68,34 @@ struct RumbleCmd {
     slot: u8,
     large: u8,
     small: u8,
+    /// Motor on-time in ms. `None` = the streaming default ([`RUMBLE_MS`], a long ceiling that
+    /// the host's continuous refresh keeps alive / stops with 0,0). A one-shot **test** pulse
+    /// sets a short value so the motors stop on their own (no stop command follows).
+    dur_ms: Option<u32>,
 }
 
 struct Shared {
     /// Latest connected-pad snapshot, sorted by uuid (stable). Replaced when state changes.
     pads: Mutex<Vec<PadView>>,
-    /// The active session's wake channel — pinged on any pad change so a blocked reader
-    /// wakes immediately (no polling). `(generation, sender)`: the generation lets an old
-    /// subscription's drop avoid clearing a newer one's sender.
-    wake: Mutex<Option<(u64, SyncSender<()>)>>,
+    /// ALL live wake subscribers — pinged on any pad change so every blocked reader wakes
+    /// immediately (no polling). Each entry is `(generation, sender)`; the generation lets a
+    /// dropped subscription remove ONLY its own sender (see [`WakeSub::drop`]). A `Vec` (not a
+    /// single slot) so that several concurrent sessions (split-mode panes) can EACH forward
+    /// controllers without the 2nd subscriber's `subscribe()` evicting the 1st — the original
+    /// single-slot design killed the 1st pane's forwarding on the 2nd connect.
+    wake: Mutex<Vec<(u64, SyncSender<()>)>>,
     wake_gen: AtomicU64,
 }
 
 impl Shared {
-    /// Wake the active reader (if any). Best-effort: a full 1-slot channel already has a
-    /// pending wake, so dropping is correct (the reader will read the latest snapshot).
+    /// Wake EVERY live reader. Best-effort per subscriber: a full 1-slot channel already has a
+    /// pending wake, so dropping is correct (the reader will read the latest snapshot). Any
+    /// subscriber whose channel is Disconnected (its `WakeSub` dropped without running its
+    /// generation-guarded drop, e.g. the receiver thread already exited) is pruned in place so
+    /// the list doesn't grow unbounded across reconnects.
     fn ping(&self) {
-        if let Some((_, tx)) = &*self.wake.lock().unwrap() {
-            let _ = tx.try_send(());
-        }
+        let mut subs = self.wake.lock().unwrap();
+        subs.retain(|(_, tx)| !matches!(tx.try_send(()), Err(std::sync::mpsc::TrySendError::Disconnected(_))));
     }
 }
 
@@ -103,10 +116,10 @@ pub struct WakeSub {
 
 impl Drop for WakeSub {
     fn drop(&mut self) {
-        let mut w = self.shared.wake.lock().unwrap();
-        if w.as_ref().map(|(g, _)| *g) == Some(self.gen) {
-            *w = None;
-        }
+        // Remove ONLY this subscription's own entry (matched by generation), leaving every
+        // other live session's wake sender intact.
+        let mut subs = self.shared.wake.lock().unwrap();
+        subs.retain(|(g, _)| *g != self.gen);
     }
 }
 
@@ -116,25 +129,123 @@ impl SdlPads {
         self.shared.pads.lock().unwrap().clone()
     }
 
-    /// Subscribe to pad-change wakeups. Replaces any prior subscription (only one session
-    /// forwards controllers at a time). The returned `WakeSub` is seeded so a `recv` returns
+    /// Subscribe to pad-change wakeups. PUSHES a new subscription (multiple sessions can each
+    /// forward controllers at once — split-mode panes), instead of replacing the prior one.
+    /// Every subscriber is pinged on every pad change ([`Shared::ping`]); each is removed only
+    /// by its own [`WakeSub::drop`]. The returned `WakeSub` is seeded so a `recv` returns
     /// promptly if pads are already connected; block on `WakeSub::rx` to wait for changes.
     pub fn subscribe(&self) -> WakeSub {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         let gen = self.shared.wake_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = tx.try_send(()); // seed: reader does an initial snapshot pass immediately
-        *self.shared.wake.lock().unwrap() = Some((gen, tx));
+        self.shared.wake.lock().unwrap().push((gen, tx));
         WakeSub { rx, shared: self.shared.clone(), gen }
     }
 
     /// Replay a host rumble command on the physical pad. `guid` = the slot's device key from
     /// the live controller order (preferred match); 0/0 stops the motors. Best-effort.
     pub fn rumble(&self, guid: Option<String>, slot: u8, large: u8, small: u8) {
-        let _ = self.rumble_tx.try_send(RumbleCmd { guid, slot, large, small });
+        let _ = self.rumble_tx.try_send(RumbleCmd { guid, slot, large, small, dur_ms: None });
+    }
+
+    /// Fire a one-shot rumble PULSE on a pad (by uuid) so the user can FEEL its vibration
+    /// setting. Both motors run full (apply_rumble still scales by the pad's level, so "off"
+    /// pads stay silent) for a short, self-stopping `TEST_RUMBLE_MS`.
+    pub fn test_rumble(&self, uuid: String) {
+        let _ = self.rumble_tx.try_send(RumbleCmd {
+            guid: Some(uuid),
+            slot: 0,
+            large: 255,
+            small: 255,
+            dur_ms: Some(TEST_RUMBLE_MS),
+        });
     }
 }
 
 static PADS: OnceLock<Option<SdlPads>> = OnceLock::new();
+
+/// PER-CONTROLLER vibration strength, keyed by pad uuid (SDL GUID hex): 0 = off, 1 = weak,
+/// 2 = medium (default), 3 = strong (full). [`apply_rumble`] (SDL thread) scales the host's
+/// 8-bit motor magnitudes by `level/3` per pad, so "off" stops that pad's motors (×0) and
+/// "strong" passes them through. Set by `set_controller_rumble` (driven by the UI's
+/// `ui.controllerRumble` map). An uuid absent from the map uses the medium default.
+static RUMBLE_LEVELS: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
+
+/// Lazily-initialised per-uuid vibration map (HashMap::new isn't const, so it can't be a
+/// plain static Mutex).
+fn rumble_map() -> &'static Mutex<HashMap<String, u8>> {
+    RUMBLE_LEVELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Replace the per-controller vibration map (uuid -> 0..3). Takes effect on the next rumble.
+pub fn set_controller_rumble(map: HashMap<String, u8>) {
+    *rumble_map().lock().unwrap() = map;
+}
+
+/// Per-controller DISABLED set (uuid hex). A disabled pad is not forwarded to the host and
+/// does not rumble — the user toggled it off in the controller settings.
+static DISABLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+fn disabled_set() -> &'static Mutex<HashSet<String>> {
+    DISABLED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+/// Replace the disabled-controller set (uuid hex). Takes effect live.
+pub fn set_disabled_controllers(set: HashSet<String>) {
+    *disabled_set().lock().unwrap() = set;
+}
+/// Whether a pad uuid is currently disabled (toggled off by the user).
+pub fn is_controller_disabled(uuid: &str) -> bool {
+    disabled_set().lock().unwrap().contains(uuid)
+}
+
+/// Per-session controller LOCK map: pad uuid (hex) -> the play/session id that has exclusively
+/// claimed this pad in the egui overlay ("Bu oturuma kilitle"). While a uuid is present here, ONLY
+/// the owning session forwards that pad to its host; an unlocked pad follows the focused session
+/// (see play.rs's forward gate + `AppState::focused_session`). Mirrors the RUMBLE_LEVELS / DISABLED
+/// lazily-initialised-Mutex pattern above. Empty on a single-session app (split mode off).
+static CONTROLLER_SESSION_LOCK: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+fn lock_map() -> &'static Mutex<HashMap<String, u64>> {
+    CONTROLLER_SESSION_LOCK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lock a controller (by uuid) to a session: only `play_id` forwards it from now on. Overwrites
+/// any prior owner (a later "lock to THIS session" from another pane wins, matching the overlay's
+/// optimistic toggle).
+pub fn set_controller_lock(uuid: String, play_id: u64) {
+    lock_map().lock().unwrap().insert(uuid, play_id);
+}
+
+/// Clear a controller's lock unconditionally (any owner). Used by the overlay's "unlock" toggle
+/// after confirming this session owns it (see `controller_lock_owner`).
+pub fn clear_controller_lock(uuid: &str) {
+    lock_map().lock().unwrap().remove(uuid);
+}
+
+/// Drop EVERY lock owned by `play_id` — called on that session's teardown so a torn-down pane
+/// never leaves a pad orphaned (locked to a dead session, forwarded by no one).
+pub fn clear_session_locks(play_id: u64) {
+    lock_map().lock().unwrap().retain(|_, owner| *owner != play_id);
+}
+
+/// The session/play id that currently owns (has locked) this pad, or `None` if it's unlocked.
+pub fn controller_lock_owner(uuid: &str) -> Option<u64> {
+    lock_map().lock().unwrap().get(uuid).copied()
+}
+
+/// The vibration level (0..3) for a pad uuid, defaulting to medium (2) when unset.
+fn rumble_level_for(uuid: &str) -> u32 {
+    rumble_map().lock().unwrap().get(uuid).copied().unwrap_or(2) as u32
+}
+
+/// A pad's vibration level as a token ("off"/"weak"/"medium"/"strong") — the form the
+/// overlay's `ctrls` line carries per pad and its seg-button highlight uses.
+pub fn rumble_token_for(uuid: &str) -> &'static str {
+    match rumble_map().lock().unwrap().get(uuid).copied().unwrap_or(2) {
+        0 => "off",
+        1 => "weak",
+        3 => "strong",
+        _ => "medium",
+    }
+}
 
 /// The process-global SDL controller manager, started on first call. `None` if SDL's
 /// gamepad subsystem can't initialize (then there's simply no controller input/rumble —
@@ -148,7 +259,7 @@ fn spawn() -> Option<SdlPads> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
     let shared = Arc::new(Shared {
         pads: Mutex::new(Vec::new()),
-        wake: Mutex::new(None),
+        wake: Mutex::new(Vec::new()),
         wake_gen: AtomicU64::new(0),
     });
     let shared_thread = shared.clone();
@@ -232,11 +343,22 @@ fn run(shared: Arc<Shared>, rumble_rx: Receiver<RumbleCmd>, ready: std::sync::mp
                 last.insert(*inst, st);
                 changed = true;
             }
+            // Battery % (None for wired/unknown). Cheap cached getter; safe to call here.
+            let battery = unsafe {
+                let mut pct: c_int = -1;
+                let _ = SDL_GetGamepadPowerInfo(p.ptr, &mut pct);
+                if pct >= 0 {
+                    Some(pct.min(100) as u8)
+                } else {
+                    None
+                }
+            };
             views.push(PadView {
                 uuid: p.uuid.clone(),
                 kind: p.kind,
                 name: p.name.clone(),
                 state: st,
+                battery,
             });
         }
         views.sort_by(|a, b| a.uuid.cmp(&b.uuid));
@@ -350,11 +472,18 @@ fn apply_rumble(open: &HashMap<u32, OpenPad>, cmd: &RumbleCmd) {
         tracing::debug!(slot = cmd.slot, guid = ?cmd.guid, pads = open.len(), "rumble: no SDL pad for slot");
         return;
     };
+    // A disabled pad neither forwards input nor rumbles.
+    if is_controller_disabled(&pad.uuid) {
+        return;
+    }
     // SDL takes 16-bit magnitudes; our wire carries 8-bit per motor → scale up.
-    let low = (cmd.large as u16) << 8;
-    let high = (cmd.small as u16) << 8;
-    let ok = unsafe { SDL_RumbleGamepad(pad.ptr, low, high, RUMBLE_MS) };
-    tracing::debug!(slot = cmd.slot, name = %pad.name, large = cmd.large, small = cmd.small, ok, "rumble: SDL_RumbleGamepad");
+    // Apply THIS pad's vibration-strength setting (level/3: off=×0, weak=×1/3, medium=×2/3,
+    // strong=×1). "off" stops the motors outright (×0 → SDL_RumbleGamepad(0,0)).
+    let lvl = rumble_level_for(&pad.uuid);
+    let low = (((cmd.large as u32) << 8) * lvl / 3) as u16;
+    let high = (((cmd.small as u32) << 8) * lvl / 3) as u16;
+    let ok = unsafe { SDL_RumbleGamepad(pad.ptr, low, high, cmd.dur_ms.unwrap_or(RUMBLE_MS)) };
+    tracing::debug!(slot = cmd.slot, name = %pad.name, large = cmd.large, small = cmd.small, lvl, ok, "rumble: SDL_RumbleGamepad");
 }
 
 /// Lowercase-hex of an SDL GUID's 16 bytes — the stable device key (matches gilrs `uuid()`).

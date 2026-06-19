@@ -172,6 +172,103 @@ pub(super) fn spawn_loopback_audio(
 	true
 }
 
+/// Windows **per-process** audio loopback (Phase 4 same-host co-op): stream ONLY `pid`'s
+/// render audio (and its child-process tree) instead of the whole system mix. Spawns the
+/// encoder ffmpeg (Opus/RTP to `dest`) + a capture thread feeding it
+/// `pulsar_core::audio::run_process_loopback_capture(pid)`. The ffmpeg is tracked in `procs`
+/// so a (re-)stream / teardown kills it, which ends the capture thread via the broken pipe.
+/// Returns whether it started — the caller falls back to the default-endpoint loopback on
+/// `false`.
+///
+/// Why this exists: two sessions to the SAME host both default-endpoint-loopback the same
+/// full mix, so each pane hears BOTH games (doubled / echoed) with no per-app isolation.
+/// Capturing per-process — keyed on the SAME PID Phase 2b resolves for the WGC window capture
+/// — gives each stream just its own game's audio.
+///
+/// HONEST scope: process-loopback isolates one process tree's *render* audio. On a shared TV
+/// the two games still mix acoustically in the room (physics), but the stream DUPLICATION /
+/// echo is gone and each stream is now per-app, which is what enables downstream headphone /
+/// L-R separation. Win10 20H1+ only (the caller gates on `process_loopback_supported()`); on
+/// older hosts it never reaches here.
+///
+/// Unlike `spawn_loopback_audio` there is NO format-tracking respawn loop and NO pinned-
+/// default re-assert: process-loopback delivers a FIXED format we dictate at Initialize
+/// (`process_loopback_format` = 48 kHz stereo f32) and has no "default endpoint changed"
+/// notion (it follows the process, not an endpoint), so the encoder's `-f/-ar/-ac` is fixed
+/// for the session and the capture either runs until the pipe breaks or errors out.
+#[cfg(windows)]
+pub(super) fn spawn_process_loopback_audio(
+	procs: &Arc<Mutex<Vec<Child>>>,
+	ffmpeg: &str,
+	dest: &str,
+	pid: u32,
+	req_layout: pulsar_core::audio::ChannelLayout,
+) -> bool {
+	use std::process::Stdio;
+	let fmt = pulsar_core::audio::process_loopback_format();
+	// Process-loopback is stereo (the fixed format we Initialize with), so clamp the encode
+	// layout to the SMALLER of the request and what we actually deliver — never claim more
+	// channels than the 2 the capture produces (a 5.1/7.1 request gets stereo here; the
+	// whole-system default-endpoint path is the one that carries true surround).
+	let cap_layout = {
+		let endpoint_layout = pulsar_core::audio::ChannelLayout::Stereo;
+		if req_layout.channels() < endpoint_layout.channels() {
+			req_layout
+		} else {
+			endpoint_layout
+		}
+	};
+	let mut args: Vec<String> = vec![
+		"-hide_banner".into(),
+		"-loglevel".into(),
+		"error".into(),
+		// Same no-input-buffering / no-probe flags as the default-endpoint loopback so audio
+		// isn't held behind the ultra-low-latency video at startup.
+		"-fflags".into(),
+		"nobuffer".into(),
+		"-probesize".into(),
+		"32".into(),
+		"-analyzeduration".into(),
+		"0".into(),
+		"-f".into(),
+		fmt.ffmpeg_sample_fmt().into(),
+		"-ar".into(),
+		fmt.rate.to_string(),
+		"-ac".into(),
+		fmt.channels.to_string(),
+		"-i".into(),
+		"pipe:0".into(),
+	];
+	args.extend(pulsar_core::audio::opus_rtp_output_layout(dest, cap_layout));
+	let mut cmd = std::process::Command::new(ffmpeg);
+	cmd.args(&args).stdin(Stdio::piped());
+	no_window(&mut cmd);
+	let mut child = match cmd.spawn() {
+		Ok(c) => c,
+		Err(_) => return false,
+	};
+	let stdin = match child.stdin.take() {
+		Some(s) => s,
+		None => {
+			let _ = child.kill();
+			return false;
+		}
+	};
+	crate::job::assign(&child); // tie ffmpeg to Pulsar's lifetime (job.rs), like spawn_tracked
+	procs.lock().unwrap().push(child);
+	std::thread::spawn(move || {
+		// Runs until the pipe breaks (ffmpeg killed on teardown) or WASAPI errors — both
+		// expected. A failure here means the per-app capture stopped; the session keeps its
+		// video and (if the user toggles) can re-stream. No re-init loop: process-loopback
+		// has no default-endpoint-change recovery to do.
+		if let Err(e) = pulsar_core::audio::run_process_loopback_capture(stdin, pid) {
+			tracing::warn!(pid, "process-loopback capture ended: {e}");
+		}
+	});
+	tracing::info!(pid, "audio: per-process WASAPI loopback (co-op per-app isolation)");
+	true
+}
+
 // ---- Host-silent via Sunshine-style default-render-endpoint REDIRECTION ----
 //
 // The host-silent intent (`req.mute_host`) is satisfied by REDIRECTING the default
@@ -788,6 +885,13 @@ fn start_audio_and_mute(
 	audio_dest: SocketAddr,
 	req: &StreamReq,
 	sid: u64,
+	// Phase 4 same-host co-op: the process whose audio THIS session should capture in
+	// isolation — the owning PID of the per-window (WGC) capture target (`target_hwnd` →
+	// `window_pid`). `Some` only when this session streams a specific app window (launched
+	// game / client-picked window) on Windows; `None` for Desktop / display capture / remote /
+	// unresolved, which take the existing default-endpoint loopback (the whole system mix).
+	// Always `None` off Windows (process-loopback is Windows-only) and on the Linux branches.
+	#[cfg_attr(not(windows), allow(unused_variables))] target_pid: Option<u32>,
 ) {
 	// Audio: a second ffmpeg streams Opus/RTP to `audio_dest` — the client's audio
 	// port directly (legacy), or the local media-over-session intake (the forwarder
@@ -847,6 +951,27 @@ fn start_audio_and_mute(
 		#[cfg(windows)]
 		let started_audio = {
 			let pinned = REDIRECT_SINK_ID.lock().unwrap().clone();
+			// PHASE 4 (same-host co-op): when THIS session captures a specific app window we know
+			// its owning PID — capture ONLY that process tree's audio so two same-host panes don't
+			// each loopback the whole system mix (doubled / echoed). Preferred over the default-
+			// endpoint loopback whenever a PID is present AND the OS supports process-loopback
+			// (Win10 20H1+, build 19041). It works even with a host-silent redirect armed: it taps
+			// the app's render stream directly (not an endpoint), and the redirect/mute still keeps
+			// the host's own speakers silent. On older Windows, an unresolved PID, or a spawn
+			// failure we fall through to the default-endpoint loopback unchanged (no regression).
+			let process_started = match target_pid {
+				Some(pid) if pulsar_core::audio::process_loopback_supported() => {
+					spawn_process_loopback_audio(procs, ffmpeg, &dest, pid, neg_layout)
+				}
+				Some(_) => {
+					tracing::info!(
+						"audio: per-process loopback unavailable (Win10 < 20H1) — using \
+						 default-endpoint loopback (whole system mix)"
+					);
+					false
+				}
+				None => false,
+			};
 			// When a host-silent sink redirect is armed (pinned is Some), ALWAYS try to capture
 			// via WASAPI loopback pinned to the virtual sink — even if the user configured a
 			// named dshow device (audio_loopback() is false with a named device). The redirect
@@ -855,8 +980,9 @@ fn start_audio_and_mute(
 			// program audio) and the client would hear silence or the wrong source. Prefer the
 			// loopback-of-redirected-sink path; only if that fails too, fall through to dshow.
 			let pinned_active = pinned.is_some();
-			(pinned_active || acfg.audio_loopback())
-				&& spawn_loopback_audio(procs, ffmpeg, &dest, pinned, neg_layout)
+			process_started
+				|| ((pinned_active || acfg.audio_loopback())
+					&& spawn_loopback_audio(procs, ffmpeg, &dest, pinned, neg_layout))
 		};
 		#[cfg(not(windows))]
 		let started_audio = false;
@@ -1092,6 +1218,67 @@ fn live_change(prev: &StreamReq, req: &StreamReq) -> Option<(bool, bool)> {
 	}
 }
 
+/// Apply (or revert) screen adaptation for one [`StreamReq`] against the session's shared
+/// [`AdaptState`](crate::display_mode::AdaptState). Called at the top of every restream so the
+/// captured monitor tracks the client's intent:
+///
+/// * `req.window_hwnd.is_some()` → per-window (WGC) capture has no monitor mode, so adaptation is
+///   skipped entirely. If a previous full-monitor stream had adapted the display, we revert it
+///   first (the capture target left the monitor), then forget the target.
+/// * `req.adapt == Some((w, h))` and the `(display_idx, w, h)` target DIFFERS from the last one we
+///   acted on → if we already hold an applied mode (display/pane changed), revert it first, then
+///   switch the monitor to the best-fit mode for the pane and store the new `PrevMode` + target.
+///   `set_best_mode` returning `None` (current mode already best, or the apply failed) still
+///   records the target so we don't re-run the best-fit on every subsequent identical restream.
+/// * `req.adapt == None` and we hold an applied mode → revert and clear (the client turned
+///   adaptation off; e.g. it went full-screen). A `None` adapt with nothing applied is a no-op.
+///
+/// All mutation goes through the one `Arc<Mutex<AdaptState>>` the [`SessionCleanupGuard`] also
+/// holds, so whatever is left applied here is reverted on teardown. No-op off Windows (the
+/// `set_best_mode`/`revert` calls are stubs and `PrevMode` is never `Some`).
+fn apply_screen_adaptation(
+	req: &StreamReq,
+	adapt_state: &Arc<Mutex<crate::display_mode::AdaptState>>,
+) {
+	let mut st = adapt_state.lock().unwrap();
+	// Per-window capture overrides the monitor — drop any monitor-mode change we applied.
+	if req.window_hwnd.is_some() {
+		if let Some(prev) = st.prev.take() {
+			crate::display_mode::revert(prev);
+		}
+		st.last = None;
+		return;
+	}
+	match req.adapt {
+		Some((w, h)) => {
+			let target = (req.display_idx, w, h);
+			// Same target we already acted on → nothing to do (don't re-run the best-fit every
+			// frame, and don't flap the mode). `last` is set even when no mode was applied.
+			if st.last == Some(target) {
+				return;
+			}
+			// A different target (display switched, or a different pane size): revert the prior
+			// change FIRST so the previous monitor (or the previous mode on the same monitor) is
+			// restored before we switch to the new best fit.
+			if let Some(prev) = st.prev.take() {
+				crate::display_mode::revert(prev);
+			}
+			st.prev = crate::display_mode::set_best_mode(req.display_idx, w, h);
+			// Remember the target regardless of whether a mode was actually applied (None = the
+			// current mode was already the best fit or the switch failed) so identical restreams
+			// don't retry.
+			st.last = Some(target);
+		}
+		None => {
+			// Adaptation turned off → restore the original mode if we changed it.
+			if let Some(prev) = st.prev.take() {
+				crate::display_mode::revert(prev);
+			}
+			st.last = None;
+		}
+	}
+}
+
 /// Build the per-session `on_stream` handler. A (re-)stream request restarts
 /// capture: it kills any ffmpeg/native capture already running for this session,
 /// then spawns the new encode (native DXGI+NVENC on Windows, else ffmpeg), pushes
@@ -1101,12 +1288,13 @@ fn live_change(prev: &StreamReq, req: &StreamReq) -> Option<(bool, bool)> {
 pub(super) fn make_on_stream(
 	stream_cfg: Arc<Mutex<crate::state::StreamCfg>>,
 	procs: Arc<Mutex<Vec<Child>>>,
-	active: Arc<Mutex<std::collections::HashMap<String, crate::state::ConnInfo>>>,
-	incoming: Arc<Mutex<std::collections::HashMap<String, (u64, oneshot::Sender<()>)>>>,
+	active: Arc<Mutex<std::collections::HashMap<u64, crate::state::ConnInfo>>>,
+	incoming: Arc<Mutex<std::collections::HashMap<u64, (String, oneshot::Sender<()>)>>>,
 	host_out: Arc<
-		Mutex<std::collections::HashMap<String, (u64, tokio::sync::mpsc::Sender<DataMsg>)>>,
+		Mutex<std::collections::HashMap<u64, (String, tokio::sync::mpsc::Sender<DataMsg>)>>,
 	>,
-	// None when the session was already registered in `incoming` at accept time (C9).
+	// Always None now: every session is registered under its own sid in `incoming` at
+	// accept time (Phase 1 same-host co-op — no peer-collision to defer around).
 	stop_tx: Option<oneshot::Sender<()>>,
 	out_tx: tokio::sync::mpsc::Sender<DataMsg>,
 	since_ms: u64,
@@ -1124,6 +1312,13 @@ pub(super) fn make_on_stream(
 	// re-resolves display_rect/set_monitor when this advances — catching same-index resolution
 	// changes that shift the virtual-desktop geometry without changing the monitor index.
 	#[cfg(windows)] native_gen_arc: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>>,
+	// Per-window (WGC) capture target discovered when THIS session launched a game in game mode
+	// (Phase 2b co-op): `on_launch`'s resolver thread stores the launched app's top-level HWND
+	// here. When the StreamReq does NOT itself carry a `window_hwnd`, this is used so a game-mode
+	// session captures the launched game's window instead of the whole monitor — per-app co-op
+	// capture. `None` => no launched-window target (Desktop entry / display-mode session) → the
+	// existing monitor/DXGI path. An explicit client-picked `req.window_hwnd` takes precedence.
+	launched_hwnd: Arc<Mutex<Option<i64>>>,
 	stats_out: tokio::sync::mpsc::Sender<DataMsg>,
 	app_h: AppHandle,
 	peer: String,
@@ -1137,10 +1332,16 @@ pub(super) fn make_on_stream(
 	// restart capture at the new geometry.  On Windows this is only populated when
 	// native_started=false (ffmpeg fallback); native DXGI sessions self-heal via ACCESS_LOST.
 	last_req_store: Arc<Mutex<Option<StreamReq>>>,
+	// Per-session screen-adaptation state (Parsec-style). When a StreamReq carries
+	// `adapt: Some((paneW, paneH))` this handler switches the captured monitor to the best-fit
+	// display mode and records the original here; the SessionCleanupGuard reverts it on teardown.
+	// Shared by Arc with the guard so the apply-side and the revert-side see the same state.
+	// Windows-only effect (the set/revert are no-ops off Windows).
+	adapt_state: Arc<Mutex<crate::display_mode::AdaptState>>,
 ) -> impl FnMut(StreamReq, SocketAddr) + Send + 'static {
 	let mut announced = false;
-	// stop_tx is already None when the session was pre-registered at accept time (C9),
-	// meaning `incoming` already holds the real sender — no re-insert needed.
+	// stop_tx is None: the session was registered under its own sid at accept time, so
+	// `incoming[sid]` already holds the real sender — no re-insert needed.
 	let mut stop_tx = stop_tx;
 	// Cursor side-channel poller's liveness flag (Linux KMS path). Held across re-streams so a
 	// re-stream can stop the prior poller before (maybe) starting a new one — avoids stacking
@@ -1154,6 +1355,13 @@ pub(super) fn make_on_stream(
 	#[cfg(windows)]
 	let mut last_native_req: Option<StreamReq> = None;
 	move |req: StreamReq, addr: SocketAddr| {
+		// SCREEN ADAPTATION (Parsec-style) — run FIRST, before any fast-path return, so every
+		// restream re-evaluates it: switch the captured monitor to the best-fit display mode for
+		// the client's split pane, and revert on a later `adapt: None` (full teardown reverts via
+		// SessionCleanupGuard). Per-window capture (WGC) has no monitor mode, so it ignores adapt
+		// entirely. The mode change is intentionally allowed to trip the host display-mode watcher
+		// / native encoder rebuild downstream — that's how the capture picks up the new geometry.
+		apply_screen_adaptation(&req, &adapt_state);
 		// last_req_store is updated below (after native_started is resolved) so the
 		// display-mode watcher only fires for ffmpeg-path sessions on Windows.
 		// FAST PATH — a live, in-session restream the running native capture can absorb without a
@@ -1252,38 +1460,37 @@ pub(super) fn make_on_stream(
 			} else {
 				crate::state::ConnMode::Remote
 			};
-			// Upgrade the active entry with the confirmed mode (go_online pre-registered
-			// it as Remote as a default; now we know the real value). A second STREAMING
-			// session from the same peer takes over here (overwriting stop_tx in incoming
-			// drops the old session's oneshot sender, firing stop_rx and ending it cleanly).
-			// Preserve any view_only flag the operator may have toggled in the
-			// accept-time → first-StartStream window (C9): do NOT clobber it with false.
+			// Upgrade THIS session's active entry (keyed by sid) with the confirmed mode
+			// (accept-time pre-registered it as Remote as a default; now we know the real
+			// value). Same-host co-op: each session has its own sid key, so this never
+			// touches a sibling pane from the same device. Preserve any view_only flag the
+			// operator may have toggled in the accept-time → first-StartStream window (C9):
+			// do NOT clobber it with false.
 			let prev_view_only = active
 				.lock()
 				.unwrap()
-				.get(&peer)
+				.get(&sid)
 				.map(|ci| ci.view_only)
 				.unwrap_or(false);
 			active.lock().unwrap().insert(
-				peer.clone(),
+				sid,
 				crate::state::ConnInfo {
-					sid,
+					peer: peer.clone(),
 					since_ms,
 					mode,
 					view_only: prev_view_only,
 				},
 			);
-			// stop_tx is Some only when go_online could NOT pre-register (a live streaming
-			// session already held the slot). In that case we register now (same-peer
-			// reconnect / stream takeover). When it is None the entry in `incoming` was
-			// written at accept time and remains valid — no re-insert needed.
+			// stop_tx is None now in the normal flow (the session was registered under its
+			// own sid at accept time, so there is no collision to defer around). The defensive
+			// re-insert is kept (keyed by sid) for any future caller that passes Some.
 			if let Some(tx) = stop_tx.take() {
-				incoming.lock().unwrap().insert(peer.clone(), (sid, tx));
+				incoming.lock().unwrap().insert(sid, (peer.clone(), tx));
 			}
 			host_out
 				.lock()
 				.unwrap()
-				.insert(peer.clone(), (sid, out_tx.clone()));
+				.insert(sid, (peer.clone(), out_tx.clone()));
 			// Open or update the connections window: bring forward for Remote, leave
 			// minimized for Game. If the window was already opened minimized at accept
 			// time, this upgrades it to the correct focus/visibility for the real mode.
@@ -1450,6 +1657,7 @@ pub(super) fn make_on_stream(
 							SessionEvent {
 								kind: "stream".into(),
 								peer,
+								sid,
 								detail: "Wayland · ekran + kontrol".into(),
 							},
 						);
@@ -1463,6 +1671,7 @@ pub(super) fn make_on_stream(
 							SessionEvent {
 								kind: "stream".into(),
 								peer,
+								sid,
 								detail: format!("Wayland yakalama başarısız: {e}"),
 							},
 						);
@@ -1474,7 +1683,8 @@ pub(super) fn make_on_stream(
 			// synchronously in the closure body, like the X11 path; the Pulse `.monitor`
 			// ffmpeg is tracked in `procs` and killed on (re-)stream/teardown.
 			let ffmpeg = ffmpeg_bin(&app_h);
-			start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid);
+			// No per-process audio loopback on the Wayland path (process-loopback is Windows-only).
+			start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid, None);
 			return;
 		}
 
@@ -1853,12 +2063,14 @@ pub(super) fn make_on_stream(
 						tracing::info!(encoder = ?genc, codec = ?gcodec, started, "x11 gst encode spawned");
 						let _ = stats_out.try_send(DataMsg::Stats(base_label));
 						let _ = stats_out.try_send(DataMsg::DisplayRotation(display_rotation(None)));
-						start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid);
+						// No per-process audio loopback on the x11/gst (Linux) path (Windows-only).
+						start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid, None);
 						let _ = app_h.emit(
 							"session",
 							SessionEvent {
 								kind: "stream".into(),
 								peer: peer.clone(),
+								sid,
 								detail: format!("{} · {}p", genc.label(), eff_h)
 									+ if started { "" } else { crate::i18n::t("host.gstFailed") },
 							},
@@ -1952,9 +2164,24 @@ pub(super) fn make_on_stream(
 		// post-resolve `if native_started` branch can spawn the encode-stat reporter thread.
 		#[allow(unused_mut)]
 		let mut native_enc_us: Option<std::sync::Arc<std::sync::atomic::AtomicU32>> = None;
+		// Effective per-window (WGC) capture target for THIS stream (Phase 2b co-op): the client's
+		// explicit pick (`req.window_hwnd`, from its window picker) wins; otherwise the window the
+		// resolver discovered for a game this session launched in game mode (`launched_hwnd`). When
+		// `Some`, the native path captures that single window via WGC instead of the whole monitor —
+		// letting two same-host panes share one monitor / target two app windows. `None` => the
+		// existing display/DXGI path, unchanged. Only meaningful on Windows (WGC is Windows-only).
+		#[cfg_attr(not(windows), allow(unused_variables))]
+		let target_hwnd: Option<i64> = req
+			.window_hwnd
+			.or_else(|| *launched_hwnd.lock().unwrap());
 		#[cfg(windows)]
+		// The native (NVENC) path runs for the normal display capture (ddagrab) OR whenever a
+		// per-window WGC target is set — WGC is a separate capture SOURCE that does not need the
+		// ddagrab display-capture method, just NVENC. HDR / 4:4:4 still force the ffmpeg path (the
+		// native pipeline doesn't do them yet); a window target with HDR/444 falls back to ffmpeg
+		// (whole-monitor) for now — documented limit. PULSAR_FFMPEG_CAPTURE still forces ffmpeg.
 		let native_started = if encoder == HwEncoder::Nvenc
-			&& capture == CaptureMethod::Ddagrab
+			&& (capture == CaptureMethod::Ddagrab || target_hwnd.is_some())
 			&& !req.hdr
 			&& !req.yuv444
 			&& std::env::var_os("PULSAR_FFMPEG_CAPTURE").is_none()
@@ -1992,6 +2219,13 @@ pub(super) fn make_on_stream(
 				output_idx: clamped_display_idx,
 				low_latency: plan.low_latency,
 				draw_mouse: true,
+				// Phase 2b co-op: when the session targets a specific WINDOW (client-picked via
+				// `req.window_hwnd`, or the game this session launched in game mode), capture that
+				// single window via Windows Graphics Capture instead of duplicating the whole
+				// monitor — so two same-host panes can share one monitor / target two app windows.
+				// `output_idx` is then ignored by the capture crate (WGC tracks a window, not a
+				// monitor). `None` (no window target) => the full-monitor DXGI source, unchanged.
+				window_hwnd: target_hwnd.map(|h| h as isize),
 			}) {
 				Ok(h) => {
 					// Publish the confirmed capture monitor for the input path. Use
@@ -2160,12 +2394,22 @@ pub(super) fn make_on_stream(
 			}
 		};
 		let _ = stats_out.try_send(DataMsg::DisplayRotation(reported_rotation));
-		start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid);
+		// PHASE 4 (same-host co-op): if this stream captures a SPECIFIC app window (`target_hwnd`
+		// — the client's pick or the launched game's resolved window), resolve that window's
+		// owning PID so the audio loopback captures ONLY that process tree, matching the video
+		// target. `None` for whole-display / Desktop / unresolved capture → default-endpoint
+		// loopback. Windows-only (process-loopback + `window_pid` are Windows-only).
+		#[cfg(windows)]
+		let audio_pid = target_hwnd.and_then(|h| pulsar_capture::window_pid(h as isize));
+		#[cfg(not(windows))]
+		let audio_pid: Option<u32> = None;
+		start_audio_and_mute(&procs, &ffmpeg, &app_h, adest, &req, sid, audio_pid);
 		let _ = app_h.emit(
 			"session",
 			SessionEvent {
 				kind: "stream".into(),
 				peer: peer.clone(),
+				sid,
 				detail: format!("{} · {}p", encoder.label(), eff_h)
 					+ if started { "" } else { crate::i18n::t("host.ffmpegFailed") },
 			},
@@ -2341,7 +2585,7 @@ fn spawn_gst_tracked(procs: &Arc<Mutex<Vec<Child>>>, pipeline: &str) -> Result<(
 /// Build the per-session `on_file` handler: reassemble an inbound file transfer
 /// (Begin → buffer, Chunk → append + detect gaps, End → save) and surface the
 /// result to the host UI.
-pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg) + Send + 'static {
+pub(super) fn make_on_file(app_h: AppHandle, peer: String, sid: u64) -> impl FnMut(DataMsg) + Send + 'static {
 	// Reassemble: Begin → state, Chunk → store BY INDEX, End → save.
 	// The session transport is unordered UDP, so chunks can arrive out of order
 	// or duplicated; keying by index (instead of appending in arrival order) lets
@@ -2579,6 +2823,7 @@ pub(super) fn make_on_file(app_h: AppHandle, peer: String) -> impl FnMut(DataMsg
 						SessionEvent {
 							kind: "file".into(),
 							peer: peer_owned.clone(),
+							sid,
 							detail: format!("{} · {} B", saved_name, written),
 						},
 					);

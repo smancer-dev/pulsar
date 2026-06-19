@@ -24,7 +24,11 @@
 		/** Host's unattended-access toggle — when ON no one-time password is issued. */
 		unattended: boolean;
 		connectErr: string;
-		hostSessions: { peer: string; since: number }[];
+		hostSessions: { sid: number; peer: string; since: number }[];
+		/** Peer map-key → the client's own device id (pushed via DataMsg::PeerId). */
+		hostClientIds: Record<string, string>;
+		/** Peer map-key → the client's pushed display name. */
+		hostNames: Record<string, string>;
 		activity: string[];
 		/** Whether the home view is the active tab (gates the gaming pad-nav bridge). */
 		active: boolean;
@@ -34,12 +38,17 @@
 		onView: (v: View) => void;
 		onGoOnline: () => void;
 		onRefreshPw: () => void;
-		onDisconnect: (peer: string) => void;
+		/** Kick a connected session by its session id. */
+		onDisconnect: (sid: number) => void;
 		onConnect: (target: Target, m?: 'remote' | 'game', gameId?: string) => void;
 		onStream: (game: Game) => void;
 		onClearConnectErr: () => void;
 		/** Settle the password prompt queued for `target` (game-list fetch auth). */
 		onAuthDone?: (target: string) => void;
+		/** Current split layout ('off' = single-session) — for the gaming-shell dock button. */
+		splitMode?: 'off' | 'h2' | 'v2' | 'grid4';
+		/** Open the split-layout chooser (gaming mode dock button). */
+		onSplit?: () => void;
 	};
 	let {
 		nav,
@@ -53,6 +62,8 @@
 		unattended,
 		connectErr,
 		hostSessions,
+		hostClientIds,
+		hostNames,
 		activity,
 		active,
 		fullscreen,
@@ -64,7 +75,9 @@
 		onConnect,
 		onStream,
 		onClearConnectErr,
-		onAuthDone = () => {}
+		onAuthDone = () => {},
+		splitMode = 'off',
+		onSplit
 	}: Props = $props();
 </script>
 
@@ -82,6 +95,8 @@
 		{onGoOnline}
 		{onConnect}
 		{onAuthDone}
+		{splitMode}
+		{onSplit}
 	/>
 {:else}
 <div class="body">
@@ -106,6 +121,8 @@
 				{connecting}
 				{unattended}
 				{hostSessions}
+				{hostClientIds}
+				{hostNames}
 				{activity}
 				debug={ui.debug}
 				{onRefreshPw}

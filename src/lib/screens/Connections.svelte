@@ -5,26 +5,49 @@
 	// Opens forward for a Remote connection, hidden for a Game one (decided host-side).
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { api, onHostChat, onPeerAvatar, onPeerName, onSessionEvent } from '$lib/api';
+	import { api, onHostChat, onPeerAvatar, onPeerName, onPeerId, onSessionEvent } from '$lib/api';
+	import { fmtPeerId } from '$lib/peers.svelte';
 	import { t } from '$lib/i18n.svelte';
 
-	type Row = { peer: string; since: number; viewOnly: boolean };
+	// One row PER SESSION (keyed by sid), not per device: a single client device can hold
+	// several concurrent sessions (couch co-op / split panes), each its own row. `peer`
+	// groups a device's sessions together (identity, chat history, "oturum N/M" sub-label).
+	type Row = { sid: number; peer: string; since: number; viewOnly: boolean };
 	let rows = $state<Row[]>([]);
+	// For a device with >1 live session, label each row "oturum i/n" so the host can tell
+	// the panes apart; single-session devices get no sub-label. Computed from the live rows.
+	function sessionLabel(r: Row): string {
+		const sameDevice = rows.filter((x) => x.peer === r.peer);
+		if (sameDevice.length < 2) return '';
+		const i = sameDevice.findIndex((x) => x.sid === r.sid);
+		return t('host.sessionN', { i: i + 1, n: sameDevice.length });
+	}
 	// Peer id → pushed identity (image + display name). Seeded from the snapshot
 	// (peer_meta host-side) so a window opened AFTER the push still shows them;
 	// kept across a row's disconnect/reconnect so a brief drop doesn't blank them.
 	let avatars = $state<Record<string, string>>({});
 	let names = $state<Record<string, string>>({});
+	// Peer map-key → the client's OWN device id (pushed via DataMsg::PeerId). On a
+	// direct/same-LAN connect the map-key is the client's ip:port; this shows the real
+	// id instead. `idFor()` renders the id (grouped) when known, else the key (ip:port).
+	let clientIds = $state<Record<string, string>>({});
+	const idFor = (peer: string) => fmtPeerId(clientIds[peer] ?? peer);
 
 	onMount(() => {
 		// Initial snapshot (connections that existed before this window opened).
 		api
 			.listConnections()
 			.then((list) => {
-				rows = list.map((c) => ({ peer: c.peer, since: c.since_ms, viewOnly: !!c.view_only }));
+				rows = list.map((c) => ({
+					sid: c.sid,
+					peer: c.peer,
+					since: c.since_ms,
+					viewOnly: !!c.view_only
+				}));
 				for (const c of list) {
 					if (c.avatar) avatars = { ...avatars, [c.peer]: c.avatar };
 					if (c.name) names = { ...names, [c.peer]: c.name };
+					if (c.client_id) clientIds = { ...clientIds, [c.peer]: c.client_id };
 				}
 			})
 			.catch(() => {});
@@ -39,10 +62,13 @@
 		};
 		onSessionEvent((e) => {
 			if (e.kind === 'connected') {
-				if (!rows.some((r) => r.peer === e.peer))
-					rows = [...rows, { peer: e.peer, since: Date.now(), viewOnly: false }];
+				// Keyed by sid: a 2nd session from the SAME device adds a 2nd row (couch
+				// co-op), it does not replace the 1st.
+				if (!rows.some((r) => r.sid === e.sid))
+					rows = [...rows, { sid: e.sid, peer: e.peer, since: Date.now(), viewOnly: false }];
 			} else if (e.kind === 'disconnected') {
-				rows = rows.filter((r) => r.peer !== e.peer);
+				// Drop only THIS session's row (by sid); a same-device sibling pane survives.
+				rows = rows.filter((r) => r.sid !== e.sid);
 			}
 		}).then(track);
 		onPeerAvatar((e) => {
@@ -50,6 +76,9 @@
 		}).then(track);
 		onPeerName((e) => {
 			names = { ...names, [e.peer]: e.name };
+		}).then(track);
+		onPeerId((e) => {
+			clientIds = { ...clientIds, [e.peer]: e.id };
 		}).then(track);
 		// Seed the modal's history from the host-side backlog: events broadcast only
 		// to live windows, so lines from before this window opened live there.
@@ -74,7 +103,8 @@
 		// that peer's modal is opened.
 		onHostChat((e) => {
 			pushMsg(e.peer, { me: false, text: e.text });
-			if (msgFor !== e.peer) unread = { ...unread, [e.peer]: (unread[e.peer] ?? 0) + 1 };
+			// Don't badge a device whose chat modal is currently open (history keyed by peer).
+			if (msgRow?.peer !== e.peer) unread = { ...unread, [e.peer]: (unread[e.peer] ?? 0) + 1 };
 		}).then(track);
 		return () => {
 			dead = true;
@@ -97,56 +127,61 @@
 			: t('host.elapsedHour', { h: Math.floor(m / 60), m: m % 60 });
 	}
 
-	// "Mesaj gönder" MODAL: per-peer chat with this window's session HISTORY (inbound
-	// via host-chat above + everything we sent). Sending reuses the host→client chat
-	// channel (DataMsg::Chat via host_send_chat) — it pops up on the client as a toast.
+	// "Mesaj gönder" MODAL: per-DEVICE chat history (inbound via host-chat above + every
+	// line we sent), keyed by `peer` so a device's panes share one conversation. The modal
+	// is OPENED from a row, so we keep that row's `sid` to route the reply to the exact
+	// session (host_send_chat takes a sid now). Sending reuses the host→client chat channel
+	// (DataMsg::Chat) — it pops up on the client as a toast.
 	type Msg = { me: boolean; text: string };
 	let history = $state<Record<string, Msg[]>>({});
-	let msgFor = $state<string | null>(null);
+	// The row whose chat modal is open (null = closed). Holds the sid (send target) + peer
+	// (history/unread key).
+	let msgRow = $state<Row | null>(null);
 	let msgText = $state('');
-	// Per-peer unread counter (badge on the row's chat button) — cleared on open.
+	// Per-DEVICE unread counter (badge on the row's chat button) — cleared on open.
 	let unread = $state<Record<string, number>>({});
 	function pushMsg(peer: string, m: Msg) {
 		history = { ...history, [peer]: [...(history[peer] ?? []), m] };
 	}
-	function openMsg(peer: string) {
-		msgFor = peer;
+	function openMsg(r: Row) {
+		msgRow = r;
 		msgText = '';
 		sendErr = null;
-		unread = { ...unread, [peer]: 0 };
+		unread = { ...unread, [r.peer]: 0 };
 	}
 	function closeMsg() {
-		msgFor = null;
+		msgRow = null;
 		sendErr = null;
 	}
-	// A failed send (peer gone, channel closed) must be VISIBLE: only a confirmed
+	// A failed send (session gone, channel closed) must be VISIBLE: only a confirmed
 	// send lands in the history; on failure the composer gets the text back and the
 	// modal shows the backend's reason (e.g. "cihaz bağlı değil").
 	let sendErr = $state<string | null>(null);
-	function sendMsg(peer: string) {
+	function sendMsg(r: Row) {
 		const text = msgText.trim();
 		if (!text) return;
 		sendErr = null;
 		msgText = '';
 		api
-			.hostSendChat(peer, text)
+			.hostSendChat(r.sid, text)
 			.then(() => {
-				pushMsg(peer, { me: true, text });
+				pushMsg(r.peer, { me: true, text });
 			})
 			.catch((e) => {
-				if (msgFor === peer) {
+				if (msgRow?.sid === r.sid) {
 					sendErr = typeof e === 'string' && e ? e : t('host.msgFailed');
 					if (!msgText) msgText = text;
 				}
 			});
 	}
 
-	// "Sadece izleme": revoke/restore this client's control — the host drops its
-	// input events while set; the stream keeps running (AnyDesk permission model).
+	// "Sadece izleme": revoke/restore THIS session's control — the host drops its input
+	// events while set; the stream keeps running (AnyDesk permission model). Keyed by sid
+	// so one pane of a same-host co-op pair can be view-only-d alone.
 	function toggleViewOnly(r: Row) {
 		const next = !r.viewOnly;
-		api.setViewOnly(r.peer, next).catch(() => {});
-		rows = rows.map((x) => (x.peer === r.peer ? { ...x, viewOnly: next } : x));
+		api.setViewOnly(r.sid, next).catch(() => {});
+		rows = rows.map((x) => (x.sid === r.sid ? { ...x, viewOnly: next } : x));
 	}
 </script>
 
@@ -161,15 +196,18 @@
 		<div class="empty">{t('host.noConnections')}</div>
 	{:else}
 		<div class="list">
-			{#each rows as r (r.peer)}
+			{#each rows as r (r.sid)}
 				<div class="pitem">
 					<div class="prow">
 						<span class="pavatar">
-							{#if avatars[r.peer]}<img src={avatars[r.peer]} alt="" />{:else}{r.peer.slice(0, 2)}{/if}
+							{#if avatars[r.peer]}<img src={avatars[r.peer]} alt="" />{:else}{idFor(r.peer).slice(0, 2)}{/if}
 						</span>
 						<div class="pmeta">
-							<span class="pname">{names[r.peer] ?? t('home.remoteDevice')}</span>
-							<span class="ptime mono">{r.peer} · {elapsed(r.since)}</span>
+							<span class="pname">
+								{names[r.peer] ?? t('home.remoteDevice')}
+								{#if sessionLabel(r)}<span class="psub">· {sessionLabel(r)}</span>{/if}
+							</span>
+							<span class="ptime mono">{idFor(r.peer)} · {elapsed(r.since)}</span>
 						</div>
 						<!-- Icon-only actions; the labels live in tooltips (they didn't fit). -->
 						<div class="acts">
@@ -184,7 +222,7 @@
 							</button>
 							<button
 								class="act"
-								onclick={() => openMsg(r.peer)}
+								onclick={() => openMsg(r)}
 								title={t('host.sendMsg')}
 								aria-label={t('host.sendMsg')}
 							>
@@ -193,7 +231,7 @@
 							</button>
 							<button
 								class="act kick"
-								onclick={() => api.disconnectPeer(r.peer).catch(() => {})}
+								onclick={() => api.disconnectPeer(r.sid).catch(() => {})}
 								title={t('host.disconnect')}
 								aria-label={t('host.disconnect')}
 							>
@@ -209,24 +247,24 @@
 	<!-- Message popup: this window's chat HISTORY with the peer + a composer.
 	     Sent lines go over the host→client chat channel; inbound lines arrive via
 	     host-chat. -->
-	{#if msgFor}
+	{#if msgRow}
 		<div class="mmask" role="presentation" onclick={closeMsg}>
 			<div class="mbox" role="dialog" aria-label={t('host.sendMsg')} onclick={(e) => e.stopPropagation()}>
 				<header class="mhdr">
 					<span class="pavatar small">
-						{#if avatars[msgFor]}<img src={avatars[msgFor]} alt="" />{:else}{msgFor.slice(0, 2)}{/if}
+						{#if avatars[msgRow.peer]}<img src={avatars[msgRow.peer]} alt="" />{:else}{idFor(msgRow.peer).slice(0, 2)}{/if}
 					</span>
-					<b>{names[msgFor] ?? t('home.remoteDevice')}</b>
-					<span class="mid mono">{msgFor}</span>
+					<b>{names[msgRow.peer] ?? t('home.remoteDevice')}</b>
+					<span class="mid mono">{idFor(msgRow.peer)}</span>
 					<button class="mclose" onclick={closeMsg} title={t('host.toastClose')}>
 						<Icon name="x" size={14} />
 					</button>
 				</header>
 				<div class="mlog">
-					{#if (history[msgFor] ?? []).length === 0}
+					{#if (history[msgRow.peer] ?? []).length === 0}
 						<div class="mempty">{t('host.chatEmpty')}</div>
 					{:else}
-						{#each history[msgFor] ?? [] as m, i (i)}
+						{#each history[msgRow.peer] ?? [] as m, i (i)}
 							<div class="mline" class:me={m.me}>{m.text}</div>
 						{/each}
 					{/if}
@@ -234,7 +272,7 @@
 				{#if sendErr}
 					<div class="merr" role="alert">{sendErr}</div>
 				{/if}
-				<form class="msgrow" onsubmit={(e) => { e.preventDefault(); if (msgFor) sendMsg(msgFor); }}>
+				<form class="msgrow" onsubmit={(e) => { e.preventDefault(); if (msgRow) sendMsg(msgRow); }}>
 					<input
 						class="msgin"
 						bind:value={msgText}

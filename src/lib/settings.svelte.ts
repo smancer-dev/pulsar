@@ -3,6 +3,7 @@
 // prefs persist here until the streaming backend consumes them.)
 
 export type VideoCodec = 'auto' | 'h264' | 'h265' | 'av1';
+export type RumbleStrength = 'off' | 'weak' | 'medium' | 'strong';
 export type Encoder =
 	| 'auto'
 	| 'nvenc'
@@ -52,6 +53,14 @@ export interface UiSettings {
 	/** Per-controller emulation target keyed by gilrs uuid hex: 'auto' (resolve from
 	 * detected kind), 'xbox' (Xbox 360), or 'ds4' (DualShock 4). Absent = 'auto'. */
 	controllerEmulation: Record<string, 'auto' | 'xbox' | 'ds4'>;
+	/** PER-CONTROLLER vibration (rumble) strength, keyed by gilrs/SDL uuid hex: the host's
+	 * motor magnitudes are scaled per pad on the client (off = motors stay still, strong =
+	 * full). Pushed to the SDL pad manager via `set_controller_rumble`. Absent uuid =
+	 * 'medium'. */
+	controllerRumble: Record<string, RumbleStrength>;
+	/** Per-controller DISABLED flag keyed by uuid hex (true = off). A disabled pad isn't
+	 * forwarded to the host and doesn't rumble. Absent = enabled. */
+	controllerDisabled: Record<string, boolean>;
 	/** Feature 2 Piece B: treat the DS4/DS5 touchpad as a relative mouse (pointer
 	 * moves + left-click). Default true. */
 	touchpadAsMouse: boolean;
@@ -60,6 +69,11 @@ export interface UiSettings {
 	 * shell (bottom dock, centered ID + numpad, no hosting). Toggled from the top bar;
 	 * the CLI `--mode game` overrides it on launch. Default 'remote'. */
 	appMode: 'remote' | 'game';
+	/** Whether GAMING mode was left in fullscreen — persisted so the app reopens
+	 * fullscreen in game mode the way the user last had it (the bottom-dock button /
+	 * F11 toggle writes this; restored at startup only when appMode==='game'). Scoped
+	 * to game mode so a fullscreen remote session never reopens fullscreen. Default false. */
+	gamingFullscreen: boolean;
 }
 
 export const CODECS: { value: VideoCodec; label: string }[] = [
@@ -85,6 +99,13 @@ export const EMULATION_TARGETS = [
 	{ value: 'xbox', label: 'Xbox 360' },
 	{ value: 'ds4', label: 'DualShock 4' }
 ] as const;
+
+export const RUMBLE_LEVELS: { value: RumbleStrength; label: string }[] = [
+	{ value: 'off', label: 'Kapalı' },
+	{ value: 'weak', label: 'Zayıf' },
+	{ value: 'medium', label: 'Orta' },
+	{ value: 'strong', label: 'Güçlü' }
+];
 
 /** Per-platform encoder families: a platform shows ONLY its own backends (foreign
  * entries never render); availability within the family is a separate, probe-driven
@@ -121,8 +142,11 @@ const DEFAULTS: UiSettings = {
 	forwardControllers: true,
 	controllerOrder: [],
 	controllerEmulation: {},
+	controllerRumble: {},
+	controllerDisabled: {},
 	touchpadAsMouse: true,
-	appMode: 'remote'
+	appMode: 'remote',
+	gamingFullscreen: false
 };
 
 const KEY = 'pulsar.ui.v1';

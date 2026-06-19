@@ -87,17 +87,38 @@ export class SessionControls {
 		});
 	}
 
-	setRes = (v: 'auto' | '1080p' | '1440p' | '4K') => {
-		this.streamRes = v;
+	// Accepts a preset ('auto'/'1080p'/'1440p'/'4K') OR an explicit "WxH" string (the overlay's
+	// per-display real-mode list emits the latter) — both resolve to a width/height for the host.
+	setRes = (v: string) => {
+		this.streamRes = v as 'auto' | '1080p' | '1440p' | '4K';
 		const playId = this.#in.playId();
 		if (playId < 0) return;
 		// The host kills its current encoder and rebuilds capture at the new geometry
 		// (set_play_resolution in session_cmds.rs). A 4K NVENC/DXGI rebuild can easily
 		// exceed 3 s, so suppress the stall detector for 4 s.
 		this.#beginSwitch(4000);
-		const [w, h] =
-			v === '4K' ? [3840, 2160] : v === '1440p' ? [2560, 1440] : v === '1080p' ? [1920, 1080] : [0, 0];
+		const wh = /^(\d+)x(\d+)$/.exec(v);
+		const [w, h] = wh
+			? [Number(wh[1]), Number(wh[2])]
+			: v === '4K'
+				? [3840, 2160]
+				: v === '1440p'
+					? [2560, 1440]
+					: v === '1080p'
+						? [1920, 1080]
+						: [0, 0];
 		api.setPlayResolution(playId, w, h).catch(() => {});
+	};
+	// Screen adaptation (overlay "Ekran uyarlama"): `on` with the pane's pixel size (w,h) asks
+	// the host to switch its captured monitor to the best-fit mode and revert on exit. The host
+	// changes resolution → new SPS, so it's the same depth of rebuild as a monitor switch.
+	streamAdapt = $state(false);
+	setAdapt = (on: boolean, w: number, h: number) => {
+		this.streamAdapt = on;
+		const playId = this.#in.playId();
+		if (playId < 0) return;
+		this.#beginSwitch(4000);
+		api.setPlayAdapt(playId, w, h, on).catch(() => {});
 	};
 	setFps = (v: 'auto' | '30' | '60' | '120') => {
 		this.streamFps = v;

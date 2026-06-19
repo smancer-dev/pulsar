@@ -40,12 +40,20 @@ pub struct CaptureConfig {
 	/// `H264` | `H265` | `Av1`. v1 implements H264; others should be rejected by the
 	/// caller so the host takes the ffmpeg branch.
 	pub codec: Codec,
-	/// Monitor index, 0 (matches `ddagrab=output_idx=0`).
+	/// Monitor index, 0 (matches `ddagrab=output_idx=0`). Ignored when `window_hwnd` is set
+	/// (the per-window WGC source captures a window, not a monitor).
 	pub output_idx: u32,
 	/// `plan.low_latency` → preset/tune/rc selection.
 	pub low_latency: bool,
 	/// Composite the cursor (v1: parsed but no-op unless `cursor.rs` landed).
 	pub draw_mouse: bool,
+	/// PER-WINDOW capture (Phase 2b): when `Some(hwnd)`, the native path captures that single
+	/// window via Windows Graphics Capture (`wgc::WgcCaptureDevice`) instead of duplicating a
+	/// whole monitor via DXGI — letting two panes share one monitor / target two app windows
+	/// (the same-monitor co-op case). `None` (default) ⇒ the existing full-monitor DXGI source.
+	/// The HWND is a raw window handle (`HWND.0 as isize`); the entire encode/RTP path is
+	/// identical either way. Has no effect on non-Windows (the native path is Windows-only).
+	pub window_hwnd: Option<isize>,
 }
 
 /// Video codec selector. The native NVENC path implements all three (`H264`, `H265`,
@@ -168,6 +176,14 @@ impl Drop for CaptureHandle {
 pub mod rtp;
 pub use rtp::{RtpEgress, RtpSender};
 
+// Top-level window enumeration for the per-window (WGC) capture target (Phase 2b co-op).
+// Cross-platform module: Windows enumerates real windows; the non-Windows arms are stubs so
+// the workspace builds everywhere and the host uses its display path off Windows.
+pub mod window;
+pub use window::{
+	find_window_for_launch, list_windows as list_capture_windows, window_pid, WindowDesc,
+};
+
 // ===========================================================================
 // Windows implementation
 // ===========================================================================
@@ -175,6 +191,10 @@ pub use rtp::{RtpEgress, RtpSender};
 pub(crate) mod dxgi;
 #[cfg(windows)]
 mod encode;
+// Per-window Windows Graphics Capture source (Phase 2b) — an alternative to `dxgi` that
+// produces the same per-frame BGRA ID3D11Texture2D the encoder consumes (see wgc.rs).
+#[cfg(windows)]
+pub(crate) mod wgc;
 
 // Shared frame type lives here so both dxgi.rs (producer) and encode.rs (consumer) import
 // it from the crate root and cannot drift. Only meaningful on Windows (it borrows D3D11/DXGI
@@ -211,6 +231,68 @@ mod frame {
 		/// transient ACCESS_LOST). The encoder forces an IDR (+ SPS/PPS) for this frame so a
 		/// client mid-GOP re-syncs immediately instead of freezing until the next safety GOP.
 		pub force_idr: bool,
+	}
+}
+
+/// The capture source the encode loop reads from: a full-monitor DXGI duplication, or a
+/// per-window WGC source (Phase 2b). Both expose the same shape (`device`/`context` for the
+/// encoder, `target_size`/`native_size`/`rotation_deg` for encode sizing, and a `run` pacing
+/// loop), so the encode loop forwards through this enum and stays source-agnostic. Built once
+/// per outer rebuild from `CaptureConfig::window_hwnd` (`Some` ⇒ WGC, `None` ⇒ DXGI).
+#[cfg(windows)]
+enum CapSource {
+	Dxgi(dxgi::CaptureDevice),
+	Wgc(wgc::WgcCaptureDevice),
+}
+
+#[cfg(windows)]
+impl CapSource {
+	/// The D3D11 device the encoder opens its NVENC session on (encode.rs AddRefs it).
+	fn device(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Device {
+		match self {
+			CapSource::Dxgi(c) => &c.device,
+			CapSource::Wgc(c) => &c.device,
+		}
+	}
+	/// The shared immediate context (encode's pre-Blt copy runs on it).
+	fn context(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext {
+		match self {
+			CapSource::Dxgi(c) => &c.context,
+			CapSource::Wgc(c) => &c.context,
+		}
+	}
+	fn target_size(&self, w: u32, h: u32) -> (u32, u32) {
+		match self {
+			CapSource::Dxgi(c) => c.target_size(w, h),
+			CapSource::Wgc(c) => c.target_size(w, h),
+		}
+	}
+	fn native_size(&self) -> (u32, u32) {
+		match self {
+			CapSource::Dxgi(c) => c.native_size(),
+			CapSource::Wgc(c) => c.native_size(),
+		}
+	}
+	fn rotation_deg(&self) -> u32 {
+		match self {
+			CapSource::Dxgi(c) => c.rotation_deg(),
+			CapSource::Wgc(c) => c.rotation_deg(),
+		}
+	}
+	/// Forward the pacing loop to the underlying source. Both `run` implementations share the
+	/// exact signature (fps, draw_cursor, requested_output, stop, on_frame) and return `RunExit`.
+	unsafe fn run(
+		&mut self,
+		fps: u32,
+		draw_mouse: bool,
+		req_out: &std::sync::atomic::AtomicU32,
+		stop: &std::sync::atomic::AtomicBool,
+		on_frame: impl FnMut(&Frame),
+	) -> dxgi::RunExit {
+		match self {
+			CapSource::Dxgi(c) => c.run(fps, draw_mouse, req_out, stop, on_frame),
+			CapSource::Wgc(c) => c.run(fps, draw_mouse, req_out, stop, on_frame),
+		}
 	}
 }
 
@@ -298,7 +380,18 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 				// taking the output) into permanent thread death. Use the LONG budget for same-index
 				// rebuilds so the mode transition resolves within ~5 s and capture recovers.
 				let fast_transient = announced && output_idx != prev_good_output;
-				let mut cap = match dxgi::CaptureDevice::create(output_idx, stop_t.clone(), fast_transient) {
+				// PER-WINDOW (WGC) vs full-monitor (DXGI) source selection (Phase 2b). When the
+				// host requested a window capture, build the WGC source; it follows ITS window
+				// regardless of output_idx (no monitor switching). Otherwise the existing DXGI
+				// duplication on `output_idx`. Both produce the same BGRA Frame for the encoder.
+				let build_result = if let Some(hwnd) = cfg.window_hwnd {
+					wgc::WgcCaptureDevice::create(hwnd, stop_t.clone(), fast_transient)
+						.map(CapSource::Wgc)
+				} else {
+					dxgi::CaptureDevice::create(output_idx, stop_t.clone(), fast_transient)
+						.map(CapSource::Dxgi)
+				};
+				let mut cap = match build_result {
 					Ok(c) => c,
 					Err(e) => {
 						if !announced {
@@ -330,8 +423,8 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 				//    bitrate from the LIVE target so a switch preserves any adaptive-bitrate step.
 				let mut last_kbps = req_kbps_t.load(Ordering::Relaxed).max(1);
 				let mut enc = match encode::Encoder::new(
-					&cap.device,
-					&cap.context,
+					cap.device(),
+					cap.context(),
 					&encode::EncParams {
 						width: w,
 						height: h,

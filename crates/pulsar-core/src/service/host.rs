@@ -18,6 +18,10 @@ pub struct DataHandlers {
 	/// What this host can actually stream (validated codec + encoder caps, best-first)
 	/// — the `QueryStreamCaps` reply. Default claims only H.264 / software.
 	pub stream_caps: Box<dyn Fn() -> StreamCaps + Send>,
+	/// The host's visible top-level windows the client may pick as a per-window capture
+	/// target (Phase 2b co-op) — the `QueryWindows` reply. Cheap, called on demand.
+	/// Default empty (a host with no per-window capture source advertises no windows).
+	pub windows: Box<dyn Fn() -> Vec<WindowInfo> + Send>,
 	/// Client reported missing RTP video seqs (media-over-session): re-send them from
 	/// the retransmit ring. Default no-op (host without a media forwarder).
 	pub on_nack: Box<dyn FnMut(Vec<u16>) + Send>,
@@ -26,6 +30,9 @@ pub struct DataHandlers {
 	pub on_avatar: Box<dyn FnMut(Vec<u8>) + Send>,
 	/// The client pushed its display name (see [`DataMsg::PeerName`]). Default no-op.
 	pub on_peer_name: Box<dyn FnMut(String) + Send>,
+	/// The client pushed its own relay device ID (see [`DataMsg::PeerId`]) so the host
+	/// can show it instead of a bare `ip:port` on a direct connect. Default no-op.
+	pub on_peer_id: Box<dyn FnMut(String) + Send>,
 	/// File-manager requests from the client (`FsList` / `FsGet`). The handler
 	/// replies through `outbound` (`FsEntries`, or the file as
 	/// `FileBegin`/`FileChunk`/`FileEnd`). Default no-op — a host without the
@@ -56,9 +63,11 @@ impl Default for DataHandlers {
 				features: Vec::new(),
 				displays: Vec::new(),
 			}),
+			windows: Box::new(Vec::new),
 			on_nack: Box::new(|_| {}),
 			on_avatar: Box::new(|_| {}),
 			on_peer_name: Box::new(|_| {}),
+			on_peer_id: Box::new(|_| {}),
 			on_fs: Box::new(|_| {}),
 		}
 	}
@@ -182,6 +191,9 @@ pub async fn serve_with(
 					.send(&enc(&Msg::StreamCaps((data.stream_caps)())))
 					.await;
 			}
+			Some(Msg::QueryWindows) => {
+				let _ = session.send(&enc(&Msg::Windows((data.windows)()))).await;
+			}
 			Some(Msg::Launch(id)) => {
 				on_launch(id);
 				let _ = session.send(&enc(&Msg::Ok)).await;
@@ -208,6 +220,7 @@ pub async fn serve_with(
 				DataMsg::MediaNack(seqs) => (data.on_nack)(seqs),
 				DataMsg::Avatar(png) => (data.on_avatar)(png),
 				DataMsg::PeerName(name) => (data.on_peer_name)(name),
+				DataMsg::PeerId(id) => (data.on_peer_id)(id),
 				m @ (DataMsg::FsList { .. } | DataMsg::FsGet { .. }) => (data.on_fs)(m),
 				DataMsg::FsEntries { .. } => {} // host→client only; ignore if echoed back
 				// Cursor side-channel + rumble are host→client only; ignore if echoed back.

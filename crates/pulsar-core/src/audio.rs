@@ -28,6 +28,11 @@
 mod command;
 #[cfg(windows)]
 mod loopback;
+// Per-process WASAPI loopback (Phase 4 same-host co-op): capture ONLY one app's render
+// audio (and its child processes) so two sessions to the same host don't each get the whole
+// system mix (doubled/echoed). Win10 20H1+ only; the host falls back to `loopback` otherwise.
+#[cfg(windows)]
+mod process_loopback;
 mod mute;
 mod settings;
 mod sink;
@@ -45,6 +50,10 @@ pub use command::{
 pub use loopback::{
 	loopback_format, run_loopback_capture, run_loopback_capture_pinned,
 	run_loopback_capture_tracking, LoopbackFormat,
+};
+#[cfg(windows)]
+pub use process_loopback::{
+	process_loopback_format, process_loopback_supported, run_process_loopback_capture,
 };
 pub use mute::{mute_fallback_marker_path, restore_stale_mute_fallback, set_host_muted};
 pub use settings::{

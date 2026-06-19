@@ -51,7 +51,16 @@
 	// audio went silent. Empty value = platform default.
 	let audioSources = $state<string[]>([]);
 	async function refreshAudioSources() {
-		audioSources = await api.listAudioSources().catch(() => []);
+		const next = await api.listAudioSources().catch(() => []);
+		// Only REASSIGN when the device list actually changed. The 10 s poll otherwise
+		// rebuilt the {#each audioSources} <option> list every tick even when identical —
+		// a childList mutation INSIDE the gaming-mode navContainer subtree, which fired its
+		// MutationObserver → a full forced-layout re-scan of the whole Settings panel every
+		// 10 s. On opi5/WebKitGTK (software paint, no forced-layout batching) that was a
+		// recurring hitch ("Settings donmaya başlıyor"); skipping the no-op reassign stops it.
+		if (next.length !== audioSources.length || next.some((s, i) => s !== audioSources[i])) {
+			audioSources = next;
+		}
 	}
 	onMount(() => {
 		refreshAudioSources();
@@ -231,6 +240,15 @@
 	.select:focus-visible {
 		outline: 2px solid var(--accent);
 		outline-offset: 2px;
+	}
+	/* Belt-and-suspenders for dark mode: even if a native popup ignores `color-scheme`,
+	   force the <option> rows to the app palette so the list stays readable. */
+	.select option {
+		background: var(--surface);
+		color: var(--text);
+	}
+	.select option:disabled {
+		color: var(--text-faint);
 	}
 	.detnote {
 		font-size: 11.5px;

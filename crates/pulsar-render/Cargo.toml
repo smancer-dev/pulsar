@@ -21,6 +21,16 @@ path = "src/main.rs"
 
 [dependencies]
 egui = "0.29"
+# Distinct icon glyphs for the overlay's category boxes + stat tiles. The bundled egui
+# font has no emoji glyphs (📡🖥📊… rendered as tofu), so we install the Phosphor icon
+# font into egui's `FontDefinitions` in `overlay::apply_theme` (the single shared font
+# setup, called by ALL three backends — Linux egui_glow, the Windows custom D3D11 painter,
+# and macOS eframe). Phosphor glyphs are just extra font glyphs in egui's atlas, so the
+# Windows custom painter (`win/egui_paint.rs`) picks them up for free once they're in the
+# Context's fonts before the atlas builds. 0.7 is the egui-0.29-compatible line (its `egui`
+# dep is 0.29.1 — verified no duplicate/bumped egui; a bump would ripple to the custom
+# painter + the Linux egui_glow path, see the NOTE above).
+egui-phosphor = "0.7"
 # The app relays the host's FsEntries as one-line JSON over stdin (`fsjson …`)
 # for the native Files view — tiny parse, no derives needed.
 serde_json = "1"

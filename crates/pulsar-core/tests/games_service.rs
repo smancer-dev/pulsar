@@ -40,11 +40,13 @@ async fn client_lists_and_launches_host_games() {
 							id: "g1".into(),
 							title: "Elden Ring".into(),
 							kind: "program".into(),
+							image: String::new(),
 						},
 						GameInfo {
 							id: "g2".into(),
 							title: "Hades II".into(),
 							kind: "program".into(),
+							image: String::new(),
 						},
 					]
 				};

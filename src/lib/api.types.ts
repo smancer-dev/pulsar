@@ -10,6 +10,9 @@ export interface GameInfo {
 	id: string;
 	title: string;
 	kind: string;
+	/** Optional cover image (data: URL or http URL): a user cover, the Steam logo, or a
+	 * live host-desktop thumbnail for the built-in `desktop` entry. Empty/absent = icon. */
+	image?: string;
 }
 
 /** A Pulsar device auto-discovered on the local network (multicast beacon). */
@@ -51,6 +54,15 @@ export interface PlayInfo {
 	host_displays: HostDisplay[];
 	/** This client's own decodable codecs (startup probe). */
 	client_codecs: string[];
+}
+
+/** One capture-able host window (Phase 2b co-op "Pencere" capture). `hwnd` is the
+ * raw Win32 window handle the host echoes back as the capture target; `title` is the
+ * window caption shown to the user in the picker. Windows-only — a non-Windows host
+ * replies with an empty list (no per-window WGC source). */
+export interface WindowInfo {
+	hwnd: number;
+	title: string;
 }
 
 /** One host monitor advertised by QueryStreamCaps. `idx` is what `setPlayMonitor`
@@ -122,6 +134,10 @@ export interface FsEntries {
 export interface SessionEvent {
 	kind: string;
 	peer: string;
+	/** The SESSION id (the host's `active`/`incoming` map key): the connections window
+	 * keys rows by sid so one client device can hold several concurrent sessions
+	 * (couch co-op / split panes); `peer` groups them. 0 for pre-accept events. */
+	sid: number;
 	detail: string;
 }
 

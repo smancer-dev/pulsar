@@ -2,6 +2,7 @@
 	// Gaming-mode host games — a full IN-STAGE screen (NOT a popup). Shown after picking a
 	// host on the home: a connecting/loading state while the host's library is fetched, then
 	// the games as big cards (Desktop pinned first). Back (button / B / Esc) returns home.
+	import { tick } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import { type GameInfo } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
@@ -14,14 +15,47 @@
 		target: string;
 		/** Fetched games, or null while loading / on error. */
 		games: GameInfo[] | null;
+		/** Live host-desktop thumbnail (data URL) for the pinned Desktop card, if any. */
+		desktopImg?: string;
 		loading: boolean;
 		err: string;
 		/** Launch: '' = whole Desktop, else the game id. */
 		onPlay: (gameId: string) => void;
 		onBack: () => void;
 	};
-	let { nav, target, games, loading, err, onPlay, onBack }: Props = $props();
+	let { nav, target, games, desktopImg = '', loading, err, onPlay, onBack }: Props = $props();
 	const navItem = nav.item;
+
+	// Cover image for a fetched game: the host-sent cover, else the bundled Steam logo for
+	// the Steam default, else none (the card shows initials).
+	function coverFor(g: GameInfo): string {
+		if (g.image) return g.image;
+		if (g.id === 'steam' || g.title.toLowerCase() === 'steam') return '/steam.svg';
+		return '';
+	}
+
+	// The first game card (the always-present "Desktop" card). Once the list has loaded
+	// we select it by default so controller nav starts ON a game — not parked on the Back
+	// button (which registers first) or the bottom dock. Without this the user had to
+	// d-pad up from the bottom to reach the first game.
+	let firstCard = $state<HTMLButtonElement>();
+	let didAutofocus = false;
+	$effect(() => {
+		// Track loading/err/games so this re-runs as the fetch resolves.
+		const ready = !loading && !err;
+		void games;
+		if (loading) {
+			didAutofocus = false; // re-arm for the next fetch
+			return;
+		}
+		if (!ready || didAutofocus) return;
+		didAutofocus = true;
+		// Wait for the cards to mount + lay out, then focus the first one. nav.focus()
+		// validates registration + visibility, so a not-yet-painted node is a no-op.
+		tick().then(() => {
+			if (firstCard) nav.focus(firstCard);
+		});
+	});
 
 	function initials(name: string) {
 		return name.split(' ').map((w) => w[0]).slice(0, 2).join('').toUpperCase();
@@ -46,15 +80,20 @@
 		<button class="btn" use:navItem onclick={onBack}>{t('gaming.back')}</button>
 	{:else}
 		<div class="games">
-			<button class="gcard" use:navItem onclick={() => onPlay('')}>
-				<span class="gicon"><Icon name="monitor" size={20} /></span>
+			<button class="gcard" use:navItem bind:this={firstCard} onclick={() => onPlay('')}>
+				<span class="gicon" class:img={!!desktopImg}>
+					{#if desktopImg}<img src={desktopImg} alt="" />{:else}<Icon name="monitor" size={20} />{/if}
+				</span>
 				<span class="gmeta"><span class="gname">{t('gaming.desktop')}</span><span class="gkind mono">{t('gaming.wholeScreen')}</span></span>
 				<Icon name="gaming" size={16} class="push" />
 			</button>
 			{#if games && games.length}
 				{#each games as g (g.id)}
+					{@const cover = coverFor(g)}
 					<button class="gcard" use:navItem onclick={() => onPlay(g.id)}>
-						<span class="gicon">{initials(g.title)}</span>
+						<span class="gicon" class:img={!!cover}>
+							{#if cover}<img src={cover} alt="" />{:else}{initials(g.title)}{/if}
+						</span>
 						<span class="gmeta"><span class="gname">{g.title}</span><span class="gkind mono">{g.kind}</span></span>
 						<Icon name="gaming" size={16} class="push" />
 					</button>
@@ -176,6 +215,18 @@
 		font-size: 13px;
 		font-family: var(--font-display);
 		flex: none;
+		overflow: hidden;
+	}
+	/* Cover-image variant: a 16:9 thumbnail (host desktop screenshot / Steam logo / cover). */
+	.gicon.img {
+		width: 64px;
+		background: var(--surface-3);
+	}
+	.gicon img {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+		display: block;
 	}
 	.gmeta {
 		display: flex;

@@ -56,7 +56,28 @@ windows = { version = "0.59", features = [
 	"Win32_System_Performance",         # QueryPerformanceCounter/Frequency (QPC→Instant for pacing)
 	"Win32_System_Power",               # SetThreadExecutionState (keep display awake)
 	"Win32_Graphics_Gdi",               # HMONITOR in DXGI_OUTPUT_DESC → IDXGIOutput::GetDesc()
-	"Win32_UI_WindowsAndMessaging",     # GetCursorInfo + CURSORINFO + CURSOR_SHOWING (live cursor pos)
+	"Win32_UI_WindowsAndMessaging",     # GetCursorInfo + CURSORINFO + CURSOR_SHOWING (live cursor pos);
+	                                    #   window.rs: EnumWindows, GetWindowThreadProcessId,
+	                                    #   IsWindowVisible, GetWindowTextW/LengthW, GetWindowRect,
+	                                    #   GetWindow(GW_OWNER), GetWindowLongW(GWL_EXSTYLE), WS_EX_TOOLWINDOW
+	"Win32_System_Diagnostics_ToolHelp", # window.rs: CreateToolhelp32Snapshot/Process32First/Next —
+	                                    #   walk the launched game's child PIDs (Steam/launcher re-parenting)
+
+	# --- Windows Graphics Capture (WGC) per-window source (src/wgc.rs) ---
+	# WinRT projection used by wgc.rs to capture a single HWND into the same per-frame
+	# ID3D11Texture2D the NVENC encoder consumes (drop-in alternative to the DXGI source).
+	"Foundation",                       # TimeSpan (frame timestamps), event-token plumbing
+	"Foundation_Collections",           # IIterable/IVector backing for the WinRT projection
+	"Graphics",                         # SizeInt32 (frame-pool + item size)
+	"Graphics_Capture",                 # GraphicsCaptureItem, Direct3D11CaptureFramePool,
+	                                    #   Direct3D11CaptureFrame, GraphicsCaptureSession
+	                                    #   (SetIsBorderRequired, IsSupported)
+	"Graphics_DirectX",                 # DirectXPixelFormat::B8G8R8A8UIntNormalized
+	"Graphics_DirectX_Direct3D11",      # IDirect3DDevice / IDirect3DSurface (WinRT D3D handles)
+	"Win32_System_WinRT_Direct3D11",    # CreateDirect3D11DeviceFromDXGIDevice +
+	                                    #   IDirect3DDxgiInterfaceAccess::GetInterface (the
+	                                    #   WinRT-surface ↔ ID3D11Texture2D bridge)
+	"Win32_System_WinRT_Graphics_Capture", # IGraphicsCaptureItemInterop::CreateForWindow (HWND→item)
 ] }
 # Interface (.cast::<T>()), Result, Error, GUID — used pervasively in the unsafe FFI
 # (GUID is reused for the NVENC codec/preset/profile GUID literals).

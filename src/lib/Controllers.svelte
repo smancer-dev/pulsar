@@ -8,10 +8,30 @@
 	import { api } from '$lib/api';
 	import type { ControllerInfo } from '$lib/types';
 	import { t } from '$lib/i18n.svelte';
-	import { ui, saveUi, slotOf, EMULATION_TARGETS } from '$lib/settings.svelte';
+	import { ui, saveUi, slotOf } from '$lib/settings.svelte';
+	import type { Action } from 'svelte/action';
 
-	// `compact` is the small in-session variant (no card chrome).
-	let { compact = false }: { compact?: boolean } = $props();
+	// Seg-button options (dark-mode styled, pad-operable) — replaces the native <select>s,
+	// which weren't dark-mode-consistent and couldn't be changed with a controller. Labels
+	// are i18n keys (the values are the stable tokens persisted/sent to the core).
+	const EMU_OPTS = [
+		{ v: 'auto', k: 'controllers.emuAuto' },
+		{ v: 'xbox', k: 'controllers.emuXbox' },
+		{ v: 'ds4', k: 'controllers.emuDs4' }
+	] as const;
+	const RUMBLE_OPTS = [
+		{ v: 'off', k: 'controllers.rumbleOff' },
+		{ v: 'weak', k: 'controllers.rumbleWeak' },
+		{ v: 'medium', k: 'controllers.rumbleMedium' },
+		{ v: 'strong', k: 'controllers.rumbleStrong' }
+	] as const;
+
+	// `compact` is the small in-session variant (no card chrome). `navItem` is the gaming
+	// GamepadNav action so the controls are pad-navigable when shown inside the gaming-mode
+	// controllers popup (no-op everywhere else, so the remote-mode Games tab is unaffected).
+	const noopAction: Action<HTMLElement> = () => {};
+	let { compact = false, navItem = noopAction }: { compact?: boolean; navItem?: Action<HTMLElement> } =
+		$props();
 
 	let pads = $state<ControllerInfo[]>([]);
 	let timer: ReturnType<typeof setInterval> | undefined;
@@ -50,10 +70,26 @@
 			saveUi();
 			api.setControllerOrder($state.snapshot(ui.controllerOrder) as string[]);
 		}
-		// Push emulation map once on every refresh so the Arc is populated before a
-		// session starts (no extra IPC if pads haven't changed — the value is the same).
+		// Push emulation + per-pad rumble maps once on every refresh so the Arcs are
+		// populated before a session starts (no extra IPC if unchanged — same values).
 		api.setControllerEmulation($state.snapshot(ui.controllerEmulation) as Record<string, string>);
+		api.setControllerRumble($state.snapshot(ui.controllerRumble) as Record<string, string>);
+		// Same for the disabled set, so the play reader knows which pads to ignore.
+		api.setDisabledControllers(Object.keys($state.snapshot(ui.controllerDisabled)));
 	});
+
+	function setRumble(uuid: string, value: string) {
+		ui.controllerRumble[uuid] = value as (typeof RUMBLE_OPTS)[number]['v'];
+		saveUi();
+		api.setControllerRumble($state.snapshot(ui.controllerRumble) as Record<string, string>);
+	}
+
+	function setDisabled(uuid: string, off: boolean) {
+		if (off) ui.controllerDisabled[uuid] = true;
+		else delete ui.controllerDisabled[uuid];
+		saveUi();
+		api.setDisabledControllers(Object.keys($state.snapshot(ui.controllerDisabled)));
+	}
 
 	// Build display rows ordered by current player slot (non-compact only).
 	// Uses slotOf(p.uuid) to compute each pad's slot index.
@@ -117,34 +153,54 @@
 			<p class="hint">{t('controllers.reorderHint')}</p>
 			<ul class="slot-list">
 				{#each slotRows as { slot, pad } (pad.uuid)}
-					<li class:off={!pad.connected}>
-						<span class="slot-label mono">{t('controllers.slot')} {slot + 1}</span>
-						<span class="dot" class:on={pad.connected}></span>
-						<span class="name">{pad.name}</span>
-						<span class="kind mono">{pad.label}</span>
-						<select
-							class="emul-select"
-							aria-label="Emülasyon hedefi"
-							value={ui.controllerEmulation[pad.uuid] ?? 'auto'}
-							onchange={(e) =>
-								setEmulation(pad.uuid, (e.currentTarget as HTMLSelectElement).value as 'auto' | 'xbox' | 'ds4')}
-						>
-							{#each EMULATION_TARGETS as et}
-								<option value={et.value}>{et.label}</option>
-							{/each}
-						</select>
-						<span class="reorder-btns">
+					<li class="pad-card" class:off={!pad.connected} class:disabled={!!ui.controllerDisabled[pad.uuid]}>
+						<div class="pad-top">
+							<span class="slot-label mono">{t('controllers.slot')} {slot + 1}</span>
+							<span class="dot" class:on={pad.connected}></span>
+							<span class="name">{pad.name}</span>
+							<span class="kind mono">{pad.label}</span>
+							{#if pad.battery != null}
+								<span class="batt mono" title={t('controllers.battery')}>{pad.battery}%</span>
+							{/if}
 							<button
-								class="mv-btn"
-								aria-label="Yukarı taşı"
-								onclick={() => moveUp(pad.uuid)}
-							>▲</button>
+								class="enable-btn"
+								class:off={!!ui.controllerDisabled[pad.uuid]}
+								use:navItem
+								aria-pressed={!ui.controllerDisabled[pad.uuid]}
+								onclick={() => setDisabled(pad.uuid, !ui.controllerDisabled[pad.uuid])}
+							>{ui.controllerDisabled[pad.uuid] ? t('controllers.disabled') : t('controllers.enabled')}</button>
+							<span class="reorder-btns">
+								<button class="mv-btn" use:navItem aria-label={t('controllers.aMoveUp')} onclick={() => moveUp(pad.uuid)}>▲</button>
+								<button class="mv-btn" use:navItem aria-label={t('controllers.aMoveDown')} onclick={() => moveDown(pad.uuid)}>▼</button>
+							</span>
+						</div>
+						<!-- Emulation target: dark-mode seg buttons (mouse + controller). -->
+						<div class="seg-row">
+							<span class="seg-lab">{t('controllers.emulation')}</span>
+							<div class="seg" role="group" aria-label={t('controllers.emulation')}>
+								{#each EMU_OPTS as o}
+									{@const on = (ui.controllerEmulation[pad.uuid] ?? 'auto') === o.v}
+									<button class="seg-btn" class:on use:navItem aria-pressed={on} onclick={() => setEmulation(pad.uuid, o.v)}>{t(o.k)}</button>
+								{/each}
+							</div>
+						</div>
+						<!-- Per-pad vibration strength: dark-mode seg buttons + a TEST pulse. -->
+						<div class="seg-row">
+							<span class="seg-lab">{t('controllers.rumble')}</span>
+							<div class="seg vib" role="group" aria-label={t('controllers.rumble')}>
+								{#each RUMBLE_OPTS as o}
+									{@const on = (ui.controllerRumble[pad.uuid] ?? 'medium') === o.v}
+									<button class="seg-btn" class:on use:navItem aria-pressed={on} onclick={() => setRumble(pad.uuid, o.v)}>{t(o.k)}</button>
+								{/each}
+							</div>
 							<button
-								class="mv-btn"
-								aria-label="Aşağı taşı"
-								onclick={() => moveDown(pad.uuid)}
-							>▼</button>
-						</span>
+								class="test-btn"
+								use:navItem
+								disabled={!pad.connected || (ui.controllerRumble[pad.uuid] ?? 'medium') === 'off'}
+								title={t('controllers.test')}
+								onclick={() => api.testControllerRumble(pad.uuid).catch(() => {})}
+							>{t('controllers.testBtn')}</button>
+						</div>
 					</li>
 				{/each}
 			</ul>
@@ -211,6 +267,110 @@
 		margin: 10px 0 0 0;
 		font-style: italic;
 	}
+	.pad-card {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 10px 12px;
+		border: 1px solid var(--border);
+		border-radius: var(--r-sm, 6px);
+		background: var(--surface-2, var(--surface));
+	}
+	.pad-top {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		font-size: 13px;
+	}
+	.seg-row {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.seg-lab {
+		font-size: 11.5px;
+		color: var(--text-muted);
+		font-weight: 600;
+		min-width: 8ch;
+		flex: none;
+	}
+	.seg {
+		display: flex;
+		gap: 4px;
+		flex-wrap: wrap;
+		margin-left: auto;
+	}
+	.seg-btn {
+		font-size: 11.5px;
+		font-family: inherit;
+		color: var(--text-muted);
+		background: var(--surface-3, var(--surface));
+		border: 1px solid var(--border-strong, var(--border));
+		border-radius: var(--r-sm, 4px);
+		padding: 3px 9px;
+		cursor: pointer;
+		transition: all var(--dur) var(--ease);
+	}
+	.seg-btn:hover {
+		color: var(--text);
+		background: var(--accent-soft);
+	}
+	.seg-btn.on {
+		color: var(--text-on-accent, #fff);
+		background: var(--accent);
+		border-color: var(--accent);
+	}
+	.test-btn {
+		font-size: 11.5px;
+		font-family: inherit;
+		font-weight: 600;
+		color: var(--accent);
+		background: var(--accent-soft);
+		border: 1px solid var(--accent);
+		border-radius: var(--r-sm, 4px);
+		padding: 3px 10px;
+		cursor: pointer;
+		flex: none;
+		transition: all var(--dur) var(--ease);
+	}
+	.test-btn:hover:not(:disabled) {
+		color: var(--text-on-accent, #fff);
+		background: var(--accent);
+	}
+	.test-btn:disabled {
+		opacity: 0.4;
+		cursor: default;
+	}
+	.batt {
+		font-size: 11px;
+		color: var(--text-muted);
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		padding: 1px 6px;
+		flex: none;
+	}
+	.enable-btn {
+		font-size: 11px;
+		font-family: inherit;
+		font-weight: 600;
+		color: var(--text-on-accent, #fff);
+		background: var(--ok, oklch(0.62 0.16 150));
+		border: none;
+		border-radius: var(--r-sm, 4px);
+		padding: 2px 9px;
+		cursor: pointer;
+		flex: none;
+	}
+	.enable-btn.off {
+		background: var(--danger, oklch(0.55 0.2 25));
+	}
+	.pad-card.disabled {
+		opacity: 0.55;
+	}
+	.pad-card.disabled .seg-btn,
+	.pad-card.disabled .name {
+		filter: grayscale(0.6);
+	}
 	ul {
 		list-style: none;
 		margin: 0;
@@ -264,20 +424,6 @@
 	.kind {
 		font-size: 11.5px;
 		color: var(--text-muted);
-	}
-	.emul-select {
-		font-size: 11.5px;
-		color: var(--text-muted);
-		background: var(--surface-raised, var(--surface));
-		border: 1px solid var(--border);
-		border-radius: var(--r-sm, 4px);
-		padding: 1px 4px;
-		cursor: pointer;
-		flex: none;
-	}
-	.emul-select:focus {
-		outline: 2px solid var(--accent);
-		outline-offset: 1px;
 	}
 	.state {
 		margin-left: auto;

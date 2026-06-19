@@ -116,11 +116,23 @@ struct SessionCleanupGuard {
 	/// Connections window and +page.svelte's `hostSessions` do not show phantom
 	/// peers and so the auto-updater liveness gate is not permanently suppressed.
 	/// These are all the same Arcs captured in the session closure.
-	incoming: Arc<Mutex<std::collections::HashMap<String, (u64, tokio::sync::oneshot::Sender<()>)>>>,
-	host_out: Arc<Mutex<std::collections::HashMap<String, (u64, tokio::sync::mpsc::Sender<pulsar_core::service::DataMsg>)>>>,
-	active: Arc<Mutex<std::collections::HashMap<String, crate::state::ConnInfo>>>,
+	incoming: Arc<Mutex<std::collections::HashMap<u64, (String, tokio::sync::oneshot::Sender<()>)>>>,
+	host_out: Arc<Mutex<std::collections::HashMap<u64, (String, tokio::sync::mpsc::Sender<pulsar_core::service::DataMsg>)>>>,
+	active: Arc<Mutex<std::collections::HashMap<u64, crate::state::ConnInfo>>>,
 	peer_meta: Arc<Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>>,
 	peer: String,
+	/// Same-host co-op pre-auth bookkeeping: the peer's pubkey + whether we registered a
+	/// pre-auth entry for it. Dropping the LAST live session for this pubkey removes the
+	/// entry (so a future connect from this device must re-authenticate). Removal is done
+	/// HERE (the guard always drops, on both the normal and abort paths) — exactly once.
+	preauth_pubkey: Option<[u8; 32]>,
+	/// Per-session screen-adaptation state. If this session switched the captured monitor's
+	/// display mode for a split pane (Windows, `StreamReq::adapt`), the original mode is stored
+	/// here; Drop reverts it so the host's resolution is ALWAYS restored on teardown — on both
+	/// the normal end and the abort() path (Drop covers both). `take()`n so it's idempotent (a
+	/// second drop / a prior revert via an `adapt: None` restream sees `None` and no-ops). The
+	/// same Arc is held by the on_stream handler, which applies/updates it during the session.
+	adapt_state: Arc<Mutex<crate::display_mode::AdaptState>>,
 	app_handle: AppHandle,
 }
 
@@ -156,6 +168,15 @@ impl Drop for SessionCleanupGuard {
 		// to ~1.5 s waiting for its next restream_tx.is_closed() check.
 		// abort() is safe to call after the task has already finished.
 		self.mode_watcher.abort();
+		// Screen adaptation (Parsec-style): if this session switched the captured monitor's
+		// display mode for a split pane, restore the ORIGINAL mode now so the host is never
+		// left stuck at a wrong resolution. This is the teardown guarantee — it fires on BOTH
+		// the normal end and the abort() path (Drop covers both). `take()` makes it idempotent
+		// (a second drop, or a prior revert from an `adapt: None` restream, finds None). No-op
+		// off Windows (the stored PrevMode is always None there).
+		if let Some(prev) = self.adapt_state.lock().unwrap().prev.take() {
+			crate::display_mode::revert(prev);
+		}
 		// Linux: close the XDG ScreenCast portal session so the compositor's
 		// "your screen is being shared" indicator disappears.
 		// `WaylandCapture::stop` is async, so we fire-and-forget a background task.
@@ -168,6 +189,14 @@ impl Drop for SessionCleanupGuard {
 		// Release per-session redirect ownership; idempotent if already released
 		// by the normal teardown block.
 		handlers::release_redirect(self.sid);
+		// Same-host co-op pre-auth: drop this session's pre-auth refcount. Done HERE only
+		// (the guard always drops, on both the normal and abort paths) so the decrement
+		// happens exactly once — the normal teardown tail does NOT also remove it. When the
+		// LAST session for this device ends the entry is removed, so a future connect from
+		// it must re-authenticate. None when this was an unattended (no-auth) session.
+		if let Some(pk) = self.preauth_pubkey {
+			crate::auth::preauth::remove(&pk);
+		}
 		// C3: Emit a `disconnected` SessionEvent and clean up the bookkeeping maps
 		// even when this session task was cancelled by `JoinHandle::abort()` (the
 		// go_online reconnect path). Without this, the abort() path skips the entire
@@ -181,50 +210,38 @@ impl Drop for SessionCleanupGuard {
 		// and is a no-op.
 		let sid = self.sid;
 		let peer = self.peer.clone();
-		// sid-guarded removal: only remove entries that still belong to THIS session.
-		// A same-peer reconnection may have already overwritten them with a newer sid.
-		{
-			let mut g = self.incoming.lock().unwrap();
-			if g.get(&peer).map(|(id, _)| *id) == Some(sid) {
-				g.remove(&peer);
-			}
-		}
-		{
-			let mut g = self.host_out.lock().unwrap();
-			if g.get(&peer).map(|(id, _)| *id) == Some(sid) {
-				g.remove(&peer);
-			}
-		}
-		let (was_mine, conns_emptied) = {
+		// Keyed by sid now: this entry is uniquely ours, so a plain remove() is correct —
+		// a same-DEVICE co-op session has its OWN sid key and is never touched here.
+		self.incoming.lock().unwrap().remove(&sid);
+		self.host_out.lock().unwrap().remove(&sid);
+		// peer_still_live: any OTHER active session sharing this peer (couch co-op) — used
+		// to refcount the per-DEVICE identity cache so session B's teardown doesn't blank
+		// session A's still-live name/avatar.
+		let (removed, peer_still_live, conns_emptied) = {
 			let mut g = self.active.lock().unwrap();
-			let mine = g.get(&peer).map(|ci| ci.sid) == Some(sid);
-			if mine {
-				g.remove(&peer);
-			}
-			(mine, g.is_empty())
+			let removed = g.remove(&sid).is_some();
+			let peer_still_live = g.values().any(|ci| ci.peer == peer);
+			(removed, peer_still_live, g.is_empty())
 		};
-		if was_mine {
-			// Release the ~50-70 KB avatar data-URL and peer name cached for this
-			// peer; a reconnect will re-push them.
+		if removed && !peer_still_live {
+			// Last session for this device left — release the ~50-70 KB avatar data-URL
+			// and peer name cached for it; a reconnect will re-push them.
 			self.peer_meta.lock().unwrap().remove(&peer);
 		}
 		if conns_emptied {
 			crate::connections::close(&self.app_handle);
 		}
-		// Emit the `disconnected` SessionEvent so both the Connections window and
-		// +page.svelte's `hostSessions` drop this peer. GATED on `was_mine`: a same-peer
-		// reconnect (game mode connects twice — a caps-probe session then the streaming one,
-		// identical peer addr) means this OLD session's Drop runs AFTER the new one already
-		// took the `active` slot (mine=false). Emitting unconditionally told the UI the peer
-		// disconnected and the window dropped the row by peer — so the LIVE game connection
-		// vanished from "active connections". The newer session owns
-		// the peer + emits its own cleanup when IT ends, so skipping here is safe.
-		if was_mine {
+		// Emit the `disconnected` SessionEvent (carrying this session's sid) so both the
+		// Connections window and +page.svelte's `hostSessions` drop THIS session's row.
+		// Gated on `removed` (we actually held the slot): the row is keyed by sid, so this
+		// only drops our own pane — a same-device co-op session's row survives.
+		if removed {
 			let _ = self.app_handle.emit(
 				"session",
 				crate::events::SessionEvent {
 					kind: "disconnected".into(),
 					peer,
+					sid,
 					detail: String::new(),
 				},
 			);
@@ -317,6 +334,9 @@ pub(crate) async fn go_online(
 	// A previous serve loop's sessions may not have torn down cleanly (independent
 	// spawns survive the accept-loop abort) — never carry a stale sink-redirect over.
 	handlers::reset_redirect_all();
+	// Likewise clear any stranded same-host co-op pre-auth entries: a fresh serve loop has
+	// no live sessions, so no device should remain pre-authorized from the prior loop.
+	crate::auth::preauth::clear_all();
 	// Crash-restore for the Sunshine-style sink redirect: a prior process that
 	// redirected the default render endpoint to the virtual sink and died before its
 	// guard dropped left the host on the sinkless sink (real speakers silent). Restore
@@ -395,6 +415,14 @@ pub(crate) async fn go_online(
 		match Discovery::start(announce_name.clone(), node_port, node.public_key(), None).await {
 			Ok(d) => {
 				tracing::info!(port = node_port, name = %announce_name, "LAN discovery beacon started");
+				// Honor the current serve gate: a beacon (re)started while in gaming mode must
+				// stay silent (don't advertise a pure client on the LAN).
+				if state
+					.hosting_disabled
+					.load(std::sync::atomic::Ordering::Relaxed)
+				{
+					d.set_paused(true);
+				}
 				*state.discovery.lock().unwrap() = Some(d.clone());
 				Some(d)
 			}
@@ -471,6 +499,11 @@ pub(crate) async fn go_online(
 			// `incoming`/`host_out` entries isn't evicted when THIS (older) session tears
 			// down (both maps are keyed by `peer`, which collides across reconnects).
 			let sid = session.id();
+			// The peer's static X25519 public key — the no-MITM-safe identity the same-host
+			// co-op pre-auth set is keyed on (NOT the spoofable relay id). Captured here while
+			// the session is still owned; `None` only if the session state was already torn
+			// down (then pre-auth simply doesn't apply and normal auth runs).
+			let peer_pubkey = session.peer_pubkey().await;
 			let session_handle = tokio::spawn(async move {
 				let mut session = session;
 				// The client's first message is its access request (password may be
@@ -506,6 +539,7 @@ pub(crate) async fn go_online(
 							SessionEvent {
 								kind: "rejected".into(),
 								peer: peer.clone(),
+								sid,
 								detail: String::new(),
 							},
 						);
@@ -547,7 +581,20 @@ pub(crate) async fn go_online(
 						let _ = app_h.emit("session-password", fresh);
 					}
 				}
-				let approved = if require_auth {
+				// Same-host co-op pre-auth: if this DEVICE already has an authorized live
+				// session, treat the new same-device session as pre-authorized — skip the
+				// single-use OTP consume AND the Allow/Deny popup. Required because the OTP
+				// rotates on consume, so a 2nd pane could never present a valid code. Keyed on
+				// the no-MITM-safe pubkey (a relay can't substitute a peer behind an id).
+				// Unattended hosts never reach here (require_auth=false → auto-allow below).
+				let preauthorized = require_auth
+					&& peer_pubkey
+						.as_ref()
+						.is_some_and(crate::auth::preauth::is_authorized);
+				if preauthorized {
+					tracing::info!(%peer, "same-device session pre-authorized (existing authorized session) — skipping OTP + popup");
+				}
+				let approved = if require_auth && !preauthorized {
 					if let Some(rem) = crate::auth::throttle::locked_out(&peer) {
 						tracing::warn!(%peer, secs = rem.as_secs(), "auth throttled: rejecting without prompt");
 						false
@@ -621,6 +668,15 @@ pub(crate) async fn go_online(
 				};
 				if approved {
 					crate::auth::throttle::clear(&peer);
+					// Same-host co-op: mark this DEVICE authorized so a subsequent same-pubkey
+					// session (2nd pane) skips the OTP + popup. Only on password-gated hosts —
+					// unattended (!require_auth) hosts auto-allow and don't need pre-auth. The
+					// matching `preauth::remove` runs on this session's teardown (both paths).
+					if require_auth {
+						if let Some(pk) = peer_pubkey {
+							crate::auth::preauth::add(pk);
+						}
+					}
 				}
 				if !approved {
 					let _ = reject(&mut session).await;
@@ -630,6 +686,7 @@ pub(crate) async fn go_online(
 						SessionEvent {
 							kind: "rejected".into(),
 							peer: peer.clone(),
+							sid,
 							detail: String::new(),
 						},
 					);
@@ -642,6 +699,7 @@ pub(crate) async fn go_online(
 					SessionEvent {
 						kind: "connected".into(),
 						peer: peer.clone(),
+						sid,
 						detail: String::new(),
 					},
 				);
@@ -671,45 +729,37 @@ pub(crate) async fn go_online(
 				// authenticated peer — including data-channel-only, scripted, or
 				// malicious clients that never send StartStream.
 				//
-				// We skip registration when a LIVE streaming session already occupies
-				// this peer slot: overwriting `incoming` would drop its stop_tx, which
-				// fires stop_rx and immediately tears the live stream down. A fresh
-				// STREAMING session from the same peer still takes over via make_on_stream
-				// (the overwritten stop_tx drop ends the old session — same-peer reconnect
-				// path). A data-channel-only same-peer shadow (the "fetch games while
-				// streaming" scenario) is therefore not visible while the stream is live,
-				// but that is an acceptable trade-off (it cannot be kicked via the UI
-				// anyway without ending the live stream).
+				// PHASE 1 (same-host co-op): the maps are keyed by SESSION id now, so a
+				// new session from a peer that's ALREADY connected NO LONGER collides — it
+				// always registers under its own sid. There is no stop_tx to clobber, so the
+				// old "skip-if-peer-present shadow" (which existed only to avoid overwriting a
+				// live session's `incoming[peer]` and tearing it down) is gone: two panes from
+				// one client device now hold two independent sessions, neither evicting the
+				// other. make_on_stream therefore never re-inserts `incoming` (it always
+				// receives None for stop_tx); it only upgrades the `active` mode + re-inserts
+				// `host_out[sid]` on the first StartStream.
 				//
 				// Mode defaults to Remote; make_on_stream upgrades it to Game/Remote on
 				// the first StartStream (and re-opens/focuses the connections window with
 				// the correct mode). The window opens minimized here so the host's screen
 				// is not disrupted before the session's mode is confirmed.
-				//
-				// make_on_stream receives None for stop_tx when we registered early (the
-				// real sender is already in `incoming`), so it skips the re-insert.
 				let stop_tx_opt: Option<oneshot::Sender<()>> = {
-					if incoming.lock().unwrap().contains_key(&peer) {
-						// Live session holds the slot — don't clobber it.
-						Some(stop_tx)
-					} else {
-						active.lock().unwrap().insert(
-							peer.clone(),
-							crate::state::ConnInfo {
-								sid,
-								since_ms,
-								// Unknown until StartStream; make_on_stream will overwrite.
-								mode: crate::state::ConnMode::Remote,
-								view_only: false,
-							},
-						);
-						incoming.lock().unwrap().insert(peer.clone(), (sid, stop_tx));
-						host_out.lock().unwrap().insert(peer.clone(), (sid, out_tx.clone()));
-						// Minimized: mode unknown until first StartStream; make_on_stream
-						// calls open_or_update again with the real mode.
-						crate::connections::open_or_update(&app_h, crate::connections::Surface::Background);
-						None
-					}
+					active.lock().unwrap().insert(
+						sid,
+						crate::state::ConnInfo {
+							peer: peer.clone(),
+							since_ms,
+							// Unknown until StartStream; make_on_stream will overwrite.
+							mode: crate::state::ConnMode::Remote,
+							view_only: false,
+						},
+					);
+					incoming.lock().unwrap().insert(sid, (peer.clone(), stop_tx));
+					host_out.lock().unwrap().insert(sid, (peer.clone(), out_tx.clone()));
+					// Minimized: mode unknown until first StartStream; make_on_stream
+					// calls open_or_update again with the real mode.
+					crate::connections::open_or_update(&app_h, crate::connections::Surface::Background);
+					None
 				};
 
 				// Media-over-session: a send-only session handle for the RTP forwarder
@@ -740,6 +790,13 @@ pub(crate) async fn go_online(
 				// populated only when the ffmpeg fallback path is active (native_started=false);
 				// native DXGI sessions self-heal via ACCESS_LOST in pulsar-capture.
 				let last_req_store: Arc<Mutex<Option<StreamReq>>> = Arc::new(Mutex::new(None));
+				// Per-session screen-adaptation state (Parsec-style): when a StreamReq carries
+				// `adapt: Some((paneW,paneH))` the on_stream handler switches the captured monitor
+				// to the best-fit mode and stores the original here; the SessionCleanupGuard reverts
+				// it on teardown (normal end AND abort()). Shared by Arc between the two so the
+				// handler applies and the guard restores. Windows-only effect (no-op stubs else).
+				let adapt_state: Arc<Mutex<crate::display_mode::AdaptState>> =
+					Arc::new(Mutex::new(crate::display_mode::AdaptState::default()));
 				// Producer half of the re-stream channel feeding `serve_with`'s restream branch:
 				// when the HOST's own display mode changes mid-session the watcher re-sends the
 				// last StreamReq so capture restarts at the new geometry (ffmpeg/Wayland/gdigrab
@@ -882,17 +939,38 @@ pub(crate) async fn go_online(
 				let native_gen_arc: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>> =
 					Arc::new(Mutex::new(None));
 
+				// Per-window (WGC) capture target discovered when THIS session launched a game in
+				// game mode (Phase 2b co-op): `on_launch` spawns a resolver that polls the launched
+				// app's PID for its top-level window and stores the HWND (as i64) here; `make_on_stream`
+				// reads it and, when set, builds a per-window WGC CaptureConfig instead of duplicating
+				// the whole monitor — so two same-host panes can each launch+capture their OWN game on
+				// one monitor. `None` until a launch resolves a window (or the launch had none, e.g.
+				// the Desktop entry), in which case the stream takes the normal display path.
+				let launched_hwnd: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
 				let provider = {
 					let games = games.clone();
+					let ffmpeg = crate::process::ffmpeg_bin(&app_h);
 					move || {
 						games
 							.lock()
 							.unwrap()
 							.iter()
-							.map(|h| GameInfo {
-								id: h.id.clone(),
-								title: h.title.clone(),
-								kind: h.kind.clone(),
+							.map(|h| {
+								// The built-in Desktop card shows a FRESH live thumbnail of the
+								// host's screen ("what you'd stream now"); every other game uses
+								// its configured cover image (if any).
+								let image = if h.id == "desktop" {
+									crate::process::desktop_thumb_data_url(&ffmpeg)
+										.unwrap_or_default()
+								} else {
+									h.image.clone()
+								};
+								GameInfo {
+									id: h.id.clone(),
+									title: h.title.clone(),
+									kind: h.kind.clone(),
+									image,
+								}
 							})
 							.collect::<Vec<_>>()
 					}
@@ -901,6 +979,7 @@ pub(crate) async fn go_online(
 					let games = games.clone();
 					let app_h = app_h.clone();
 					let peer = peer.clone();
+					let launched_hwnd = launched_hwnd.clone();
 					move |id: String| {
 						// Match by id first, then tolerantly by title (case-insensitive) so a
 						// CLI `--app <name>` works. An unmatched app (incl. "Desktop"/"Masaüstü")
@@ -920,10 +999,28 @@ pub(crate) async fn go_online(
 								SessionEvent {
 									kind: "launch".into(),
 									peer: peer.clone(),
+									sid,
 									detail: g.title.clone(),
 								},
 							);
-							launch_host_game(&g);
+							// Launch the app and capture its PID. In GAME mode, resolve its top-level
+							// window off-thread (games create windows async / launchers re-parent) and
+							// stash the HWND so this session's next StartStream WGC-captures that window
+							// instead of the whole monitor — per-app co-op capture (Phase 2b). The
+							// resolver is best-effort + bounded (~10 s); on no-window it leaves the slot
+							// None and the stream falls back to the display path. Reset the slot before
+							// each launch so a re-launch (or a launch after a prior game closed) can't
+							// capture a stale window. The Desktop entry launches nothing (pid None) →
+							// slot stays None → whole-desktop capture, unchanged.
+							*launched_hwnd.lock().unwrap() = None;
+							if let Some(pid) = launch_host_game(&g) {
+								let slot = launched_hwnd.clone();
+								std::thread::spawn(move || {
+									if let Some(hwnd) = crate::process::resolve_launched_window(pid) {
+										*slot.lock().unwrap() = Some(hwnd);
+									}
+								});
+							}
 						}
 					}
 				};
@@ -946,6 +1043,7 @@ pub(crate) async fn go_online(
 					native_out_arc.clone(),
 					#[cfg(windows)]
 					native_gen_arc.clone(),
+					launched_hwnd.clone(),
 					stats_out.clone(),
 					app_h.clone(),
 					peer.clone(),
@@ -959,6 +1057,7 @@ pub(crate) async fn go_online(
 					#[cfg(target_os = "linux")]
 					cap_gen.clone(),
 					last_req_store.clone(),
+					adapt_state.clone(),
 				);
 				// Route the client's input: controllers into a virtual gamepad, and
 				// mouse/keyboard into a uinput desktop injector — both created lazily.
@@ -971,6 +1070,23 @@ pub(crate) async fn go_online(
 							std::collections::HashMap::new();
 					let mut desktop: Option<pulsar_core::input::DesktopInput> = None;
 					let mut tried = false;
+					// PHASE 3B (same-host co-op): per-WINDOW input target. When THIS session captures
+					// a specific window (a launched game / picked app — Phase 2b stashed its HWND in
+					// `launched_hwnd`), its kb/mouse is delivered to THAT window's message pump via
+					// `WindowInput` (PostMessage) instead of the OS-global `SendInput` desktop cursor —
+					// so two co-op panes on one host don't fight over the single system focus. The HWND
+					// resolves asynchronously after launch, so we (re)build the injector lazily when the
+					// stashed target changes. `None` HWND (display capture / Desktop entry / unresolved)
+					// keeps the global `DesktopInput` path, unchanged. HONEST CEILING: PostMessage reaches
+					// Win32 message-pump apps only, NOT DirectInput/RawInput/GetAsyncKeyState games — see
+					// `pulsar_core::input::WindowInput` docs; those need OS multiseat (out of scope).
+					#[cfg(windows)]
+					let launched_hwnd_in = launched_hwnd.clone();
+					#[cfg(windows)]
+					let mut window_input: Option<pulsar_core::input::WindowInput> = None;
+					// The HWND currently bound to `window_input` (so we only rebuild when it changes).
+					#[cfg(windows)]
+					let mut bound_hwnd: Option<i64> = None;
 					// Which monitor's geometry is currently applied to the desktop injector, so we
 					// only re-resolve the virtual-desktop rect when the streamed monitor changes.
 					// `u32::MAX` = "none applied yet" (forces the first resolve).
@@ -992,7 +1108,6 @@ pub(crate) async fn go_online(
 					// Connections-window toggle takes effect mid-session, sid-guarded
 					// against a same-peer reconnection's newer entry.
 					let view_active = active.clone();
-					let view_peer = peer.clone();
 					// Tracks the view-only state we last saw so we can detect the
 					// FALSE->TRUE edge and flush any input held at the instant control was
 					// revoked: the gate below then drops the matching key-up/button-up, so
@@ -1010,8 +1125,8 @@ pub(crate) async fn go_online(
 						let view_only = view_active
 							.lock()
 							.unwrap()
-							.get(&view_peer)
-							.map(|ci| ci.sid == sid && ci.view_only)
+							.get(&sid)
+							.map(|ci| ci.view_only)
 							.unwrap_or(false);
 						if view_only {
 							// On the FALSE->TRUE edge, release whatever was held at the instant
@@ -1021,6 +1136,13 @@ pub(crate) async fn go_online(
 								was_view_only = true;
 								if let Some(d) = desktop.as_mut() {
 									d.flush_held();
+								}
+								// Release anything held on the per-window injector too (Phase 3B), so a
+								// window-captured session can't latch a key/drag in the target window
+								// when control is revoked mid-press.
+								#[cfg(windows)]
+								if let Some(w) = window_input.as_mut() {
+									w.flush_held();
 								}
 								for (_, p) in pads.values_mut() {
 									p.apply(&pulsar_core::input::GamepadState::default());
@@ -1085,6 +1207,58 @@ pub(crate) async fn go_online(
 								}
 							}
 							other => {
+								// PHASE 3B: pick the per-session input target. If this session captured a
+								// specific window (Phase 2b stashed its HWND in `launched_hwnd`), route the
+								// kb/mouse to that window's message pump (`WindowInput`/PostMessage) instead
+								// of the global desktop (`DesktopInput`/SendInput). The HWND resolves async
+								// after launch; rebuild the injector when the stashed target changes, and
+								// fall back to the global path if the window is gone or none is set.
+								#[cfg(windows)]
+								let mut routed_to_window = false;
+								#[cfg(windows)]
+								{
+									let target = *launched_hwnd_in.lock().unwrap();
+									if target != bound_hwnd {
+										// Target changed (resolved / re-launched / cleared): rebuild.
+										bound_hwnd = target;
+										window_input = match target {
+											Some(h) => pulsar_core::input::WindowInput::new(h),
+											None => None,
+										};
+									}
+									// Drop a dead window's injector so a closed game falls back to global.
+									if window_input.as_ref().map(|w| !w.is_alive()).unwrap_or(false) {
+										window_input = None;
+									}
+									if let Some(w) = window_input.as_mut() {
+										routed_to_window = true;
+										match &other {
+											InputEvent::PointerMotion { x, y } => w.pointer(*x, *y),
+											InputEvent::PointerRelative { dx, dy } => {
+												w.pointer_relative(*dx, *dy)
+											}
+											InputEvent::PointerButton { button, down } => {
+												w.button(*button, *down)
+											}
+											InputEvent::Scroll { dx, dy } => w.scroll(*dx, *dy),
+											InputEvent::Key { code, down } => w.key(*code, *down),
+											InputEvent::Char(c) => w.type_char(*c),
+											// Controllers never reach the desktop/window injector.
+											InputEvent::Gamepad(_)
+											| InputEvent::GamepadSlot { .. }
+											| InputEvent::GamepadDisconnect { .. } => {
+												routed_to_window = false;
+											}
+										}
+									}
+								}
+								// Global desktop path: used when there's no window target (display capture)
+								// OR on non-Windows (per-window injection is Windows-only). Skipped when the
+								// event was already delivered to the target window above.
+								#[cfg(windows)]
+								if routed_to_window {
+									return;
+								}
 								if !tried {
 									tried = true;
 									match pulsar_core::input::DesktopInput::new() {
@@ -1212,7 +1386,7 @@ pub(crate) async fn go_online(
 						);
 					}
 				};
-				let on_file = make_on_file(app_h.clone(), peer.clone());
+				let on_file = make_on_file(app_h.clone(), peer.clone(), sid);
 				let on_audio = make_on_audio();
 				let on_reverse = {
 					let app_h = app_h.clone();
@@ -1429,6 +1603,18 @@ pub(crate) async fn go_online(
 						let _ = app_h.emit("peer-name", (peer.clone(), name));
 					}
 				};
+				// The client pushed its OWN device ID (DataMsg::PeerId): remember it keyed
+				// by this connection's peer-key and broadcast it so every connections window
+				// shows the client's id instead of its ip:port (direct/same-LAN connects).
+				let on_peer_id = {
+					let app_h = app_h.clone();
+					let peer = peer.clone();
+					let peer_ids = tauri::Manager::state::<AppState>(&app_h).peer_ids.clone();
+					move |id: String| {
+						peer_ids.lock().unwrap().insert(peer.clone(), id.clone());
+						let _ = app_h.emit("peer-id", (peer.clone(), id));
+					}
+				};
 				// NACK requests from the client → the active video forwarder's channel.
 				let on_nack = {
 					let nack_slot = nack_slot.clone();
@@ -1446,9 +1632,32 @@ pub(crate) async fn go_online(
 					on_audio: Box::new(on_audio),
 					on_reverse: Box::new(on_reverse),
 					stream_caps: Box::new(stream_caps),
+					// The host's visible top-level windows the client can pick as a per-window
+					// (WGC) capture target (Phase 2b co-op) — answers the client's QueryWindows.
+					// Cheap (one EnumWindows pass), called on demand when the client opens its
+					// window picker. Empty on non-Windows (no per-window source) → no picker.
+					windows: Box::new(|| {
+						// pulsar-capture (and its WGC/EnumWindows window source) is a Windows-only
+						// dependency; off Windows there is no per-window source, so reply empty.
+						#[cfg(windows)]
+						{
+							pulsar_capture::list_capture_windows()
+								.into_iter()
+								.map(|(hwnd, title)| pulsar_core::service::WindowInfo {
+									hwnd: hwnd as i64,
+									title,
+								})
+								.collect()
+						}
+						#[cfg(not(windows))]
+						{
+							Vec::<pulsar_core::service::WindowInfo>::new()
+						}
+					}),
 					on_nack: Box::new(on_nack),
 					on_avatar: Box::new(on_avatar),
 					on_peer_name: Box::new(on_peer_name),
+					on_peer_id: Box::new(on_peer_id),
 					// File manager: FsList/FsGet from this client, answered through the
 					// same outbound queue (HOME-jailed; see fs_browse).
 					on_fs: Box::new(crate::fs_browse::make_on_fs(fs_out)),
@@ -1477,6 +1686,11 @@ pub(crate) async fn go_online(
 					active: active.clone(),
 					peer_meta: peer_meta.clone(),
 					peer: peer.clone(),
+					// We registered a pre-auth entry iff this is a password-gated host (the
+					// add() above had the same condition) — drop it on the guard's teardown.
+					preauth_pubkey: if require_auth { peer_pubkey } else { None },
+					// Same Arc the on_stream handler applies adaptation into — Drop reverts it.
+					adapt_state: adapt_state.clone(),
 					app_handle: app_h.clone(),
 				};
 				tokio::select! {
@@ -1510,35 +1724,24 @@ pub(crate) async fn go_online(
 				// Compare-and-remove: only drop the entries if they still belong to THIS
 				// session. A same-peer reconnection may have already overwritten them with
 				// its own (newer) sid; removing unconditionally would kill the live one.
-				{
-					let mut g = incoming.lock().unwrap();
-					if g.get(&peer).map(|(id, _)| *id) == Some(sid) {
-						g.remove(&peer);
-					}
-				}
-				{
-					let mut g = host_out.lock().unwrap();
-					if g.get(&peer).map(|(id, _)| *id) == Some(sid) {
-						g.remove(&peer);
-					}
-				}
+				// Keyed by sid now: this entry is uniquely ours, so a plain remove() is
+				// correct — a same-DEVICE co-op session has its OWN sid key and is untouched.
+				incoming.lock().unwrap().remove(&sid);
+				host_out.lock().unwrap().remove(&sid);
 				tracing::info!(%peer, "session disconnected");
-				// Drop from the connections window's list (sid-guarded like incoming/host_out,
-				// so a same-peer reconnection's newer entry survives); close the window once
-				// the last connection ends.
-				let (was_mine, conns_emptied) = {
+				// Drop this session's row from the connections window's list; close the
+				// window once the LAST connection ends. peer_still_live = any OTHER active
+				// session sharing this device (couch co-op), used to refcount the per-device
+				// identity cache so a co-op sibling's teardown keeps our name/avatar.
+				let (removed, peer_still_live, conns_emptied) = {
 					let mut g = active.lock().unwrap();
-					let cur = g.get(&peer).map(|ci| ci.sid);
-					let mine = cur == Some(sid);
-					if mine {
-						g.remove(&peer);
-					}
-					(mine, g.is_empty())
+					let removed = g.remove(&sid).is_some();
+					let peer_still_live = g.values().any(|ci| ci.peer == peer);
+					(removed, peer_still_live, g.is_empty())
 				};
-				if was_mine {
-					// Identity cache too (sid-guarded the same way): keeping a ~50-70 KB
-					// avatar data-URL per ever-seen peer just leaks — a reconnect
-					// re-pushes name/avatar anyway.
+				if removed && !peer_still_live {
+					// Last session for this device left — release its cached ~50-70 KB
+					// avatar data-URL + name; a reconnect re-pushes them.
 					peer_meta.lock().unwrap().remove(&peer);
 				}
 				if conns_emptied {
@@ -1557,19 +1760,16 @@ pub(crate) async fn go_online(
 						cap.stop().await;
 					}
 				}
-				// Only tell the UI "disconnected" if THIS session still owned the peer. A
-				// same-peer reconnect (game mode connects twice: a caps-probe session then the
-				// streaming one, identical peer addr) means the old session's teardown fires here
-				// AFTER the new one already took the `active` slot (sid-guarded above: mine=false,
-				// remaining=1). Emitting unconditionally made the window drop the row by peer and
-				// the LIVE game connection vanished from "active connections". Skip it — the
-				// peer is still connected via the newer session.
-				if was_mine {
+				// Tell the UI "disconnected" (carrying this session's sid) when we actually
+				// held the slot. The Connections window keys rows by sid, so this drops only
+				// THIS session's row — a same-device co-op session's row survives.
+				if removed {
 					let _ = app_h.emit(
 						"session",
 						SessionEvent {
 							kind: "disconnected".into(),
 							peer,
+							sid,
 							detail: String::new(),
 						},
 					);

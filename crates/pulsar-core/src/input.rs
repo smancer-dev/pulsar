@@ -39,6 +39,13 @@ pub mod touchpad_linux;
 #[cfg(windows)]
 mod windows;
 
+/// Windows host-side per-WINDOW mouse + keyboard injection via `PostMessage`
+/// (same-host co-op: route a window-captured session's input to THAT window's
+/// message pump instead of the global desktop). See [`window_win::WindowInput`]
+/// for the honest ceiling (message-pump apps only, NOT DirectInput/RawInput games).
+#[cfg(windows)]
+mod window_win;
+
 /// macOS host-side mouse + keyboard injection via CoreGraphics `CGEvent`.
 #[cfg(target_os = "macos")]
 mod macos;
@@ -56,6 +63,12 @@ pub use uinput::DesktopInput;
 
 #[cfg(windows)]
 pub use windows::{DesktopInput, MonitorRect};
+
+/// Windows-only per-window input injector (PostMessage). See its docs for the
+/// message-pump-apps-only ceiling. Selected per-session by the host when the
+/// session's capture target is a specific window (a launched game / picked app).
+#[cfg(windows)]
+pub use window_win::WindowInput;
 
 #[cfg(target_os = "macos")]
 pub use macos::DesktopInput;

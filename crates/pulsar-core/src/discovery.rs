@@ -129,6 +129,10 @@ pub struct Discovery {
 	ifaces: Vec<Ipv4Addr>,
 	inner: Mutex<Inner>,
 	cancel: Arc<Notify>,
+	/// When true the beacon stops ANNOUNCING (broadcasting) itself — set while this device
+	/// is in gaming mode, a pure client that is not a host and must not advertise on the LAN.
+	/// Receiving still runs, so it can keep discovering others. Default false (announcing).
+	paused: std::sync::atomic::AtomicBool,
 }
 
 impl Discovery {
@@ -173,6 +177,7 @@ impl Discovery {
 				peers: HashMap::new(),
 			}),
 			cancel: Arc::new(Notify::new()),
+			paused: std::sync::atomic::AtomicBool::new(false),
 		});
 		tokio::spawn(announce_loop(Arc::downgrade(&disc), disc.cancel.clone()));
 		tokio::spawn(recv_loop(Arc::downgrade(&disc), disc.cancel.clone(), sock));
@@ -182,6 +187,13 @@ impl Discovery {
 	/// Update the announced id once relay registration finishes (or it's lost).
 	pub async fn set_id(&self, id: Option<DeviceId>) {
 		self.inner.lock().await.announce.id = id.map(|d| d.0);
+	}
+
+	/// Pause/resume ANNOUNCING (broadcasting) this device on the LAN. Paused while in gaming
+	/// mode (a pure client must not advertise itself as connectable). Receiving is unaffected.
+	pub fn set_paused(&self, paused: bool) {
+		self.paused
+			.store(paused, std::sync::atomic::Ordering::Relaxed);
 	}
 
 	/// The non-stale peers seen so far (excluding ourselves), sorted by name.
@@ -196,6 +208,10 @@ impl Discovery {
 	}
 
 	async fn send_announce(&self) {
+		// Gaming mode: don't advertise ourselves (not a host).
+		if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+			return;
+		}
 		let bytes = encode(&self.inner.lock().await.announce);
 		// No enumerable NIC → fall back to the OS default multicast interface.
 		if self.ifaces.is_empty() {

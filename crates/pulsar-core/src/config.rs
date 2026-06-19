@@ -89,6 +89,14 @@ pub struct Config {
 	/// configs written before surround support still load and stay stereo.
 	#[serde(default)]
 	pub audio_layout: crate::audio::ChannelLayout,
+	/// Hardware acceleration for the APP'S OWN UI (the WebKitGTK/WebView2 webview that draws
+	/// the menus/settings) — NOT the video stream's encode/decode (those are separate per-session
+	/// codec/encoder settings). `None` = platform default: ON everywhere EXCEPT the Orange Pi 5
+	/// (RK3588/Mali), where WebKitGTK's accelerated compositing has an unrecoverable "stops
+	/// presenting" freeze, so it defaults OFF there. `Some(true/false)` overrides. Read once at
+	/// process startup (sets the WebKitGTK env), so a change needs an app restart to apply.
+	#[serde(default)]
+	pub ui_hardware_accel: Option<bool>,
 }
 
 fn default_avatar_mode() -> String {
@@ -115,6 +123,7 @@ impl Default for Config {
 			avatar_mode: default_avatar_mode(),
 			native_player: false,
 			audio_layout: crate::audio::ChannelLayout::Stereo,
+			ui_hardware_accel: None,
 		}
 	}
 }

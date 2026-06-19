@@ -217,6 +217,59 @@ pub(crate) mod throttle {
 	}
 }
 
+/// Same-host co-op pre-authorization: once a DEVICE has an authorized live session,
+/// a NEW session from that same device is treated as already authorized — we skip the
+/// one-time-password consume AND the Allow/Deny popup. This is required for couch co-op
+/// / split-pane: the OTP is single-use and rotates on consume, so pane B literally
+/// cannot present pane A's code; without this skip the 2nd pane could never connect.
+///
+/// Keyed on the peer's STATIC X25519 PUBLIC KEY (`Session::peer_pubkey`), NOT the
+/// spoofable relay device id — so a malicious relay substituting a different peer
+/// behind a known id is NOT silently pre-authorized (preserves the no-MITM property).
+/// A refcount (live-session count per pubkey) so the entry is dropped only when the
+/// LAST session for that device ends; unattended hosts (`!require_auth`) never reach
+/// this path (they auto-allow), so this purely affects password-gated hosts.
+pub(crate) mod preauth {
+	use std::collections::HashMap;
+	use std::sync::{LazyLock, Mutex};
+
+	/// pubkey → number of live authorized sessions for that device.
+	static PREAUTHED: LazyLock<Mutex<HashMap<[u8; 32], usize>>> =
+		LazyLock::new(|| Mutex::new(HashMap::new()));
+
+	/// Is a session from this pubkey already authorized (≥1 live session)? Called at
+	/// auth time to decide whether to skip the OTP consume + Allow/Deny popup.
+	pub(crate) fn is_authorized(pubkey: &[u8; 32]) -> bool {
+		PREAUTHED.lock().unwrap().get(pubkey).is_some_and(|n| *n > 0)
+	}
+
+	/// Record that a session for this device became authorized (increment its refcount).
+	/// Call once per accepted session, AFTER approval.
+	pub(crate) fn add(pubkey: [u8; 32]) {
+		*PREAUTHED.lock().unwrap().entry(pubkey).or_insert(0) += 1;
+	}
+
+	/// Drop one authorized session for this device (decrement; remove the entry at 0).
+	/// Call once on session teardown, only if `add` ran for it. Idempotent-safe: a
+	/// missing/zero entry stays removed.
+	pub(crate) fn remove(pubkey: &[u8; 32]) {
+		let mut g = PREAUTHED.lock().unwrap();
+		if let Some(n) = g.get_mut(pubkey) {
+			*n = n.saturating_sub(1);
+			if *n == 0 {
+				g.remove(pubkey);
+			}
+		}
+	}
+
+	/// go_online re-run hook: a fresh serve loop has no live sessions, so clear the set
+	/// (mirrors `reset_redirect_all`). Prevents a stranded pre-auth entry from a session
+	/// whose teardown was skipped by an abort surviving across reconnects.
+	pub(crate) fn clear_all() {
+		PREAUTHED.lock().unwrap().clear();
+	}
+}
+
 /// Maximum number of Allow/Deny popups that may be open at the same time.
 ///
 /// An id-cycling attacker who sends a fresh connection on each of N relay ids
@@ -389,6 +442,8 @@ pub(crate) async fn race_host_auth(
 		SessionEvent {
 			kind: "request".into(),
 			peer: peer.into(),
+			// Pre-accept (Allow/Deny popup): no session id assigned yet.
+			sid: 0,
 			detail: "wait".into(),
 		},
 	);
@@ -685,13 +740,27 @@ pub(crate) async fn submit_password(
 	Ok(())
 }
 
-/// Host: forcibly disconnect a connected client by its peer id.
+/// Host: forcibly disconnect a connected SESSION by its session id. The connections
+/// window passes the row's `sid` so kicking pane B of a same-host co-op pair leaves
+/// pane A (a different sid from the same device) untouched.
 #[tauri::command]
 pub(crate) async fn disconnect_peer(
 	state: State<'_, AppState>,
-	peer: String,
+	sid: u64,
 ) -> Result<(), String> {
-	if let Some((_, tx)) = state.incoming.lock().unwrap().remove(&peer) {
+	if let Some((_peer, tx)) = state.incoming.lock().unwrap().remove(&sid) {
+		let _ = tx.send(());
+	}
+	Ok(())
+}
+
+/// Host: forcibly disconnect EVERY connected session. Called when the app enters gaming mode
+/// (a pure-client personality where nobody may be connected to this machine) — authoritative
+/// over the `incoming` map, so it tears down sessions even if the UI's session list missed one.
+#[tauri::command]
+pub(crate) async fn disconnect_all_peers(state: State<'_, AppState>) -> Result<(), String> {
+	let entries: Vec<_> = state.incoming.lock().unwrap().drain().collect();
+	for (_sid, (_peer, tx)) in entries {
 		let _ = tx.send(());
 	}
 	Ok(())

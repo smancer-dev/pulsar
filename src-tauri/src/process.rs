@@ -79,6 +79,11 @@ pub fn host_displays() -> Vec<pulsar_core::service::DisplayInfo> {
 		return raw
 			.into_iter()
 			.map(|(idx, name, width, height, primary)| DisplayInfo {
+				// `name` is the DXGI `DeviceName` (the GDI `\\.\DISPLAYn` trimmed of the
+				// `\\.\` prefix), so it doubles as the EnumDisplaySettings device name — and
+				// the iteration order matches `display_idx`. Advertise this monitor's available
+				// resolutions for the session menu + the screen-adaptation best-fit picker.
+				modes: enum_display_modes(&name),
 				idx,
 				name,
 				width,
@@ -98,6 +103,9 @@ pub fn host_displays() -> Vec<pulsar_core::service::DisplayInfo> {
 				width: w,
 				height: h,
 				primary,
+				// X11 mode enumeration is not wired here; the client falls back to its fixed
+				// resolution presets (and screen adaptation is Windows-only anyway).
+				modes: Vec::new(),
 			})
 			.collect();
 	}
@@ -105,6 +113,66 @@ pub fn host_displays() -> Vec<pulsar_core::service::DisplayInfo> {
 	{
 		Vec::new()
 	}
+}
+
+/// Enumerate a monitor's available resolutions via `EnumDisplaySettingsW` on its GDI device
+/// name, returning distinct `(width, height)` pairs, largest-area first, capped to a sane count.
+///
+/// `dev_name` is the trimmed DXGI/GDI name (`DISPLAY1`); we re-prepend `\\.\` to form the full
+/// `\\.\DISPLAYn` the API wants (same convention as `util::display_rotation_detect`). Only modes
+/// at the monitor's CURRENT color depth are kept (so the same physical resolution doesn't appear
+/// once per bit-depth), then deduped on `(w, h)` and sorted by descending area. The cap (24)
+/// keeps the advertised list — which travels in `StreamCaps::displays[..].modes` — small on the
+/// wire; a 4K panel typically exposes well under that anyway. Empty on any failure (the client
+/// then shows only its fixed presets and screen adaptation simply has no candidates to pick).
+#[cfg(windows)]
+fn enum_display_modes(dev_name: &str) -> Vec<(u32, u32)> {
+	use windows_sys::Win32::Graphics::Gdi::{
+		EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+	};
+	let wide: Vec<u16> = format!(r"\\.\{dev_name}")
+		.encode_utf16()
+		.chain(std::iter::once(0u16))
+		.collect();
+	let mut modes: Vec<(u32, u32)> = Vec::new();
+	unsafe {
+		// Current color depth: only enumerate modes matching it, so a single resolution isn't
+		// listed once per supported bit depth (8/16/32-bit). Fall back to 0 (= "any") if the
+		// current-settings query fails, which keeps the loop inclusive rather than empty.
+		let cur_bpp = {
+			let mut dm: DEVMODEW = std::mem::zeroed();
+			dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+			if EnumDisplaySettingsW(wide.as_ptr(), ENUM_CURRENT_SETTINGS, &mut dm) != 0 {
+				dm.dmBitsPerPel
+			} else {
+				0
+			}
+		};
+		let mut i = 0u32;
+		loop {
+			let mut dm: DEVMODEW = std::mem::zeroed();
+			dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+			if EnumDisplaySettingsW(wide.as_ptr(), i, &mut dm) == 0 {
+				break; // exhausted the driver's mode list
+			}
+			i += 1;
+			if cur_bpp != 0 && dm.dmBitsPerPel != cur_bpp {
+				continue;
+			}
+			let wh = (dm.dmPelsWidth, dm.dmPelsHeight);
+			if wh.0 == 0 || wh.1 == 0 {
+				continue;
+			}
+			if !modes.contains(&wh) {
+				modes.push(wh);
+			}
+		}
+	}
+	// Largest area first (the UI shows the biggest resolutions on top, and the adaptation
+	// best-fit's native-area bias assumes the list reflects real geometry, not driver order).
+	modes.sort_by(|a, b| (b.0 as u64 * b.1 as u64).cmp(&(a.0 as u64 * a.1 as u64)));
+	modes.truncate(24);
+	modes
 }
 
 pub fn capture_from_str(s: &str) -> CaptureMethod {
@@ -646,11 +714,65 @@ pub struct HostGame {
 	pub args: String,
 	#[serde(default)]
 	pub command: String,
+	/// Optional cover image (data URL or http URL) sent to clients on the game card.
+	#[serde(default)]
+	pub image: String,
 	#[serde(rename = "cmdStart", default)]
 	pub cmd_start: String,
 	#[allow(dead_code)]
 	#[serde(rename = "cmdStop", default)]
 	pub cmd_stop: String,
+}
+
+/// Grab ONE live frame of the host's screen as a small JPEG `data:` URL — the cover for
+/// the built-in "Desktop" game card, so the client shows what it would stream right now.
+/// Uses the bundled ffmpeg's screen-capture input per platform (gdigrab/x11grab/
+/// avfoundation), scaled to 480px wide. Best-effort: returns `None` on any failure
+/// (headless/no display/timeout) so the client just falls back to an icon. Bounded to a
+/// few seconds so a wedged grab never stalls the games-list reply.
+pub fn desktop_thumb_data_url(ffmpeg: &str) -> Option<String> {
+	let tmp = std::env::temp_dir().join("pulsar-desk-thumb.jpg");
+	let mut cmd = std::process::Command::new(ffmpeg);
+	cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+	#[cfg(windows)]
+	cmd.args(["-f", "gdigrab", "-framerate", "1", "-i", "desktop"]);
+	#[cfg(target_os = "linux")]
+	{
+		let disp = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into());
+		cmd.args(["-f", "x11grab", "-framerate", "1", "-i"]).arg(disp);
+	}
+	#[cfg(target_os = "macos")]
+	cmd.args(["-f", "avfoundation", "-framerate", "1", "-i", "1"]);
+	cmd.args(["-frames:v", "1", "-vf", "scale=480:-1", "-q:v", "6"])
+		.arg(&tmp);
+	no_window(&mut cmd);
+	cmd.stdout(std::process::Stdio::null());
+	cmd.stderr(std::process::Stdio::null());
+	let mut child = cmd.spawn().ok()?;
+	#[cfg(windows)]
+	crate::job::assign(&child);
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	let ok = loop {
+		match child.try_wait() {
+			Ok(Some(st)) => break st.success(),
+			Ok(None) => {
+				if std::time::Instant::now() >= deadline {
+					let _ = child.kill();
+					let _ = child.wait();
+					break false;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(40));
+			}
+			Err(_) => break false,
+		}
+	};
+	let out = if ok {
+		std::fs::read(&tmp).ok().map(|jpg| crate::avatar::data_url(&jpg))
+	} else {
+		None
+	};
+	let _ = std::fs::remove_file(&tmp);
+	out
 }
 
 /// Run a command through the platform shell (fire-and-forget), no console window.
@@ -670,14 +792,112 @@ pub fn spawn_shell(cmd: &str) {
 	let _ = std::process::Command::new("sh").args(["-c", cmd]).spawn();
 }
 
-/// Launch a host game: its start hook, then the program/command itself.
-pub fn launch_host_game(g: &HostGame) {
+/// Launch a host game: its start hook, then the program/command itself. Returns the PID of
+/// the launched process so the caller can resolve its top-level window for per-window (WGC)
+/// capture in game mode (`None` when nothing was launched — e.g. the "Desktop" entry, which
+/// streams the whole desktop). The launched process is tracked in the Windows Job Object so
+/// it dies with Pulsar, exactly like before; capturing the `Child` (instead of the old
+/// fire-and-forget `spawn_shell`) is what lets us read its `id()`.
+///
+/// For `program` we spawn the executable DIRECTLY (so the returned PID is the game's own,
+/// not a `cmd.exe` wrapper's). For `command` we spawn through the shell and return the
+/// shell's PID — the real program is a DESCENDANT, which `resolve_launched_window` matches
+/// (it walks child PIDs). The launcher case (Steam/Epic) is also covered by that descendant
+/// walk + the retry budget, since those re-parent the game into a separate child process.
+pub fn launch_host_game(g: &HostGame) -> Option<u32> {
 	spawn_shell(&g.cmd_start);
 	match g.kind.as_str() {
-		"program" if !g.path.is_empty() => spawn_shell(&format!("\"{}\" {}", g.path, g.args)),
-		"command" if !g.command.is_empty() => spawn_shell(&g.command),
-		_ => {}
+		"program" if !g.path.is_empty() => spawn_program_pid(&g.path, &g.args),
+		"command" if !g.command.is_empty() => spawn_shell_pid(&g.command),
+		_ => None,
 	}
+}
+
+/// Spawn an executable directly (no shell), no console window, tracked in the Job Object.
+/// Returns its PID. `args` is a single user-entered argument string, split on whitespace
+/// (best-effort — matches the old `spawn_shell(format!("\"{path}\" {args}"))` behavior
+/// without a shell in the middle, so the PID we get is the program's). Fire-and-forget: the
+/// `Child` handle is dropped (the Job Object owns lifetime).
+fn spawn_program_pid(path: &str, args: &str) -> Option<u32> {
+	let mut cmd = std::process::Command::new(path);
+	for a in args.split_whitespace() {
+		cmd.arg(a);
+	}
+	no_window(&mut cmd);
+	cmd.stdout(std::process::Stdio::null());
+	cmd.stderr(std::process::Stdio::null());
+	let child = cmd.spawn().ok()?;
+	#[cfg(windows)]
+	crate::job::assign(&child);
+	let pid = child.id();
+	// Drop the handle but keep the process running (Job Object owns teardown).
+	std::mem::forget(child);
+	Some(pid)
+}
+
+/// Like [`spawn_shell`] but returns the shell process's PID (the launched command runs as a
+/// descendant). Used for the `command` game kind, where the user's command may be a script /
+/// pipeline that needs a shell. The game's window is found via the descendant-PID walk.
+fn spawn_shell_pid(cmd_str: &str) -> Option<u32> {
+	let cmd_str = cmd_str.trim();
+	if cmd_str.is_empty() {
+		return None;
+	}
+	#[cfg(windows)]
+	let mut c = {
+		let mut c = std::process::Command::new("cmd");
+		c.args(["/C", cmd_str]);
+		c
+	};
+	#[cfg(not(windows))]
+	let mut c = {
+		let mut c = std::process::Command::new("sh");
+		c.args(["-c", cmd_str]);
+		c
+	};
+	no_window(&mut c);
+	let child = c.spawn().ok()?;
+	#[cfg(windows)]
+	crate::job::assign(&child);
+	let pid = child.id();
+	std::mem::forget(child);
+	Some(pid)
+}
+
+/// Poll for the top-level window of a launched game/app (Phase 2b game-mode WGC capture).
+/// Games create their window asynchronously (and launchers re-parent into a child process),
+/// so this retries [`pulsar_capture::find_window_for_launch`] — which matches the launched
+/// PID *and its descendants* — for up to ~10 s (250 ms apart). Returns the resolved HWND as
+/// an `i64` (wire/`StreamReq::window_hwnd` form) or `None` if no window appeared in time
+/// (the caller then falls back to whole-desktop/monitor capture). Blocking — run it off the
+/// session task (e.g. in a spawned thread that stashes the result into a per-session slot).
+///
+/// ## Reliability caveats
+/// - Borderless-fullscreen games are found fine; a few anti-cheat / DRM titles create their
+///   render window in a protected process whose windows EnumWindows can't see — those fall
+///   back to monitor capture.
+/// - A launcher that hands off to an ALREADY-RUNNING game instance (e.g. Steam reusing a live
+///   client) spawns no new descendant, so the new window isn't tied to our PID tree → not
+///   found (fallback). This is the documented honest ceiling; the explicit window-list pick
+///   (`host_window_list`) is the robust path for those.
+#[cfg(windows)]
+pub fn resolve_launched_window(pid: u32) -> Option<i64> {
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+	loop {
+		if let Some(hwnd) = pulsar_capture::find_window_for_launch(pid) {
+			return Some(hwnd as i64);
+		}
+		if std::time::Instant::now() >= deadline {
+			return None;
+		}
+		std::thread::sleep(std::time::Duration::from_millis(250));
+	}
+}
+
+/// Non-Windows stub (see [`resolve_launched_window`]) — per-window capture is Windows-only.
+#[cfg(not(windows))]
+pub fn resolve_launched_window(_pid: u32) -> Option<i64> {
+	None
 }
 
 /// Resolve a bundled binary by name (`ffmpeg.exe` / `ffplay.exe`), preferring the

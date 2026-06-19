@@ -99,9 +99,16 @@ pub(crate) fn close(app: &AppHandle) {
 	});
 }
 
-/// One row of the connections window's list.
+/// One row of the connections window's list — ONE per live SESSION (not per device).
+/// A single client device with two concurrent sessions (couch co-op / split panes)
+/// produces two rows that share `peer` but differ by `sid`.
 #[derive(serde::Serialize)]
 pub(crate) struct ConnRow {
+	/// This session's id — the key the kick / view-only actions pass back so they
+	/// target exactly this session, not a sibling pane from the same device.
+	pub(crate) sid: u64,
+	/// The connected device's grouping key (relay id or ip:port). Shared across a
+	/// device's concurrent sessions, so the UI can group rows by device.
 	pub(crate) peer: String,
 	pub(crate) since_ms: u64,
 	pub(crate) mode: ConnMode,
@@ -110,37 +117,46 @@ pub(crate) struct ConnRow {
 	/// sent them — so a window opened AFTER the push still shows who connected.
 	pub(crate) name: Option<String>,
 	pub(crate) avatar: Option<String>,
+	/// The client's own relay device ID (`DataMsg::PeerId`), when pushed — shown
+	/// instead of the `peer` ip:port on direct/same-LAN connects.
+	pub(crate) client_id: Option<String>,
 }
 
 /// The connections window's initial snapshot (it then stays live via `session` events).
+/// `active` is keyed by sid now, so this yields one row PER SESSION; identity
+/// decorations (`peer_meta`/`peer_ids`) are per-device, looked up by each row's `peer`.
 #[tauri::command]
 pub(crate) async fn list_connections(state: State<'_, AppState>) -> Result<Vec<ConnRow>, String> {
 	let meta = state.peer_meta.lock().unwrap().clone();
+	let ids = state.peer_ids.lock().unwrap().clone();
 	let g = state.active.lock().unwrap();
 	Ok(g.iter()
-		.map(|(peer, ci)| {
-			let (name, avatar) = meta.get(peer).cloned().unwrap_or((None, None));
+		.map(|(sid, ci)| {
+			let (name, avatar) = meta.get(&ci.peer).cloned().unwrap_or((None, None));
 			ConnRow {
-				peer: peer.clone(),
+				sid: *sid,
+				peer: ci.peer.clone(),
 				since_ms: ci.since_ms,
 				mode: ci.mode,
 				view_only: ci.view_only,
 				name,
 				avatar,
+				client_id: ids.get(&ci.peer).cloned(),
 			}
 		})
 		.collect())
 }
 
-/// "Sadece izleme" toggle: revoke/restore a connected client's CONTROL — the serve
-/// loop's input handler drops its events while set; the stream keeps running.
+/// "Sadece izleme" toggle: revoke/restore a connected SESSION's CONTROL — the serve
+/// loop's input handler drops its events while set; the stream keeps running. Keyed by
+/// the row's `sid` so one pane of a same-host co-op pair can be view-only-d alone.
 #[tauri::command]
 pub(crate) async fn set_view_only(
 	state: State<'_, AppState>,
-	peer: String,
+	sid: u64,
 	on: bool,
 ) -> Result<(), String> {
-	if let Some(ci) = state.active.lock().unwrap().get_mut(&peer) {
+	if let Some(ci) = state.active.lock().unwrap().get_mut(&sid) {
 		ci.view_only = on;
 	}
 	Ok(())

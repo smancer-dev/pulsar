@@ -63,7 +63,10 @@ fn send_key(vk: u16, flags: u32) {
 
 /// Map a Linux evdev keycode (what the client sends — see `keymap.ts`) to a
 /// Windows virtual-key code. Pure + testable.
-fn evdev_to_vk(code: u32) -> Option<u16> {
+///
+/// `pub(crate)` so the per-window `PostMessage` injector (`window_win.rs`) reuses
+/// the exact same evdev→VK table the global `SendInput` path uses.
+pub(crate) fn evdev_to_vk(code: u32) -> Option<u16> {
 	Some(match code {
 		1 => 0x1B,                          // Escape
 		2..=10 => 0x31 + (code - 2) as u16, // Digit1..9 → '1'..'9'

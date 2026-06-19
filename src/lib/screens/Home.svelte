@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
-	import { historyPeers, removeFromHistory, fmtPeerId, addPeer, isSaved } from '$lib/peers.svelte';
+	import { historyPeers, removeFromHistory, fmtPeerId, normalizeId, addPeer, isSaved } from '$lib/peers.svelte';
 	import { api, onNodePort } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 	import { canConnectTarget, fmtTarget } from '$lib/connectTarget';
@@ -16,11 +16,20 @@
 		connecting?: boolean;
 		/** Host's unattended-access toggle — no one-time password is issued when ON. */
 		unattended?: boolean;
-		hostSessions: { peer: string; since: number }[];
+		hostSessions: { sid: number; peer: string; since: number }[];
+		/** Peer map-key → the client's own device id (pushed via DataMsg::PeerId). */
+		hostClientIds?: Record<string, string>;
+		/** Peer map-key → the client's pushed display name. */
+		hostNames?: Record<string, string>;
 		activity: string[];
 		debug?: boolean;
+		/** Connect-only variant (used inside a split pane): hides the device-global "share
+		 * your own id / Allow this device" half (SelfCard) + the page header, so the pane
+		 * focuses purely on connecting OUT to a remote device. Same components/styling. */
+		connectOnly?: boolean;
 		onRefreshPw?: () => void;
-		onDisconnect?: (peer: string) => void;
+		/** Kick a connected session by its session id. */
+		onDisconnect?: (sid: number) => void;
 		onConnect: (t: Target, m?: 'remote' | 'game', gameId?: string) => void;
 	};
 	let {
@@ -30,8 +39,11 @@
 		connecting = false,
 		unattended = false,
 		hostSessions,
+		hostClientIds = {},
+		hostNames = {},
 		activity,
 		debug = false,
+		connectOnly = false,
 		onRefreshPw = () => {},
 		onDisconnect = () => {},
 		onConnect
@@ -46,9 +58,28 @@
 	// go_online rebinds (e.g. after a Settings port change → reconnect).
 	let localIp = $state('');
 	let nodePort = $state(0);
+	// LAN-discovered device keys (normalized ids + addresses), polled so the recents list
+	// can show which saved peers are reachable RIGHT NOW (a green/grey dot). LAN-based: a
+	// peer reachable only via the relay (not on this LAN) reads as offline here.
+	let lanKeys = $state<Set<string>>(new Set());
+	const isOnline = (id: string) => lanKeys.has(normalizeId(id)) || lanKeys.has(id);
 	onMount(() => {
 		api.localIp().then((ip) => (localIp = ip)).catch(() => {});
 		api.nodePort().then((p) => (nodePort = p)).catch(() => {});
+		const refreshLan = () =>
+			api.lanDevices().then((list) => {
+				const s = new Set<string>();
+				for (const d of list) {
+					if (d.id) s.add(normalizeId(d.id));
+					if (d.addr) {
+						s.add(d.addr);
+						s.add(d.addr.split(':')[0]);
+					}
+				}
+				lanKeys = s;
+			}).catch(() => {});
+		refreshLan();
+		const lanTimer = setInterval(refreshLan, 4000);
 		let off: (() => void) | undefined;
 		let dead = false;
 		onNodePort((p) => (nodePort = p)).then((o) => {
@@ -59,6 +90,7 @@
 		});
 		return () => {
 			dead = true;
+			clearInterval(lanTimer);
 			off?.();
 		};
 	});
@@ -86,28 +118,34 @@
 	}
 </script>
 
-<div class="head">
-	<div>
-		<h1>{t('home.title')}</h1>
-		<p class="sub">{t('home.sub')}</p>
+{#if !connectOnly}
+	<div class="head">
+		<div>
+			<h1>{t('home.title')}</h1>
+			<p class="sub">{t('home.sub')}</p>
+		</div>
 	</div>
-</div>
+{/if}
 
-<div class="grid">
-	<SelfCard
-		{selfId}
-		{selfPw}
-		{online}
-		{unattended}
-		{connecting}
-		{hostSessions}
-		{activity}
-		{debug}
-		{localIp}
-		{nodePort}
-		{onRefreshPw}
-		{onDisconnect}
-	/>
+<div class="grid" class:single={connectOnly}>
+	{#if !connectOnly}
+		<SelfCard
+			{selfId}
+			{selfPw}
+			{online}
+			{unattended}
+			{connecting}
+			{hostSessions}
+			{hostClientIds}
+			{hostNames}
+			{activity}
+			{debug}
+			{localIp}
+			{nodePort}
+			{onRefreshPw}
+			{onDisconnect}
+		/>
+	{/if}
 
 	<div class="card col">
 		<span class="eyebrow mono">{t('home.connectRemote')}</span>
@@ -151,7 +189,10 @@
 							{#if r.avatar}<img class="rimg" src={r.avatar} alt="" />{:else}{initials(r.name)}{/if}
 						</span>
 						<span class="rmeta">
-							<span class="rname">{r.name}</span>
+							<span class="rname">
+								<span class="rdot" class:on={isOnline(r.id)} title={isOnline(r.id) ? t('home.online') : t('home.offline')}></span>
+								{r.name}
+							</span>
 							<span class="rid mono">{fmtPeerId(r.id)}</span>
 						</span>
 						<Icon name="arrowRight" size={15} class="push" />
@@ -200,6 +241,11 @@
 		display: grid;
 		grid-template-columns: 1fr 1fr;
 		gap: 18px;
+	}
+	/* Connect-only (split pane) variant: drop the device-global SelfCard column so the
+	   connect card fills the pane. */
+	.grid.single {
+		grid-template-columns: 1fr;
 	}
 	.card.col {
 		display: flex;
@@ -322,6 +368,20 @@
 	.rname {
 		font-size: 13.5px;
 		font-weight: 600;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.rdot {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--text-faint);
+		flex: none;
+	}
+	.rdot.on {
+		background: var(--ok);
+		box-shadow: 0 0 0 2px color-mix(in oklch, var(--ok) 22%, transparent);
 	}
 	.rid {
 		font-size: 11px;

@@ -83,6 +83,14 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 			return Promise.resolve([] as unknown as T);
 		case 'launch_remote_game':
 			return Promise.resolve(undefined as unknown as T);
+		case 'host_window_list':
+			// Deterministic sample windows so the "Pencere" picker is browsable in the
+			// browser preview (real hosts reply over a live session; the mock has none).
+			return Promise.resolve([
+				{ hwnd: 65772, title: 'Not Defteri' },
+				{ hwnd: 131308, title: 'Hesap Makinesi' },
+				{ hwnd: 198844, title: 'Firefox' }
+			] as unknown as T);
 		case 'available_encoders':
 			return Promise.resolve(['software'] as unknown as T);
 		case 'list_audio_sources':
@@ -123,6 +131,8 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 			return Promise.resolve(undefined as unknown as T);
 		case 'set_controller_order':
 		case 'set_controller_emulation':
+		case 'set_controller_rumble':
+		case 'set_disabled_controllers':
 		case 'set_tray':
 		case 'set_host_serving':
 		case 'gamepad_nav_start':
@@ -131,6 +141,9 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'stop_stream':
 		case 'set_play_resolution':
 		case 'set_overlay':
+		case 'set_active_session':
+		case 'set_pane_count':
+		case 'set_controller_lock':
 		case 'set_play_bitrate':
 		case 'set_play_quality':
 		case 'set_play_monitor':

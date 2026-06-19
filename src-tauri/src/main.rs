@@ -19,15 +19,31 @@ fn main() {
 	if std::env::var_os("GDK_BACKEND").is_none() {
 		std::env::set_var("GDK_BACKEND", "x11");
 	}
-	// ARM Linux (RK3588/Mali): WebKitGTK's accelerated compositing intermittently
-	// stops PRESENTING frames at startup — JS runs, state updates, but the window
-	// shows a stale frame forever (blank white / stuck splash / half-painted UI).
-	// Forcing the non-AC software path is fully stable (3/3 cold-launch verified on
-	// the Orange Pi 5; the host UI is light, so software rendering is fine). The
-	// DMABUF-disable knob is NOT used — it segfaults this stack. An explicit env wins.
-	#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-	if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
-		std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+	// APP-UI hardware acceleration (the WebKitGTK webview's accelerated/GPU compositing) — NOT
+	// the video stream's encode/decode (those are separate per-session codec settings). Decided
+	// ONCE here, before the webview is created (the WebKitGTK env can't change at runtime → the
+	// `ui_hardware_accel` setting needs an app restart to apply).
+	//
+	// Default: ON everywhere EXCEPT the Orange Pi 5 (RK3588/Mali), where WebKitGTK's accelerated
+	// compositing has an UNRECOVERABLE "stops presenting" freeze (verified: not recoverable by a
+	// window resize or fullscreen toggle). So opi5 defaults to the software path — stable, and the
+	// per-row blurred-shadow paint cost is stripped in gaming mode (app.css) so heavy pages stay
+	// smooth without the GPU. The `Config.ui_hardware_accel` setting (Some(true)/Some(false))
+	// overrides the per-device default. On opi5-with-AC-on we also set PULSAR_FORCE_AC so the
+	// frontend runs the present-keepalive (a best-effort freeze reducer).
+	#[cfg(target_os = "linux")]
+	{
+		let is_rk3588 = std::fs::read("/proc/device-tree/compatible")
+			.map(|b| b.windows(6).any(|w| w == b"rk3588"))
+			.unwrap_or(false);
+		let ac_on = ui_hwaccel_pref().unwrap_or(!is_rk3588);
+		if ac_on {
+			if is_rk3588 && std::env::var_os("PULSAR_FORCE_AC").is_none() {
+				std::env::set_var("PULSAR_FORCE_AC", "1");
+			}
+		} else if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+			std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+		}
 	}
 	// Windows: the native video child fully OCCLUDES the webview during a session, and
 	// WebView2's native-window occlusion detection then THROTTLES the page (timers +
@@ -58,4 +74,16 @@ fn main() {
 		return;
 	}
 	pulsar_tauri::run()
+}
+
+/// Read the persisted `ui_hardware_accel` preference from the app config file BEFORE Tauri starts
+/// (so the WebKitGTK compositing env is set before the webview is created). Returns `None` (auto)
+/// if the file/field is absent — the per-device default then applies.
+#[cfg(target_os = "linux")]
+fn ui_hwaccel_pref() -> Option<bool> {
+	let base = std::env::var_os("XDG_CONFIG_HOME")
+		.map(std::path::PathBuf::from)
+		.or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+	let path = base.join("dev.pulsar.app").join("config.json");
+	pulsar_core::config::Config::load(&path).ui_hardware_accel
 }

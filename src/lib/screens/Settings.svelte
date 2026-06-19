@@ -5,13 +5,15 @@
 	import type { Config, NetworkMode } from '$lib/types';
 	import { t } from '$lib/i18n.svelte';
 	import { saveTick, configTick } from '$lib/settings.svelte';
+	import { navContainer } from '$lib/gamepadNav.svelte';
 	import DisplayTab from './Settings/DisplayTab.svelte';
 	import NetworkTab from './Settings/NetworkTab.svelte';
 	import SecurityTab from './Settings/SecurityTab.svelte';
 	import GeneralTab from './Settings/GeneralTab.svelte';
 
-	// Called after the relay/network settings change so the app re-registers.
-	let { onReconnect }: { onReconnect?: () => void } = $props();
+	// `onReconnect` re-registers after relay/network changes. `padNav` = make every control
+	// here controller-navigable (set when Settings is shown inside the gaming-mode shell).
+	let { onReconnect, padNav = false }: { onReconnect?: () => void; padNav?: boolean } = $props();
 
 	let tab = $state<'display' | 'network' | 'security' | 'general'>('display');
 	let config = $state<Config | null>(null);
@@ -129,7 +131,7 @@
 
 <div class="head"><h1>{t('settings.title')}</h1><p class="sub">{t('settings.sub')}</p></div>
 
-<div class="layout">
+<div class="layout" use:navContainer={padNav}>
 	<div class="rail">
 		{#each tabs as tb (tb.id)}
 			<button class="tab" class:on={tab === tb.id} onclick={() => (tab = tb.id)}>

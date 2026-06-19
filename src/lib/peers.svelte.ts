@@ -203,6 +203,29 @@ export function removeFromGameHistory(id: string) {
 	persist();
 }
 
+/** Rename a game-recent in place (gaming-mode recents edit modal). Mirrors
+ * `removeFromGameHistory`: look the entry up by canonical id, mutate, persist.
+ * No-op when the id isn't in the store or the name is blank. */
+export function renameGamePeer(id: string, name: string) {
+	const i = peers.findIndex((p) => p.id === normalizeId(id));
+	if (i < 0) return;
+	const n = name.trim();
+	if (!n) return;
+	peers[i].name = n;
+	persist();
+}
+
+/** Set a game-recent's user-chosen image (gaming-mode recents edit modal): either
+ * `icon:<name>` for a built-in line icon, or a small data URL for an uploaded
+ * picture — same `image` field the Devices add/edit modal writes. Mirrors
+ * `removeFromGameHistory`'s find-mutate-persist. */
+export function setGamePeerImage(id: string, image: string) {
+	const i = peers.findIndex((p) => p.id === normalizeId(id));
+	if (i < 0) return;
+	peers[i].image = image;
+	persist();
+}
+
 /** Manually save a device to the address book (Devices). Marks an existing
  * history-only entry as saved, or adds a new saved one. */
 export function addPeer(name: string, id: string, cat: PeerCategory = 'pc', image?: string): boolean {

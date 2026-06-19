@@ -59,6 +59,16 @@
 		 * events (kbd-leave / overlay-toggle / kbd-engaged…) must only be owned/handled
 		 * by the visible tab — otherwise one combo ends/changes EVERY open session. */
 		active?: boolean;
+		/** Split mode: this session is one pane of a tiled grid (not a fullscreen tab). In
+		 * split, `active` means THIS is the FOCUSED pane; non-focused panes stay live (no
+		 * rect-zeroing / data-occluded) and the embedded --wid container path is forced so
+		 * the renderers compose side-by-side. */
+		split?: boolean;
+		/** Split mode: clicking this pane's video focuses the pane (routes input to it). */
+		onPaneFocus?: () => void;
+		/** A shell modal (e.g. the SplitPicker) is open ON TOP — hide this pane's native render
+		 * window (which on Linux composites OVER the webview, hiding the modal) while true. */
+		occludeNative?: boolean;
 		onToggleFullscreen: () => void;
 		onEnd?: () => void;
 	};
@@ -77,6 +87,9 @@
 		hostDisplays = [],
 		fullscreen = false,
 		active = true,
+		split = false,
+		onPaneFocus,
+		occludeNative = false,
 		onToggleFullscreen,
 		onEnd = () => {}
 	}: Props = $props();
@@ -209,6 +222,10 @@
 	// the session tab (chrome/tabs stay visible) instead of covering the window. Report
 	// the rect on layout/resize; the tab going inactive (display:none) yields a 0×0 rect
 	// → container unmaps. Cleanup reports 0×0 so an unmounted tab never leaves video up.
+	// Split mode forces the embedded per-pane `--wid` container path (rect-positioned over
+	// the grid cell) and NEVER the single fullscreen GtkGLArea surface — 4 renderers must
+	// compose side-by-side, so `embedded` (the single-surface mode) is treated as off here.
+	const useEmbedded = $derived(embedded && !split);
 	let screenEl = $state<HTMLDivElement | null>(null);
 	$effect(() => {
 		const el = screenEl;
@@ -220,7 +237,14 @@
 		// (plus the window resize listener + settle-delayed reports below) pushes
 		// the fresh rect without relying on RO delivery.
 		void fullscreen;
-		if (!native || embedded || playId < 0 || !el) return;
+		if (!native || useEmbedded || playId < 0 || !el) return;
+		// A shell modal (the SplitPicker) is open ON TOP. On Linux the native --wid render window
+		// composites OVER the webview, so it would hide the modal. Unmap it (0×0) while occluded;
+		// reading `occludeNative` makes this effect re-run + re-report the real rect when it closes.
+		if (occludeNative) {
+			api.nativeViewRect(playId, 0, 0, 0, 0).catch(() => {});
+			return;
+		}
 		const report = () => {
 			const r = el.getBoundingClientRect();
 			api
@@ -252,7 +276,7 @@
 	// the reporter above re-runs on every fullscreen toggle, and unmapping the
 	// container from ITS cleanup blanked the video for a frame on each toggle.
 	$effect(() => {
-		if (!native || embedded || playId < 0) return;
+		if (!native || useEmbedded || playId < 0) return;
 		return () => {
 			api.nativeViewRect(playId, 0, 0, 0, 0).catch(() => {});
 		};
@@ -345,6 +369,9 @@
 		// The overlay-button hotspot opens the overlay; it must never count as the
 		// click-to-engage opt-in.
 		if ((e.target as HTMLElement | null)?.closest?.('.ovbtn-hotspot')) return;
+		// Split mode: a click anywhere in this pane focuses it (routes keyboard/mouse +
+		// unlocked controllers here) before the engage/pointer handling below.
+		onPaneFocus?.();
 		if (native && !nativeEngaged) {
 			api.kbdEngage().catch(() => {});
 			// Start the host cursor where the user clicked: map the click into the video
@@ -404,7 +431,7 @@
 	// (`.window`) goes transparent and the GLArea shows through. Chrome/dock stay opaque.
 	$effect(() => {
 		if (typeof document === 'undefined') return;
-		document.documentElement.toggleAttribute('data-embedded', embedded);
+		document.documentElement.toggleAttribute('data-embedded', useEmbedded);
 		return () => document.documentElement.removeAttribute('data-embedded');
 	});
 
@@ -446,18 +473,29 @@
 	// killing the focus-gated combos). Shortcuts (Ctrl/Alt/Meta chords) pass through.
 	$effect(() => {
 		if (!native || playId < 0 || typeof window === 'undefined' || !dock.overlayOpen) return;
+		const navDirs: Record<string, string> = {
+			ArrowUp: 'up',
+			ArrowDown: 'down',
+			ArrowLeft: 'left',
+			ArrowRight: 'right',
+			Escape: 'escape'
+		};
 		const onKey = (e: KeyboardEvent) => {
 			if (e.ctrlKey || e.altKey || e.metaKey) return;
-			if (e.key.length === 1) {
+			const dir = navDirs[e.key];
+			if (dir) {
+				// Arrows / Escape drive the overlay nav on the SAME `k <dir>` channel the pad
+				// uses → keyboard navigates the menus (up/down/left/right) like a controller.
+				api.renderNav(playId, dir).catch(() => {});
+			} else if (e.key === 'Enter') {
+				// Enter both activates the focused nav item (non-chat views) AND sends the
+				// chat composer (chat view) — each view consumes only its own channel.
+				api.renderNav(playId, 'go').catch(() => {});
+				api.renderKin(playId, 'k', 'enter').catch(() => {});
+			} else if (e.key.length === 1) {
 				api.renderKin(playId, 't', e.key).catch(() => {});
 			} else if (e.key === 'Backspace') {
 				api.renderKin(playId, 'k', 'backspace').catch(() => {});
-			} else if (e.key === 'Enter') {
-				api.renderKin(playId, 'k', 'enter').catch(() => {});
-			} else if (e.key === 'ArrowLeft') {
-				api.renderKin(playId, 'k', 'left').catch(() => {});
-			} else if (e.key === 'ArrowRight') {
-				api.renderKin(playId, 'k', 'right').catch(() => {});
 			} else {
 				return;
 			}
@@ -633,8 +671,72 @@
 					}
 					break;
 				}
+				// Overlay PER-PAD vibration picker: the egui Controllers view emits
+				// `ov set ctrlrumble uuid,level` (off/weak/medium/strong). Persist to
+				// ui.controllerRumble[uuid] and push the map to the SDL pad manager (live).
+				case 'ctrlrumble': {
+					const comma = val.indexOf(',');
+					if (comma < 0) break;
+					const uuid = val.slice(0, comma);
+					const lvl = val.slice(comma + 1).trim();
+					if (uuid && (lvl === 'off' || lvl === 'weak' || lvl === 'medium' || lvl === 'strong')) {
+						ui.controllerRumble[uuid] = lvl;
+						saveUi();
+						api.setControllerRumble($state.snapshot(ui.controllerRumble) as Record<string, string>).catch(() => {});
+					}
+					break;
+				}
+				// Overlay enable/disable SET: the egui Controllers view emits
+				// `ov set ctrldisable uuid,state` (state 1 = disabled, 0 = enabled).
+				case 'ctrldisable': {
+					const comma = val.indexOf(',');
+					if (comma < 0) break;
+					const uuid = val.slice(0, comma);
+					const state = val.slice(comma + 1).trim();
+					if (uuid) {
+						if (state === '1') ui.controllerDisabled[uuid] = true;
+						else delete ui.controllerDisabled[uuid];
+						saveUi();
+						const list = Object.keys($state.snapshot(ui.controllerDisabled));
+						api.setDisabledControllers(list).catch(() => {});
+					}
+					break;
+				}
+				// Overlay controller-LOCK SET (split mode): the egui Controllers view emits
+				// `ov set ctrllock uuid,state` (state 1 = locked to this pane, 0 = unlocked).
+				// Mirrors `ctrldisable` exactly; forwarded with this session's play id so the
+				// backend can scope the lock owner.
+				case 'ctrllock': {
+					const comma = val.indexOf(',');
+					if (comma < 0) break;
+					const uuid = val.slice(0, comma);
+					const state = val.slice(comma + 1).trim();
+					if (uuid) {
+						api.setControllerLock(uuid, playId, state === '1').catch(() => {});
+					}
+					break;
+				}
+				// Overlay vibration TEST: `ov set ctrltest <uuid>` → one-shot rumble pulse on
+				// that pad at its current level so the player can feel it.
+				case 'ctrltest': {
+					const uuid = val.trim();
+					if (uuid) api.testControllerRumble(uuid).catch(() => {});
+					break;
+				}
 				case 'reverse': reverse(); break;
 				case 'fullscreen': onToggleFullscreen(); break;
+				// Overlay "Ekran uyarlama" (screen adaptation): `ov set adapt <w>x<h>` turns it on
+				// with the pane's pixel size, `ov set adapt off` turns it off. The host switches the
+				// captured monitor to the best-fit mode (and reverts on exit).
+				case 'adapt': {
+					if (val === 'off') {
+						controls.setAdapt(false, 0, 0);
+					} else {
+						const m = /^(\d+)x(\d+)$/.exec(val);
+						if (m) controls.setAdapt(true, Number(m[1]), Number(m[2]));
+					}
+					break;
+				}
 			}
 		}));
 		// Native Chat: composer line from the overlay → host + echo back so the
@@ -680,7 +782,7 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="screen" class:embedded bind:this={screenEl} onpointerdowncapture={onScreenDown}>
+<div class="screen" class:embedded={useEmbedded} bind:this={screenEl} onpointerdowncapture={onScreenDown}>
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<canvas
 		bind:this={canvas}

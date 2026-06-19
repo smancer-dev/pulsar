@@ -6,7 +6,9 @@
 // starts and when it ends (Sunshine-style prep commands). Streaming quality is a
 // single host-level setting, not per-game.
 
-export type GameType = 'program' | 'command' | 'image';
+// A game launches either a program (exe + args) or a raw command. (There is NO 'image'
+// type — a cover image is a separate optional `image` field, not a launch kind.)
+export type GameType = 'program' | 'command';
 
 export interface Game {
 	id: string;
@@ -60,11 +62,13 @@ export function isBuiltin(id: string): boolean {
 }
 
 function desktopEntry(): Game {
-	// type 'image' = "launch nothing, just stream" — i.e. the live desktop.
+	// Desktop launches NOTHING (a 'command' with an empty command) — the host streams the
+	// whole live desktop when the client picks it (gameId '' / unmatched). It's filtered
+	// out of the client's fetched game list, which pins its own Desktop card.
 	return {
 		id: DESKTOP_ID,
 		title: 'Masaüstü',
-		type: 'image',
+		type: 'command',
 		path: '',
 		args: '',
 		command: '',
@@ -99,6 +103,11 @@ function load(): Store {
 	try {
 		const raw = localStorage.getItem(KEY);
 		const s = raw ? { ...defaults(), ...(JSON.parse(raw) as Partial<Store>) } : defaults();
+		// Migrate the removed 'image' game type (was "launch nothing, just stream / cover
+		// only") to a no-op 'command'; the cover stays in the separate `image` field.
+		for (const g of s.games) {
+			if ((g.type as string) === 'image') g.type = 'command';
+		}
 		ensureDesktop(s);
 		return s;
 	} catch {

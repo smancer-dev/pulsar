@@ -24,6 +24,10 @@ export interface Config {
 	avatar_mode: string;
 	/** Use the native (ffplay) hardware-decoded renderer instead of the webview. */
 	native_player: boolean;
+	/** Hardware acceleration for the APP'S OWN UI (the webview that draws menus/settings) —
+	 * NOT the video stream's encode/decode. null = per-device default (off on Orange Pi 5,
+	 * on elsewhere); true/false overrides. Applied at startup → needs an app restart. */
+	ui_hardware_accel?: boolean | null;
 }
 
 export type Transport = 'direct' | 'relay';
@@ -68,6 +72,8 @@ export interface ControllerInfo {
 	label: string;
 	/** Connected + forwardable right now. */
 	connected: boolean;
+	/** Battery charge 0..100, or null for a wired pad / unknown. */
+	battery?: number | null;
 }
 
 export interface SessionStats {

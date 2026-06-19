@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Icon from '$lib/Icon.svelte';
 	import { api, copyText } from '$lib/api';
+	import { fmtPeerId } from '$lib/peers.svelte';
 	import { t } from '$lib/i18n.svelte';
 
 	type Props = {
@@ -11,14 +12,20 @@
 		/** Host has unattended access ON → no one-time password is issued; anyone with
 		 * the ID can connect without approval. */
 		unattended?: boolean;
-		hostSessions: { peer: string; since: number }[];
+		hostSessions: { sid: number; peer: string; since: number }[];
+		/** Peer map-key → the client's own device id (pushed via DataMsg::PeerId): show
+		 * the client's ID even on a direct/same-LAN connect (peer key is an ip:port then). */
+		hostClientIds?: Record<string, string>;
+		/** Peer map-key → the client's pushed display name (shown in parens after the id/ip). */
+		hostNames?: Record<string, string>;
 		activity: string[];
 		debug?: boolean;
 		localIp: string;
 		/** The node's actual bound UDP port (0 = offline) — shown as "ip:port". */
 		nodePort?: number;
 		onRefreshPw?: () => void;
-		onDisconnect?: (peer: string) => void;
+		/** Kick a connected session by its session id. */
+		onDisconnect?: (sid: number) => void;
 	};
 	let {
 		selfId,
@@ -27,6 +34,8 @@
 		connecting = false,
 		unattended = false,
 		hostSessions,
+		hostClientIds = {},
+		hostNames = {},
 		activity,
 		debug = false,
 		localIp,
@@ -34,6 +43,15 @@
 		onRefreshPw = () => {},
 		onDisconnect = () => {}
 	}: Props = $props();
+
+	// Show the client's pushed device ID when known, else the raw peer key (ip:port on a
+	// direct/same-LAN connect, the grouped relay id otherwise) — and append the pushed
+	// display name in parens when known: "303 036 449 (orangepi)".
+	function peerLabel(peer: string): string {
+		const id = fmtPeerId(hostClientIds[peer] ?? peer);
+		const name = hostNames[peer];
+		return name ? `${id} (${name})` : id;
+	}
 
 	let copied = $state(false);
 	async function copyId() {
@@ -128,10 +146,10 @@
 	{#if hostSessions.length === 0}
 		<div class="connempty">{t('home.noConnected')}</div>
 	{:else}
-		{#each hostSessions as s (s.peer)}
+		{#each hostSessions as s (s.sid)}
 			<div class="connrow">
-				<span class="cdot"></span><span class="mono">{s.peer}</span>
-				<button class="kick" onclick={() => onDisconnect(s.peer)} title={t('home.kick')}>
+				<span class="cdot"></span><span class="mono">{peerLabel(s.peer)}</span>
+				<button class="kick" onclick={() => onDisconnect(s.sid)} title={t('home.kick')}>
 					<Icon name="x" size={12} />{t('home.kickLabel')}
 				</button>
 			</div>

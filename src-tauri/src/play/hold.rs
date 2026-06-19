@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pulsar_core::service::{
-	decode_data, media, request_stream, send_data, send_input, send_keepalive, DataMsg, InputEvent,
-	QualityPref, StreamReq,
+	decode_data, media, query_windows, request_stream, send_data, send_input, send_keepalive,
+	DataMsg, InputEvent, QualityPref, StreamReq,
 };
 use pulsar_core::Session;
 use tauri::{AppHandle, Emitter};
@@ -61,6 +61,21 @@ pub(super) async fn hold_session(
 	cursor_external: bool,
 	req_hdr: bool,
 	init_quality: QualityPref,
+	// Initial host monitor (0 = primary). Seeds `cur_display` so a re-request (adaptive
+	// bitrate step / menu change) preserves the monitor the session STARTED on — without
+	// this, a same-host second pane that started on a free monitor would snap back to 0 on
+	// the first adaptive step, re-colliding with the sibling pane's DXGI capture.
+	init_display: u32,
+	// Initial per-window capture target (Phase 2b co-op). Seeds `cur_window` so every
+	// re-request (adaptive bitrate / menu change) preserves the WGC window the session
+	// started on — without this, the first adaptive step would drop `window_hwnd` to None
+	// and snap the host back to whole-monitor DXGI capture. `None` = the monitor path.
+	init_window: Option<i64>,
+	// On-demand host-window-list queries (Phase 2b co-op): the `host_window_list` command
+	// sends a oneshot reply-sender here; we service it by asking the host (`query_windows`)
+	// over the control session we own and answering on the oneshot. Routed through the hold
+	// loop so the held `Session` stays single-owner.
+	mut windows_query_rx: Receiver<tokio::sync::oneshot::Sender<Vec<pulsar_core::service::WindowInfo>>>,
 	// Host → client rumble: each DataMsg::Rumble is forwarded here for the gilrs reader
 	// thread to replay on the physical pad (force-feedback).
 	rumble_tx: tokio::sync::mpsc::Sender<(u8, u8, u8)>,
@@ -116,9 +131,21 @@ pub(super) async fn hold_session(
 	// captured endpoint — see play.rs). Preserved across every re-request; the user can flip it
 	// mid-session from the overlay (sets cur_mute below).
 	let mut cur_mute = game_mode;
-	// Host monitor index (0 = primary). Changed live by the session menu's monitor
-	// picker (Restream::Display); preserved across every re-request below.
-	let mut cur_display: u32 = 0;
+	// Host monitor index (0 = primary). Seeded from the INITIAL request — a same-host
+	// second pane starts on a FREE monitor (not 0) — and changed live by the session menu's
+	// monitor picker (Restream::Display); preserved across every re-request below.
+	let mut cur_display: u32 = init_display;
+	// Per-window capture target (Phase 2b co-op). Seeded from the INITIAL request so it
+	// survives every re-request; a session-menu "window" pick changes it live via
+	// Restream::Window. `Some(hwnd)` makes the host capture that single window via WGC
+	// (overriding cur_display); `None` = the cur_display monitor path.
+	let mut cur_window: Option<i64> = init_window;
+	// Screen-ADAPTATION target (Parsec-style): `Some((w,h))` asks the host to switch the captured
+	// monitor to the display mode best fitting a w×h pane (this renderer's window) and to REVERT it
+	// on teardown; `None` = no change. Flipped live by the overlay's "Ekran uyarlama" toggle via
+	// Restream::Adapt; preserved across every re-request. Ignored host-side when a window target is
+	// set (per-window capture has no monitor mode).
+	let mut cur_adapt: Option<(u32, u32)> = None;
 	// Requested audio channel layout. Stereo today (the client default in play.rs — the
 	// audio paths expect opus/48000/2 and the host negotiates surround down anyway);
 	// kept as state so it's preserved across every re-request and a future surround
@@ -623,6 +650,8 @@ pub(super) async fn hold_session(
 							media_over_session: mos,
 							cursor_external,
 							display_idx: cur_display,
+							window_hwnd: cur_window,
+							adapt: cur_adapt,
 							audio_layout: cur_audio_layout,
 						};
 						if request_stream(&mut sess, &req).await.is_err() {
@@ -660,6 +689,18 @@ pub(super) async fn hold_session(
 						Restream::Display(d) => {
 							tracing::info!(display = d, "host monitor switch requested");
 							cur_display = d;
+							// Picking a monitor clears any per-window target: the two are
+							// mutually exclusive (the host ignores display_idx when window_hwnd
+							// is Some), so a Display switch means "go back to whole-monitor".
+							cur_window = None;
+						}
+						Restream::Window(w) => {
+							tracing::info!(hwnd = ?w, "per-window capture target requested");
+							cur_window = w;
+						}
+						Restream::Adapt(a) => {
+							tracing::info!(adapt = ?a, "screen adaptation toggle");
+							cur_adapt = a;
 						}
 					}
 					let req = StreamReq {
@@ -682,6 +723,8 @@ pub(super) async fn hold_session(
 						media_over_session: mos,
 						cursor_external,
 						display_idx: cur_display,
+						window_hwnd: cur_window,
+						adapt: cur_adapt,
 						audio_layout: cur_audio_layout,
 					};
 					let rs = request_stream(&mut sess, &req).await;
@@ -689,6 +732,18 @@ pub(super) async fn hold_session(
 					if rs.is_err() {
 						break;
 					}
+				}
+				None => {}
+			},
+			// On-demand host-window-list query (Phase 2b co-op "window" capture picker): ask
+			// the host over the control session we own and answer on the oneshot. A failed
+			// query (old host / non-Windows host -> no reply within query_windows' own timeout)
+			// resolves to an empty list, so the client picker just shows no windows. Dropping
+			// the reply (client gave up) is fine (`let _ =`).
+			q = windows_query_rx.recv() => match q {
+				Some(reply) => {
+					let list = query_windows(&mut sess).await.unwrap_or_default();
+					let _ = reply.send(list);
 				}
 				None => {}
 			},

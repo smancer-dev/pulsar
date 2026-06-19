@@ -9,6 +9,8 @@
 	import Numpad from './Numpad.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import { canConnectTarget, fmtTarget } from '$lib/connectTarget';
+	import { portal } from '$lib/portal';
+	import { openModal, closeModal } from '$lib/overlayModals.svelte';
 	import type { GamepadNav } from '$lib/gamepadNav.svelte';
 
 	type Props = {
@@ -35,6 +37,9 @@
 	}
 
 	onMount(() => {
+		// Hide every pane's native render while this numpad is up, so a neighbour pane's live
+		// video (composited over the webview on Linux) can't occlude it (split-mode #8).
+		openModal();
 		nav.pushBack(onClose);
 		// Focus the ID box next frame (after items register) so the keyboard can type
 		// immediately and controller focus is confined to the modal.
@@ -44,6 +49,7 @@
 		});
 	});
 	onDestroy(() => {
+		closeModal();
 		nav.popBack(onClose);
 		nav.focusFirst(); // return focus to the shell
 	});
@@ -51,6 +57,7 @@
 
 <div
 	class="backdrop"
+	use:portal
 	role="presentation"
 	onclick={(e) => {
 		if (e.target === e.currentTarget) onClose();

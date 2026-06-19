@@ -20,6 +20,10 @@ mod avatar;
 mod caps;
 mod commands;
 mod connections;
+// Host-side "screen adaptation" (Parsec-style): switch a captured monitor to the
+// best-fit display mode for a client split-pane and revert on teardown. Windows-only
+// implementation; no-op stubs elsewhere.
+mod display_mode;
 mod events;
 mod files;
 mod files_window;
@@ -55,7 +59,7 @@ pub(crate) use process::no_window;
 
 // Re-export every `#[tauri::command]` so `tauri::generate_handler!` below resolves
 // them by bare name (they're defined across the submodules above).
-use auth::{disconnect_peer, respond_request, submit_password};
+use auth::{disconnect_all_peers, disconnect_peer, respond_request, submit_password};
 use avatar::{device_user_name, self_avatar};
 use commands::{
 	auto_connect_target, available_encoders, connect, controllers, forget_peer, get_config,
@@ -63,6 +67,8 @@ use commands::{
 	node_port, publish_games,
 	relaunch_to_home, run_command, scan_folder, self_update_possible, session_password, set_config,
 	gamepad_nav_start, gamepad_nav_stop, set_controller_emulation, set_controller_order,
+	set_controller_rumble, set_disabled_controllers, test_controller_rumble, force_ac, default_ui_hwaccel,
+	webview_sw_painted,
 	set_host_serving, set_language, set_stream_settings, set_tray, steam_path,
 };
 use connections::{list_connections, set_view_only, show_connections};
@@ -72,15 +78,16 @@ use host::go_online;
 use io_cmds::{
 	chat_log, host_send_chat, input_button, input_char, input_key, input_pointer, input_scroll,
 	kbd_capture_start, kbd_capture_stop, kbd_engage, mic_start, mic_stop, native_view_rect,
-	read_clipboard_text, send_chat, send_clipboard, send_file, send_file_path,
-	set_window_fullscreen, write_clipboard_text,
+	read_clipboard_text, send_chat, send_clipboard, send_file, send_file_path, set_active_session,
+	set_controller_lock, set_pane_count, set_window_fullscreen, write_clipboard_text,
 };
 use play::{start_remote_play, stop_stream};
 use session_cmds::{
-	fs_get, fs_list, render_chat, render_fs, render_hint, render_kin, render_toast, reverse_play,
-	set_frame_pacing, set_overlay, set_overlay_button, set_overlay_button_pos, set_play_audio,
-	set_play_bitrate, set_play_codec, set_play_encoder, set_play_fps, set_play_monitor,
-	set_play_quality, set_play_resolution, set_stats_hud,
+	fs_get, fs_list, host_window_list, render_chat, render_fs, render_hint, render_kin, render_nav,
+	render_toast, reverse_play, set_frame_pacing, set_overlay, set_overlay_button,
+	set_overlay_button_pos, set_play_adapt, set_play_audio, set_play_bitrate, set_play_codec,
+	set_play_encoder, set_play_fps, set_play_monitor, set_play_quality, set_play_resolution,
+	set_play_window, set_stats_hud,
 };
 
 // Headless `pulsar --relay` mode lives in its own module to keep this file focused.
@@ -309,7 +316,7 @@ pub fn run() {
 	}
 
 	tauri::Builder::default()
-		.manage(AppState::default())
+		.manage(AppState::new())
 		.plugin(tauri_plugin_process::init())
 		.plugin(tauri_plugin_updater::Builder::new().build())
 		.setup(|app| {
@@ -340,6 +347,11 @@ pub fn run() {
 			// Startup capability probe (encode + decode), Moonlight-style: every launch,
 			// in the background; the frontend splash waits for the `local-caps` event.
 			crate::caps::spawn_startup_probe(app.handle().clone());
+
+			// Always-on PS/Guide-button watcher: lets a controller toggle gaming mode (the
+			// `guide-toggle` event) even from remote mode, independent of the gaming-mode nav
+			// bridge. The shell only acts on it when idle (not mid-session).
+			crate::commands::spawn_guide_watcher(app.handle().clone());
 
 			// Kiosk auto-engage is ONE-SHOT: arm it only when THIS launch will actually
 			// auto-connect. AUTO_CONNECT alone is the wrong key — app.restart() preserves
@@ -507,6 +519,12 @@ pub fn run() {
 			controllers,
 			set_controller_order,
 			set_controller_emulation,
+			set_controller_rumble,
+			set_disabled_controllers,
+			test_controller_rumble,
+			force_ac,
+			default_ui_hwaccel,
+			webview_sw_painted,
 			local_ip,
 			node_port,
 			auto_connect_target,
@@ -528,12 +546,15 @@ pub fn run() {
 			start_remote_play,
 			stop_stream,
 			set_play_resolution,
+			set_play_adapt,
 			set_play_encoder,
 			set_play_codec,
 			set_play_fps,
 			set_play_bitrate,
 			set_play_quality,
 			set_play_monitor,
+			set_play_window,
+			host_window_list,
 			set_frame_pacing,
 			set_stats_hud,
 			set_overlay_button,
@@ -543,6 +564,7 @@ pub fn run() {
 			render_chat,
 			render_fs,
 			render_kin,
+			render_nav,
 			set_overlay,
 			set_play_audio,
 			reverse_play,
@@ -557,6 +579,7 @@ pub fn run() {
 			respond_request,
 			submit_password,
 			disconnect_peer,
+			disconnect_all_peers,
 			list_connections,
 			show_connections,
 			open_files_window,
@@ -568,6 +591,9 @@ pub fn run() {
 			input_char,
 			kbd_capture_start,
 			kbd_capture_stop,
+			set_active_session,
+			set_pane_count,
+			set_controller_lock,
 			send_clipboard,
 			read_clipboard_text,
 			write_clipboard_text,

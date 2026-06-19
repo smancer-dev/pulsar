@@ -57,6 +57,14 @@ export const onGamepadNav = (cb: (s: NavInput) => void) => listenTo<NavInput>('g
 /** The node (re)bound its UDP socket on `go_online` — the ACTUAL port for direct
  * `ip:port` connects (Home shows it next to the local IP). */
 export const onNodePort = (cb: (port: number) => void) => listenTo<number>('node-port', cb);
+/** A controller's PS / Home / Guide button was pressed (always-on watcher, every platform).
+ * The shell toggles gaming mode on/off when idle — entering gaming mode from remote, or
+ * leaving it — but only when NOT in a session. Payload-less. */
+export const onGuideToggle = (cb: () => void) => listenTo<null>('guide-toggle', () => cb());
+/** A controller was just connected (always-on watcher). Carries its name + battery (0..100
+ * or null). The shell shows a toast when idle (not in a session). */
+export const onControllerConnected = (cb: (e: { name: string; battery: number | null }) => void) =>
+	listenTo<{ name: string; battery: number | null }>('controller-connected', cb);
 /** The relay reissued a DIFFERENT 9-digit device ID (a relay restart that lost its
  * pubkey→id map): the displayed ID + LAN beacon rotated. Payload is the new grouped
  * ID — the Home screen must adopt it, else it keeps showing the now-unreachable old one. */
@@ -97,6 +105,11 @@ export const onPeerAvatar = (cb: (e: { peer: string; dataUrl: string }) => void)
  * keying as `onPeerAvatar` (host side: peer id; client side: play id as string). */
 export const onPeerName = (cb: (e: { peer: string; name: string }) => void) =>
 	listenTo<[string, string]>('peer-name', (p) => cb({ peer: p[0], name: p[1] }));
+/** A peer pushed its OWN relay device ID (`DataMsg::PeerId`) over the session. Keyed
+ * like `onPeerName` by the host-side peer map-key; lets the host show the client's id
+ * instead of its `ip:port` on a direct/same-LAN connect. */
+export const onPeerId = (cb: (e: { peer: string; id: string }) => void) =>
+	listenTo<[string, string]>('peer-id', (p) => cb({ peer: p[0], id: p[1] }));
 /** Client (Windows hook): the user pressed the Ctrl+Alt+Shift leave combo while
  * the OS-level keyboard hook had focus — the UI should drop control. */
 export const onKbdLeave = (cb: () => void) => listenTo<null>('kbd-leave', () => cb());

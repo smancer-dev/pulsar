@@ -185,9 +185,15 @@ static MODE_REMOTE: AtomicBool = AtomicBool::new(false);
 /// Connected controllers pushed by the app over stdin (`ctrls slot:kind:name:uuid:target,...`).
 /// Game mode only; empty list in remote mode or when no pads are connected. Copied
 /// into `state.controllers` each frame in the render loop.
-/// Tuple: (slot, kind_label, device_name, uuid, target). Legacy 3-field lines get uuid="" target="auto".
-static CONTROLLERS: std::sync::Mutex<Vec<(u8, String, String, String, String)>> =
+/// Tuple: (slot, kind_label, device_name, uuid, target, rumble, disabled). Legacy short lines
+/// default the missing tail. `rumble` = per-pad vibration level; `disabled` = pad toggled off.
+static CONTROLLERS: std::sync::Mutex<Vec<(u8, String, String, String, String, String, bool)>> =
 	std::sync::Mutex::new(Vec::new());
+/// SPLIT MODE: pad uuids LOCKED to THIS session (this renderer == one pane), parsed from the
+/// `ctrls` line's 8th per-pad field. Copied into `state.controllers_locked` each frame. Stored
+/// as a Vec (const-constructible — `HashSet::new()` is not const) and collected on read. Empty
+/// when split mode is off.
+static CONTROLLERS_LOCKED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 #[derive(Clone)]
 struct CursorImg {
@@ -632,23 +638,32 @@ pub fn run() {
 				// Mirrors win/mod.rs's CONTROLLERS static + parse (same protocol).
 				Some("ctrls") => {
 					let payload = it.next().unwrap_or("").trim();
-					let list: Vec<(u8, String, String, String, String)> = if payload.is_empty() {
+					let mut locked: Vec<String> = Vec::new();
+					let list: Vec<(u8, String, String, String, String, String, bool)> = if payload.is_empty() {
 						Vec::new()
 					} else {
 						payload
 							.split(',')
 							.filter_map(|e| {
-								let mut p = e.splitn(5, ':');
+								let mut p = e.splitn(8, ':');
 								let slot: u8 = p.next()?.parse().ok()?;
 								let kind = p.next()?.replace('_', " ");
 								let name = p.next()?.replace('_', " ");
 								let uuid = p.next().unwrap_or("").to_string();
 								let target = p.next().unwrap_or("auto").to_string();
-								Some((slot, kind, name, uuid, target))
+								let rumble = p.next().unwrap_or("medium").to_string();
+								let disabled = p.next() == Some("1");
+								// SPLIT MODE: 8th field = locked-to-this-session (1). Absent on
+								// 7-field (split-off) lines → defaults unlocked.
+								if p.next() == Some("1") {
+									locked.push(uuid.clone());
+								}
+								Some((slot, kind, name, uuid, target, rumble, disabled))
 							})
 							.collect()
 					};
 					*CONTROLLERS.lock().unwrap() = list;
+					*CONTROLLERS_LOCKED.lock().unwrap() = locked;
 				}
 				_ => {}
 			}
@@ -1024,7 +1039,9 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		}
 		state.chat_enter = ENTER_IN.swap(false, Ordering::SeqCst);
 		// Connected controllers (game mode only — sent by play.rs gilrs reader via `ctrls` line).
+		// The per-pad vibration level rides in each entry's 6th field.
 		state.controllers = CONTROLLERS.lock().unwrap().clone();
+		state.controllers_locked = CONTROLLERS_LOCKED.lock().unwrap().iter().cloned().collect();
 		{
 			let cl = CONN_LABEL.lock().unwrap();
 			if !cl.is_empty() && state.conn_label != *cl {
@@ -1533,6 +1550,45 @@ fn emit_cmd(state: &mut OverlayState, c: OverlayCmd) {
 								row.4 = target.to_string();
 								break;
 							}
+						}
+					}
+				}
+				// Optimistic PER-PAD vibration update: `val` = "uuid,level". Reflect it
+				// locally (the matching pad row's 6th field) so the highlight moves
+				// immediately; the frontend confirms via set_controller_rumble → ctrls.
+				"ctrlrumble" => {
+					if let Some((uuid, level)) = val.split_once(',') {
+						let mut ctrls = CONTROLLERS.lock().unwrap();
+						for row in ctrls.iter_mut() {
+							if row.3 == uuid {
+								row.5 = level.to_string();
+								break;
+							}
+						}
+					}
+				}
+				// Optimistic enable/disable SET: `val` = "uuid,state" (1 = disabled, 0 = enabled).
+				"ctrldisable" => {
+					if let Some((uuid, state)) = val.split_once(',') {
+						let mut ctrls = CONTROLLERS.lock().unwrap();
+						for row in ctrls.iter_mut() {
+							if row.3 == uuid {
+								row.6 = state == "1";
+								break;
+							}
+						}
+					}
+				}
+				// Optimistic SPLIT-MODE lock SET: `val` = "uuid,state" (1 = lock to this
+				// session, 0 = unlock). Reflect locally so the row's Kilitli/Serbest updates
+				// immediately; play.rs confirms via the ctrls line's 8th field. The lock is
+				// applied app-side (set_controller_lock, via the `ov set ctrllock` below).
+				"ctrllock" => {
+					if let Some((uuid, state)) = val.split_once(',') {
+						let mut locked = CONTROLLERS_LOCKED.lock().unwrap();
+						locked.retain(|u| u != uuid);
+						if state == "1" {
+							locked.push(uuid.to_string());
 						}
 					}
 				}

@@ -2,11 +2,14 @@
 	// Bottom navigation dock for gaming mode — replaces the left sidebar. The gaming
 	// personality is a pure client (no host), so the dock carries only Bağlan + Ayarlar
 	// (no Devices / Connections), an identity+status chip, and a live controller count.
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount, onDestroy, tick } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
+	import Modal from '$lib/Modal.svelte';
+	import Controllers from '$lib/Controllers.svelte';
 	import { api } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 	import type { Action } from 'svelte/action';
+	import type { GamepadNav } from '$lib/gamepadNav.svelte';
 
 	type GView = 'home' | 'settings' | 'games';
 	type Props = {
@@ -14,24 +17,48 @@
 		onView: (v: GView) => void;
 		/** GamepadNav.item — dock buttons are controller/keyboard focusable. */
 		navItem: Action<HTMLElement>;
+		/** The shell's GamepadNav — drives the controllers popup's pad focus + B-to-close. */
+		nav: GamepadNav;
 		online: boolean;
 		connecting: boolean;
 		connError: string;
 		fullscreen: boolean;
 		onToggleFullscreen: () => void;
 		onGoOnline: () => void;
+		/** Current split layout ('off' = single-session) — lights up the split button. */
+		splitMode?: 'off' | 'h2' | 'v2' | 'grid4';
+		/** Open the split-layout chooser (SplitPicker). */
+		onSplit?: () => void;
 	};
 	let {
 		gview,
 		onView,
 		navItem,
+		nav,
 		online,
 		connecting,
 		connError,
 		fullscreen,
 		onToggleFullscreen,
-		onGoOnline
+		onGoOnline,
+		splitMode = 'off',
+		onSplit
 	}: Props = $props();
+
+	// Controllers detail popup: clicking the controller-count chip opens a modal listing
+	// every connected pad + its settings (slot order, emulation, vibration). Pad-navigable
+	// (the modal is [data-navmodal] so GamepadNav confines focus to it) and B/Esc closes.
+	let showCtrls = $state(false);
+	function openCtrls() {
+		showCtrls = true;
+		nav.pushBack(closeCtrls); // B / Escape closes the popup instead of leaving the view
+		tick().then(() => nav.focusFirst()); // land focus inside the modal
+	}
+	function closeCtrls() {
+		showCtrls = false;
+		nav.popBack(closeCtrls);
+		tick().then(() => nav.focusFirst()); // return focus to the dock
+	}
 
 	const NAV: { id: GView; icon: string }[] = [
 		{ id: 'home', icon: 'gaming' },
@@ -84,22 +111,23 @@
 
 	<div class="right">
 		<button
-			class="fsbtn"
-			class:on={fullscreen}
+			class="pads"
 			use:navItem
-			onclick={onToggleFullscreen}
-			title={t('gaming.fullscreen')}
-			aria-label={t('gaming.fullscreen')}
-			aria-pressed={fullscreen}
+			onclick={openCtrls}
+			title={t('controllers.title')}
+			aria-label={t('controllers.title')}
 		>
-			<Icon name="expand" size={17} />
-		</button>
-		<div class="pads" title={t('controllers.title')}>
 			<Icon name="gaming" size={16} />
 			<span class="mono">{pads}</span>
-		</div>
+		</button>
 	</div>
 </nav>
+
+{#if showCtrls}
+	<Modal title={t('controllers.title')} onClose={closeCtrls} navModal>
+		<Controllers navItem={nav.item} />
+	</Modal>
+{/if}
 
 <style>
 	.dock {
@@ -241,5 +269,17 @@
 		gap: 6px;
 		color: var(--text-muted);
 		font-size: 13px;
+		font-family: inherit;
+		border: 1px solid var(--border);
+		border-radius: var(--r-sm);
+		background: var(--surface);
+		height: 38px;
+		padding: 0 11px;
+		cursor: pointer;
+		transition: all var(--dur) var(--ease);
+	}
+	.pads:hover {
+		background: var(--surface-3);
+		color: var(--text);
 	}
 </style>

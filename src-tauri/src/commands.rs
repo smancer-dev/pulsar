@@ -444,6 +444,7 @@ pub(crate) async fn controllers() -> Result<Vec<ControllerInfo>, String> {
 						kind: format!("{:?}", p.kind),
 						label: p.kind.label().to_string(),
 						connected: true,
+						battery: p.battery,
 					})
 					.collect()
 			})
@@ -636,6 +637,11 @@ pub(crate) fn set_host_serving(state: State<'_, AppState>, serving: bool) {
 	state
 		.hosting_disabled
 		.store(!serving, std::sync::atomic::Ordering::Relaxed);
+	// A pure client (gaming mode) must not advertise itself on the LAN — pause/resume the
+	// discovery beacon's announcing alongside the serve gate.
+	if let Some(d) = state.discovery.lock().unwrap().clone() {
+		d.set_paused(!serving);
+	}
 }
 
 /// A controller-navigation snapshot emitted to the gaming-mode UI. Booleans (not raw
@@ -713,6 +719,52 @@ pub(crate) fn gamepad_nav_start(app: AppHandle, state: State<'_, AppState>) {
 	});
 }
 
+/// Start the always-on PS / Home / Guide-button watcher. INDEPENDENT of the gaming-mode nav
+/// bridge above (which only runs in gaming mode and doesn't carry GUIDE): this runs for the
+/// whole process so a controller's PS button can TOGGLE gaming mode even from remote mode.
+/// Emits a `guide-toggle` event on each rising edge (a press, debounced — never while held);
+/// the shell decides whether to act (only when idle, never mid-session). Polls the shared SDL
+/// snapshot at ~40 ms — cheap, and a no-op when no pad is connected. Started once at setup.
+pub(crate) fn spawn_guide_watcher(app: AppHandle) {
+	std::thread::spawn(move || {
+		let Some(mgr) = crate::controllers::manager() else {
+			return;
+		};
+		use pulsar_core::input::button;
+		let mut prev_down = false;
+		// Track the connected-pad set so we can fire a `controller-connected` toast event
+		// for each NEW pad (name + battery), for the idle (out-of-session) UI.
+		let mut prev_uuids: std::collections::HashSet<String> = std::collections::HashSet::new();
+		let mut first_pass = true;
+		loop {
+			let snap = mgr.snapshot();
+			// Any connected pad's GUIDE/PS/Home button counts (the user may pick up any pad).
+			let down = snap.iter().any(|p| p.state.is_pressed(button::GUIDE));
+			if down && !prev_down {
+				let _ = app.emit("guide-toggle", ());
+			}
+			prev_down = down;
+			// New-pad detection → connect toast. Skip the very first pass so already-connected
+			// pads at launch don't all toast.
+			let cur_uuids: std::collections::HashSet<String> =
+				snap.iter().map(|p| p.uuid.clone()).collect();
+			if !first_pass {
+				for p in &snap {
+					if !prev_uuids.contains(&p.uuid) {
+						let _ = app.emit(
+							"controller-connected",
+							serde_json::json!({ "name": p.name, "battery": p.battery }),
+						);
+					}
+				}
+			}
+			prev_uuids = cur_uuids;
+			first_pass = false;
+			std::thread::sleep(std::time::Duration::from_millis(40));
+		}
+	});
+}
+
 /// Stop the gilrs→webview controller-nav bridge (the reader thread exits on the next tick).
 #[tauri::command]
 pub(crate) fn gamepad_nav_stop(state: State<'_, AppState>) {
@@ -747,6 +799,83 @@ pub(crate) async fn set_controller_emulation(
 	map: std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
 	*state.controller_emulation.lock().unwrap() = map;
+	Ok(())
+}
+
+/// Set the PER-CONTROLLER vibration strength from the UI. `map` is uuid -> "off"|"weak"|
+/// "medium"|"strong"; each is mapped to 0..3 and stored in the SDL pad manager, which scales
+/// that pad's host rumble by `level/3` (off = motors stay still, strong = full). Applies live
+/// to in-session pads without reconnect; an uuid absent from the map uses the medium default.
+/// Set the DISABLED-controller set from the UI (uuid hex list). A disabled pad forwards a
+/// neutral state to the host (no input) and never rumbles. Applies live.
+#[tauri::command]
+pub(crate) async fn set_disabled_controllers(uuids: Vec<String>) -> Result<(), String> {
+	crate::controllers::set_disabled_controllers(uuids.into_iter().collect());
+	Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_controller_rumble(
+	map: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+	let levels = map
+		.into_iter()
+		.map(|(uuid, level)| {
+			let n: u8 = match level.as_str() {
+				"off" => 0,
+				"weak" => 1,
+				"strong" => 3,
+				_ => 2,
+			};
+			(uuid, n)
+		})
+		.collect();
+	crate::controllers::set_controller_rumble(levels);
+	Ok(())
+}
+
+/// Whether accelerated (GPU) compositing is forced on (PULSAR_FORCE_AC=1, aarch64 Linux). The
+/// frontend uses this to run the present-keepalive rAF (which prevents WebKitGTK/Mali's
+/// intermittent "stops presenting" freeze) ONLY when AC is on — it would waste CPU under the
+/// default software path.
+#[tauri::command]
+pub(crate) fn force_ac() -> bool {
+	std::env::var_os("PULSAR_FORCE_AC").is_some()
+}
+
+/// Whether the webview is SOFTWARE-painted this session (accelerated compositing disabled). The
+/// frontend flags the root with `data-sw-ui` when true so the gaming-mode CSS can strip blurred
+/// shadows (cheap-on-GPU but brutal in software) ONLY where it's actually needed.
+#[tauri::command]
+pub(crate) fn webview_sw_painted() -> bool {
+	std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some()
+}
+
+/// The per-device DEFAULT for app-UI hardware acceleration (used to show the toggle's state when
+/// the user hasn't set an explicit preference): ON everywhere except the Orange Pi 5 (RK3588).
+#[tauri::command]
+pub(crate) fn default_ui_hwaccel() -> bool {
+	#[cfg(target_os = "linux")]
+	{
+		let is_rk3588 = std::fs::read("/proc/device-tree/compatible")
+			.map(|b| b.windows(6).any(|w| w == b"rk3588"))
+			.unwrap_or(false);
+		!is_rk3588
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		true
+	}
+}
+
+/// Fire a one-shot rumble PULSE on a single pad (by uuid) so the user can FEEL its configured
+/// vibration strength while picking it. The SDL manager scales by the pad's level (an "off" pad
+/// stays silent) and the pulse self-stops after ~0.5 s. No-op if SDL has no such open pad.
+#[tauri::command]
+pub(crate) async fn test_controller_rumble(uuid: String) -> Result<(), String> {
+	if let Some(mgr) = crate::controllers::manager() {
+		mgr.test_rumble(uuid);
+	}
 	Ok(())
 }
 

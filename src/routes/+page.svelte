@@ -12,6 +12,9 @@
 		onLocalCaps,
 		onPeerAvatar,
 		onPeerName,
+		onPeerId,
+		onGuideToggle,
+		onControllerConnected,
 		onNodeId,
 		onNodeVersionError,
 		onSessionPassword
@@ -19,12 +22,16 @@
 	import { setPeerIdentity } from '$lib/peers.svelte';
 	import { gameStore } from '$lib/games.svelte';
 	import { ui, configTick, saveUi } from '$lib/settings.svelte';
+	import { modalCount } from '$lib/overlayModals.svelte';
 	import { initCaps } from '$lib/caps.svelte';
 	import { t, i18n } from '$lib/i18n.svelte';
 	import { theme, toggleTheme } from '$lib/theme.svelte';
 	import type { Config } from '$lib/types';
 	import Connecting from '$lib/screens/Connecting.svelte';
 	import SessionView from '$lib/screens/Session.svelte';
+	import Home from '$lib/screens/Home.svelte';
+	import PaneGameConnect from '$lib/screens/Gaming/PaneGameConnect.svelte';
+	import SplitPicker from './page/SplitPicker.svelte';
 	import Approve from '$lib/screens/Approve.svelte';
 	import Connections from '$lib/screens/Connections.svelte';
 	import FilesWindow from '$lib/screens/FilesWindow.svelte';
@@ -84,10 +91,32 @@
 
 	// Flip the personality and persist the choice so the app reopens in the last mode.
 	function toggleMode() {
-		mode = mode === 'game' ? 'remote' : 'game';
-		ui.appMode = mode;
+		const next = mode === 'game' ? 'remote' : 'game';
+		// Changing personality ALWAYS leaves split mode (either direction) — the split's panes are
+		// tied to the mode it was entered in. Switching INTO gaming also closes any open
+		// (remote-mode) sessions/tabs — gaming is a fresh pure-client personality.
+		if (sm.splitMode !== 'off') sm.exitSplit();
+		if (next === 'game') {
+			for (const s of [...sm.sessions]) sm.endSession(s.tabId);
+		}
+		mode = next;
+		ui.appMode = next;
 		saveUi();
 	}
+	// Split mode: the "nasıl bölünsün?" layout chooser is shown when the user presses the
+	// chrome split button. The actual split state (layout / panes / focus) lives on the
+	// SessionManager (sm.splitMode / sm.panes / sm.focusedPane).
+	let showSplitPicker = $state(false);
+	// The personality every pane runs in split mode, captured the moment the picker opens.
+	// In SPLIT mode ALL panes are one fixed mode (gaming OR remote) — never a mix. When not
+	// yet split we snapshot the app's current `mode`; once split we keep the established
+	// `sm.splitSessionMode` so a reshape (e.g. 2→4) never flips the panes' personality.
+	let splitEntryMode = $state<'game' | 'remote'>('remote');
+	function openSplit() {
+		splitEntryMode = sm.splitMode === 'off' ? mode : sm.splitSessionMode;
+		showSplitPicker = true;
+	}
+
 	let selfId = $state('—');
 	let selfPw = $state('');
 	let online = $state(false);
@@ -183,9 +212,21 @@
 		return pwQueue.some((q) => peerMatchesTarget(q.peer, targetId));
 	}
 
-	// Host-side activity: who's connected + a recent event log.
-	let hostSessions = $state<{ peer: string; since: number }[]>([]);
+	// Host-side activity: who's connected + a recent event log. Keyed by SESSION id (a
+	// device can hold several concurrent sessions — couch co-op / split panes), with the
+	// peer kept for the label + kick routing.
+	let hostSessions = $state<{ sid: number; peer: string; since: number }[]>([]);
+	// Peer map-key → the client's own device id (pushed via DataMsg::PeerId). Lets the
+	// connect-tab list show a client's ID even on a direct/same-LAN connect (where the
+	// session's peer key is the client's ip:port).
+	let hostClientIds = $state<Record<string, string>>({});
+	// Peer map-key → the connecting client's pushed display name, so the connect-tab list can
+	// show "303 036 449 (orangepi)" next to the id/ip.
+	let hostNames = $state<Record<string, string>>({});
 	let activity = $state<string[]>([]);
+	// Controller-connect toast (idle, not in a session): name + battery, bottom-right, ~4.5 s.
+	let padToast = $state<{ name: string; battery: number | null } | null>(null);
+	let padToastTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// Bind + register with the configured relay. Re-runnable: called on startup,
 	// on manual retry, and whenever the relay/network settings change.
@@ -349,6 +390,20 @@
 		initCaps();
 		boot();
 		if (isPopup) return; // approval popup: nothing else to bootstrap
+		// opi5: when GPU compositing is forced on, run the present-keepalive so WebKitGTK/Mali
+		// doesn't intermittently freeze the display when the page goes idle (see acKeepalive).
+		if (isTauri) {
+			api.forceAc()
+				.then((on) => {
+					if (on) import('$lib/acKeepalive').then((m) => m.startAcKeepalive());
+				})
+				.catch(() => {});
+			// Flag the root when the webview is software-painted (AC off) so the gaming-mode CSS
+			// strips expensive blurred shadows only there (cheap on the GPU path; keep the full look).
+			api.webviewSwPainted()
+				.then((sw) => document.documentElement.toggleAttribute('data-sw-ui', sw))
+				.catch(() => {});
+		}
 		// The one-time password rotates after each successful auth (host-side) — reflect
 		// the fresh code in the SelfCard immediately instead of waiting for a re-poll.
 		onSessionPassword((pw) => {
@@ -381,11 +436,12 @@
 			if (e.kind === 'request') {
 				activity = [t('activity.wants', { peer: e.peer }), ...activity].slice(0, 8);
 			} else if (e.kind === 'connected') {
-				if (!hostSessions.some((s) => s.peer === e.peer))
-					hostSessions = [...hostSessions, { peer: e.peer, since: Date.now() }];
+				// Keyed by sid: a 2nd session from the same device adds a row, not replace.
+				if (!hostSessions.some((s) => s.sid === e.sid))
+					hostSessions = [...hostSessions, { sid: e.sid, peer: e.peer, since: Date.now() }];
 				activity = [t('activity.connected', { peer: e.peer }), ...activity].slice(0, 8);
 			} else if (e.kind === 'disconnected') {
-				hostSessions = hostSessions.filter((s) => s.peer !== e.peer);
+				hostSessions = hostSessions.filter((s) => s.sid !== e.sid);
 				activity = [t('activity.left', { peer: e.peer }), ...activity].slice(0, 8);
 			} else if (e.kind === 'rejected') {
 				activity = [t('activity.rejected', { peer: e.peer }), ...activity].slice(0, 8);
@@ -405,6 +461,27 @@
 		});
 		await onPeerName((e) => {
 			if (isDeviceId(e.peer)) setPeerIdentity(e.peer, { name: e.name });
+			hostNames = { ...hostNames, [e.peer]: e.name };
+		});
+		// A connecting client pushed its OWN device id — show it in the connect-tab list
+		// instead of its ip:port (direct/same-LAN connects, where the peer key is an addr).
+		await onPeerId((e) => {
+			hostClientIds = { ...hostClientIds, [e.peer]: e.id };
+		});
+		// Controller PS/Guide button (always-on watcher): toggle gaming mode on/off, but
+		// ONLY when idle — never while connecting/in a client session or hosting one, and
+		// never in the approval popup. In gaming mode this leaves it; from remote it enters.
+		await onGuideToggle(() => {
+			if (isPopup) return;
+			if (sm.sessions.length > 0 || hostSessions.length > 0) return;
+			toggleMode();
+		});
+		// Controller connected → toast (only when idle; in a session it's surfaced in-overlay).
+		await onControllerConnected((e) => {
+			if (sm.sessions.length > 0) return;
+			padToast = e;
+			clearTimeout(padToastTimer);
+			padToastTimer = setTimeout(() => (padToast = null), 4500);
 		});
 		// A controlled client asked to reverse direction — connect back to it so the
 		// roles swap (it must be online/serving for this to land).
@@ -412,7 +489,8 @@
 			if (e.id) sm.startConnect({ name: t('home.remoteDevice'), id: e.id }, 'remote');
 		});
 		// Client (Linux native): Ctrl+Shift+F12 (evdev-captured, so it never reaches the
-		// webview as a keydown) — toggle the window's fullscreen state.
+		// webview as a keydown) — toggle fullscreen (SAME action as the button + F11). The
+		// shell F11/Ctrl+Shift+F12 (unengaged app) is a separate $effect window listener below.
 		await onFullscreenToggle(() => sm.toggleFullscreen());
 		// A host is asking us for a password — show the prompt (a re-fire means the
 		// previous password was wrong).
@@ -501,6 +579,11 @@
 		// session) — the updater must never interrupt a remote session. Deferred a few
 		// seconds so it never delays first paint / the splash. Self-swallows all errors.
 		if (!(ac && ac.id)) {
+			// Restore the gaming-mode fullscreen preference on a normal (non-kiosk) launch:
+			// if the user last left game mode fullscreen, reopen fullscreen. The window is
+			// already shown (boot()) and goOnline() has completed, so the OS-level
+			// fullscreen sticks. Scoped to game mode so remote never reopens fullscreen.
+			if (mode === 'game' && ui.gamingFullscreen && !sm.fullscreen) sm.toggleFullscreen();
 			setTimeout(() => {
 				// Re-check session state at fire time: the user may have connected (client
 				// session) or a peer may have connected to control this host within the 3s
@@ -538,14 +621,27 @@
 	// and the active-session input rAF pump keep running. Cleared the instant the active
 	// tab leaves the native session (home/another tab) or the session ends.
 	$effect(() => {
+		// In split mode the panes only tile PART of the window (chrome/tabs + any empty
+		// PaneConnect cells stay visible), so the webview is never fully occluded — keep
+		// repaint live. Single-tab mode is unchanged.
 		const s = sm.sessions.find((x) => x.tabId === sm.activeTab);
-		const occluded = !!s && !!s.native && s.phase === 'active' && !!s.ready;
+		const occluded =
+			sm.splitMode === 'off' && !!s && !!s.native && s.phase === 'active' && !!s.ready;
 		document.documentElement.toggleAttribute('data-occluded', occluded);
 	});
 
 	// Give the whole app a gaming look (cyan accent) while the app is in gaming mode OR
 	// a game-stream session is the active tab; revert as soon as both are false.
 	$effect(() => {
+		// Split mode: every pane is the SAME fixed personality, so the gaming look follows
+		// `sm.splitSessionMode` (NOT the focused pane). Single-tab mode reads the active tab.
+		if (sm.splitMode !== 'off') {
+			document.documentElement.toggleAttribute(
+				'data-gaming',
+				mode === 'game' || sm.splitSessionMode === 'game'
+			);
+			return;
+		}
 		const s = sm.sessions.find((x) => x.tabId === sm.activeTab);
 		document.documentElement.toggleAttribute(
 			'data-gaming',
@@ -562,7 +658,13 @@
 		if (isPopup || !isTauri) return;
 		api.setHostServing(mode !== 'game').catch(() => {});
 		if (mode === 'game') {
-			for (const s of hostSessions) kickPeer(s.peer);
+			// Authoritative kick of EVERY inbound session (covers any the UI list missed).
+			api.disconnectAllPeers().catch(() => {});
+			// Per-session kick converges the local list (kickPeer filters each out, so it stops
+			// writing once empty). Do NOT reassign `hostSessions = []` here — this effect READS
+			// hostSessions, so a fresh-array write would re-trigger itself forever (the splash-
+			// stuck infinite reactive loop).
+			for (const s of hostSessions) kickPeer(s.sid);
 		}
 	});
 
@@ -579,10 +681,44 @@
 		return () => document.removeEventListener('contextmenu', onCtx);
 	});
 
-	// Host: kick a connected client.
-	function kickPeer(peer: string) {
-		api.disconnectPeer(peer).catch(() => {});
-		hostSessions = hostSessions.filter((s) => s.peer !== peer);
+	// Shell shortcut: F11 or Ctrl+Shift+F12 toggles IMMERSIVE fullscreen (true-fullscreen that also
+	// hides the top bar everywhere, incl. the home). Fires only when keys reach the webview — i.e.
+	// the unengaged app shell; an engaged session's keys are evdev/hook-captured (handled by
+	// onFullscreenToggle). Ignored while typing in a field.
+	$effect(() => {
+		const onKey = (e: KeyboardEvent) => {
+			const el = e.target as HTMLElement | null;
+			if (el && (el.isContentEditable || /^(input|textarea|select)$/i.test(el.tagName))) return;
+			if (e.key === 'F11' || (e.key === 'F12' && e.ctrlKey && e.shiftKey)) {
+				// Guard auto-repeat: holding F11 fired a keydown EVERY frame → toggled fullscreen
+				// over and over ("sürekli fullscreen"). One toggle per physical press. Also stop the
+				// event so WebKitGTK/the WM never ALSO acts on F11 (its own fullscreen binding fought
+				// ours, which is why F11 behaved differently). SAME action as the button.
+				e.preventDefault();
+				e.stopImmediatePropagation();
+				if (e.repeat) return;
+				sm.toggleFullscreen();
+			}
+		};
+		window.addEventListener('keydown', onKey);
+		return () => window.removeEventListener('keydown', onKey);
+	});
+
+	// Split mode: grid-cell placement for a paned session (CSS grid line numbers). Pane
+	// order is row-major: h2 = [left,right]; v2 = [top,bottom]; grid4 = [TL,TR,BL,BR].
+	function paneCellStyle(i: number): string {
+		if (sm.splitMode === 'h2') return `grid-column:${i + 1};grid-row:1`;
+		if (sm.splitMode === 'v2') return `grid-row:${i + 1};grid-column:1`;
+		// grid4 (2×2)
+		const col = (i % 2) + 1;
+		const row = Math.floor(i / 2) + 1;
+		return `grid-column:${col};grid-row:${row}`;
+	}
+
+	// Host: kick a connected SESSION (by sid, so a same-device co-op sibling survives).
+	function kickPeer(sid: number) {
+		api.disconnectPeer(sid).catch(() => {});
+		hostSessions = hostSessions.filter((s) => s.sid !== sid);
 	}
 
 	// Keep the core's published game list in sync so connecting clients can see it.
@@ -617,6 +753,13 @@
 	<FilesWindow playId={filesReq.id} peer={filesReq.peer} />
 {:else}
 	<HostChat />
+	{#if padToast}
+		<div class="pad-toast" role="status">
+			<span class="pt-dot"></span>
+			<span class="pt-name">{padToast.name}</span>
+			<span class="pt-sub">{t('toast.padConnected')}{#if padToast.battery != null} · {padToast.battery}%{/if}</span>
+		</div>
+	{/if}
 	<div class="desktop">
 	<div class="window" class:fullscreen={sm.fullscreen}>
 		{#if splashOn}
@@ -625,15 +768,19 @@
 				<div class="splash-word">Pulsar</div>
 			</div>
 		{/if}
-		{#if !sm.fullscreen}
+		{#if !sm.fullscreen || (sm.splitMode === 'off' && sm.activeTab === 'home')}
 			<Chrome
 				title={sm.activeTab === 'home' && mode !== 'game' ? t('nav.' + view) : ''}
 				dark={theme.dark}
 				onToggleTheme={toggleTheme}
 				gaming={mode === 'game'}
 				onToggleMode={toggleMode}
+				splitMode={sm.splitMode}
+				onSplit={openSplit}
+				fullscreen={sm.fullscreen}
+				onToggleFullscreen={sm.toggleFullscreen}
 			/>
-			{#if sm.sessions.length}
+			{#if sm.sessions.length && sm.splitMode === 'off'}
 				<Tabs
 					sessions={sm.sessions}
 					activeTab={sm.activeTab}
@@ -644,8 +791,10 @@
 			{/if}
 		{/if}
 
-		<div class="stage">
-		<div class="layer" class:hidden={sm.activeTab !== 'home'}>
+		<div class="stage" class:split={sm.splitMode !== 'off'} data-layout={sm.splitMode}>
+		<!-- Home is hidden whenever a session tab is active OR split mode is on (split has
+		     no "home" pane). Single-tab flow is unchanged when splitMode==='off'. -->
+		<div class="layer" class:hidden={sm.activeTab !== 'home' || sm.splitMode !== 'off'}>
 			<HomeView
 				nav={NAV}
 				{view}
@@ -658,8 +807,10 @@
 				unattended={config?.unattended_access ?? false}
 				connectErr={sm.connectErr}
 				{hostSessions}
+				{hostClientIds}
+				{hostNames}
 				{activity}
-				active={sm.activeTab === 'home'}
+				active={sm.activeTab === 'home' && sm.splitMode === 'off'}
 				fullscreen={sm.fullscreen}
 				onToggleFullscreen={sm.toggleFullscreen}
 				onView={(v) => (view = v)}
@@ -670,11 +821,23 @@
 				onStream={sm.startHostSession}
 				onClearConnectErr={() => (sm.connectErr = '')}
 				onAuthDone={closePwFor}
+				splitMode={sm.splitMode}
+				onSplit={openSplit}
 			/>
 		</div>
 
 		{#each sm.sessions as s (s.tabId)}
-			<div class="layer" class:hidden={sm.activeTab !== s.tabId}>
+			{@const paneIdx = sm.splitMode === 'off' ? -1 : sm.panes.indexOf(s.tabId)}
+			<!-- Split: a session in a pane becomes a grid cell (placed by paneCellStyle); a
+			     session NOT in any pane stays mounted but hidden (background tab). Single: the
+			     active tab shows, the rest are CSS-hidden — exactly as before. -->
+			<div
+				class="layer"
+				class:hidden={sm.splitMode === 'off' ? sm.activeTab !== s.tabId : paneIdx < 0}
+				class:pane={paneIdx >= 0}
+				class:focused={paneIdx >= 0 && paneIdx === sm.focusedPane}
+				style={paneIdx >= 0 ? paneCellStyle(paneIdx) : ''}
+			>
 				{#if s.phase === 'connecting'}
 					<Connecting
 						target={s.target}
@@ -697,14 +860,65 @@
 						hostEncoders={s.hostEncoders ?? []}
 						hostDisplays={s.hostDisplays ?? []}
 						{selfId}
-						active={sm.activeTab === s.tabId}
+						active={sm.splitMode === 'off'
+							? sm.activeTab === s.tabId
+							: paneIdx === sm.focusedPane}
+						split={sm.splitMode !== 'off'}
 						fullscreen={sm.fullscreen}
 						onToggleFullscreen={sm.toggleFullscreen}
+						onPaneFocus={paneIdx >= 0 ? () => sm.focusPane(paneIdx) : undefined}
+						occludeNative={showSplitPicker || modalCount.n > 0}
 						onEnd={() => sm.endSession(s.tabId)}
 					/>
 				{/if}
 			</div>
 		{/each}
+
+		<!-- Split mode: an empty pane (null) shows the FULL normal connect screen for the
+		     split's fixed mode — the real Home (remote) or the real gaming connect flow
+		     (game), just rendered inside the cell. Clicking it focuses the pane; connecting
+		     fills THAT pane via sm.connectIntoPane (which forces the split mode + auto-assigns
+		     a free host monitor). The screen is wrapped in an overflow:auto box sized to the
+		     cell so a cramped 2×2 scrolls instead of overflowing. -->
+		{#if sm.splitMode !== 'off'}
+			{#each sm.panes as pane, i (i)}
+				{#if pane === null}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<!-- svelte-ignore a11y_click_events_have_key_events -->
+					<div
+						class="layer pane"
+						class:focused={i === sm.focusedPane}
+						style={paneCellStyle(i)}
+						onpointerdowncapture={() => sm.focusPane(i)}
+					>
+						<div class="pane-connect-scroll">
+							{#if sm.splitSessionMode === 'game'}
+								<PaneGameConnect
+									index={i}
+									focused={i === sm.focusedPane}
+									onConnect={sm.connectIntoPane}
+								/>
+							{:else}
+								<Home
+									connectOnly
+									{selfId}
+									{selfPw}
+									{online}
+									{connecting}
+									unattended={config?.unattended_access ?? false}
+									{hostSessions}
+									{hostClientIds}
+									{hostNames}
+									{activity}
+									debug={ui.debug}
+									onConnect={(t, _m, g) => sm.connectIntoPane(i, t, 'remote', g)}
+								/>
+							{/if}
+						</div>
+					</div>
+				{/if}
+			{/each}
+		{/if}
 		</div>
 
 		{#if pwPrompt}
@@ -714,6 +928,16 @@
 				{pwChecking}
 				onSubmit={submitPw}
 				onCancel={cancelPw}
+			/>
+		{/if}
+
+		{#if showSplitPicker}
+			<SplitPicker
+				splitMode={sm.splitMode}
+				entryMode={splitEntryMode}
+				onPick={(layout) => sm.setLayout(layout, splitEntryMode)}
+				onExit={() => sm.exitSplit()}
+				onClose={() => (showSplitPicker = false)}
 			/>
 		{/if}
 	</div>
@@ -733,5 +957,94 @@
 	}
 	.layer.hidden {
 		display: none;
+	}
+	/* ── Split mode ───────────────────────────────────────────────────────────────
+	   The stage becomes a CSS grid; each pane (a paned session OR an empty connect screen)
+	   is a RELATIVE grid item placed by inline grid-column/grid-row. Background sessions
+	   (mounted but not in a pane) keep the absolute+hidden treatment. */
+	.stage.split {
+		display: grid;
+		gap: 2px;
+		background: var(--border);
+	}
+	.stage.split[data-layout='h2'] {
+		grid-template-columns: 1fr 1fr;
+		grid-template-rows: 1fr;
+	}
+	.stage.split[data-layout='v2'] {
+		grid-template-columns: 1fr;
+		grid-template-rows: 1fr 1fr;
+	}
+	.stage.split[data-layout='grid4'] {
+		grid-template-columns: 1fr 1fr;
+		grid-template-rows: 1fr 1fr;
+	}
+	/* A paned cell sits in the grid flow (not absolutely positioned). */
+	.stage.split .layer.pane {
+		position: relative;
+		inset: auto;
+		min-width: 0;
+		min-height: 0;
+		overflow: hidden;
+	}
+	/* The focused pane gets a subtle accent ring so the user knows where input goes. */
+	.stage.split .layer.pane.focused {
+		outline: 2px solid var(--accent);
+		outline-offset: -2px;
+		z-index: 1;
+	}
+	/* An empty pane renders the FULL connect screen (real Home / gaming flow). Those screens
+	   are sized for a whole window, so a 2×2 cell would clip them — this box fills the cell
+	   and scrolls (both axes) instead of overflowing. The inner padding gives the remote
+	   Home (which has no built-in stage padding) breathing room; the gaming screens carry
+	   their own. */
+	.pane-connect-scroll {
+		flex: 1;
+		min-width: 0;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		overflow: auto;
+		padding: 18px;
+		background:
+			radial-gradient(120% 80% at 50% -10%, var(--accent-soft) 0%, transparent 55%),
+			var(--surface-2);
+	}
+	/* The gaming flow brings its own padded, scrolling layout — drop the wrapper's padding
+	   so it isn't double-padded and let its internal scroll handle overflow. */
+	.pane-connect-scroll:has(> :global(.pane-game)) {
+		padding: 0;
+		overflow: hidden;
+	}
+	/* Controller-connect toast (idle): bottom-right, brief. */
+	.pad-toast {
+		position: fixed;
+		right: 18px;
+		bottom: 18px;
+		z-index: 90;
+		display: flex;
+		align-items: center;
+		gap: 9px;
+		padding: 10px 14px;
+		border-radius: var(--r-md, 10px);
+		background: var(--surface-2, var(--surface));
+		border: 1px solid var(--accent-soft-2, var(--border));
+		box-shadow: var(--shadow-2, 0 14px 34px oklch(0.2 0.03 265 / 0.28));
+		font-size: 13px;
+		color: var(--text);
+	}
+	.pad-toast .pt-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--ok);
+		box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 22%, transparent);
+		flex: none;
+	}
+	.pad-toast .pt-name {
+		font-weight: 600;
+	}
+	.pad-toast .pt-sub {
+		color: var(--text-muted);
 	}
 </style>

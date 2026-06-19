@@ -3,7 +3,7 @@
 
 import type { AutoConnectTarget, Config, ConnInfo, ControllerInfo } from './types';
 import type { FsEntry, LocalCaps } from './api.types';
-import type { GameInfo, LanDevice, PlayInfo, ScannedApp } from './api.types';
+import type { GameInfo, LanDevice, PlayInfo, ScannedApp, WindowInfo } from './api.types';
 import { invoke } from './api.invoke';
 
 export const api = {
@@ -23,6 +23,26 @@ export const api = {
 	 * reader reads it live so changes apply without reconnect. */
 	setControllerEmulation: (map: Record<string, string>) =>
 		invoke<void>('set_controller_emulation', { map }),
+	/** Set PER-CONTROLLER vibration strength. map[uuid] = 'off'|'weak'|'medium'|'strong'. The
+	 * SDL pad manager scales each pad's host rumble by its level live. */
+	setControllerRumble: (map: Record<string, string>) =>
+		invoke<void>('set_controller_rumble', { map }),
+	/** Set the disabled-controller set (uuid hex list). Disabled pads aren't forwarded. */
+	setDisabledControllers: (uuids: string[]) =>
+		invoke<void>('set_disabled_controllers', { uuids }),
+	/** Fire a one-shot rumble pulse on one pad (by uuid) at its configured level so the
+	 * user can FEEL the vibration setting. No-op if the level is 'off' or the pad is gone. */
+	testControllerRumble: (uuid: string) =>
+		invoke<void>('test_controller_rumble', { uuid }),
+	/** Whether GPU compositing is forced on (opi5). The shell runs the present-keepalive only
+	 * when true. */
+	forceAc: () => invoke<boolean>('force_ac'),
+	/** Per-device DEFAULT for app-UI hardware acceleration (off on Orange Pi 5, on elsewhere) —
+	 * shown by the Settings toggle when no explicit preference is set. */
+	defaultUiHwaccel: () => invoke<boolean>('default_ui_hwaccel'),
+	/** Whether the webview is software-painted (AC off) this session — the root gets `data-sw-ui`
+	 * so the gaming CSS strips expensive blurred shadows only where needed. */
+	webviewSwPainted: () => invoke<boolean>('webview_sw_painted'),
 	/** This machine's primary LAN IPv4 (for "connect to me by IP"); empty if none. */
 	localIp: () => invoke<string>('local_ip'),
 	/** The node's actual bound UDP port (0 = not online yet) — shown as "ip:port". */
@@ -51,18 +71,23 @@ export const api = {
 	/** Client password prompt → reply (null = cancelled). */
 	submitPassword: (req: number, password: string | null) =>
 		invoke<void>('submit_password', { req, password }),
-	/** Host: kick a connected client by its peer id. */
-	disconnectPeer: (peer: string) => invoke<void>('disconnect_peer', { peer }),
+	/** Host: kick a connected SESSION by its session id (so one pane of a same-host
+	 * co-op pair can be kicked without ending the other). */
+	disconnectPeer: (sid: number) => invoke<void>('disconnect_peer', { sid }),
+	/** Host: kick EVERY connected client (authoritative) — used when entering gaming mode. */
+	disconnectAllPeers: () => invoke<void>('disconnect_all_peers'),
 	/** Host: snapshot of active inbound connections (the connections window's initial list). */
 	listConnections: () =>
 		invoke<
 			{
+				sid: number;
 				peer: string;
 				since_ms: number;
 				mode: 'remote' | 'game';
 				view_only: boolean;
 				name: string | null;
 				avatar: string | null;
+				client_id: string | null;
 			}[]
 		>('list_connections'),
 	/** Host: reveal/focus the dedicated connections window (sidebar button). */
@@ -70,9 +95,9 @@ export const api = {
 	/** Client: open (or focus) the per-session file-manager window for play `id`;
 	 * `peer` decorates the title/header so multi-session windows stay tellable apart. */
 	openFilesWindow: (id: number, peer: string) => invoke<void>('open_files_window', { id, peer }),
-	/** Host: revoke/restore a connected client's CONTROL ("Sadece izleme") — its
-	 * input is dropped while set; the stream keeps running. */
-	setViewOnly: (peer: string, on: boolean) => invoke<void>('set_view_only', { peer, on }),
+	/** Host: revoke/restore a connected SESSION's CONTROL ("Sadece izleme") — its
+	 * input is dropped while set; the stream keeps running. Keyed by session id. */
+	setViewOnly: (sid: number, on: boolean) => invoke<void>('set_view_only', { sid, on }),
 	/** Host: chat backlog [(peer, text, me)] — seeds the connections window's message
 	 * modal with lines from before that window existed. */
 	chatLog: () => invoke<[string, string, boolean][]>('chat_log'),
@@ -81,6 +106,11 @@ export const api = {
 	/** Ask the host at `target` to launch one of its games. */
 	launchRemoteGame: (target: string, gameId: string) =>
 		invoke<void>('launch_remote_game', { target, gameId }),
+	/** List the host's capture-able windows (Phase 2b co-op "Pencere" picker), routed
+	 * through an EXISTING live session's control channel (`id` = its Rust play id). The
+	 * user picks one and its `hwnd` becomes the new pane's window-capture target. Empty on
+	 * a non-Windows / old host (no per-window WGC source). */
+	hostWindowList: (id: number) => invoke<WindowInfo[]>('host_window_list', { id }),
 	/** Startup-probed local caps (null while the probe is still running — listen to
 	 * the `local-caps` event for the push). */
 	localCaps: () => invoke<LocalCaps | null>('local_caps'),
@@ -114,7 +144,16 @@ export const api = {
 		/** 'auto' | 'hq' | 'fast' — from Settings → Display 'Varsayılan kalite'. */
 		quality?: string,
 		/** Treat the DS4/DS5 touchpad as a relative mouse (Linux only; Feature 2B). */
-		touchpadAsMouse = true
+		touchpadAsMouse = true,
+		/** Initial host monitor to capture (0 = primary; null = host default). A second
+		 * same-host split pane passes a FREE display so two panes capture DIFFERENT
+		 * monitors and dodge the host's DXGI same-monitor collision. */
+		displayIdx?: number,
+		/** Initial per-WINDOW capture target (Phase 2b co-op). A raw Win32 HWND (from
+		 * `hostWindowList`, or the host-resolved game window) makes the host WGC-capture
+		 * that single window instead of a whole monitor — so two panes can share ONE
+		 * monitor. Wins over `displayIdx` on the host when set; null = monitor capture. */
+		windowHwnd?: number
 	) =>
 		invoke<PlayInfo>('start_remote_play', {
 			target,
@@ -125,7 +164,9 @@ export const api = {
 			gamepad,
 			gameMode,
 			quality: quality ?? null,
-			touchpadAsMouse
+			touchpadAsMouse,
+			displayIdx: displayIdx ?? null,
+			windowHwnd: windowHwnd ?? null
 		}),
 	/** CLI `--connect` auto-connect target (id/ip + password + mode + app), or null. */
 	autoConnectTarget: () =>
@@ -154,6 +195,10 @@ export const api = {
 	/** Switch which HOST monitor is streamed (session menu); idx into host_displays, 0 = primary. */
 	setPlayMonitor: (id: number, displayIdx: number) =>
 		invoke<void>('set_play_monitor', { id, displayIdx }),
+	/** Toggle Parsec-style screen adaptation: when `on`, the host switches the captured monitor
+	 *  to the mode best fitting a `w×h` pane and reverts on exit (no-op on a non-Windows host). */
+	setPlayAdapt: (id: number, w: number, h: number, on: boolean) =>
+		invoke<void>('set_play_adapt', { id, w, h, on }),
 	/** Change the target bitrate live in kbps (0 = host default; UI converts Mbit→kbps). */
 	setPlayBitrate: (id: number, kbps: number) => invoke<void>('set_play_bitrate', { id, kbps }),
 	/** Switch the encode quality/perf profile live (the host restarts ffmpeg with it). */
@@ -185,12 +230,28 @@ export const api = {
 	/** Relay a keyboard input to the overlay's Chat composer ('t' text / 'k' named key). */
 	renderKin: (id: number, kind: 't' | 'k', data: string) =>
 		invoke<void>('render_kin', { id, kind, data }),
+	/** Relay a NAV keypress to the overlay (the same `k <dir>` channel the pad uses) so a
+	 * physical keyboard drives the menus like a controller. dir: up/down/left/right/go/escape. */
+	renderNav: (id: number, dir: string) => invoke<void>('render_nav', { id, dir }),
 	/** Toggle host audio transmit + host-mute live (session-menu audio options). */
 	setPlayAudio: (id: number, transmit: boolean, mute: boolean) =>
 		invoke<void>('set_play_audio', { id, transmit, mute }),
 	/** Open/close the in-session gaming overlay (Linux: ungrabs input + pauses the
 	 * native mpv; Windows/macOS: no-op pause, overlay floats over the live canvas). */
 	setOverlay: (id: number, open: boolean) => invoke<void>('set_overlay', { id, open }),
+	/** Split mode: tell the backend which play OWNS keyboard/mouse + the unlocked
+	 * controllers (AppState.focused_session). Called on pane focus so input follows
+	 * the focused pane. `playId` is the session's Rust play id. */
+	setActiveSession: (playId: number) => invoke<void>('set_active_session', { playId }),
+	/** Split mode: tell the backend how many panes are active (AppState.split_pane_count;
+	 * default 1). Used as the resident-pool reap cap so up to 4 live renderers aren't
+	 * reaped as "excess". Called after every pane-count change. */
+	setPaneCount: (count: number) => invoke<void>('set_pane_count', { count }),
+	/** Split mode: apply a controller-lock toggle from a session overlay. `locked=true`
+	 * makes only this play forward that pad; `locked=false` releases it (if this play owns
+	 * the lock). Mirrors the overlay `ctrllock` "uuid,0|1" wire. */
+	setControllerLock: (uuid: string, playId: number, locked: boolean) =>
+		invoke<void>('set_controller_lock', { uuid, playId, locked }),
 	/** Ask the controlled host to reverse direction (it connects back to `myId`). */
 	reversePlay: (id: number, myId: string) => invoke<void>('reverse_play', { id, myId }),
 	/** Control: absolute pointer motion, normalized 0..1 over the remote screen. */
@@ -227,8 +288,9 @@ export const api = {
 	sendClipboard: (id: number, text: string) => invoke<void>('send_clipboard', { id, text }),
 	/** Client → host: send a chat line. */
 	sendChat: (id: number, text: string) => invoke<void>('send_chat', { id, text }),
-	/** Host → client: reply to a connected peer's chat. */
-	hostSendChat: (peer: string, text: string) => invoke<void>('host_send_chat', { peer, text }),
+	/** Host → client: reply to a connected SESSION's chat (routed by session id so
+	 * two panes from one client device get the reply on the right pane). */
+	hostSendChat: (sid: number, text: string) => invoke<void>('host_send_chat', { sid, text }),
 	/** Client → host: send a file (raw bytes, chunked + saved on the host). */
 	sendFile: (id: number, name: string, data: number[]) =>
 		invoke<void>('send_file', { id, name, data }),

@@ -53,6 +53,11 @@
 	--ease: cubic-bezier(0.22, 1, 0.36, 1);
 	--ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 	--dur: 220ms;
+
+	/* Light theme by default → native form controls (the <select> popup, scrollbars)
+	   render with a light UA color scheme. Overridden to `dark` below so the native
+	   <option> list isn't an unreadable light popup over the dark app. */
+	color-scheme: light;
 }
 
 /* Game-stream mode: shift the whole accent family from electric indigo to the
@@ -83,6 +88,9 @@
 }
 
 :root[data-theme='dark'] {
+	/* Make WebKitGTK/Chromium render native controls (the <select> dropdown popup,
+	   scrollbars, etc.) with the dark UA scheme so the <option> list matches the app. */
+	color-scheme: dark;
 	--bg: oklch(0.17 0.012 265);
 	--bg-tint: oklch(0.2 0.015 265);
 	--surface: oklch(0.215 0.013 265);
@@ -295,6 +303,83 @@ h4 {
 	background: var(--border-strong);
 	border-radius: 6px;
 	border: 3px solid var(--bg);
+}
+
+/* SOFTWARE PAINT (AC off, e.g. opi5/WebKitGTK): no GPU compositing, so every frame software-
+   re-rasterises the whole visible page. Blurred box-shadows (60px --shadow-lg, 30px --shadow-accent),
+   backdrop-filter blur, and color-mix(oklch) per-pixel are the dominant cost and make navigation
+   janky. Strip the GPU-heavy effects APP-WIDE whenever the webview is software-painted (`data-sw-ui`),
+   so every page scrolls/navigates smoothly without GPU. Win/macOS + AC-on keep the full styling. */
+
+/* 1. Cheapen the blurred shadow tokens to flat ones — covers every `var(--shadow-lg/accent/2)`
+   usage (modals, cards, popovers) in one place, including the `var(--shadow-2, <blurred fallback>)`
+   sites whose fallback we override by defining the var. */
+:root[data-sw-ui] {
+	--shadow-lg: 0 1px 2px oklch(0 0 0 / 0.45);
+	--shadow-accent: none;
+	--shadow-2: 0 1px 2px oklch(0 0 0 / 0.45);
+}
+/* 2. backdrop-filter (modal / overlay / video-status blur) is the single worst CPU cost in
+   software paint — kill it everywhere. */
+:root[data-sw-ui] *,
+:root[data-sw-ui] *::before,
+:root[data-sw-ui] *::after {
+	backdrop-filter: none !important;
+	-webkit-backdrop-filter: none !important;
+}
+/* 3. Flatten the heavy control/card atoms (blurred shadows + transitions + gradient images) —
+   ungated from [data-gaming] so it applies in remote mode too. */
+:root[data-sw-ui] .card,
+:root[data-sw-ui] .srow,
+:root[data-sw-ui] .toggle,
+:root[data-sw-ui] .knob,
+:root[data-sw-ui] .seg,
+:root[data-sw-ui] .seg-btn,
+:root[data-sw-ui] .select,
+:root[data-sw-ui] .field,
+:root[data-sw-ui] .pad-card,
+:root[data-sw-ui] .tab {
+	box-shadow: none !important;
+	transition: none !important;
+	background-image: none !important;
+}
+/* The pad-nav focus ring is a 3px-spread box-shadow re-rasterised every scroll frame while a
+   control is focused — use a flat outline instead (no blur, no per-pixel cost). */
+:root[data-sw-ui] [data-navfocus] {
+	box-shadow: none !important;
+	outline: 2px solid var(--accent) !important;
+	outline-offset: 1px;
+}
+
+/* HARDWARE-ACCELERATED (AC on): GPU compositing is available, so lean INTO richer effects — the
+   full blurred shadows + backdrop blur above are kept (the strip only fires under [data-sw-ui]),
+   and modals/dialogs get a smooth scale+fade entrance and backdrops fade in. Gated to
+   :not([data-sw-ui]) so the software-painted opi5/AC-off path stays animation-free + cheap. */
+@keyframes pulsar-modal-in {
+	from {
+		opacity: 0;
+		transform: translateY(10px) scale(0.96);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0) scale(1);
+	}
+}
+@keyframes pulsar-backdrop-in {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+:root:not([data-sw-ui]) .modal,
+:root:not([data-sw-ui]) [data-navmodal],
+:root:not([data-sw-ui]) [role='dialog'] {
+	animation: pulsar-modal-in 0.19s cubic-bezier(0.2, 0.85, 0.25, 1) both;
+}
+:root:not([data-sw-ui]) .backdrop {
+	animation: pulsar-backdrop-in 0.16s ease both;
 }
 
 /* form atoms */

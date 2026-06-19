@@ -38,6 +38,7 @@ export {
 	onFsEntries,
 	onPeerAvatar,
 	onPeerName,
+	onPeerId,
 	onKbdLeave,
 	onKbdEngaged,
 	onKbdReleased,
@@ -62,6 +63,8 @@ export {
 	onSessionEvent,
 	onAuthPrompt,
 	onNodePort,
+	onGuideToggle,
+	onControllerConnected,
 	onNodeId,
 	onNodeVersionError,
 	onSessionPassword
