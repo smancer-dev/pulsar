@@ -557,23 +557,13 @@ fn win_fullscreen(
 		return;
 	};
 	let hwnd: HWND = handle.0 as _;
-	use windows_sys::Win32::UI::WindowsAndMessaging::{
-		GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_THICKFRAME,
-	};
 	unsafe {
-		// Tauri's set_decorations/set_resizable are queued through the event loop and can
-		// land AFTER this SetWindowPos — the frame change then never re-lays anything out
-		// and the client area keeps an 8px WS_THICKFRAME inset inside the fullscreen
-		// window (transparent gutter → desktop visible around the video). Toggle the
-		// styles synchronously here instead.
-		let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-		// The window is FRAMELESS (decorations:false — the app draws its own title bar), so there
-		// is no WS_CAPTION to manage; only strip the resize border (WS_THICKFRAME) for the
-		// borderless-fullscreen cover and restore it on exit. (Restoring WS_CAPTION here would
-		// wrongly graft a native title bar back on when leaving fullscreen.)
-		let strip = WS_THICKFRAME as isize;
-		let new_style = if on { style & !strip } else { style | strip };
-		SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+		// The window is already FRAMELESS (decorations:false — the app draws its own title bar):
+		// tao's undecorated WM_NCCALCSIZE keeps the client rect == the FULL window, so we must NOT
+		// touch the window style here. Stripping WS_THICKFRAME (what the old DECORATED path did)
+		// left the client rect inset by the resize border, so `fill_children_to_client` snapped the
+		// webview in by that margin → the desktop showed through as gaps around the fullscreen
+		// content. Just cover the monitor / restore the windowed rect; tao gives a gap-free client.
 		if on {
 			// Clear any maximize/minimize first, else SetWindowPos is clamped to the
 			// work area (taskbar stays visible).
