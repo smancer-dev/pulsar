@@ -2,8 +2,10 @@
 	// "Nasıl bölünsün?" — the split-layout chooser shown when the user presses the split
 	// button. Three layouts (2 side-by-side, 2 stacked, 2×2) → enterSplit(layout). While
 	// already split it also offers a "böl modundan çık" affordance to leave split mode.
+	import { onMount, onDestroy } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import { t } from '$lib/i18n.svelte';
+	import { gamingNav } from '$lib/gamepadNav.svelte';
 
 	type Layout = 'h2' | 'v2' | 'grid4';
 	type Props = {
@@ -32,6 +34,19 @@
 		onExit();
 		onClose();
 	}
+
+	// Pad-navigable popup: confine controller focus to this modal ([data-navmodal] below), make B/Esc
+	// close it, and land focus inside on open — mirrors ConnectModal. Without it the pad kept
+	// navigating the gaming home BEHIND the picker (and the picker itself wasn't reachable).
+	const navItem = gamingNav.item;
+	onMount(() => {
+		gamingNav.pushBack(onClose);
+		requestAnimationFrame(() => gamingNav.focusFirst());
+	});
+	onDestroy(() => {
+		gamingNav.popBack(onClose);
+		gamingNav.focusFirst(); // return focus to the shell
+	});
 </script>
 
 <div
@@ -41,8 +56,8 @@
 		if (e.target === e.currentTarget) onClose();
 	}}
 >
-	<div class="modal" role="dialog" aria-modal="true" aria-label={t('split.title')}>
-		<button class="close" onclick={onClose} aria-label={t('split.close')}>
+	<div class="modal" data-navmodal role="dialog" aria-modal="true" aria-label={t('split.title')}>
+		<button class="close" use:navItem onclick={onClose} aria-label={t('split.close')}>
 			<Icon name="x" size={16} />
 		</button>
 
@@ -51,7 +66,7 @@
 
 		<div class="layouts">
 			{#each LAYOUTS as l (l.id)}
-				<button class="layout" class:on={splitMode === l.id} onclick={() => pick(l.id)}>
+				<button class="layout" use:navItem class:on={splitMode === l.id} onclick={() => pick(l.id)}>
 					<!-- A tiny diagram of the layout. -->
 					<span class="diagram {l.id}" aria-hidden="true">
 						{#if l.id === 'grid4'}
@@ -66,7 +81,7 @@
 		</div>
 
 		{#if splitMode !== 'off'}
-			<button class="exit" onclick={exit}>
+			<button class="exit" use:navItem onclick={exit}>
 				<Icon name="x" size={15} />
 				{t('split.exit')}
 			</button>
