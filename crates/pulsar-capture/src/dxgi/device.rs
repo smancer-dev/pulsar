@@ -4,12 +4,12 @@
 //! the `Send` marker. The pacing loop lives in `pacing.rs`; cursor compositing in `cursor.rs`.
 
 use windows::core::Interface;
-use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE};
+use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
 	D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-	D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+	D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
 	D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
 	D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
@@ -92,6 +92,15 @@ pub struct CaptureDevice {
 	/// Set once we've ATTEMPTED to build the compositor, so a build failure isn't retried
 	/// every frame (it would just fail again, wasting time on the pacing-critical path).
 	pub(super) compositor_tried: bool,
+	/// B11: cached RTV over `present` for the cursor blit. Built lazily in `composite_cursor`;
+	/// invalidated (None) whenever `present` is rebuilt (`build_pool`) or dropped
+	/// (`teardown_duplication`), so it never dangles. Avoids a CreateRenderTargetView every tick.
+	pub(super) present_rtv: Option<ID3D11RenderTargetView>,
+	/// B11: cached monitor desktop-coordinate rect (IDXGIOutput::GetDesc().DesktopCoordinates).
+	/// `refresh_live_cursor` maps the OS pointer into this output's pixel space EVERY tick; the
+	/// rect only changes on a resolution/output rebuild, so cache it and refresh lazily —
+	/// invalidated alongside the duplication in `build_pool`/`teardown_duplication`.
+	pub(super) output_rect_cache: Option<RECT>,
 	/// Shared session-stop flag (cloned from the capture thread's `stop`). `build_duplication`
 	/// polls it between its transient retry sleeps so an init/switch that hits the long
 	/// `NOT_CURRENTLY_AVAILABLE` retry loop bails immediately when the session is torn down,
@@ -129,6 +138,16 @@ impl CaptureDevice {
 		// IDXGIDevice), which every D3D11 device implements, so QI for it via .cast().
 		let dxgi_dev: IDXGIDevice1 = device.cast()?;
 		let _ = dxgi_dev.SetMaximumFrameLatency(1);
+		// A18: raise this device's GPU scheduling priority to the max (+7; valid range -7..=7) so
+		// the capture→encode GPU work (the duplication CopyResource + the VideoProcessor NV12 Blt)
+		// is scheduled ahead of background GPU jobs — the Sunshine technique. Tunable: PULSAR_GPU_PRIO=0
+		// disables. Best-effort — ignore failure (some drivers/constrained contexts reject it).
+		if std::env::var("PULSAR_GPU_PRIO")
+			.map(|v| v != "0")
+			.unwrap_or(true)
+		{
+			let _ = dxgi_dev.SetGPUThreadPriority(7);
+		}
 
 		let mut me = CaptureDevice {
 			device,
@@ -145,6 +164,8 @@ impl CaptureDevice {
 			cursor: CursorState::default(),
 			compositor: None,
 			compositor_tried: false,
+			present_rtv: None,
+			output_rect_cache: None,
 			stop,
 		};
 		me.build_duplication(fast_transient)?;
@@ -475,6 +496,10 @@ impl CaptureDevice {
 		self.device
 			.CreateTexture2D(&desc, None, Some(&mut present))?;
 		self.present = present;
+		// B11: `present` is a fresh texture and the output desc may have changed — drop the cached
+		// RTV (it was over the OLD present) and the cached output rect so both are rebuilt lazily.
+		self.present_rtv = None;
+		self.output_rect_cache = None;
 		Ok(())
 	}
 
@@ -536,6 +561,9 @@ impl CaptureDevice {
 		self.dup = None;
 		self.pool = None;
 		self.present = None;
+		// B11: the cached cursor RTV is over the now-dropped `present` — clear it so a stale RTV
+		// can never be reused before `build_pool` rebuilds both `present` and (lazily) the RTV.
+		self.present_rtv = None;
 	}
 
 	/// Re-enumerate the owning output (it may have moved to the other GPU) and rebuild the

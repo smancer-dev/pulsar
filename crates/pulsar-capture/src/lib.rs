@@ -96,6 +96,19 @@ pub struct CaptureHandle {
 	/// around each `enc.submit`; the host reads it (`encode_us_arc`) to push the overlay's
 	/// "kodlama" stat, which the native NVENC path otherwise lacked (only ffmpeg metered it).
 	encode_us: std::sync::Arc<std::sync::atomic::AtomicU32>,
+	/// One-shot client keyframe request (`MediaNack([0])` sentinel): the host sets it via
+	/// `request_idr()`; the capture thread polls+clears it each tick and forces the next
+	/// encoded frame to be an IDR. Without this, a client whose decoder was rebuilt
+	/// mid-session stays frozen until the 10 s safety GOP.
+	requested_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	/// Liveness flag: `true` while the capture thread is running, cleared (via an RAII guard) when
+	/// the thread exits for ANY reason — a both-outputs-unbuildable death (lib.rs revert-build
+	/// failure), a `RunExit::Stop` from an unrecoverable reinit, or a panic. The host polls this on
+	/// its live-restream fast path (`switch_output`/`set_bitrate`): once the thread is dead those
+	/// calls only write atomics no thread reads, so a switch/bitrate restream would silently no-op
+	/// on a dead pipeline. Seeing `is_alive()==false` lets the host fall through to a full capture
+	/// restart instead. Distinct from `stop`: `stop` is host→thread intent; this is thread→host state.
+	alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CaptureHandle {
@@ -114,6 +127,14 @@ impl CaptureHandle {
 	pub fn switch_output(&self, idx: u32) {
 		self.requested_output
 			.store(idx, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// Force the next encoded frame to be an IDR (client keyframe request — the
+	/// `MediaNack([0])` sentinel). Lock-free one-shot; the capture thread consumes it
+	/// on its next tick.
+	pub fn request_idr(&self) {
+		self.requested_idr
+			.store(true, std::sync::atomic::Ordering::SeqCst);
 	}
 
 	/// The output index the capture thread is ACTUALLY streaming right now (written by the thread
@@ -150,6 +171,20 @@ impl CaptureHandle {
 	/// the overlay's encode-ms stat for the native NVENC path (G2). 0 = no frame timed yet.
 	pub fn encode_us_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
 		self.encode_us.clone()
+	}
+
+	/// Whether the capture+encode thread is still running. Becomes `false` once the thread exits
+	/// for any reason (unbuildable output, unrecoverable reinit, or panic). The host checks this on
+	/// its live-restream fast path so a `switch_output`/`set_bitrate` restream against a DEAD thread
+	/// falls through to a full capture restart instead of silently writing atomics no thread reads.
+	pub fn is_alive(&self) -> bool {
+		self.alive.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
+	/// A clone of the liveness Arc (see [`is_alive`]) so a caller can poll the capture thread's
+	/// liveness without holding the `CaptureHandle` / its owning lock.
+	pub fn alive_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+		self.alive.clone()
 	}
 
 	/// Signal the thread, join it (releases the NVENC session + DXGI duplication), return.
@@ -322,6 +357,9 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 	// G2: per-frame encode wall-time EWMA (µs), written by the capture thread around submit.
 	let encode_us = Arc::new(AtomicU32::new(0));
 	let encode_us_t = encode_us.clone();
+	// Client keyframe request (MediaNack([0]) sentinel) — polled+cleared per tick.
+	let requested_idr = Arc::new(AtomicBool::new(false));
+	let req_idr_t = requested_idr.clone();
 	// Actual output the thread is streaming — written after each confirmed build (including
 	// reverts). The host reads this via CaptureHandle::current_output() to reconcile its
 	// input-mapping and fast-path baseline after a failed switch revert.
@@ -331,15 +369,35 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 	// resolution-change rebuilds so the host input path can detect geometry changes — C8).
 	let build_gen = Arc::new(AtomicU32::new(0));
 	let build_gen_t = build_gen.clone();
+	// Liveness flag: true while the thread runs, cleared on ANY exit (death / stop / panic) via
+	// the RAII guard below so the host can detect a dead capture thread on its fast path.
+	let alive = Arc::new(AtomicBool::new(true));
+	let alive_t = alive.clone();
 
 	let thread = std::thread::Builder::new()
 		.name("pulsar-capture".into())
 		.spawn(move || unsafe {
+			// Clear the liveness flag on EVERY exit path of this thread — the several `return`s
+			// below (unbuildable output, nvenc init fail, revert-build fail), the normal
+			// `RunExit::Stop` break, and a panic. RAII covers them all in one place so no exit can
+			// leave `alive` stale-true; the host polls `CaptureHandle::is_alive()` to fall through
+			// to a full capture restart when a live-restream fast path would hit a dead thread.
+			struct AliveGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+			impl Drop for AliveGuard {
+				fn drop(&mut self) {
+					self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+				}
+			}
+			let _alive = AliveGuard(alive_t);
 			// 1. Thread priority + display-keepalive (both RAII / restored on scope exit).
 			//    TIME_CRITICAL keeps the pacing loop off the scheduler's slow path; the
 			//    display-keepalive prevents the monitor sleeping mid-stream.
 			let _prio = ThreadPriorityGuard::time_critical();
 			let _wake = DisplayKeepAlive::engage();
+			// A18: also join the MMCSS "Capture" task class so Windows gives this capture/pacing
+			// thread glitch-resistant scheduling on top of TIME_CRITICAL (the technique Sunshine/
+			// OBS use for the capture thread). RAII — reverted on scope exit. Opt-out: PULSAR_MMCSS=0.
+			let _mmcss = MmcssGuard::engage();
 
 			// Live MONITOR switch is handled by REBUILDING capture+encode on the new output in
 			// THIS thread (the outer loop below), NOT by mutating the live device in place. A
@@ -385,7 +443,7 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 				// regardless of output_idx (no monitor switching). Otherwise the existing DXGI
 				// duplication on `output_idx`. Both produce the same BGRA Frame for the encoder.
 				let build_result = if let Some(hwnd) = cfg.window_hwnd {
-					wgc::WgcCaptureDevice::create(hwnd, stop_t.clone(), fast_transient)
+					wgc::WgcCaptureDevice::create(hwnd, output_idx, stop_t.clone(), fast_transient)
 						.map(CapSource::Wgc)
 				} else {
 					dxgi::CaptureDevice::create(output_idx, stop_t.clone(), fast_transient)
@@ -509,7 +567,10 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 						}
 						// First frame after a same-res reinit (Hz change / transient ACCESS_LOST):
 						// force a keyframe so the client re-syncs instead of waiting a safety GOP.
-						if frame.force_idr {
+						// Same for an explicit client keyframe request (MediaNack([0]) → the host
+						// calls CaptureHandle::request_idr, e.g. after the phone rebuilt its
+						// decoder mid-session).
+						if frame.force_idr || req_idr_t.swap(false, Ordering::AcqRel) {
 							enc.request_idr();
 						}
 						let enc_t0 = std::time::Instant::now();
@@ -557,6 +618,8 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 			current_output,
 			build_gen,
 			encode_us,
+			requested_idr,
+			alive,
 		}),
 		Ok(Err(msg)) => {
 			// Thread reported an init error and is returning; join to reap it.
@@ -750,6 +813,53 @@ impl Drop for DisplayKeepAlive {
 			// power policy) so we don't pin the display awake after the stream ends.
 			unsafe {
 				let _ = SetThreadExecutionState(ES_CONTINUOUS);
+			}
+		}
+	}
+}
+
+/// RAII guard that joins the MMCSS (Multimedia Class Scheduler Service) "Capture" task class for
+/// the calling thread and reverts it on drop. MMCSS gives a registered multimedia thread
+/// glitch-resistant scheduling — the same boost Sunshine/OBS apply to their capture thread, on
+/// top of TIME_CRITICAL. Tunable: `PULSAR_MMCSS=0` disables the join. Best-effort: if avrt/MMCSS
+/// is unavailable the handle stays null and Drop does nothing — capture is unaffected.
+#[cfg(windows)]
+struct MmcssGuard {
+	handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl MmcssGuard {
+	unsafe fn engage() -> Self {
+		use windows::core::w;
+		use windows::Win32::Foundation::HANDLE;
+		use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+		// Opt-out knob (default on): PULSAR_MMCSS=0 skips the MMCSS join.
+		if std::env::var("PULSAR_MMCSS")
+			.map(|v| v == "0")
+			.unwrap_or(false)
+		{
+			return Self {
+				handle: HANDLE::default(),
+			};
+		}
+		// AvSetMmThreadCharacteristicsW takes an in/out task index (0 in; the driver fills it).
+		// "Capture" is the standard MMCSS task class for a screen/video capture thread. On
+		// failure (constrained env / no MMCSS) we keep a null handle so Drop is a no-op.
+		let mut task_index: u32 = 0;
+		let handle =
+			AvSetMmThreadCharacteristicsW(w!("Capture"), &mut task_index).unwrap_or_default();
+		Self { handle }
+	}
+}
+
+#[cfg(windows)]
+impl Drop for MmcssGuard {
+	fn drop(&mut self) {
+		if !self.handle.is_invalid() {
+			use windows::Win32::System::Threading::AvRevertMmThreadCharacteristics;
+			unsafe {
+				let _ = AvRevertMmThreadCharacteristics(self.handle);
 			}
 		}
 	}

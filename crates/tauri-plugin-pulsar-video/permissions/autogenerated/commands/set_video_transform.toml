@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-set-video-transform"
+description = "Enables the set_video_transform command without any pre-configured scope."
+commands.allow = ["set_video_transform"]
+
+[[permission]]
+identifier = "deny-set-video-transform"
+description = "Denies the set_video_transform command without any pre-configured scope."
+commands.deny = ["set_video_transform"]

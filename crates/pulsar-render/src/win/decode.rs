@@ -40,7 +40,7 @@ use windows::Win32::Media::MediaFoundation::{
 	MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
 	MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
 	MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-	MF_VERSION,
+	MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 
 static MF_INIT: Once = Once::new();
@@ -235,8 +235,14 @@ impl Decoder {
 	}
 }
 
-/// Create the decoder `IMFTransform` for `subtype`. Tries a hardware DXVA MFT first (sync or
-/// async), then a software MFT, so the path works regardless of GPU vendor.
+/// Create the decoder `IMFTransform` for `subtype`. This decoder is driven SYNCHRONOUSLY
+/// (`ProcessInput` → `ProcessOutput` drain), so it PREFERS a synchronous MFT — the Microsoft
+/// inbox decoder. A hardware MFT is ALWAYS asynchronous and requires the full event-driven
+/// `IMFMediaEventGenerator` model; driven synchronously it accepts input but never yields a
+/// frame (permanent black screen). We still activate + UNLOCK hardware/async MFTs
+/// (`MF_TRANSFORM_ASYNC_UNLOCK` is mandatory before any call, else every call fails
+/// `MF_E_TRANSFORM_ASYNC_LOCKED`) and keep the first as a LAST-RESORT fallback for hardware that
+/// registers only async decoders (e.g. Qualcomm ARM64), but a sync MFT wins whenever one exists.
 unsafe fn create_decoder_mft(subtype: GUID) -> Result<IMFTransform> {
 	let in_info = MFT_REGISTER_TYPE_INFO {
 		guidMajorType: MFMediaType_Video,
@@ -253,6 +259,9 @@ unsafe fn create_decoder_mft(subtype: GUID) -> Result<IMFTransform> {
 		// omitting HARDWARE yields software/registered MFTs).
 		MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
 	];
+
+	// An unlocked async hardware MFT, kept only in case no synchronous MFT is found at all.
+	let mut async_fallback: Option<IMFTransform> = None;
 
 	for flags in attempts {
 		let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
@@ -272,27 +281,58 @@ unsafe fn create_decoder_mft(subtype: GUID) -> Result<IMFTransform> {
 			continue;
 		}
 
-		// Activate the first MFT in the (sorted/filtered) list.
+		// Prefer the first SYNCHRONOUS MFT in the (sorted/filtered) list; unlock + stash the
+		// first async one as a fallback and keep scanning.
 		let list = std::slice::from_raw_parts(activates, count as usize);
-		let mut transform: Option<IMFTransform> = None;
+		let mut sync_pick: Option<IMFTransform> = None;
 		for activate in list {
 			if let Some(act) = activate {
 				if let Ok(t) = act.ActivateObject::<IMFTransform>() {
-					transform = Some(t);
-					break;
+					if is_async_mft(&t) {
+						unlock_async_mft(&t);
+						if async_fallback.is_none() {
+							async_fallback = Some(t);
+						}
+					} else {
+						sync_pick = Some(t);
+						break;
+					}
 				}
 			}
 		}
 		windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
 
-		if let Some(t) = transform {
+		if let Some(t) = sync_pick {
 			return Ok(t);
 		}
+	}
+
+	// No synchronous MFT anywhere — fall back to the unlocked async HW MFT (hardware-only
+	// clients). It may still not decode under the synchronous drive, but it is the only option.
+	if let Some(t) = async_fallback {
+		return Ok(t);
 	}
 
 	Err(windows::core::Error::from(
 		windows::Win32::Foundation::E_FAIL,
 	))
+}
+
+/// True if an activated MFT is asynchronous. All hardware MFTs are async; they must be unlocked
+/// before use and require the event-driven drive model this decoder does not implement.
+unsafe fn is_async_mft(t: &IMFTransform) -> bool {
+	t.GetAttributes()
+		.and_then(|a| a.GetUINT32(&MF_TRANSFORM_ASYNC))
+		.map(|v| v == 1)
+		.unwrap_or(false)
+}
+
+/// Set `MF_TRANSFORM_ASYNC_UNLOCK` on a hardware/async MFT so its `IMFTransform` methods stop
+/// failing with `MF_E_TRANSFORM_ASYNC_LOCKED` (mandatory per the MF async-MFT contract).
+unsafe fn unlock_async_mft(t: &IMFTransform) {
+	if let Ok(attrs) = t.GetAttributes() {
+		let _ = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1);
+	}
 }
 
 /// Enumerate the MFT's available output types and `SetOutputType` to the first NV12 one.

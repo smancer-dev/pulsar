@@ -8,6 +8,7 @@ use super::d3d::chk;
 use super::encoder::Encoder;
 use super::nvenc;
 use crate::Frame;
+use windows::core::Interface; // `.as_raw()` for the cached-input-view source-pointer key (B3)
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::Graphics::Direct3D11::{
 	ID3D11Texture2D, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
@@ -112,7 +113,9 @@ impl Encoder {
 			let force_idr = self.force_idr_once
 				|| self.frame_idx % interval == 0
 				|| (self.frame_idx < fast_window && self.frame_idx % fast_step == 0);
-			self.force_idr_once = false; // one-shot — consumed
+			// NB: `force_idr_once` is NOT cleared here — it is a client keyframe request
+			// (`MediaNack([0])` / decoder rebuild) and must survive a transient encode/lock
+			// failure. It is consumed only AFTER a successful encode + bitstream lock below.
 			pic.encodePicFlags = if force_idr {
 				nvenc::NV_ENC_PIC_FLAG_FORCEIDR | nvenc::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
 			} else {
@@ -133,6 +136,14 @@ impl Encoder {
 			lock.set_flags(0); // blocking lock (we want the bytes now)
 			chk(lock_fn(self.enc, &mut lock), &self.fns, self.enc)
 				.map_err(|e| format!("nvEncLockBitstream: {e}"))?;
+
+			// One-shot forced-IDR request: consumed ONLY now that both the encode AND the
+			// bitstream lock succeeded — i.e. the keyframe was actually produced and its bytes
+			// retrieved for send. A transient failure at encode/lock above returns Err with the
+			// flag still set (per-frame errors are non-fatal upstream), so the next tick re-forces
+			// the IDR instead of silently dropping the client's keyframe request (which would leave
+			// a rebuilt-decoder client frozen until the multi-second safety GOP).
+			self.force_idr_once = false;
 
 			// Hand the Annex-B AU (in the locked buffer, valid only until Unlock) to the
 			// dedicated RTP sender thread. `RtpEgress::send_access_unit` copies it into an owned
@@ -178,49 +189,67 @@ impl Encoder {
 	/// One ID3D11VideoProcessorBlt: read `src` (BGRA) → write our NV12 texture (NV12).
 	/// This is the GPU colour conversion ddagrab's `format=nv12` filter did before. The
 	/// destination is OUR single non-array NV12 texture, so a TEXTURE2D output view.
+	///
+	/// B3: the input/output views + the stream rotation are CACHED across frames (they were
+	/// rebuilt every tick = a driver call + alloc per frame). The output view (over the fixed
+	/// `nv12_tex`) and the rotation are constant for the encoder's life; the input view only
+	/// changes when the SOURCE texture changes (the DXGI path alternates present/pool; a same-res
+	/// reinit swaps the pool texture), so we key it by the source-texture COM pointer and rebuild
+	/// only on a change. A rebuilt encoder (resolution/rotation change) starts with empty caches,
+	/// so this self-corrects on resize.
 	unsafe fn blt_bgra_to_nv12(&mut self, src: &ID3D11Texture2D) -> Result<(), String> {
-		// Input view onto the BGRA source (whole texture, array slice 0).
-		let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-			FourCC: 0,
-			ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-			Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-				Texture2D: windows::Win32::Graphics::Direct3D11::D3D11_TEX2D_VPIV {
-					MipSlice: 0,
-					ArraySlice: 0,
-				},
-			},
-		};
-		let mut input_view: Option<ID3D11VideoProcessorInputView> = None;
-		let vdevice = self._kept_vdevice.as_ref().unwrap();
-		vdevice
-			.CreateVideoProcessorInputView(src, &self.vp_enum, &in_desc, Some(&mut input_view))
-			.map_err(|e| format!("CreateVideoProcessorInputView: {e}"))?;
-		let input_view = input_view.ok_or("null input view")?;
+		// Owned handles so we can create+cache views below without holding a borrow of `self`.
+		let vdevice = self._kept_vdevice.clone().ok_or("no video device")?;
+		let vp_enum = self.vp_enum.clone();
 
-		// Output view onto OUR NV12 texture. It is a single non-array Texture2D, so a
-		// TEXTURE2D output view (MipSlice 0) — NOT the Texture2DArray slice the ffmpeg
-		// hwframe pool needed.
-		let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-			ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-			Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-				Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-			},
-		};
-		let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
-		vdevice
-			.CreateVideoProcessorOutputView(
-				&self.nv12_tex,
-				&self.vp_enum,
-				&out_desc,
-				Some(&mut output_view),
-			)
-			.map_err(|e| format!("CreateVideoProcessorOutputView: {e}"))?;
-		let output_view = output_view.ok_or("null output view")?;
+		// Output view onto OUR NV12 texture — built ONCE, then reused. It is a single non-array
+		// Texture2D, so a TEXTURE2D output view (MipSlice 0) — NOT the Texture2DArray slice the
+		// ffmpeg hwframe pool needed.
+		if self.cached_output_view.is_none() {
+			let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+				ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+				Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+					Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+				},
+			};
+			let nv12 = self.nv12_tex.clone();
+			let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
+			vdevice
+				.CreateVideoProcessorOutputView(&nv12, &vp_enum, &out_desc, Some(&mut output_view))
+				.map_err(|e| format!("CreateVideoProcessorOutputView: {e}"))?;
+			self.cached_output_view = output_view;
+		}
+		let output_view = self.cached_output_view.clone().ok_or("null output view")?;
+
+		// Input view onto the BGRA source (whole texture, array slice 0) — cached, keyed by the
+		// source-texture COM pointer. On a source change the old view is dropped (released) and a
+		// new one built; in steady state (same present/pool texture) we reuse the cached one.
+		let src_raw = src.as_raw();
+		if self.cached_input_view.is_none() || self.cached_input_src != src_raw {
+			let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+				FourCC: 0,
+				ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+				Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+					Texture2D: windows::Win32::Graphics::Direct3D11::D3D11_TEX2D_VPIV {
+						MipSlice: 0,
+						ArraySlice: 0,
+					},
+				},
+			};
+			let mut input_view: Option<ID3D11VideoProcessorInputView> = None;
+			vdevice
+				.CreateVideoProcessorInputView(src, &vp_enum, &in_desc, Some(&mut input_view))
+				.map_err(|e| format!("CreateVideoProcessorInputView: {e}"))?;
+			self.cached_input_view = input_view;
+			self.cached_input_src = src_raw;
+		}
+		let input_view = self.cached_input_view.clone().ok_or("null input view")?;
 
 		// Rotate the stream by the host display's orientation so the encoded frame is upright
-		// for the viewer (no client-side rotation needed). IDENTITY for 0°. Set on the stream
-		// BEFORE the Blt; the output view is already sized to the rotated dims (see new.rs).
-		{
+		// for the viewer (no client-side rotation needed). IDENTITY for 0°. Set ONCE (it's fixed
+		// for the encoder's life; a rotation change rebuilds the whole encoder — see new.rs). The
+		// output view is already sized to the rotated dims (see new.rs).
+		if !self.rotation_set {
 			use windows::Win32::Graphics::Direct3D11::{
 				D3D11_VIDEO_PROCESSOR_ROTATION_180, D3D11_VIDEO_PROCESSOR_ROTATION_270,
 				D3D11_VIDEO_PROCESSOR_ROTATION_90, D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY,
@@ -233,12 +262,14 @@ impl Encoder {
 			};
 			self.vctx
 				.VideoProcessorSetStreamRotation(&self.vproc, 0, true, rot);
+			self.rotation_set = true;
 		}
 
 		// One input stream. windows-rs models the COM-interface fields as `ManuallyDrop<Option<…>>`. The
-		// struct is a non-owning *view* the API only reads during the call, so we MOVE
-		// the input_view in (no clone → no extra ref), run the Blt, then ManuallyDrop::drop
-		// the field to release it. Skipping that drop would leak one ref PER FRAME.
+		// struct is a non-owning *view* the API only reads during the call, so we move a CLONE of
+		// the cached input view in (one AddRef), run the Blt, then ManuallyDrop::drop the field to
+		// release that per-frame ref — the CACHED view keeps its own ref for the next frame.
+		// Skipping that drop would leak one ref PER FRAME.
 		let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
 			Enable: BOOL(1),
 			OutputIndex: 0,

@@ -5,6 +5,19 @@ use std::sync::Weak;
 
 use super::*;
 
+/// Mint a random session id constrained to 53 bits.
+///
+/// `SessionId` is a `u64`, but the desktop host exposes it to its SvelteKit
+/// connections-window UI (the per-row "disconnect" button passes the sid back to
+/// `disconnect_peer`). JSON numbers are IEEE-754 doubles, exact only up to 2^53, so
+/// a full random `u64` is silently rounded on the JS round-trip — the returned sid
+/// then never matches the `incoming` map key and the host can't tear the session
+/// down (the disconnect button appears to do nothing). 53 bits keeps the value
+/// JS-exact while leaving ample randomness to demux concurrent sessions.
+fn new_session_id() -> SessionId {
+	rand::random::<u64>() & ((1u64 << 53) - 1)
+}
+
 /// A Pulsar endpoint: one UDP socket, one identity, talking to one relay.
 pub struct Node {
 	pub(super) sock: Arc<UdpSocket>,
@@ -93,8 +106,17 @@ impl Node {
 				Domain::IPV6
 			};
 			let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-			let _ = s.set_recv_buffer_size(4 << 20);
-			let _ = s.set_send_buffer_size(4 << 20);
+			let want: usize = 4 << 20;
+			let _ = s.set_recv_buffer_size(want);
+			let _ = s.set_send_buffer_size(want);
+			// A16: read the rcvbuf back — the kernel silently CLAMPS the request to
+			// rmem_max (Android clamps it hard), and a too-small rcvbuf is exactly what
+			// drops packets during an IDR burst. Log the achieved size so a clamp is
+			// visible in the logs instead of being invisible. (Linux reports ~2x the
+			// requested value by convention — that's expected, not the request itself.)
+			if let Ok(got) = s.recv_buffer_size() {
+				tracing::info!(requested = want, achieved = got, "UDP recv buffer");
+			}
 			s.set_nonblocking(true)?;
 			s.bind(&local.into())?;
 			UdpSocket::from_std(s.into())?
@@ -256,7 +278,7 @@ impl Node {
 				g.token.ok_or(ConnError::NotRegistered)?,
 			)
 		};
-		let session: SessionId = rand::random();
+		let session: SessionId = new_session_id();
 
 		// Register a waiter, then ask the relay to rendezvous.
 		let pf = Arc::new(Notify::new());
@@ -309,10 +331,13 @@ impl Node {
 			g.identity_mismatch.remove(&session);
 			// On failure the key is never derived, so drop the stashed salt too —
 			// and a PeerFound landing between the timeout and this cleanup may
-			// already have inserted the session; nothing will ever use it.
+			// already have inserted the session AND its rate cap (the handler
+			// inserts both together); no Session is built to consume the cap, so
+			// remove it here too or it leaks one u32 per racy failed connect.
 			if rv.is_err() {
 				g.pending_salt.remove(&session);
 				g.expected_pubkey.remove(&session);
+				g.pending_rate_cap.remove(&session);
 				g.sessions.remove(&session);
 			}
 		}
@@ -338,7 +363,13 @@ impl Node {
 		let transport = match self.establish_transport(session).await {
 			Ok(t) => t,
 			Err(e) => {
-				self.inner.lock().await.sessions.remove(&session);
+				// Rendezvous succeeded here, so PeerFound deterministically stashed the
+				// per-session rate cap alongside the session; the success-path consumer
+				// below never runs on this error, so drop both or the cap leaks one u32
+				// per failed connect (e.g. a P2pOnly punch miss).
+				let mut g = self.inner.lock().await;
+				g.sessions.remove(&session);
+				g.pending_rate_cap.remove(&session);
 				return Err(e);
 			}
 		};
@@ -389,7 +420,7 @@ impl Node {
 		peer_addr: SocketAddr,
 		peer_pubkey: Option<PublicKey>,
 	) -> Result<Session, ConnError> {
-		let session: SessionId = rand::random();
+		let session: SessionId = new_session_id();
 		let (data_tx, data_rx) = mpsc::unbounded_channel();
 		// Mint our salt and stash it; the `HelloAck` handler derives the key using it
 		// plus the peer's salt from the ack.
@@ -523,6 +554,9 @@ impl Drop for DirectGuard {
 				g.expected_pubkey.remove(&session);
 				g.identity_mismatch.remove(&session);
 				g.punched.remove(&session);
+				// Exhaustive sweep for symmetry with the relay-path cleanup (the direct
+				// path never inserts a rate cap, so this is a defensive no-op today).
+				g.pending_rate_cap.remove(&session);
 				g.sessions.remove(&session);
 			});
 		}

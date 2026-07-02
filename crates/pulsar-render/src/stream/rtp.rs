@@ -12,7 +12,9 @@
 //!
 //! Loss handling mirrors the TS players: track the 16-bit RTP sequence number, and on a forward
 //! gap set `awaiting_idr` + drop partial state until the next clean keyframe so a corrupt NAL/TU
-//! never reaches the decoder.
+//! never reaches the decoder. Duplicate (`fwd==0`) and backward/late (`fwd>=0x8000`, e.g. a NACK
+//! retransmit that lands after its frame was assembled) packets are DROPPED without touching
+//! payload state — splicing them into the in-flight AU would corrupt it.
 
 #![allow(dead_code)]
 
@@ -76,22 +78,28 @@ impl Depacketizer {
 			| ((rtp_packet[6] as u32) << 8)
 			| rtp_packet[7] as u32;
 
-		// Sequence-gap detection: forward distance only (ignore reorder/dupes). On a gap drop
-		// partial state and wait for the next keyframe.
+		// Sequence-gap detection: forward distance only. On a gap drop partial state and wait
+		// for the next keyframe.
 		if let Some(last) = self.last_seq {
 			let fwd = seq.wrapping_sub(last);
-			// fwd==1: consecutive (normal). fwd==0: duplicate. fwd>=0x8000: backward/reorder.
-			// Only trigger a gap and advance last_seq for a genuine forward packet.
-			if fwd < 0x8000 {
-				// Forward packet (newer than last seen).
-				if fwd != 1 && fwd != 0 {
-					// Gap: one or more sequence numbers were skipped.
-					self.awaiting_idr = true;
-					self.drop_partial();
-				}
-				self.last_seq = Some(seq);
+			// fwd==1: consecutive (normal). fwd==0: duplicate. fwd>=0x8000: backward/reorder/late.
+			if fwd == 0 || fwd >= 0x8000 {
+				// Duplicate, reordered, or a NACK retransmit that arrives ≥1 RTT after its frame
+				// was already assembled: DROP it WITHOUT touching payload state. Splicing its
+				// NAL/FU/OBU bytes into the AU currently being assembled would corrupt that
+				// (unrelated) AU — during keyframe assembly it poisons the whole next GOP — and a
+				// late retransmit can never heal a gap we are already past. Leave last_seq and all
+				// partial state untouched. (Mirrors the mobile depacketizer's stale-retransmit
+				// guard in mobile/src/rtp.rs.)
+				return None;
 			}
-			// else: reordered / duplicate — leave last_seq unchanged, no gap triggered.
+			// Forward packet (newer than last seen).
+			if fwd != 1 {
+				// Gap: one or more sequence numbers were skipped.
+				self.awaiting_idr = true;
+				self.drop_partial();
+			}
+			self.last_seq = Some(seq);
 		} else {
 			self.last_seq = Some(seq);
 		}
@@ -718,5 +726,66 @@ mod tests {
 		let au = d.push(&rtp(104, 4, true, &idr)).expect("resumes on key");
 		assert!(au.key);
 		assert_eq!(au.data, vec![0, 0, 0, 1, 0x65, 9, 10]);
+	}
+
+	#[test]
+	fn dup_and_stale_retransmit_dropped() {
+		// Mirrors mobile/src/rtp.rs::stale_retransmit_dropped_but_restart_accepted: a duplicate
+		// or a late (backward) NACK retransmit must be dropped without emitting an AU and without
+		// disturbing the assembly of the next frame.
+		let mut d = Depacketizer::new(Codec::H264);
+		// Prime with an IDR (clears awaiting_idr, establishes last_seq=100).
+		let idr = [0x65u8, 0xaa];
+		assert!(d.push(&rtp(100, 0, true, &idr)).is_some(), "initial IDR");
+		// A clean delta AU advances last_seq to 101.
+		let delta = [0x41u8, 1, 2, 3];
+		let au = d.push(&rtp(101, 1, true, &delta)).expect("delta AU");
+		assert!(!au.key);
+
+		// DUPLICATE of seq 101 (fwd==0): dropped, no AU, state untouched.
+		assert!(
+			d.push(&rtp(101, 1, true, &delta)).is_none(),
+			"duplicate packet dropped, not re-emitted"
+		);
+		// STALE/backward NACK retransmit (seq 99 < 101 → fwd>=0x8000): dropped, not spliced, and
+		// must NOT trigger a gap (awaiting_idr stays clear).
+		let stale = [0x41u8, 9, 9];
+		assert!(
+			d.push(&rtp(99, 0, true, &stale)).is_none(),
+			"stale retransmit dropped"
+		);
+
+		// The next genuine forward delta (seq 102) is unaffected — last_seq is still 101, so 102
+		// is consecutive (no gap) and emits a clean AU.
+		let delta2 = [0x41u8, 4, 5, 6];
+		let au = d.push(&rtp(102, 2, true, &delta2)).expect("next AU unaffected");
+		assert!(!au.key);
+		assert_eq!(au.data, vec![0, 0, 0, 1, 0x41, 4, 5, 6]);
+	}
+
+	#[test]
+	fn stale_packet_not_spliced_into_open_au() {
+		let mut d = Depacketizer::new(Codec::H264);
+		// Prime with an IDR so we are not awaiting a keyframe (last_seq=50).
+		assert!(d.push(&rtp(50, 0, true, &[0x65u8, 0x00])).is_some());
+		// Begin a 2-NAL delta AU (first packet has no marker), seq 51.
+		let n1 = [0x41u8, 1, 1];
+		assert!(
+			d.push(&rtp(51, 5, false, &n1)).is_none(),
+			"first NAL — AU still open"
+		);
+		// A STALE retransmit (seq 40, backward) arrives mid-assembly: it must be DROPPED, not
+		// appended to the open AU.
+		let stale = [0x41u8, 7, 7, 7];
+		assert!(
+			d.push(&rtp(40, 0, false, &stale)).is_none(),
+			"stale packet dropped mid-AU"
+		);
+		// Second NAL + marker closes the AU (seq 52 — consecutive after 51).
+		let n2 = [0x41u8, 2, 2];
+		let au = d.push(&rtp(52, 5, true, &n2)).expect("AU closes on marker");
+		// The AU contains ONLY n1 and n2 — the stale packet's bytes are absent.
+		let expect = vec![0, 0, 0, 1, 0x41, 1, 1, 0, 0, 0, 1, 0x41, 2, 2];
+		assert_eq!(au.data, expect, "stale bytes not spliced into the AU");
 	}
 }

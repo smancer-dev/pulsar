@@ -8,7 +8,8 @@ use std::ptr;
 
 use windows::Win32::Graphics::Direct3D11::{
 	ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
-	ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+	ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+	ID3D11VideoProcessorOutputView,
 };
 
 use super::nvenc;
@@ -42,6 +43,22 @@ pub struct Encoder {
 	pub(super) vctx: ID3D11VideoContext,
 	pub(super) vproc: ID3D11VideoProcessor,
 	pub(super) vp_enum: ID3D11VideoProcessorEnumerator,
+	// --- B3: cached VideoProcessor views + one-shot rotation. The views were rebuilt EVERY
+	//     frame (a driver call + alloc per tick); the output view (over the fixed `nv12_tex`)
+	//     and the stream rotation never change for an encoder's life, and the input view only
+	//     changes when the SOURCE texture changes (the DXGI path alternates present/pool, and a
+	//     same-res reinit swaps the pool texture). So cache the output view once, the input view
+	//     keyed by its source-texture pointer, and set the rotation once (see `blt_bgra_to_nv12`).
+	/// Cached BGRA→NV12 output view over `nv12_tex` (built once; reused every frame).
+	pub(super) cached_output_view: Option<ID3D11VideoProcessorOutputView>,
+	/// Cached input view over the current source texture, valid while `cached_input_src` matches
+	/// the frame's source pointer; rebuilt (releasing the old) when the source texture changes.
+	pub(super) cached_input_view: Option<ID3D11VideoProcessorInputView>,
+	/// Raw COM pointer of the texture `cached_input_view` was created for (cache key). Null = none.
+	pub(super) cached_input_src: *mut c_void,
+	/// Whether `VideoProcessorSetStreamRotation` has been applied (it's fixed for the encoder's
+	/// life — a rotation change rebuilds the whole encoder, resetting this to false).
+	pub(super) rotation_set: bool,
 
 	// --- CROSS-ADAPTER BRIDGE (None in the same-device fast path) — CPU-staging roundtrip.
 	//     Keyed-mutex shared textures aren't supported on all AMD↔NVIDIA combos, so the hop
@@ -137,7 +154,10 @@ impl Encoder {
 		// The copied `encodeConfig` still points into our stable boxed `enc_config`.
 		rc.reInitEncodeParams = std::ptr::read(&*self.init_params);
 		rc.set_reset_encoder(false);
-		rc.set_force_idr(true);
+		// NO forced IDR: a CBR bitrate change is seamless to the decoder (just a QP
+		// shift) — forcing an IDR every ABR step injected a big keyframe = a periodic
+		// latency/bitrate SPIKE on the client. (Sunshine/Moonlight reconfigure without IDR.)
+		// A real resolution change goes through a full encoder rebuild, not this path.
 		let f = self
 			.fns
 			.nvEncReconfigureEncoder

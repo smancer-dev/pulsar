@@ -1,0 +1,14 @@
+node_modules
+# Ad-hoc debug screenshots / logs from manual device test loops — not project code.
+scratchpad/
+# Tauri mobile generated native projects keep their own sources committed, but
+# build outputs / local machine paths must not be:
+/gen/android/.gradle
+/gen/android/app/build
+/gen/android/build
+/gen/android/local.properties
+/gen/apple/build
+/gen/apple/Externals
+/gen/apple/*.xcodeproj/project.xcworkspace
+/gen/apple/*.xcodeproj/xcuserdata
+target

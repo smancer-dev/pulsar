@@ -454,10 +454,13 @@
 			selfPw = '';
 			connError = t('connErr.incompatibleVersion');
 		});
-		await goOnline();
-		// Sync the persisted tray preference into the Rust backend on startup so
-		// CloseRequested knows whether to hide-to-tray or quit from the first launch.
+		// Sync the persisted tray preference into the Rust backend BEFORE going online (it
+		// has no dependency on being online) so CloseRequested knows whether to hide-to-tray
+		// or quit even while the startup relay registration is still in flight. If the relay
+		// is unreachable, goOnline blocks for its full timeout; a close during that window
+		// would otherwise hide-to-tray for a user who disabled it, leaving a ghost process.
 		api.setTray(ui.tray).catch(() => {});
+		await goOnline();
 		// Surface incoming connections on the host UI.
 		await onSessionEvent((e) => {
 			if (e.kind === 'request') {
@@ -599,8 +602,9 @@
 				holdConnecting: splashDone
 			});
 			// Kiosk / headless start (CLI --connect): begin fullscreen so the host fills
-			// the screen with no app chrome. Toggle off with Ctrl+Shift+F12.
-			if (!sm.fullscreen) sm.toggleFullscreen();
+			// the screen with no app chrome. Toggle off with Ctrl+Shift+F12. `--nofullscreen`
+			// (ac.nofullscreen) opts out — the session starts windowed (dev test loops / embedded).
+			if (!ac.nofullscreen && !sm.fullscreen) sm.toggleFullscreen();
 		}
 		// Auto-update: only when this launch is IDLE (no CLI --connect into a live
 		// session) — the updater must never interrupt a remote session. Deferred a few

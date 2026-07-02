@@ -1,0 +1,7 @@
+{
+	"$schema": "../gen/schemas/mobile-schema.json",
+	"identifier": "default",
+	"description": "Pulsar mobile base capability",
+	"windows": ["main"],
+	"permissions": ["core:default", "pulsar-video:default"]
+}

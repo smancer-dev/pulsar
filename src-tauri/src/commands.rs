@@ -595,10 +595,10 @@ pub(crate) async fn run_command(command: String) -> Result<(), String> {
 /// The CLI `--connect` auto-connect target (id/ip + optional password), for the frontend
 /// to initiate a session on startup. `None` unless `--connect` was passed.
 ///
-/// A one-shot `.skip-autoconnect` marker (written by `relaunch_to_home`) suppresses the
-/// auto-connect for exactly the next launch and is consumed here: after the user disconnects
-/// from a direct-connect (kiosk) session the app relaunches to a fresh, usable home WITHOUT
-/// reconnecting (the new process gives WebKitGTK a healthy webview again — see `relaunch_to_home`).
+/// A one-shot `.skip-autoconnect` marker suppresses the auto-connect for exactly the next
+/// launch and is consumed here (delete-on-read). No code currently writes the marker, so this
+/// is defensive: any future "relaunch to a fresh home after a kiosk session" path can drop the
+/// marker to have the relaunched instance land on the Connect screen instead of reconnecting.
 #[tauri::command]
 pub(crate) fn auto_connect_target(app: AppHandle) -> Option<AutoConnect> {
 	let marker = config_path(&app).with_file_name(".skip-autoconnect");
@@ -685,15 +685,21 @@ struct NavInput {
 #[tauri::command]
 pub(crate) fn gamepad_nav_start(app: AppHandle, state: State<'_, AppState>) {
 	use std::sync::atomic::Ordering;
-	// Bump the generation epoch BEFORE the swap so any thread from the previous
-	// start that is mid-sleep wakes to a mismatched epoch and exits.
+	// Claim the running flag FIRST: a second call while the bridge is live must be a
+	// true no-op (per the doc above). Bumping the generation epoch before this check
+	// would invalidate the LIVE reader thread's epoch — it would exit on its next 16ms
+	// tick while the flag stayed latched true, leaving the bridge dead and unrestartable
+	// (every later start early-returns here) until an explicit gamepad_nav_stop.
+	if state.nav_gamepad_on.swap(true, Ordering::SeqCst) {
+		return; // already running
+	}
+	// We are the one that flipped the flag on → bump the generation epoch now so any
+	// thread left over from a previous start that is mid-sleep wakes to a mismatched
+	// epoch and exits, then spawn our fresh reader under the new epoch.
 	let my_gen = state
 		.nav_gamepad_gen
 		.fetch_add(1, Ordering::SeqCst)
 		.wrapping_add(1);
-	if state.nav_gamepad_on.swap(true, Ordering::SeqCst) {
-		return; // already running
-	}
 	let flag = state.nav_gamepad_on.clone();
 	let gen = state.nav_gamepad_gen.clone();
 	std::thread::spawn(move || {
@@ -895,24 +901,3 @@ pub(crate) async fn test_controller_rumble(uuid: String) -> Result<(), String> {
 	Ok(())
 }
 
-/// Relaunch the app to a fresh home after the user disconnects from a direct-connect (kiosk)
-/// session. On Linux the native video renderer leaves WebKitGTK unable to process clicks once it
-/// tears down on this headless path (the webview is covered from boot and never warmed by a real
-/// click), so the only reliable way back to a usable UI is a new process. We drop a one-shot
-/// `.skip-autoconnect` marker (consumed by `auto_connect_target`) so the relaunched instance lands
-/// on the Connect screen instead of reconnecting, then restart. No-op on Windows/macOS, where the
-/// WebView2/WKWebView webview stays interactive after a session ends.
-#[tauri::command]
-pub(crate) fn relaunch_to_home(app: AppHandle) {
-	#[cfg(all(unix, not(target_os = "macos")))]
-	{
-		let marker = config_path(&app).with_file_name(".skip-autoconnect");
-		if let Some(dir) = marker.parent() {
-			let _ = std::fs::create_dir_all(dir);
-		}
-		let _ = std::fs::write(&marker, b"1");
-		app.restart();
-	}
-	#[cfg(not(all(unix, not(target_os = "macos"))))]
-	let _ = app;
-}

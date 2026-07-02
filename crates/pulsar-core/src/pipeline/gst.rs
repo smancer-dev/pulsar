@@ -128,12 +128,17 @@ pub fn encoder_fragment(
 }
 
 /// Full Wayland (portal/PipeWire) pipeline: capture → bounded leaky queue (drop stale
-/// frames instead of growing latency) → I420 convert → encoder fragment → UDP RTP.
+/// frames instead of growing latency) → NV12 convert → encoder fragment → UDP RTP.
+///
+/// NV12 (not I420) is the universal encoder input: `nvh264enc`/`vaapih264enc` accept
+/// `video/x-raw` only in {NV12, Y444, RGBA, …} — NOT I420 — so forcing I420 made the
+/// NVENC/VAAPI link fail and the host silently fell back to **software x264**. `x264enc`
+/// accepts NV12 too (verified), so NV12 works for every gst encoder on this path.
 pub fn wayland_pipeline(fd: i32, node_id: u32, fragment: &str, ip: &str, port: u16) -> String {
 	format!(
 		"pipewiresrc fd={fd} path={node_id} do-timestamp=true keepalive-time=1000 \
 		 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-		 ! videoconvert ! video/x-raw,format=I420 \
+		 ! videoconvert ! video/x-raw,format=NV12 \
 		 ! {fragment} \
 		 ! udpsink host={ip} port={port} sync=false"
 	)
@@ -252,10 +257,13 @@ pub fn kms_probe_pipeline(fragment: &str) -> String {
 /// One-frame validation pipeline for an encoder fragment (the gst analog of the
 /// ffmpeg `probe_command`): exit 0 ⇒ the elements exist AND initialize on this box.
 pub fn probe_pipeline(fragment: &str) -> String {
+	// NV12, matching wayland_pipeline: probing with I420 made nvh264enc/vaapih264enc fail
+	// to link (they don't accept I420), so they were marked unsupported and the host used
+	// software x264 even on machines with a working NVENC/VAAPI encoder.
 	format!(
 		"videotestsrc num-buffers=2 \
 		 ! video/x-raw,width=640,height=360,framerate=30/1 \
-		 ! videoconvert ! video/x-raw,format=I420 \
+		 ! videoconvert ! video/x-raw,format=NV12 \
 		 ! {fragment} \
 		 ! fakesink sync=false"
 	)

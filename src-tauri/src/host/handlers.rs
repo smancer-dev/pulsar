@@ -1105,8 +1105,20 @@ fn spawn_media_forwarders(
 		loop {
 			tokio::select! {
 				r = vsock.recv(&mut buf) => {
-					let Ok(n) = r else { break };
+					// An oversized datagram makes recv return Err on Windows (WSAEMSGSIZE) —
+					// keep the forwarder alive; one rogue local datagram must not kill video.
+					// (Brief sleep so a persistent error can't busy-spin; teardown aborts us.)
+					let Ok(n) = r else {
+						tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+						continue;
+					};
 					let rtp = &buf[..n];
+					// Same threat model as the audio intake below: this is an UNCONNECTED
+					// loopback ephemeral port — forward only plausible RTP v2 with the video
+					// payload type (96, both the native packetizer and the ffmpeg path).
+					if n < 13 || rtp[0] >> 6 != 2 || (rtp[1] & 0x7F) != 96 {
+						continue;
+					}
 					if let Some(seq) = media::rtp_seq(rtp) {
 						if let Some(last) = m_last_seq {
 							let d = media::seq_forward(last, seq);
@@ -1164,8 +1176,25 @@ fn spawn_media_forwarders(
 	});
 	let atx = media_tx.clone();
 	let ah = tokio::spawn(async move {
-		let mut buf = vec![0u8; 2048];
-		while let Ok(n) = asock.recv(&mut buf).await {
+		let mut buf = vec![0u8; 4096];
+		loop {
+			// recv Err (e.g. WSAEMSGSIZE from an oversized rogue datagram on Windows)
+			// must NOT kill the forwarder — skip and keep serving. (Brief sleep so a
+			// persistent error can't busy-spin; teardown aborts this task.)
+			let Ok(n) = asock.recv(&mut buf).await else {
+				tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+				continue;
+			};
+			// Forward only plausible RTP v2 + payload-type 97 (the ffmpeg opus output,
+			// audio/command.rs). This intake is an UNCONNECTED loopback ephemeral port:
+			// without the check, anything a local process throws at it — an orphaned
+			// encoder from a previous session, RTCP on a port collision — is wrapped as
+			// TAG_AUDIO and fed VERBATIM to the client's opus decoder, where a single
+			// invalid packet is a FATAL codec error (observed live: C2 err 14 → dead
+			// audio + a main-thread exception storm that froze the video).
+			if n < 13 || buf[0] >> 6 != 2 || (buf[1] & 0x7F) != 97 {
+				continue;
+			}
 			if atx
 				.send(&media::frame(media::TAG_AUDIO, &buf[..n]))
 				.await
@@ -1312,6 +1341,12 @@ pub(super) fn make_on_stream(
 	// re-resolves display_rect/set_monitor when this advances — catching same-index resolution
 	// changes that shift the virtual-desktop geometry without changing the monitor index.
 	#[cfg(windows)] native_gen_arc: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>>,
+	// Publishes the HWND the CURRENT stream actually per-window (WGC) captures, for the input path
+	// (Bug 0). Set to the window target ONLY when the native NVENC per-window path started; cleared
+	// to `None` on every other outcome (whole-monitor ddagrab, ffmpeg fallback, HDR/4:4:4, or a
+	// capture-start error). `on_input` gates its per-window PostMessage routing on THIS — never on
+	// the raw `launched_hwnd`, which can point at a window the stream isn't actually showing.
+	#[cfg(windows)] win_capture_hwnd: Arc<Mutex<Option<i64>>>,
 	// Per-window (WGC) capture target discovered when THIS session launched a game in game mode
 	// (Phase 2b co-op): `on_launch`'s resolver thread stores the launched app's top-level HWND
 	// here. When the StreamReq does NOT itself carry a `window_hwnd`, this is used so a game-mode
@@ -1354,6 +1389,13 @@ pub(super) fn make_on_stream(
 	// (ffmpeg fallback) — then a monitor change falls through to the normal restart.
 	#[cfg(windows)]
 	let mut last_native_req: Option<StreamReq> = None;
+	// Cancel flag for the current stream's G2 native encode-stats reporter thread (spawned per
+	// native (re)stream below). Held across restreams so a slow-path restream/teardown can stop
+	// the PRIOR reporter before a new one starts — binding the reporter to its stream generation
+	// instead of leaking one detached 2 Hz thread per restream (each re-pushing the OLD stream's
+	// now-frozen encode-ms label for the rest of the session).
+	#[cfg(windows)]
+	let mut stats_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
 	move |req: StreamReq, addr: SocketAddr| {
 		// SCREEN ADAPTATION (Parsec-style) — run FIRST, before any fast-path return, so every
 		// restream re-evaluates it: switch the captured monitor to the best-fit display mode for
@@ -1630,7 +1672,27 @@ pub(super) fn make_on_stream(
 				if let Some(p) = prev {
 					p.stop().await;
 				}
-				match pulsar_core::capture::start(&ip, port, &fragment, token).await {
+				// The portal screen-picker inside capture::start can stay open for
+				// seconds. If the session tears down meanwhile (both the disconnect
+				// cleanup and the abort guard bump cap_gen), drop the start future
+				// instead of leaving the dialog up — capture.rs's SessionCloseGuard
+				// then closes the portal session and dismisses the picker.
+				let started = {
+					let start_fut = pulsar_core::capture::start(&ip, port, &fragment, token);
+					tokio::pin!(start_fut);
+					loop {
+						tokio::select! {
+							res = &mut start_fut => break Some(res),
+							_ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+								if cap_gen.load(Ordering::SeqCst) != gen {
+									break None;
+								}
+							}
+						}
+					}
+				};
+				let Some(start_res) = started else { return };
+				match start_res {
 					Ok((cap, new_token)) => {
 						if let Some(t) = new_token {
 							*restore_token.lock().unwrap() = Some(t);
@@ -1699,6 +1761,14 @@ pub(super) fn make_on_stream(
 		#[cfg(windows)]
 		if let Some(h) = native_slot.lock().unwrap().take() {
 			h.stop();
+		}
+		// Stop the prior stream's G2 encode-stats reporter (bound to that now-stopped capture)
+		// so it doesn't linger past this restream re-pushing the old, now-frozen encode-ms label
+		// — one leaked thread per restream otherwise. (Full session teardown is handled instead by
+		// the shared out_tx closing, which the reporter treats as its other exit condition.)
+		#[cfg(windows)]
+		if let Some(c) = stats_cancel.take() {
+			c.store(true, std::sync::atomic::Ordering::Relaxed);
 		}
 		// Clear the live-confirmed output Arc so on_input falls back to cur_display while
 		// no native handle is active (ffmpeg path or between teardown and a new handle). (C4)
@@ -2255,6 +2325,16 @@ pub(super) fn make_on_stream(
 		#[cfg(not(windows))]
 		let native_started = false;
 
+		// Publish the per-window capture state for the input path (Bug 0): the current stream routes
+		// kb/mouse to WindowInput ONLY when it ACTUALLY WGC-captured a specific window — i.e. the
+		// native path started AND a window target was set. Every other outcome (whole-monitor
+		// ddagrab, ffmpeg fallback, HDR/4:4:4, or a start_capture_encode error) streams the whole
+		// monitor, so the window must NOT be the input target even if `launched_hwnd` holds an HWND.
+		#[cfg(windows)]
+		{
+			*win_capture_hwnd.lock().unwrap() = if native_started { target_hwnd } else { None };
+		}
+
 		// Remember this request for the in-place monitor-switch fast path — but ONLY when the
 		// native capture actually started. If we fell back to ffmpeg there's no CaptureHandle to
 		// switch_output on, so a later monitor change must take the full restart path.
@@ -2330,21 +2410,38 @@ pub(super) fn make_on_stream(
 			if let Some(enc_us) = native_enc_us.clone() {
 				let stats_enc = stats_out.clone();
 				let label_enc = base_label.clone();
+				// Bind this reporter to the stream generation: a slow-path restream/teardown flips
+				// this flag (above) so THIS thread exits instead of lingering and re-pushing the old
+				// stream's now-frozen encode-ms label. Store it so the next restream can cancel us.
+				#[cfg(windows)]
+				let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+				#[cfg(windows)]
+				{
+					stats_cancel = Some(cancel.clone());
+				}
 				std::thread::spawn(move || loop {
 					std::thread::sleep(std::time::Duration::from_millis(500));
+					// Exit once this stream generation is gone (restreamed / native handle stopped).
+					#[cfg(windows)]
+					if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+						break;
+					}
 					let us = enc_us.load(std::sync::atomic::Ordering::Relaxed);
 					if us == 0 {
 						continue;
 					}
-					if stats_enc
-						.try_send(DataMsg::Stats(format!(
+					// Only a CLOSED channel (session torn down) ends the reporter. A transient Full
+					// must NOT: this per-session channel is shared with chat/clipboard/file-manager
+					// replies, so a momentary backlog would otherwise permanently kill the live
+					// stream's encode-ms stat.
+					if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = stats_enc.try_send(
+						DataMsg::Stats(format!(
 							"{label_enc} · {:.1} {}",
 							us as f32 / 1000.0,
 							crate::i18n::t("stream.msEncode")
-						)))
-						.is_err()
-					{
-						break; // session torn down (channel closed)
+						)),
+					) {
+						break;
 					}
 				});
 			}

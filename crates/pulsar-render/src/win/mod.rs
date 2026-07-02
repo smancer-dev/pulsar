@@ -103,6 +103,10 @@ static HOST_ENC: Mutex<String> = Mutex::new(String::new());
 #[allow(clippy::type_complexity)]
 static CAPS_SEED: Mutex<Option<(Vec<String>, Vec<String>, String, String, String)>> =
 	Mutex::new(None);
+/// Host monitors `(idx, label)` from the caps line `displays=` field — the overlay's
+/// Display-section screen picker (mirrors linux.rs / desktop.rs DISPLAYS). Empty / single =
+/// no picker. Copied into `ostate.displays` each frame (apply_caps_seed).
+static DISPLAYS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
 /// Stream-selection respawn seeds (C14): pushed by the app over stdin after a codec/monitor
 /// switch respawn so the fresh renderer's overlay shows the user's last picks, not defaults.
 /// Take-once (Option/sentinel) so the overlay can update them live after the initial seed.
@@ -346,6 +350,7 @@ fn stdin_control() {
 						"codec" => codec = v.to_string(),
 						"encoder" => encoder = v.to_string(),
 						"conn" => conn = v.to_string(),
+						"displays" => *DISPLAYS.lock().unwrap() = crate::overlay::parse_displays(v),
 						"statshud" => STATS_HUD.store(on, Ordering::SeqCst),
 						"ovbtn" => OVERLAY_BTN.store(on, Ordering::SeqCst),
 						"btnpos" => {
@@ -1167,6 +1172,9 @@ impl Renderer {
 				DISPLAY_IDX_SEED.store(u32::MAX, Ordering::SeqCst);
 			}
 		}
+		// Host monitor list (persists across frames; cloned each frame so the Display picker
+		// stays populated — mirrors linux.rs / desktop.rs). Empty/single = no picker.
+		self.ostate.displays = DISPLAYS.lock().unwrap().clone();
 	}
 
 	/// Closed-state chrome (Linux-parity with linux.rs's `else` paint branch): the mini
@@ -1621,7 +1629,9 @@ unsafe fn event_loop(
 	// child left below WRY_WEBVIEW renders invisibly behind the session screen.
 	let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
 
-	let mut r = Renderer::new(hwnd, parent, w0, h0, codec, mode)?;
+	// `Option` so a GPU device-loss (below) can drop the whole renderer — releasing its
+	// swapchain from the HWND — and rebuild a fresh one in place.
+	let mut renderer: Option<Renderer> = Some(Renderer::new(hwnd, parent, w0, h0, codec, mode)?);
 
 	// RTP receive runs on its own thread (blocking UDP); completed access units land in a
 	// shared bounded queue. The render thread drains + decodes + presents — keeping decode on
@@ -1638,14 +1648,32 @@ unsafe fn event_loop(
 				codec,
 				|au| {
 					let mut g = q.lock().unwrap();
-					// Bound the backlog (low latency): keep at most a few AUs; on overflow drop
-					// the oldest non-key so we never play seconds-late video. Dropping a keyframe
-					// would orphan every P-frame after it (green/mosaic until the next IDR), so
-					// skip keys and only drop the oldest delta; if the backlog is somehow all
-					// keyframes, drop the oldest of those to keep latency bounded.
+					// Bound the backlog (low latency): keep at most a few AUs. On overflow we must
+					// NOT remove a delta AU from the MIDDLE of the backlog — the host encodes a
+					// single-reference sequential P-chain (bframes=0), so every P-frame after the
+					// removed one references it (directly or transitively) and the decoder would
+					// smear/mosaic for the rest of the GOP. Instead drop from the FRONT up to (and
+					// preserving) the NEWEST keyframe in the backlog: that discards the stale
+					// lead-in while keeping an intact, self-contained GOP tail. If the backlog holds
+					// no keyframe at all we can't drop without breaking the chain, so shed only the
+					// single oldest AU as a last resort. Either way log the count — never sever
+					// references silently (Moonlight-style overflow handling).
 					if g.len() >= 8 {
-						let drop_idx = g.iter().position(|au| !au.key).unwrap_or(0);
-						g.remove(drop_idx);
+						let dropped = match g.iter().rposition(|au| au.key) {
+							Some(k) => {
+								g.drain(..k);
+								k
+							}
+							None => {
+								g.pop_front();
+								1
+							}
+						};
+						if dropped > 0 {
+							eprintln!(
+								"pulsar-render(win): AU backlog overflow — dropped {dropped} stale AU(s) ahead of newest keyframe"
+							);
+						}
 					}
 					g.push_back(au);
 				},
@@ -1667,6 +1695,53 @@ unsafe fn event_loop(
 	const STALL_SECS: u64 = 3;
 	let mut last_au_at = std::time::Instant::now();
 	loop {
+		// GPU device-loss recovery (driver TDR / reset / update mid-session — common while
+		// gaming): a removed D3D11 device makes every VideoProcessorBlt / Present / decode fail
+		// forever, so the video freezes black while the session stays "connected". The app does
+		// NOT respawn this child on an unexpected exit (render_stats.rs only READS its stdout),
+		// so exiting is not a recovery — rebuild the whole D3D stack in place instead.
+		// GetDeviceRemovedReason is the authoritative, cheap check and catches every device-loss
+		// source (blt/present/decode/resize) at a single point.
+		if renderer
+			.as_ref()
+			.is_some_and(|r| unsafe { r.device.GetDeviceRemovedReason() }.is_err())
+		{
+			eprintln!("pulsar-render(win): D3D device removed — rebuilding renderer");
+			std::thread::sleep(std::time::Duration::from_millis(200)); // let the driver settle
+			// Drop the old renderer FIRST (its swapchain must release the HWND — DXGI permits
+			// only one flip-model swapchain per HWND), carrying the overlay UI state across so
+			// the user's selections / conn label survive the rebuild.
+			let (ostate, ov_ui, cw, ch) = match renderer
+				.take()
+				.map(|r| (r.ostate, r.ov_ui, r.width.max(1), r.height.max(1)))
+			{
+				Some((o, u, w, h)) => (Some(o), Some(u), w, h),
+				None => (None, None, w0, h0),
+			};
+			match Renderer::new(hwnd, parent, cw, ch, codec, mode) {
+				Ok(mut fresh) => {
+					if let Some(o) = ostate {
+						fresh.ostate = o;
+					}
+					if let Some(u) = ov_ui {
+						fresh.ov_ui = u;
+					}
+					// The decoder + VideoProcessor rebuild lazily on the next AU / frame against
+					// the fresh device (decoder=None, src_w/h=0). Reset the stall timer.
+					renderer = Some(fresh);
+					last_au_at = std::time::Instant::now();
+				}
+				Err(e) => {
+					eprintln!("pulsar-render(win): renderer rebuild failed: {e} — retrying");
+					// renderer stays None; retry on the next iteration.
+				}
+			}
+		}
+		let Some(r) = renderer.as_mut() else {
+			// Rebuild failed (device still gone) — wait a beat and retry without spinning.
+			std::thread::sleep(std::time::Duration::from_millis(200));
+			continue;
+		};
 		while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
 			let _ = TranslateMessage(&msg);
 			DispatchMessageW(&msg);

@@ -67,6 +67,29 @@ fn clear_cloexec(fd: i32) -> std::io::Result<()> {
 	Ok(())
 }
 
+/// Closes a portal ScreenCast session when dropped. ashpd does NOT close the
+/// session on drop, so if [`start`] is cancelled WHILE THE PICKER DIALOG IS STILL
+/// OPEN — the realistic case being the client connection dropping before the user
+/// has picked a screen — the future is dropped mid-`.await` and the session (and its
+/// on-screen picker) would otherwise linger forever. Held across the fallible body
+/// of `start`; on success it's defused (the session is moved into [`WaylandCapture`],
+/// whose own `stop()`/`Drop` then owns the close).
+struct SessionCloseGuard(Option<Session<'static, Screencast<'static>>>);
+
+impl Drop for SessionCloseGuard {
+	fn drop(&mut self) {
+		if let Some(session) = self.0.take() {
+			// `close()` is async (D-Bus); fire-and-forget on the current runtime so
+			// the picker dialog is dismissed without blocking the drop.
+			if let Ok(handle) = tokio::runtime::Handle::try_current() {
+				handle.spawn(async move {
+					let _ = session.close().await;
+				});
+			}
+		}
+	}
+}
+
 /// Start a portal screencast and pipe the screen to `udp://ip:port` as RTP.
 /// `encoder_fragment` is a prebuilt gst encode→parse→rtp-payload fragment from
 /// [`crate::pipeline::gst::encoder_fragment`] — the codec/encoder choice (and thus
@@ -83,14 +106,17 @@ pub async fn start(
 	let proxy: Screencast<'static> = Screencast::new().await?;
 	let session: Session<'static, Screencast<'static>> = proxy.create_session().await?;
 	// Everything past `create_session` can fail with the portal cast already live
-	// (the realistic case: gstreamer not installed). ashpd does NOT close the
-	// session on drop (see the struct docs above), so a bare `?` here would leave
-	// the compositor showing "your screen is being shared" forever with no stream
-	// behind it — run the fallible tail in a block and close the session on error.
+	// (e.g. gstreamer not installed) OR be CANCELLED mid-picker (the connection
+	// dropped before the user chose a screen). ashpd does NOT close the session on
+	// drop, so either case would leave the compositor's picker / "you're sharing"
+	// state up with no stream behind it. The guard closes the session on every exit
+	// except success, where it's defused and ownership passes to `WaylandCapture`.
+	let mut guard = SessionCloseGuard(Some(session));
 	let res = async {
+		let session = guard.0.as_ref().expect("session present");
 		proxy
 			.select_sources(
-				&session,
+				session,
 				CursorMode::Embedded,
 				SourceType::Monitor | SourceType::Window,
 				false,
@@ -99,7 +125,7 @@ pub async fn start(
 			)
 			.await?;
 		let response = proxy
-			.start(&session, &WindowIdentifier::default())
+			.start(session, &WindowIdentifier::default())
 			.await?
 			.response()?;
 		let stream = response
@@ -109,7 +135,7 @@ pub async fn start(
 		let node_id = stream.pipe_wire_node_id();
 		let token = response.restore_token().map(|s| s.to_string());
 
-		let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(&session).await?;
+		let pw_fd: OwnedFd = proxy.open_pipe_wire_remote(session).await?;
 		clear_cloexec(pw_fd.as_raw_fd())?;
 
 		// Latency: the builder's `leaky=downstream` queue drops stale frames if the
@@ -150,17 +176,20 @@ pub async fn start(
 	.await;
 
 	match res {
-		Ok((child, pw_fd, token)) => Ok((
-			WaylandCapture {
-				child,
-				session,
-				_pw_fd: pw_fd,
-			},
-			token,
-		)),
-		Err(e) => {
-			let _ = session.close().await;
-			Err(e)
+		Ok((child, pw_fd, token)) => {
+			// Success: defuse the guard — ownership of the session passes to
+			// WaylandCapture (its stop()/Drop closes it on teardown).
+			let session = guard.0.take().expect("session present on success");
+			Ok((
+				WaylandCapture {
+					child,
+					session,
+					_pw_fd: pw_fd,
+				},
+				token,
+			))
 		}
+		// On error (or if this fn is dropped mid-picker) the guard closes the session.
+		Err(e) => Err(e),
 	}
 }

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-read-clipboard"
+description = "Enables the read_clipboard command without any pre-configured scope."
+commands.allow = ["read_clipboard"]
+
+[[permission]]
+identifier = "deny-read-clipboard"
+description = "Denies the read_clipboard command without any pre-configured scope."
+commands.deny = ["read_clipboard"]

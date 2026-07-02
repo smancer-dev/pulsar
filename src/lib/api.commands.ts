@@ -173,10 +173,6 @@ export const api = {
 		invoke<AutoConnectTarget | null>('auto_connect_target'),
 	/** Stop one remote-play session (tab) by id. */
 	stopStream: (id: number) => invoke<void>('stop_stream', { id }),
-	/** Relaunch the app to a fresh, usable home after a direct-connect (kiosk) session ends.
-	 * Linux only (the native renderer leaves WebKitGTK unable to process clicks once it tears
-	 * down on the headless path); a new process is the reliable fix. Skips auto-connect. */
-	relaunchToHome: () => invoke<void>('relaunch_to_home'),
 	/** Whether an in-app self-update can actually replace the running binary on this platform.
 	 * False on Linux when launched without FUSE (no $APPIMAGE: extract-and-run / raw dev binary),
 	 * where the updater would silently rewrite a throwaway temp file instead of the deployed

@@ -77,6 +77,27 @@ pub async fn query_windows(session: &mut Session) -> Result<Vec<WindowInfo>, Con
 	Ok(Vec::new())
 }
 
+/// Client: send a `QueryWindows` request WITHOUT waiting for the reply. Lets a caller
+/// that owns the session's read side (the client's hold loop) fire the query and then
+/// match the host's `Windows` reply out of its OWN inbound demux (via [`decode_windows`])
+/// — instead of a blocking read-loop like [`query_windows`], whose 16-message reply budget
+/// is otherwise consumed by the media/RTP datagrams racing on the same session (so the
+/// reply almost never lands and the picker shows no windows). Mirrors [`send_data`].
+pub async fn send_query_windows(session: &Session) -> Result<(), ConnError> {
+	session.send(&enc(&Msg::QueryWindows)).await
+}
+
+/// Decode a received frame as the host's `Windows` reply (the answer to the request sent
+/// by [`send_query_windows`]), if it is one. Lets a caller that owns the session's read
+/// side resolve a pending window-list query from its inbound branch without depending on
+/// the private `Msg` enum. Mirrors [`decode_data`].
+pub fn decode_windows(bytes: &[u8]) -> Option<Vec<WindowInfo>> {
+	match dec(bytes) {
+		Some(Msg::Windows(list)) => Some(list),
+		_ => None,
+	}
+}
+
 /// Client: ask the peer to launch a game by id.
 pub async fn request_launch(session: &mut Session, id: &str) -> Result<(), ConnError> {
 	session.send(&enc(&Msg::Launch(id.to_string()))).await
@@ -90,6 +111,14 @@ pub async fn request_stream(session: &mut Session, req: &StreamReq) -> Result<()
 /// Client: send one control event (mouse / keyboard / controller) to the host.
 pub async fn send_input(session: &mut Session, event: &InputEvent) -> Result<(), ConnError> {
 	session.send(&enc(&Msg::Input(*event))).await
+}
+
+/// Like [`send_input`] but via a cloned [`crate::SessionSender`], so a caller that
+/// doesn't own the session (e.g. a mobile client's input commands, separate from the
+/// read loop that owns `Session`) can forward input concurrently. `enc`/`Session::send`
+/// serialize through the node lock, so this is safe alongside the read loop's sends.
+pub async fn send_input_via(sender: &crate::SessionSender, event: &InputEvent) -> Result<(), ConnError> {
+	sender.send(&enc(&Msg::Input(*event))).await
 }
 
 /// Client: liveness keepalive so the host's `serve` doesn't block forever after a
@@ -108,6 +137,14 @@ pub async fn send_bye(session: &mut Session) -> Result<(), ConnError> {
 /// Either peer: send one side-channel data message (clipboard/chat/file/audio).
 pub async fn send_data(session: &Session, msg: &DataMsg) -> Result<(), ConnError> {
 	session.send(&enc(&Msg::Data(msg.clone()))).await
+}
+
+/// Like [`send_data`] but via a cloned [`crate::SessionSender`], so a caller that
+/// doesn't own the session (e.g. a mobile client's side-channel commands that only
+/// hold a cloned sender, separate from the read loop that owns `Session`) can
+/// forward data messages concurrently. Mirrors [`send_input_via`] exactly.
+pub async fn send_data_via(sender: &crate::SessionSender, msg: &DataMsg) -> Result<(), ConnError> {
+	sender.send(&enc(&Msg::Data(msg.clone()))).await
 }
 
 /// True if `bytes` is the host's `Pong` reply (lets the client time round-trips

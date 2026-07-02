@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-screen-refresh-rate"
+description = "Enables the screen_refresh_rate command without any pre-configured scope."
+commands.allow = ["screen_refresh_rate"]
+
+[[permission]]
+identifier = "deny-screen-refresh-rate"
+description = "Denies the screen_refresh_rate command without any pre-configured scope."
+commands.deny = ["screen_refresh_rate"]

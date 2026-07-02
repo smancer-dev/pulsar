@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-mic-start"
+description = "Enables the mic_start command without any pre-configured scope."
+commands.allow = ["mic_start"]
+
+[[permission]]
+identifier = "deny-mic-start"
+description = "Denies the mic_start command without any pre-configured scope."
+commands.deny = ["mic_start"]

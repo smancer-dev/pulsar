@@ -29,8 +29,6 @@ pub(crate) struct AppState {
 	pub(crate) games: Arc<Mutex<Vec<HostGame>>>,
 	/// Host stream settings (resolution/fps/bitrate/encoder/display).
 	pub(crate) stream_cfg: Arc<Mutex<StreamCfg>>,
-	/// Saved windowed geometry while fullscreen, restored on exit.
-	pub(crate) fs_geom: Mutex<Option<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>)>>,
 	/// Startup-probed local capabilities (encoders + decoders); None until the
 	/// background probe finishes. Re-probed on every launch (Moonlight model).
 	pub(crate) local_caps: Mutex<Option<crate::caps::LocalCaps>>,
@@ -285,6 +283,13 @@ pub(crate) struct RenderSeed {
 	/// Replayed as `display <idx>` on respawn so the Display picker highlights the
 	/// correct monitor on the freshly-spawned renderer.
 	pub(crate) display_idx: Option<u32>,
+	/// Last video-placement rect in PHYSICAL px (x, y, w, h) as streamed to the
+	/// Windows renderer child over stdin (`native_view_rect`). Replayed as
+	/// `viewrect <x> <y> <w> <h>` on respawn so the fresh renderer covers only the
+	/// session's content area — without it the child defaults to the WHOLE parent
+	/// client rect and buries the app chrome/tabs in a windowed session (Windows only;
+	/// Linux positions its GDK container, macOS is a no-op, so both leave this `None`).
+	pub(crate) viewrect: Option<(i32, i32, i32, i32)>,
 }
 
 /// One active outbound remote-play session (one connected-host tab): the local

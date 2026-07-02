@@ -85,6 +85,11 @@ const MAX_FU_PAYLOAD: usize = MTU - RTP_HEADER_LEN - 2;
 /// HEVC FU prefix (2-byte PayloadHdr + 1-byte FU header).
 const MAX_FU_HEVC_PAYLOAD: usize = MTU - RTP_HEADER_LEN - 3;
 
+/// Per-AV1-packet OBU payload budget: MTU minus the RTP header (12), the 1-byte AV1 aggregation
+/// header, and up to 2 bytes of LEB128 element-length prefix. A chunk this size is < 16384, so
+/// its length always LEB128-encodes in ≤ 2 bytes — the 2-byte reservation is never exceeded.
+const MAX_AV1_OBU_PAYLOAD: usize = MTU - RTP_HEADER_LEN - 1 - 2;
+
 /// An RTP/H.264 sender bound to one UDP socket, `connect()`ed to the client so
 /// `send()` needs no destination per call. Holds the rolling sequence number and
 /// the random SSRC for the lifetime of the stream.
@@ -95,7 +100,8 @@ pub struct RtpSender {
 	/// the H.264 rules for an HEVC NAL corrupts the 2-byte header (the FU indicator overwrites
 	/// `nal_unit_type` → the decoder sees a bogus NAL type 30 / "Multi-layer HEVC" and the IDR
 	/// never reassembles), which is exactly the "h265 freezes" bug. AV1 is an OBU stream (no
-	/// Annex-B NALs) and is not fragmented through this path.
+	/// Annex-B NALs), so it bypasses NAL splitting entirely and takes the dedicated `send_av1_tu`
+	/// OBU packetizer (aomedia AV1 RTP format) instead.
 	codec: Codec,
 	ssrc: u32,
 	seq: u16,
@@ -236,6 +242,14 @@ impl RtpSender {
 	/// of FU-A fragments. The marker bit is set on the very last packet so the
 	/// client decodes the AU as a unit. Returns the number of RTP packets sent.
 	pub fn send_access_unit(&mut self, annexb: &[u8], pts_90k: u32) -> io::Result<usize> {
+		// AV1 is a low-overhead OBU temporal-unit stream (no Annex-B start codes), so `split_nals`
+		// would return nothing (or bogus pseudo-NALs on a coincidental `00 00 01` in an OBU payload,
+		// since AV1 has no emulation prevention) → zero packets on the wire. Packetize it via the
+		// aomedia AV1 RTP format the clients expect (`send_av1_tu`), NOT NAL splitting. Here `annexb`
+		// is actually the raw OBU TU the encoder emitted.
+		if self.codec == Codec::Av1 {
+			return self.send_av1_tu(annexb, pts_90k);
+		}
 		// Collect the NAL byte-ranges first so we know which one is last (the
 		// marker bit must land on the final RTP packet of the AU).
 		let nals = split_nals(annexb);
@@ -278,6 +292,66 @@ impl RtpSender {
 		}
 		// Carry the schedule into the next AU so back-to-back frames keep a smooth wire cadence
 		// (Sunshine ratecontrol_next_frame_start, stream.cpp:1570-1572).
+		if self.pace && self.pace_per_ms > 0.0 {
+			self.next_frame_start = Some(
+				self.pace_frame_start
+					+ Duration::from_secs_f64(self.pace_pkts as f64 / self.pace_per_ms / 1000.0),
+			);
+		}
+		Ok(sent)
+	}
+
+	/// Packetize and send one AV1 temporal unit. `tu` is the low-overhead OBU byte stream NVENC
+	/// emits (NO Annex-B start codes; each OBU carries its own `obu_size` field). We frame it with
+	/// the aomedia "RTP Payload Format for AV1" aggregation header the Pulsar clients depacketize
+	/// (mobile `rtp::process_av1`, `pulsar-render` `push_av1`): the TU is split into MTU-sized
+	/// chunks, each sent as ONE length-prefixed OBU *element* under a `W=0` aggregation header
+	/// (`Z=0 Y=0 N=0` → the byte `0x00`). Both clients reassemble a `W=0` stream by pure byte
+	/// concatenation, so an arbitrary byte split reproduces the exact TU with no OBU parsing needed.
+	///
+	/// `W=0` is deliberate and load-bearing: the two client depacketizers disagree on the `W`
+	/// field's width/position (mobile reads a 3-bit `W` at bit 3 with `N` at bit 2; pulsar-render
+	/// reads a 2-bit `W` at bit 4 with `N` at bit 3), but an all-zero aggregation header is `W=0`
+	/// and `N=0` under BOTH layouts, making it the only cross-client-safe framing. The RTP marker
+	/// bit lands on the final chunk so the depacketizer emits the whole TU as one access unit.
+	fn send_av1_tu(&mut self, tu: &[u8], pts_90k: u32) -> io::Result<usize> {
+		if tu.is_empty() {
+			return Ok(0);
+		}
+		// Stage-1 pacing setup (identical rate model to the NAL path): the chunk count caps the
+		// AU's spread at ~one frame interval so a big key-frame TU doesn't burst-saturate the link.
+		if self.pace {
+			let total = ((tu.len() + MAX_AV1_OBU_PAYLOAD - 1) / MAX_AV1_OBU_PAYLOAD).max(1) as u32;
+			let now = Instant::now();
+			self.pace_frame_start = self.next_frame_start.map_or(now, |t| t.max(now));
+			let bps = (self.bitrate_kbps.load(Ordering::Relaxed).max(1) as f64) * 1000.0;
+			let bitrate_per_ms = bps * 1.1 / (MTU as f64 * 8.0) / 1000.0;
+			let floor_per_ms = total as f64 * self.fps.max(1) as f64 / 1000.0;
+			self.pace_per_ms = bitrate_per_ms.max(floor_per_ms).max(0.001);
+			self.pace_pkts = 0;
+		}
+
+		let n = tu.len();
+		let mut off = 0usize;
+		let mut sent = 0usize;
+		while off < n {
+			let end = (off + MAX_AV1_OBU_PAYLOAD).min(n);
+			let is_last = end == n;
+			let chunk = &tu[off..end];
+
+			self.buf.clear();
+			self.write_rtp_header(pts_90k, is_last);
+			self.buf.push(0x00); // aggregation header: Z=0 Y=0 W=0 N=0 (cross-client safe)
+			write_leb128(&mut self.buf, chunk.len()); // W=0 ⇒ every element is length-prefixed
+			self.buf.extend_from_slice(chunk);
+			self.pace_gate();
+			self.socket.send(&self.buf)?;
+			self.seq = self.seq.wrapping_add(1);
+
+			off = end;
+			sent += 1;
+		}
+		// Carry the pacing schedule into the next AU (Sunshine ratecontrol_next_frame_start).
 		if self.pace && self.pace_per_ms > 0.0 {
 			self.next_frame_start = Some(
 				self.pace_frame_start
@@ -475,7 +549,7 @@ pub struct RtpEgress {
 impl RtpEgress {
 	/// Bind the RTP socket (unchanged `RtpSender::new`) and, unless `PULSAR_RTP_INLINE=1`,
 	/// spawn the sender thread that drains the mailbox. `PULSAR_RTP_QCAP` overrides the
-	/// mailbox depth (default 16 access units).
+	/// mailbox depth (default 3 access units).
 	pub fn spawn(
 		dest: SocketAddr,
 		codec: Codec,
@@ -520,11 +594,16 @@ impl RtpEgress {
 		{
 			sender.enable_pacing(fps, bitrate_kbps);
 		}
+		// A19: a SHALLOW egress mailbox (3 AUs, was 16). The mailbox only buffers AUs the sender
+		// thread hasn't put on the wire yet; on overflow it drops the STALE backlog (newest-wins),
+		// so a deep queue just lets old frames pile up and adds delivery latency before they're
+		// dropped anyway. 3 absorbs a brief send hiccup without hoarding stale frames. Still
+		// env-overridable via PULSAR_RTP_QCAP.
 		let cap = std::env::var("PULSAR_RTP_QCAP")
 			.ok()
 			.and_then(|v| v.parse::<usize>().ok())
 			.filter(|n| *n > 0)
-			.unwrap_or(16);
+			.unwrap_or(3);
 		let mb = Arc::new(AuMailbox {
 			state: Mutex::new(MailState {
 				q: VecDeque::with_capacity(cap),
@@ -537,6 +616,17 @@ impl RtpEgress {
 		let join = std::thread::Builder::new()
 			.name("pulsar-rtp-send".into())
 			.spawn(move || {
+				// A4: raise THIS sender thread to THREAD_PRIORITY_HIGHEST so the OS schedules its
+				// blocking UDP send promptly under load (the IDR packet burst must drain fast). NOT
+				// TIME_CRITICAL on purpose: that would let a long send loop starve the capture/encode
+				// thread (which already runs TIME_CRITICAL) — we want the sender just below it.
+				#[cfg(windows)]
+				unsafe {
+					use windows::Win32::System::Threading::{
+						GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+					};
+					let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+				}
 				let mut sender = sender;
 				loop {
 					// Wait for the next AU (or a stop). Holding the lock only across the
@@ -700,6 +790,22 @@ fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
 		i += 1;
 	}
 	None
+}
+
+/// Append `value` as an unsigned LEB128 integer (AV1 spec §4.10.5) — the OBU-element length
+/// prefix the AV1 RTP depacketizers decode with their own `read_leb128` (mobile/pulsar-render).
+fn write_leb128(buf: &mut Vec<u8>, mut value: usize) {
+	loop {
+		let mut byte = (value & 0x7f) as u8;
+		value >>= 7;
+		if value != 0 {
+			byte |= 0x80;
+		}
+		buf.push(byte);
+		if value == 0 {
+			break;
+		}
+	}
 }
 
 #[cfg(test)]
@@ -964,6 +1070,110 @@ mod tests {
 		let tid = nals[0][1] & 0x07;
 		assert_eq!(layer_id, 0, "nuh_layer_id stays 0 (single-layer)");
 		assert_eq!(tid, 2, "nuh_temporal_id_plus1 preserved");
+	}
+
+	// -------------------------------------------------------------------------
+	// AV1 OBU packetization (aomedia AV1 RTP format) tests
+	// -------------------------------------------------------------------------
+
+	/// Read a LEB128 unsigned integer from `data[pos..]`, returning `(value, bytes_consumed)`.
+	/// Mirrors both clients' `read_leb128` so the test depacketizes exactly as they do.
+	fn read_leb128_at(data: &[u8], mut pos: usize) -> (usize, usize) {
+		let mut value = 0usize;
+		let mut shift = 0u32;
+		let start = pos;
+		loop {
+			let b = data[pos];
+			pos += 1;
+			value |= ((b & 0x7f) as usize) << shift;
+			shift += 7;
+			if b & 0x80 == 0 {
+				break;
+			}
+		}
+		(value, pos - start)
+	}
+
+	/// Build a low-overhead AV1 OBU temporal unit: a sequence-header OBU (type 1) + a frame OBU
+	/// (type 6), each with `obu_has_size_field=1` and a LEB128 `obu_size` — the exact shape NVENC's
+	/// `outputAnnexBFormat=0` OBU stream has (no Annex-B start codes).
+	fn av1_tu(frame_payload_len: usize) -> Vec<u8> {
+		let mut tu = Vec::new();
+		let seq_payload = [0xAAu8, 0xBB, 0xCC];
+		tu.push((1u8 << 3) | 0x02); // obu_type=1 (seq header), has_size=1
+		write_leb128(&mut tu, seq_payload.len());
+		tu.extend_from_slice(&seq_payload);
+		tu.push((6u8 << 3) | 0x02); // obu_type=6 (frame), has_size=1
+		write_leb128(&mut tu, frame_payload_len);
+		tu.extend(std::iter::repeat(0xE5).take(frame_payload_len));
+		tu
+	}
+
+	/// Reassemble an AV1 temporal unit from RTP packets the way BOTH Pulsar clients do for a `W=0`
+	/// stream (mobile `process_av1` / pulsar-render `push_av1`): skip the 1-byte aggregation header
+	/// and concatenate every length-prefixed OBU element. Also asserts the aggregation header is
+	/// `W=0`/`N=0` under BOTH clients' (differing) bit layouts, plus the PT/timestamp/seq/marker
+	/// invariants the depacketizers rely on.
+	fn depacketize_av1(pkts: &[Vec<u8>], expect_ts: u32) -> Vec<u8> {
+		let mut tu = Vec::new();
+		let mut last_seq: Option<u16> = None;
+		for (i, pkt) in pkts.iter().enumerate() {
+			assert!(pkt.len() >= RTP_HEADER_LEN);
+			let (marker, pt, seq, ts, _ssrc) = parse_header(pkt);
+			assert_eq!(pt, PAYLOAD_TYPE, "payload type must be 96");
+			assert_eq!(ts, expect_ts, "timestamp constant across the TU");
+			assert_eq!(marker, i == pkts.len() - 1, "marker only on the final packet");
+			if let Some(prev) = last_seq {
+				assert_eq!(seq, prev.wrapping_add(1), "sequence increments by 1");
+			}
+			last_seq = Some(seq);
+			let pl = &pkt[RTP_HEADER_LEN..];
+			let agg = pl[0];
+			// The whole aggregation byte must be zero: that is the ONLY value that reads as
+			// Z=0/Y=0/W=0/N=0 under BOTH client layouts (mobile W@bit3/N@bit2, render W@bit4/N@bit3).
+			assert_eq!(agg, 0x00, "AV1 aggregation header must be 0x00 for cross-client compat");
+			let mut p = 1;
+			while p < pl.len() {
+				let (len, consumed) = read_leb128_at(pl, p);
+				p += consumed;
+				assert!(p + len <= pl.len(), "OBU element length within payload");
+				tu.extend_from_slice(&pl[p..p + len]);
+				p += len;
+			}
+		}
+		tu
+	}
+
+	#[test]
+	fn av1_small_tu_single_packet() {
+		// A small TU (≤ MTU) → exactly one packet, marker set; reassembles byte-for-byte.
+		let tu = av1_tu(40);
+		let pkts = roundtrip_codec(&tu, 900, Codec::Av1);
+		assert_eq!(pkts.len(), 1);
+		let out = depacketize_av1(&pkts, 900);
+		assert_eq!(out, tu, "single-packet AV1 TU round-trips exactly");
+	}
+
+	#[test]
+	fn av1_large_tu_fragments_and_reassembles() {
+		// A >MTU key-frame TU must fragment across several packets and reassemble to the exact TU
+		// (the regression: the old NAL-splitting path emitted ZERO packets for an OBU stream).
+		let tu = av1_tu(MTU * 3);
+		let pkts = roundtrip_codec(&tu, 4242, Codec::Av1);
+		assert!(pkts.len() > 3, "a >3·MTU TU must fragment into several packets");
+		// Every packet carries a Z=0/Y=0/W=0/N=0 aggregation header (no Annex-B, no OBU parsing).
+		for pkt in &pkts {
+			assert_eq!(pkt[RTP_HEADER_LEN], 0x00, "AV1 aggregation header must be 0x00");
+		}
+		let out = depacketize_av1(&pkts, 4242);
+		assert_eq!(out, tu, "fragmented AV1 TU reassembles byte-for-byte");
+	}
+
+	#[test]
+	fn av1_empty_tu_sends_nothing() {
+		// A degenerate empty TU emits no packets (mirrors the H.264/HEVC empty-input contract).
+		let pkts = roundtrip_codec(&[], 1, Codec::Av1);
+		assert!(pkts.is_empty());
 	}
 
 	#[test]

@@ -13,6 +13,10 @@ pub(crate) struct AutoConnect {
 	pub(crate) pw: String,
 	pub(crate) mode: String,
 	pub(crate) app: String,
+	/// `--nofullscreen`: a `--connect` kiosk launch normally goes fullscreen so the
+	/// host fills the screen with no chrome. With this flag the auto-connect session
+	/// starts windowed instead (debugging / dev test loops / embedded use).
+	pub(crate) nofullscreen: bool,
 }
 
 #[derive(Serialize)]

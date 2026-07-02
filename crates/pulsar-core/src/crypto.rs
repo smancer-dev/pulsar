@@ -20,7 +20,9 @@
 //! Nonces embed a direction byte so the two halves of a session never collide
 //! even though both peers count their own sequence numbers from zero.
 
-use chacha20poly1305::aead::{Aead, KeyInit};
+use std::sync::{Arc, Mutex};
+
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -133,11 +135,14 @@ impl Identity {
 			our_salt,
 			peer_salt,
 		);
-		Session {
+		// Wrap the cipher + replay window in one Arc so the connection layer can clone
+		// a cheap `Session` handle out from under the node lock and run the per-packet
+		// AEAD off-lock (the cipher is immutable; only the replay window needs a Mutex).
+		Session(Arc::new(SessionCrypto {
 			cipher: ChaCha20Poly1305::new(&key),
 			role,
-			recv_window: ReplayWindow::default(),
-		}
+			recv_window: Mutex::new(ReplayWindow::default()),
+		}))
 	}
 }
 
@@ -178,22 +183,77 @@ struct ReplayWindow {
 	/// Highest seq accepted so far (the right edge of the window). `None` until the
 	/// first datagram is accepted.
 	high: Option<u64>,
-	/// Bitmap of seen seqs in `[high - (WINDOW-1) ..= high]`; bit 0 == `high`.
-	bitmap: u64,
+	/// Bitmap of seen seqs in `[high - (WINDOW-1) ..= high]`; offset 0 == `high`.
+	/// Spread across [`WORDS`] u64 words (offset `o` → word `o / 64`, bit `o % 64`)
+	/// so the window can exceed 64 bits.
+	bitmap: [u64; WORDS],
 }
 
-const WINDOW: u64 = 64;
+/// Anti-replay window depth, in sequence numbers. Widened 64 → 1024 for the upcoming
+/// jitter buffer: with deeper reordering/jitter a 64-deep window would reject
+/// legitimately-late datagrams as "older than the window".
+const WINDOW: u64 = 1024;
+/// Number of u64 words backing the [`WINDOW`]-bit replay bitmap.
+const WORDS: usize = (WINDOW / 64) as usize;
 
 impl Default for ReplayWindow {
 	fn default() -> Self {
 		Self {
 			high: None,
-			bitmap: 0,
+			bitmap: [0; WORDS],
 		}
 	}
 }
 
 impl ReplayWindow {
+	/// Read the replay bit at `offset` (`offset == high - seq`).
+	fn get_bit(&self, offset: u64) -> bool {
+		let word = (offset / 64) as usize;
+		let bit = offset % 64;
+		self.bitmap[word] & (1u64 << bit) != 0
+	}
+
+	/// Set the replay bit at `offset`.
+	fn set_bit(&mut self, offset: u64) {
+		let word = (offset / 64) as usize;
+		let bit = offset % 64;
+		self.bitmap[word] |= 1u64 << bit;
+	}
+
+	/// Slide the window right by `shift` seqs: every recorded offset grows by `shift`
+	/// (a multi-word left shift of the bignum bitmap). Bits pushed past the window
+	/// edge are forgotten. Needed now that the bitmap spans more than one u64 word.
+	fn shift(&mut self, shift: u64) {
+		if shift >= WINDOW {
+			self.bitmap = [0; WORDS];
+			return;
+		}
+		let word_shift = (shift / 64) as usize;
+		let bit_shift = shift % 64;
+		if bit_shift == 0 {
+			// Whole-word shift only — the carry path below does `>> (64 - bit_shift)`,
+			// which would be a UB `>> 64` when bit_shift == 0, so handle it separately.
+			for i in (0..WORDS).rev() {
+				self.bitmap[i] = if i >= word_shift {
+					self.bitmap[i - word_shift]
+				} else {
+					0
+				};
+			}
+		} else {
+			for i in (0..WORDS).rev() {
+				let mut v = 0u64;
+				if i >= word_shift {
+					v = self.bitmap[i - word_shift] << bit_shift;
+					if i > word_shift {
+						v |= self.bitmap[i - word_shift - 1] >> (64 - bit_shift);
+					}
+				}
+				self.bitmap[i] = v;
+			}
+		}
+	}
+
 	/// Check whether `seq` is acceptable, and if so record it. Returns `false` for a
 	/// duplicate (already seen) or a seq older than the window (so the caller drops
 	/// the datagram); returns `true` for a fresh seq (in-order, reordered-within-
@@ -203,19 +263,15 @@ impl ReplayWindow {
 			None => {
 				// First datagram of this direction; it becomes the window's right edge.
 				self.high = Some(seq);
-				self.bitmap = 1; // bit 0 == high == seq
+				self.bitmap = [0; WORDS];
+				self.set_bit(0); // offset 0 == high == seq
 				true
 			}
 			Some(high) if seq > high => {
 				// Ahead of the window: slide right by the gap, then mark the new edge.
-				let shift = seq - high;
-				self.bitmap = if shift >= WINDOW {
-					0
-				} else {
-					self.bitmap << shift
-				};
-				self.bitmap |= 1; // bit 0 == new high == seq
+				self.shift(seq - high);
 				self.high = Some(seq);
+				self.set_bit(0); // offset 0 == new high == seq
 				true
 			}
 			Some(high) => {
@@ -224,24 +280,34 @@ impl ReplayWindow {
 				if offset >= WINDOW {
 					return false; // too old — outside the window
 				}
-				let mask = 1u64 << offset;
-				if self.bitmap & mask != 0 {
+				if self.get_bit(offset) {
 					return false; // duplicate — already seen
 				}
-				self.bitmap |= mask;
+				self.set_bit(offset);
 				true
 			}
 		}
 	}
 }
 
-/// A symmetric, authenticated session between two peers.
-pub struct Session {
+/// The cipher + replay-window state of a session, held behind one [`Arc`] (see
+/// [`Session`]). The cipher is immutable — `seal`/`open` only need `&self` — so the
+/// only interior mutability is the receive replay window, kept behind a small
+/// `Mutex`. This lets the connection layer clone a cheap [`Session`] handle out from
+/// under the node lock and run the per-packet AEAD AFTER releasing it, rather than
+/// holding the global lock across a full encrypt/decrypt.
+struct SessionCrypto {
 	cipher: ChaCha20Poly1305,
 	role: Role,
 	/// Anti-replay state for the *receive* direction.
-	recv_window: ReplayWindow,
+	recv_window: Mutex<ReplayWindow>,
 }
+
+/// A symmetric, authenticated session between two peers. Cheap to [`Clone`] — it is
+/// an `Arc` handle to the shared [`SessionCrypto`] — so the send and receive paths
+/// can each hold a clone and seal/open OFF the node lock.
+#[derive(Clone)]
+pub struct Session(Arc<SessionCrypto>);
 
 impl Session {
 	fn nonce(dir: u8, seq: u64) -> Nonce {
@@ -252,7 +318,7 @@ impl Session {
 	}
 
 	fn send_dir(&self) -> u8 {
-		match self.role {
+		match self.0.role {
 			Role::Initiator => 0,
 			Role::Responder => 1,
 		}
@@ -264,7 +330,8 @@ impl Session {
 
 	/// Encrypt + authenticate a payload for the given (per-direction) sequence number.
 	pub fn seal(&self, seq: u64, plaintext: &[u8]) -> Vec<u8> {
-		self.cipher
+		self.0
+			.cipher
 			.encrypt(&Self::nonce(self.send_dir(), seq), plaintext)
 			.expect("ChaCha20-Poly1305 encryption never fails for valid inputs")
 	}
@@ -278,15 +345,35 @@ impl Session {
 	/// the window) and reject a duplicate or a seq older than the window with
 	/// [`CryptoError::Replay`]. The window is advanced **only after** the ciphertext
 	/// authenticates, so a forged/garbage seq can never poison it.
-	pub fn open(&mut self, seq: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+	///
+	/// Takes `&self` (not `&mut self`): the cipher is immutable and the replay window
+	/// is behind a `Mutex`, so a cheaply-cloned handle can `open` off the node lock.
+	pub fn open(&self, seq: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
 		let plain = self
+			.0
 			.cipher
 			.decrypt(&Self::nonce(self.recv_dir(), seq), ciphertext)
 			.map_err(|_| CryptoError::Decrypt)?;
-		if !self.recv_window.accept(seq) {
+		// Only the tiny window update is serialized — never the decrypt above.
+		if !self.0.recv_window.lock().unwrap().accept(seq) {
 			return Err(CryptoError::Replay);
 		}
 		Ok(plain)
+	}
+
+	/// Like [`open`](Self::open) but decrypts the ciphertext **in place** to avoid a
+	/// second allocation on the hot receive path: `buf` arrives as `ciphertext||tag`
+	/// and is truncated to the recovered plaintext on success. Same authenticate-then-
+	/// advance-replay ordering (and same `&self` rationale) as [`open`](Self::open).
+	pub fn open_in_place(&self, seq: u64, buf: &mut Vec<u8>) -> Result<(), CryptoError> {
+		self.0
+			.cipher
+			.decrypt_in_place(&Self::nonce(self.recv_dir(), seq), b"", buf)
+			.map_err(|_| CryptoError::Decrypt)?;
+		if !self.0.recv_window.lock().unwrap().accept(seq) {
+			return Err(CryptoError::Replay);
+		}
+		Ok(())
 	}
 }
 
@@ -322,7 +409,7 @@ mod tests {
 
 	#[test]
 	fn both_directions_round_trip() {
-		let (mut a, mut b) = pair();
+		let (a, b) = pair();
 		// initiator -> responder
 		let ct = a.seal(0, b"merhaba dunya");
 		assert_eq!(b.open(0, &ct).unwrap(), b"merhaba dunya");
@@ -333,7 +420,7 @@ mod tests {
 
 	#[test]
 	fn sequence_numbers_are_independent_per_direction() {
-		let (a, mut b) = pair();
+		let (a, b) = pair();
 		for seq in 0..32u64 {
 			let msg = format!("frame {seq}");
 			let ct = a.seal(seq, msg.as_bytes());
@@ -343,7 +430,7 @@ mod tests {
 
 	#[test]
 	fn tampered_ciphertext_is_rejected() {
-		let (a, mut b) = pair();
+		let (a, b) = pair();
 		let mut ct = a.seal(1, b"secret");
 		ct[0] ^= 0xFF;
 		assert!(b.open(1, &ct).is_err());
@@ -364,7 +451,7 @@ mod tests {
 			salt_a,
 			salt_eve,
 		);
-		let mut eve_as_b = eve.session(
+		let eve_as_b = eve.session(
 			a.public_bytes(),
 			Role::Responder,
 			session_id,
@@ -391,7 +478,7 @@ mod tests {
 		// would produce), responder side.
 		let sid_b = 0xBBBB_BBBB_BBBB_BBBB;
 		let (sb1, sb2) = (random_salt(), random_salt());
-		let mut b_in_sb = b.session(a.public_bytes(), Role::Responder, sid_b, sb2, sb1);
+		let b_in_sb = b.session(a.public_bytes(), Role::Responder, sid_b, sb2, sb1);
 
 		// A ciphertext sealed under session A must NOT open under session B.
 		let ct = a_in_sa.seal(0, b"frame from session A");
@@ -403,14 +490,14 @@ mod tests {
 		// Sanity: differing only in session_id (same salts) still differs.
 		let (s1, s2) = (random_salt(), random_salt());
 		let a_x = a.session(b.public_bytes(), Role::Initiator, 1, s1, s2);
-		let mut b_y = b.session(a.public_bytes(), Role::Responder, 2, s2, s1);
+		let b_y = b.session(a.public_bytes(), Role::Responder, 2, s2, s1);
 		let ct2 = a_x.seal(0, b"same salts, different session_id");
 		assert!(b_y.open(0, &ct2).is_err());
 	}
 
 	#[test]
 	fn anti_replay_rejects_dup_but_tolerates_reordering() {
-		let (a, mut b) = pair();
+		let (a, b) = pair();
 		// Pre-seal a run of frames so we can feed them in any order.
 		let ct: Vec<Vec<u8>> = (0..10u64)
 			.map(|seq| a.seal(seq, format!("frame {seq}").as_bytes()))
@@ -446,17 +533,34 @@ mod tests {
 
 	#[test]
 	fn anti_replay_drops_seq_older_than_window() {
-		let (a, mut b) = pair();
-		// Accept a high seq to advance the window far forward.
-		let hi = a.seal(200, b"far ahead");
-		assert_eq!(b.open(200, &hi).unwrap(), b"far ahead");
+		let (a, b) = pair();
+		// Accept a high seq to advance the window far forward (past the 1024 window).
+		let hi = a.seal(2000, b"far ahead");
+		assert_eq!(b.open(2000, &hi).unwrap(), b"far ahead");
 		// A seq more than WINDOW behind the high-water mark is outside the window and
 		// must be dropped (can't prove it isn't a replay).
 		let old = a.seal(10, b"ancient");
 		assert!(matches!(b.open(10, &old), Err(CryptoError::Replay)));
-		// But a seq just inside the window (200 - 63 = 137) is still accepted.
-		let edge = a.seal(137, b"window edge");
-		assert_eq!(b.open(137, &edge).unwrap(), b"window edge");
+		// But a seq just inside the window (2000 - 1023 = 977) is still accepted.
+		let edge = a.seal(977, b"window edge");
+		assert_eq!(b.open(977, &edge).unwrap(), b"window edge");
+	}
+
+	#[test]
+	fn open_in_place_round_trips_and_enforces_replay() {
+		// `open_in_place` (B7 hot-path decrypt) must match `open`: decrypt the
+		// ciphertext in place, then reject a replay of the same seq.
+		let (a, b) = pair();
+		let ct = a.seal(7, b"in-place payload");
+		let mut buf = ct.clone();
+		assert!(b.open_in_place(7, &mut buf).is_ok());
+		assert_eq!(buf, b"in-place payload");
+		// Replaying the same seq is rejected just like `open`.
+		let mut again = ct;
+		assert!(matches!(
+			b.open_in_place(7, &mut again),
+			Err(CryptoError::Replay)
+		));
 	}
 
 	#[test]

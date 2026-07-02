@@ -104,6 +104,11 @@ struct SessionCleanupGuard {
 	fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 	#[cfg(target_os = "linux")]
 	cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
+	/// This session's capture generation counter (shared with on_stream). Bumped in
+	/// Drop so a capture::start task still in the portal picker — when cap_slot is
+	/// empty — observes the change and aborts, dismissing the dialog.
+	#[cfg(target_os = "linux")]
+	cap_gen: Arc<std::sync::atomic::AtomicU64>,
 	/// Display-mode watcher task; aborted here so an abort()-path teardown (e.g.
 	/// go_online reconnect) cancels it immediately instead of waiting up to ~1.5 s
 	/// for the next restream_tx.is_closed() check.  On Windows this watcher is
@@ -183,8 +188,16 @@ impl Drop for SessionCleanupGuard {
 		// The runtime is still live when this Drop runs: abort() fires from within the
 		// running Tokio executor, not from its shutdown path.
 		#[cfg(target_os = "linux")]
-		if let Some(cap) = self.cap_slot.lock().unwrap().take() {
-			let _ = tokio::spawn(cap.stop());
+		{
+			// Bump FIRST so a capture::start STILL SITTING IN THE PORTAL PICKER (nothing
+			// in cap_slot yet) sees the stale generation and drops its start future,
+			// which dismisses the picker (capture.rs's SessionCloseGuard). Covers the
+			// abort() teardown path, where serve_with's own cleanup (which also bumps
+			// cap_gen) is skipped.
+			self.cap_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			if let Some(cap) = self.cap_slot.lock().unwrap().take() {
+				let _ = tokio::spawn(cap.stop());
+			}
 		}
 		// Release per-session redirect ownership; idempotent if already released
 		// by the normal teardown block.
@@ -479,8 +492,13 @@ pub(crate) async fn go_online(
 			let incoming = incoming.clone();
 			let host_out = host_out.clone();
 			let active = active.clone();
+			// PER-SESSION restore token (was a shared AppState clone): start each new
+			// incoming connection with `None` so the Wayland ScreenCast picker prompts
+			// on EVERY new connection (re-consent per remote viewer). The token the
+			// portal returns is still reused WITHIN this session for re-streams
+			// (resolution/codec/monitor changes) so those don't re-prompt.
 			#[cfg(target_os = "linux")]
-			let restore_token = restore_token.clone();
+			let restore_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 			let app_h = app_h.clone();
 			let peer = {
 				let id = session.peer();
@@ -803,6 +821,10 @@ pub(crate) async fn go_online(
 				// have no DXGI ACCESS_LOST signal).  On Windows this only fires for ffmpeg-path
 				// sessions because on_stream only populates last_req_store when native_started=false.
 				let (restream_tx, restream_rx) = tokio::sync::mpsc::channel::<StreamReq>(4);
+				// Also handed to on_nack: on the ffmpeg fallback path (no live CaptureHandle to force
+				// an IDR on) a client keyframe-request — MediaNack([0]) — re-issues the last StreamReq
+				// here so capture restarts with a fresh IDR (see on_nack below for the gating).
+				let nack_restream_tx = restream_tx.clone();
 				// Poll the host's own display geometry; on a STABLE change to the streamed
 				// display's size, re-issue the stored StreamReq once so capture rebuilds at the
 				// new size. Inert when nothing has streamed yet (no stored req) and on platforms
@@ -947,6 +969,17 @@ pub(crate) async fn go_online(
 				// one monitor. `None` until a launch resolves a window (or the launch had none, e.g.
 				// the Desktop entry), in which case the stream takes the normal display path.
 				let launched_hwnd: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
+				// The HWND the CURRENT stream is ACTUALLY per-window (WGC) capturing, published by
+				// `make_on_stream` (Bug 0). `launched_hwnd` only records the resolver's discovered
+				// window; the stream may still fall back to WHOLE-MONITOR capture (no NVENC / HDR /
+				// 4:4:4 / PULSAR_FFMPEG_CAPTURE / a capture-start error), in which case the video
+				// shows the monitor, not the window. `on_input` must gate its per-window PostMessage
+				// routing on THIS (the confirmed capture target) — NOT on `launched_hwnd` — so kb/
+				// mouse never diverts into a window the client can't even see. Set to the target only
+				// when the native WGC path started with that window; cleared to `None` on every other
+				// path. Windows-only (WGC + WindowInput are Windows-only).
+				#[cfg(windows)]
+				let win_capture_hwnd: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
 				let provider = {
 					let games = games.clone();
 					let ffmpeg = crate::process::ffmpeg_bin(&app_h);
@@ -1043,6 +1076,8 @@ pub(crate) async fn go_online(
 					native_out_arc.clone(),
 					#[cfg(windows)]
 					native_gen_arc.clone(),
+					#[cfg(windows)]
+					win_capture_hwnd.clone(),
 					launched_hwnd.clone(),
 					stats_out.clone(),
 					app_h.clone(),
@@ -1080,8 +1115,13 @@ pub(crate) async fn go_online(
 					// keeps the global `DesktopInput` path, unchanged. HONEST CEILING: PostMessage reaches
 					// Win32 message-pump apps only, NOT DirectInput/RawInput/GetAsyncKeyState games — see
 					// `pulsar_core::input::WindowInput` docs; those need OS multiseat (out of scope).
+					// Gate per-window routing on the CONFIRMED capture target (Bug 0): the HWND the
+					// current stream is actually WGC-capturing, published by make_on_stream. Reading
+					// `launched_hwnd` directly here routed kb/mouse into the window even when the stream
+					// fell back to whole-monitor capture (non-NVENC host / HDR / 4:4:4 / capture error) —
+					// clicks remapped onto an invisible window while the video showed the monitor.
 					#[cfg(windows)]
-					let launched_hwnd_in = launched_hwnd.clone();
+					let win_capture_hwnd_in = win_capture_hwnd.clone();
 					#[cfg(windows)]
 					let mut window_input: Option<pulsar_core::input::WindowInput> = None;
 					// The HWND currently bound to `window_input` (so we only rebuild when it changes).
@@ -1217,9 +1257,19 @@ pub(crate) async fn go_online(
 								let mut routed_to_window = false;
 								#[cfg(windows)]
 								{
-									let target = *launched_hwnd_in.lock().unwrap();
+									let target = *win_capture_hwnd_in.lock().unwrap();
 									if target != bound_hwnd {
-										// Target changed (resolved / re-launched / cleared): rebuild.
+										// Target changed (resolved / re-launched / cleared): rebuild. Before
+										// routing kb/mouse to the window path, release everything the client is
+										// holding on the GLOBAL desktop injector (SendInput): its up-strokes are
+										// about to be delivered to the window instead, so without this a held
+										// Shift/Ctrl or a drag button stays latched on the host desktop until
+										// teardown (stuck-modifier — Bug 2). flush_held is idempotent and a
+										// no-op when nothing is held. The OLD window injector (Some(a)→Some(b)/
+										// →None) self-releases on Drop when window_input is reassigned below.
+										if let Some(d) = desktop.as_mut() {
+											d.flush_held();
+										}
 										bound_hwnd = target;
 										window_input = match target {
 											Some(h) => pulsar_core::input::WindowInput::new(h),
@@ -1655,7 +1705,46 @@ pub(crate) async fn go_online(
 				// NACK requests from the client → the active video forwarder's channel.
 				let on_nack = {
 					let nack_slot = nack_slot.clone();
+					#[cfg(windows)]
+					let native_idr = native_slot.clone();
+					// ffmpeg-fallback keyframe recovery for the MediaNack([0]) sentinel below:
+					// last_req_store is Some only on the ffmpeg path (native sessions clear it and
+					// use request_idr above); the restart channel re-issues that req so a fresh
+					// ffmpeg/capture opens on an IDR, and last_kf_restart debounces the client's
+					// ~400 ms nack cadence so it can't restart-storm.
+					let last_req_store = last_req_store.clone();
+					let mut last_kf_restart: Option<std::time::Instant> = None;
 					move |seqs: Vec<u16>| {
+						// MediaNack([0]) is the client's keyframe-request sentinel (its decoder
+						// was rebuilt mid-session and needs an IDR now, not at the next scheduled
+						// GOP). seq 0 is ~never in the retransmit ring, so before this the sentinel
+						// was a silent no-op.
+						if seqs.contains(&0) {
+							// Native (NVENC) path: force an immediate IDR on the live encoder.
+							#[cfg(windows)]
+							if let Some(h) = native_idr.lock().unwrap().as_ref() {
+								h.request_idr();
+							}
+							// ffmpeg fallback (no live CaptureHandle): a spawned CLI ffmpeg has no
+							// runtime force-keyframe hook, so re-issue the last StreamReq — a fresh
+							// ffmpeg/capture opens on an IDR. Gated to DESKTOP sessions (game mode's
+							// ~0.25 s GOP self-heals faster than a restart's rebuild, so a restart
+							// there would only regress it) and debounced (1.5 s) so the client's
+							// ~400 ms nack cadence can't restart-storm. last_req_store is populated
+							// only on the ffmpeg path, so native sessions skip this branch entirely.
+							if let Some(req) = last_req_store.lock().unwrap().clone() {
+								let due = last_kf_restart
+									.map(|t| t.elapsed() >= std::time::Duration::from_millis(1500))
+									.unwrap_or(true);
+								if !req.game_mode && due {
+									// Full (a restart already queued / in flight) or Closed (session
+									// torn down) → skip; the next nack or the natural GOP still recovers.
+									if nack_restream_tx.try_send(req).is_ok() {
+										last_kf_restart = Some(std::time::Instant::now());
+									}
+								}
+							}
+						}
 						if let Some(tx) = nack_slot.lock().unwrap().as_ref() {
 							let _ = tx.send(seqs);
 						}
@@ -1716,6 +1805,8 @@ pub(crate) async fn go_online(
 					fwd_slot: fwd_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_slot: cap_slot.clone(),
+					#[cfg(target_os = "linux")]
+					cap_gen: cap_gen.clone(),
 					mode_watcher,
 					sid,
 					incoming: incoming.clone(),

@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pulsar_core::service::{
-	decode_data, media, query_windows, request_stream, send_data, send_input, send_keepalive,
-	DataMsg, InputEvent, QualityPref, StreamReq,
+	decode_data, media, request_stream, send_data, send_input, send_keepalive, DataMsg, InputEvent,
+	QualityPref, StreamReq,
 };
 use pulsar_core::Session;
 use tauri::{AppHandle, Emitter};
@@ -206,10 +206,24 @@ pub(super) async fn hold_session(
 		last_activity: std::time::Instant,
 	}
 	let mut f_xfers: std::collections::HashMap<u32, FileReasm> = std::collections::HashMap::new();
+	// Pending host-window-list query (Phase 2b co-op picker, Bug 4). When the
+	// `host_window_list` command hands us a oneshot reply-sender we fire a `QueryWindows`
+	// over the session and stash the sender + a deadline here — then resolve it from the
+	// inbound demux below when the host's `Windows` reply arrives, instead of a blocking
+	// read-loop that consumed (and discarded) the media/RTP racing on the same session. A
+	// stale query (old / non-Windows host that never replies) resolves to an empty list at
+	// the deadline. At most one is in flight; a superseding query answers the prior empty.
+	let mut pending_windows: Option<(
+		tokio::sync::oneshot::Sender<Vec<pulsar_core::service::WindowInfo>>,
+		tokio::time::Instant,
+	)> = None;
 	loop {
 		if !send_flag.load(Ordering::SeqCst) {
 			break;
 		}
+		// Deadline for a still-pending window-list query, so the select's fallback arm can
+		// resolve it empty if the host never sends a `Windows` reply. `None` disables that arm.
+		let win_deadline = pending_windows.as_ref().map(|(_, d)| *d);
 		tokio::select! {
 			ev = input_rx.recv() => match ev {
 				Some(ev) => if send_input(&mut sess, &ev).await.is_err() { break },
@@ -593,6 +607,13 @@ pub(super) async fn hold_session(
 							}
 							_ => {}
 						}
+					} else if let Some(list) = pulsar_core::service::decode_windows(&bytes) {
+						// Host reply to our QueryWindows (Bug 4): resolve the pending
+						// window-list picker query from the inbound demux instead of a
+						// blocking read-loop that consumed the interleaved media/RTP.
+						if let Some((reply, _)) = pending_windows.take() {
+							let _ = reply.send(list);
+						}
 					}
 				}
 				None => break, // host closed the session
@@ -757,17 +778,37 @@ pub(super) async fn hold_session(
 				}
 				None => {}
 			},
-			// On-demand host-window-list query (Phase 2b co-op "window" capture picker): ask
-			// the host over the control session we own and answer on the oneshot. A failed
-			// query (old host / non-Windows host -> no reply within query_windows' own timeout)
-			// resolves to an empty list, so the client picker just shows no windows. Dropping
-			// the reply (client gave up) is fine (`let _ =`).
+			// On-demand host-window-list query (Phase 2b co-op "window" capture picker, Bug 4):
+			// FIRE the QueryWindows request and stash the reply-sender; the host's `Windows`
+			// answer is resolved from the inbound demux above (out of the media/RTP racing on
+			// this same session), NOT via a blocking read-loop whose 16-message budget the video
+			// stream would eat. A still-pending prior query is superseded → answer it empty so its
+			// caller never hangs. A send failure answers empty (picker shows no windows).
 			q = windows_query_rx.recv() => match q {
 				Some(reply) => {
-					let list = query_windows(&mut sess).await.unwrap_or_default();
-					let _ = reply.send(list);
+					if let Some((old, _)) = pending_windows.take() {
+						let _ = old.send(Vec::new());
+					}
+					if pulsar_core::service::send_query_windows(&sess).await.is_err() {
+						let _ = reply.send(Vec::new());
+					} else {
+						pending_windows = Some((
+							reply,
+							tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+						));
+					}
 				}
 				None => {}
+			},
+			// Fallback deadline for a pending window-list query the host never answered (old /
+			// non-Windows host → no `Windows` reply): resolve it to an empty list so the picker
+			// just shows no windows instead of the caller hanging. Disabled when nothing pends.
+			_ = tokio::time::sleep_until(win_deadline.unwrap_or_else(tokio::time::Instant::now)),
+				if win_deadline.is_some() =>
+			{
+				if let Some((reply, _)) = pending_windows.take() {
+					let _ = reply.send(Vec::new());
+				}
 			},
 		}
 	}

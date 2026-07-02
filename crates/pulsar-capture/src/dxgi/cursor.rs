@@ -29,7 +29,6 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
 	IDXGIOutputDuplication, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
-	DXGI_OUTPUT_DESC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
 
@@ -425,11 +424,19 @@ impl CaptureDevice {
 		if GetCursorInfo(&mut ci).is_err() {
 			return;
 		}
-		let desc: DXGI_OUTPUT_DESC = match self.output.GetDesc() {
-			Ok(d) => d,
-			Err(_) => return,
+		// B11: the monitor rect only changes on a resolution/output rebuild (which clears this
+		// cache via build_pool/teardown_duplication), so fetch IDXGIOutput::GetDesc ONCE and reuse
+		// it — instead of a GetDesc COM call every tick on the pacing-critical path.
+		let r = match self.output_rect_cache {
+			Some(r) => r,
+			None => match self.output.GetDesc() {
+				Ok(d) => {
+					self.output_rect_cache = Some(d.DesktopCoordinates);
+					d.DesktopCoordinates
+				}
+				Err(_) => return,
+			},
 		};
-		let r = desc.DesktopCoordinates;
 		let p = ci.ptScreenPos;
 		let on_output = p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 		self.cursor.visible = ci.flags == CURSOR_SHOWING && on_output;
@@ -478,10 +485,10 @@ impl CaptureDevice {
 				Err(_) => return self.pool.as_ref(),
 			}
 		}
-		let comp = match self.compositor.as_ref() {
-			Some(c) => c,
-			None => return self.pool.as_ref(),
-		};
+		// Bail before any GPU work if the compositor isn't available (a prior build failed).
+		if self.compositor.is_none() {
+			return self.pool.as_ref();
+		}
 		let present = match self.present.as_ref() {
 			Some(p) => p.clone(),
 			None => return self.pool.as_ref(),
@@ -490,16 +497,33 @@ impl CaptureDevice {
 		// 1. Fresh copy of the clean desktop into `present` (erases last tick's cursor).
 		self.context.CopyResource(&present, pool);
 
-		// 2. Blend the cursor onto `present`. Build an RTV over it; on failure fall back.
-		let mut rtv: Option<ID3D11RenderTargetView> = None;
-		if self
-			.device
-			.CreateRenderTargetView(&present, None, Some(&mut rtv))
-			.is_err()
-		{
-			return self.pool.as_ref();
+		// 2. Blend the cursor onto `present`. B11: CACHE the RTV across ticks — `present` only
+		//    changes on a resize/reinit, which clears `present_rtv` (build_pool/teardown), so an
+		//    RTV built once stays valid until then; this drops a CreateRenderTargetView from every
+		//    pacing tick. Built (and the cache filled) BEFORE `comp` is borrowed so the mutable
+		//    cache write doesn't collide with the compositor borrow held through the draws below.
+		//    On a build failure fall back to the clean desktop.
+		if self.present_rtv.is_none() {
+			let mut rtv: Option<ID3D11RenderTargetView> = None;
+			if self
+				.device
+				.CreateRenderTargetView(&present, None, Some(&mut rtv))
+				.is_err()
+			{
+				return self.pool.as_ref();
+			}
+			self.present_rtv = rtv;
 		}
-		let rtv = rtv.unwrap();
+		let rtv = match self.present_rtv.as_ref() {
+			Some(r) => r.clone(),
+			None => return self.pool.as_ref(),
+		};
+
+		// Now take the compositor pipeline (immutable borrow, held through the draws below).
+		let comp = match self.compositor.as_ref() {
+			Some(c) => c,
+			None => return self.pool.as_ref(),
+		};
 
 		let ctx = &self.context;
 		// Viewport positions+sizes the cursor: the VS emits a fullscreen triangle with tex

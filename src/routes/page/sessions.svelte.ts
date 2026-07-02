@@ -602,10 +602,12 @@ export class SessionManager {
 			if (s.stopCmd) api.runCommand(s.stopCmd).catch(() => {});
 		}
 		this.removeTab(tabId);
-		// Force-exit fullscreen when the last session closes WITHOUT persisting — this is a
+		// Force-exit fullscreen ONLY when the LAST session closes WITHOUT persisting — this is a
 		// programmatic exit, not the user's intent, so it must not clobber the saved
-		// game-mode fullscreen preference (restored next launch).
-		if (this.fullscreen) {
+		// game-mode fullscreen preference (restored next launch). Closing one pane/tab while
+		// other sessions are still live (e.g. split couch co-op) must NOT drop the whole window
+		// out of fullscreen for the players still streaming.
+		if (this.sessions.length === 0 && this.fullscreen) {
 			this.fullscreen = false;
 			setFullscreen(false).catch(() => {});
 		}

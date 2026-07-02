@@ -96,7 +96,16 @@ impl CaptureDevice {
 				return RunExit::Switch(req_out);
 			}
 
-			let deadline = start + frame_no * interval_ns;
+			let now0 = self.qpc.now_ns();
+			let mut deadline = start + frame_no * interval_ns;
+			if now0 - deadline > 2 * interval_ns {
+				// Big overrun (a stall / long IDR encode / scheduler hiccup): re-anchor the
+				// cadence to NOW instead of bursting several catch-up frames back-to-back —
+				// the client renders a catch-up burst as a jump+gap latency SPIKE. One long
+				// tick now costs ~1 frame, not a burst.
+				start = now0 - frame_no * interval_ns;
+				deadline = now0;
+			}
 			frame_no += 1;
 
 			// 1. Grab a frame, WAITING up to this frame's deadline for a real screen/pointer
@@ -137,6 +146,10 @@ impl CaptureDevice {
 					// fullscreen app) — all invalidate the duplication. Rebuild it, then decide.
 					// Don't emit a frame this tick.
 					self.teardown_duplication();
+					// Snapshot the streamed output index BEFORE reinit(): its find_output can fall
+					// back to a DIFFERENT monitor (index 0) when the streamed one was hot-unplugged,
+					// silently changing self.output_idx.
+					let prev_output_idx = self.output_idx;
 					if self.reinit().is_err() {
 						// Couldn't rebuild — give the host a chance to restart us.
 						return RunExit::Stop;
@@ -156,7 +169,14 @@ impl CaptureDevice {
 					// the unrotated scan-out surface; orientation lives in dup_desc.Rotation), so
 					// without the rotation check a landscape↔portrait flip slips through as a
 					// "rate-only reinit" and the stream permanently bakes the stale orientation.
-					if self.dup_desc.ModeDesc.Width != built_w
+					//
+					// Also treat an output-index CHANGE as a switch even when WxH/rotation are
+					// identical (two same-mode monitors): reinit() re-targeted a different output, so
+					// the outer lib.rs loop must rebuild to republish current_output()/build_gen —
+					// otherwise the host input path stays mapped to the vanished monitor's rect and
+					// absolute clicks land at the wrong virtual-desktop coordinates for the session.
+					if self.output_idx != prev_output_idx
+						|| self.dup_desc.ModeDesc.Width != built_w
 						|| self.dup_desc.ModeDesc.Height != built_h
 						|| self.rotation_deg() != built_rotation
 					{
@@ -174,8 +194,15 @@ impl CaptureDevice {
 				Capture::Error(_e) => {
 					// One reinit retry on an unclassified error, then exit cleanly.
 					self.teardown_duplication();
+					let prev_output_idx = self.output_idx;
 					if self.reinit().is_err() {
 						return RunExit::Stop;
+					}
+					// If reinit() fell back to a different monitor (streamed output gone), rebuild via
+					// the outer loop so current_output()/build_gen + the host input rect follow it —
+					// same silent-desync guard as the Reinit arm above.
+					if self.output_idx != prev_output_idx {
+						return RunExit::Switch(self.output_idx);
 					}
 					// Re-anchor the pacing clock after the reinit sleeps, as above.
 					start = self.qpc.now_ns();

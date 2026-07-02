@@ -91,7 +91,10 @@ pub const NV_ENC_TUNING_INFO_LOW_LATENCY: u32 = 2;
 pub const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
 pub const NV_ENC_H264_ENTROPY_CODING_MODE_CABAC: u32 = 1;
 // NV_ENC_RC_FLAGS bit: zero reorder delay.
-pub const NV_ENC_RC_FLAG_ZERO_REORDER_DELAY: u32 = 0x4;
+// zeroReorderDelay is bit 9 of the NV_ENC_RC_PARAMS bitfield word. (0x4 is bit 2 =
+// enableInitialRCQP — the old value wrongly armed initial-QP RC; harmless only while the
+// config was ignored, but wrong once encodeConfig is honored.)
+pub const NV_ENC_RC_FLAG_ZERO_REORDER_DELAY: u32 = 0x200;
 
 // --- GUIDs (stable across NVENC versions — copy the header bytes exactly) -----
 // Codec: H.264 = 6BC82762-4E63-4ca4-AA85-1E50F321F6BF
@@ -503,14 +506,15 @@ pub struct NV_ENC_INITIALIZE_PARAMS {
 	pub frameRateNum: u32,
 	pub frameRateDen: u32,
 	pub enableEncodeAsync: u32,
-	ptd_flags: u32, // bitfield word: enablePTD(bit0) + the rest
-	pub reportSliceOffsets: u32,
-	pub enableSubFrameWrite: u32,
-	pub enableExternalMEHints: u32,
-	pub enableMEOnlyMode: u32,
-	pub enableWeightedPrediction: u32,
-	pub enableOutputInVidmem: u32,
-	pub reservedBitFields: u32,
+	ptd_flags: u32, // enablePTD lives at bit 0 of this word (set via set_enablePTD)
+	// reportSliceOffsets:1, enableSubFrameWrite:1, enableExternalMEHints:1, enableMEOnlyMode:1,
+	// enableWeightedPrediction:1, enableOutputInVidmem:1, reservedBitFields:26 — ONE packed u32
+	// in nvEncodeAPI.h. Declaring them as SEVEN separate words (the old bug) pushed `encodeConfig`
+	// 24 bytes past the driver-expected offset 88 → the driver read `encodeConfig` as NULL → the
+	// ENTIRE NV_ENC_CONFIG (CBR / averageBitRate / VBV) was silently dropped at init AND at every
+	// nvEncReconfigureEncoder, so the encoder ran NVENC's default RC and ignored all bitrate
+	// requests (no init cap, no adaptive-bitrate). Keep this ONE word; the offset assert below pins it.
+	pub bitfields: u32,
 	pub privDataSize: u32,
 	pub privData: *mut c_void,
 	pub encodeConfig: *mut NV_ENC_CONFIG,
@@ -534,6 +538,12 @@ impl NV_ENC_INITIALIZE_PARAMS {
 		}
 	}
 }
+
+// Pin the ABI: on x64 the driver reads `encodeConfig` at offset 88. If a field width above is
+// wrong, encodeConfig moves and the driver reads it as garbage/NULL → it silently ignores the
+// whole NV_ENC_CONFIG (the bitrate bug this fixed). A compile error here means the layout drifted.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::offset_of!(NV_ENC_INITIALIZE_PARAMS, encodeConfig) == 88);
 
 #[repr(C)]
 pub struct NV_ENC_REGISTER_RESOURCE {

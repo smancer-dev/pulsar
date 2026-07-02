@@ -167,22 +167,49 @@ pub fn save_received_file_chunks<'a>(
 			Err(_) => return None,
 		}
 	}
-	// Write to a sibling `.part` temp file so that a mid-stream failure never
-	// leaves a partial file under the real name and never poisons the dedup
-	// counter for a subsequent retry of the same transfer.
-	let tmp_path = path.with_extension(format!("{}.part", ext.trim_start_matches('.')));
-	let write_result = (|| {
-		let mut file = std::fs::File::create(&tmp_path).ok()?;
-		for chunk in chunks {
-			file.write_all(chunk).ok()?;
+	// Write to a sibling `.part` temp file so that a mid-stream failure never leaves a
+	// partial file under the real name and never poisons the dedup counter for a retry.
+	//
+	// The temp is reserved with create_new too — NOT just derived-and-truncated. The
+	// transfer name is peer-controlled, so a name whose derived `.part` sibling collides
+	// with ANOTHER concurrent transfer's create_new-reserved FINAL path (e.g. `report.txt`
+	// -> temp `report.txt.part`, which is also the reserved final path of a peer-named
+	// `report.txt.part`) would let a plain File::create TRUNCATE that other transfer's file.
+	// A process-unique sequence keeps our own concurrent temps distinct; create_new then
+	// guarantees exclusivity against any peer-chosen name. The suffix is appended to the
+	// already-reserved unique `path`, so the temp name is never itself a dedup candidate.
+	static PART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let (mut file, tmp_path) = loop {
+		let seq = PART_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let mut os = path.clone().into_os_string();
+		os.push(format!(".{seq}.part"));
+		let candidate = PathBuf::from(os);
+		match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+			Ok(f) => break (f, candidate),
+			// A peer pre-created exactly this name — advance to the next sequence value.
+			Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+			Err(_) => {
+				// Roll back the final-path reservation before bailing.
+				let _ = std::fs::remove_file(&path);
+				return None;
+			}
 		}
-		Some(())
-	})();
-	if write_result.is_none() {
+	};
+	let mut write_ok = true;
+	for chunk in chunks {
+		if file.write_all(chunk).is_err() {
+			write_ok = false;
+			break;
+		}
+	}
+	// Close the temp handle before the rename (a lingering open handle can block it on
+	// Windows), then either publish it or clean up.
+	drop(file);
+	if !write_ok {
 		let _ = std::fs::remove_file(&tmp_path);
-		// Roll back the create_new reservation at `path`: otherwise a failed
-		// .part write leaves a zero-byte stub under the real name and poisons
-		// the dedup counter for a subsequent retry of the same transfer.
+		// Roll back the create_new reservation at `path`: otherwise a failed .part write
+		// leaves a zero-byte stub under the real name and poisons the dedup counter for a
+		// subsequent retry of the same transfer.
 		let _ = std::fs::remove_file(&path);
 		return None;
 	}

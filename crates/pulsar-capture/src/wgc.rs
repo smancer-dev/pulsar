@@ -55,7 +55,6 @@ use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
@@ -103,8 +102,10 @@ pub struct WgcCaptureDevice {
     /// The WinRT capture item (HWND→item). Holds a Closed event we don't subscribe to;
     /// we detect closure by `IsWindow(hwnd)` + `TryGetNextFrame` returning errors instead.
     item: GraphicsCaptureItem,
-    /// The WinRT D3D device wrapper around `device` (frame pool + session need this handle).
-    rt_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice,
+    /// The WinRT D3D device wrapper around `device`, kept alive for the pool/session's lifetime
+    /// (they were created from it). Underscore-prefixed: held for its refcount, never read now that
+    /// a content-resize rebuilds the whole device instead of `Recreate`-ing the pool in place.
+    _rt_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice,
     /// The free-threaded frame pool (B8G8R8A8). Recreated on a content-size change.
     pool: Direct3D11CaptureFramePool,
     /// The live capture session (Drop closes it → stops capture).
@@ -113,12 +114,26 @@ pub struct WgcCaptureDevice {
     /// tick. We `CopyResource` each WGC frame's texture into this so the encoder always
     /// reads ONE fixed texture (exactly like the DXGI path's `pool`).
     tex: Option<ID3D11Texture2D>,
-    /// Current capture (content) size — the frame-pool + `tex` dimensions. Updated on a
-    /// size change (the pool is `Recreate`d, `tex` rebuilt).
+    /// Current capture (content) size — the frame-pool + `tex` dimensions. On a content-size
+    /// change `run` returns `RunExit::Switch` so lib.rs rebuilds capture+encoder at the new size.
     width: u32,
     height: u32,
+    /// The monitor index this session was started with. WGC captures a WINDOW (not a monitor), so
+    /// this is never used to pick a source; it is carried purely so a content-resize `RunExit::Switch`
+    /// hands lib.rs back the SAME index (keeping its `output_idx`/`current_output()` stable across
+    /// the rebuild instead of clobbering it with a placeholder).
+    output_idx: u32,
     /// Session-stop flag (cloned from the capture thread's `stop`); polled in `run`.
     stop: Arc<AtomicBool>,
+}
+
+/// Outcome of one `pump_latest` drain: a fresh frame was copied into `tex`, no new frame arrived
+/// this tick (reuse the last surface), or the captured window's content size changed (which
+/// invalidates the encoder's fixed-size textures → `run` triggers a full rebuild).
+enum Pump {
+    Fresh,
+    Idle,
+    Resized,
 }
 
 impl WgcCaptureDevice {
@@ -129,9 +144,12 @@ impl WgcCaptureDevice {
     /// can fall back to ffmpeg, exactly like `CaptureDevice::create`.
     ///
     /// `_fast_transient` is accepted for signature-parity with `CaptureDevice::create`
-    /// (WGC has no equivalent transient-duplication retry budget); it is ignored.
+    /// (WGC has no equivalent transient-duplication retry budget); it is ignored. `output_idx`
+    /// is likewise carried only so a content-resize rebuild can round-trip it back to lib.rs
+    /// (WGC follows a window, not a monitor).
     pub unsafe fn create(
         hwnd: isize,
+        output_idx: u32,
         stop: Arc<AtomicBool>,
         _fast_transient: bool,
     ) -> windows::core::Result<Self> {
@@ -193,12 +211,13 @@ impl WgcCaptureDevice {
             context,
             hwnd,
             item,
-            rt_device,
+            _rt_device: rt_device,
             pool,
             session,
             tex: None,
             width,
             height,
+            output_idx,
             stop,
         };
         me.build_pool_texture()?;
@@ -347,10 +366,10 @@ impl WgcCaptureDevice {
         let qpc = Qpc::new();
 
         let mut have_content = false;
-        // QPC anchor: deadline for frame N is `start + N*interval`. WGC never re-anchors mid-run
-        // (no DXGI-style mode-change reinit — a content-resize is absorbed by Recreate in-band),
-        // so unlike the DXGI loop this stays fixed.
-        let start = qpc.now_ns();
+        // QPC anchor: deadline for frame N is `start + N*interval`. A content-resize is absorbed
+        // by Recreate in-band (no DXGI-style mode-change reinit), but we DO re-anchor on a big
+        // pacing overrun below (A17), so `start` is mutable.
+        let mut start = qpc.now_ns();
         let mut frame_no: i64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
@@ -363,20 +382,42 @@ impl WgcCaptureDevice {
                 return RunExit::Stop;
             }
 
-            let deadline = start + frame_no * interval_ns;
+            // A17: re-anchor the cadence on a big overrun (a stall / long encode / scheduler
+            // hiccup), mirroring the DXGI pacing loop (dxgi/pacing.rs ~99-108). Without this the
+            // post-stall deadlines are all in the past and the loop bursts several catch-up frames
+            // back-to-back, which the client renders as a jump+latency SPIKE. One long tick now
+            // costs ~1 frame, not a burst.
+            let now0 = qpc.now_ns();
+            let mut deadline = start + frame_no * interval_ns;
+            if now0 - deadline > 2 * interval_ns {
+                start = now0 - frame_no * interval_ns;
+                deadline = now0;
+            }
             frame_no += 1;
 
             // 1. Drain the freshest frame: WGC's free-threaded pool buffers up to POOL_BUFFERS
             //    frames; pull the MOST RECENT (drop older ones) to minimize latency, copy it
-            //    into the stable `tex`. `None` (no new frame this interval) → reuse last `tex`.
+            //    into the stable `tex`. `Idle` (no new frame this interval) → reuse last `tex`.
             match self.pump_latest() {
-                Ok(Some(())) => {
+                Ok(Pump::Fresh) => {
                     have_content = true;
                     last_was_new = true;
                 }
-                Ok(None) => {
+                Ok(Pump::Idle) => {
                     // No new frame this tick — reuse the last surface (paced reuse path).
                     last_was_new = false;
+                }
+                Ok(Pump::Resized) => {
+                    // The captured window's content size changed. Unlike the DXGI path, we can't
+                    // just recreate the pool in-band: the encoder's textures are sized to the OLD
+                    // capture size (in the HYBRID cross-adapter path `amd_shared` is a fixed-size
+                    // STAGING, so submit()'s CopyResource(amd_shared, frame.texture) would be a
+                    // dimension mismatch D3D11 silently drops → the client freezes on the last
+                    // pre-resize frame). Return Switch so lib.rs rebuilds capture+encoder at the new
+                    // size (it re-creates this WgcCaptureDevice on the SAME window and re-opens NVENC
+                    // sized to the new extent — the encoder rebuild also forces a fresh IDR). The
+                    // carried index is just this session's output_idx, kept stable across the rebuild.
+                    return RunExit::Switch(self.output_idx);
                 }
                 Err(_e) => {
                     // A transient WGC error (e.g. mid-resize). Reuse last surface; if we never
@@ -400,9 +441,9 @@ impl WgcCaptureDevice {
                         width: self.width.max(2) & !1,
                         height: self.height.max(2) & !1,
                         is_new: last_was_new,
-                        // WGC never reinits the encoder mid-run the way a DXGI mode-change does
-                        // (a content-resize is handled in-band by Recreate + tex rebuild, which
-                        // keeps the same encode size via the Blt downscale), so no forced IDR.
+                        // A content-resize is NOT handled in-band; it exits via RunExit::Switch (see
+                        // pump_latest → the Pump::Resized arm above) so the encoder is rebuilt at the
+                        // new size and forces its own fresh IDR. Steady-state frames never force one.
                         force_idr: false,
                     };
                     on_frame(&frame);
@@ -412,13 +453,14 @@ impl WgcCaptureDevice {
         RunExit::Stop
     }
 
-    /// Pull the most-recent available WGC frame (dropping any older queued ones to cap
-    /// latency), copy it into the stable `tex`, and handle a content-size change by recreating
-    /// the pool + `tex`. Returns `Ok(Some(()))` when a fresh frame was copied, `Ok(None)` when
-    /// the pool had no new frame this tick, or `Err` on a copy/interop failure.
-    unsafe fn pump_latest(&mut self) -> windows::core::Result<Option<()>> {
+    /// Pull the most-recent available WGC frame (dropping any older queued ones to cap latency)
+    /// and copy it into the stable `tex`. Returns `Pump::Fresh` when a frame was copied,
+    /// `Pump::Idle` when the pool had no new frame this tick, `Pump::Resized` when the window's
+    /// content size changed (the caller rebuilds capture+encoder), or `Err` on a copy/interop
+    /// failure.
+    unsafe fn pump_latest(&mut self) -> windows::core::Result<Pump> {
         let mut got: Option<ID3D11Texture2D> = None;
-        let mut new_size: Option<(u32, u32)> = None;
+        let mut resized = false;
 
         // TryGetNextFrame returns Ok(frame) while frames are queued and an error / null when
         // empty. Loop to drain to the newest so we never encode a stale buffered frame.
@@ -429,11 +471,11 @@ impl WgcCaptureDevice {
                 Err(_) => break,
             };
             // Detect a content-size change (the window resized): WGC keeps delivering at the
-            // OLD pool size until we Recreate, but ContentSize reports the new extent.
+            // OLD pool size until the pool is recreated, but ContentSize reports the new extent.
             if let Ok(cs) = frame.ContentSize() {
                 let (cw, ch) = (cs.Width.max(1) as u32, cs.Height.max(1) as u32);
                 if cw != self.width || ch != self.height {
-                    new_size = Some((cw, ch));
+                    resized = true;
                 }
             }
             // WinRT surface → ID3D11Texture2D via the DXGI-interface-access bridge.
@@ -444,43 +486,24 @@ impl WgcCaptureDevice {
             // `frame` drops here, returning its buffer to the pool — keep looping for a newer one.
         }
 
-        // Apply a pending size change BEFORE copying (so the dest `tex` matches the source).
-        if let Some((cw, ch)) = new_size {
-            self.resize(cw, ch)?;
-            // After Recreate the just-pulled `got` is the OLD size; drop it and wait for the
-            // next tick to deliver a correctly-sized frame into the rebuilt pool.
-            return Ok(None);
+        // A content-size change must NOT be absorbed in-band: the encoder's textures (and, in the
+        // hybrid cross-adapter path, its fixed-size `amd_shared` STAGING) are sized to the OLD
+        // capture size, so a differently-sized frame would be silently dropped by submit()'s
+        // CopyResource. Signal a rebuild; the just-pulled OLD-size `got` is discarded.
+        if resized {
+            return Ok(Pump::Resized);
         }
 
         let Some(src) = got else {
-            return Ok(None);
+            return Ok(Pump::Idle);
         };
         let Some(dst) = self.tex.as_ref() else {
-            return Ok(None);
+            return Ok(Pump::Idle);
         };
         // Straight GPU→GPU blit (same B8G8R8A8 format, same size) on the immediate context —
         // the encoder reads `dst` next. Same pattern as the DXGI `snapshot` CopyResource.
         self.context.CopyResource(dst, &src);
-        Ok(Some(()))
-    }
-
-    /// Handle a window content-size change: update `width`/`height`, `Recreate` the frame pool
-    /// at the new size (keeping the same device/format/buffer count), and rebuild `tex`.
-    unsafe fn resize(&mut self, w: u32, h: u32) -> windows::core::Result<()> {
-        self.width = w.max(1);
-        self.height = h.max(1);
-        let size = SizeInt32 {
-            Width: self.width as i32,
-            Height: self.height as i32,
-        };
-        self.pool.Recreate(
-            &self.rt_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            POOL_BUFFERS,
-            size,
-        )?;
-        self.build_pool_texture()?;
-        Ok(())
+        Ok(Pump::Fresh)
     }
 }
 

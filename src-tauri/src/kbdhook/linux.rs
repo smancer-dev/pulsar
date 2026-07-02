@@ -285,25 +285,45 @@ fn shortcut_held(devs: &[evdev::Device]) -> bool {
 /// Ctrl/Shift/Alt (or any key) latched (the "modifiers stick after Ctrl+Shift+M / Ctrl+Alt+Z"
 /// bug). The Linux analog of the Windows `imp.rs::flush_held` — same guarantee, kernel-sourced.
 fn flush_held(
-	tx: &Sender<InputEvent>,
+	app: &AppHandle,
+	default_tx: &Sender<InputEvent>,
 	grabbed: &[evdev::Device],
 	held_buttons: &mut std::collections::HashSet<u8>,
 ) {
-	let mut released: std::collections::HashSet<u16> = std::collections::HashSet::new();
+	// Route each device's held-key UPs to the SAME session its key-downs were forwarded to
+	// (split kbm-lock: a keyboard LOCKED to a pane routes to THAT pane, everything else to the
+	// focused-session `default_tx`). Sending every flush to `default_tx` instead left a modifier
+	// held on a pane-locked keyboard latched on that pane's host until teardown — its down went
+	// to pane N but the flush-up went elsewhere, so the host's uinput never released it. No
+	// cross-device dedup: each device flushes to its own route (a duplicate idempotent UP is
+	// harmless, and two panes must each get their own release).
 	for d in grabbed.iter() {
 		if let Ok(st) = d.get_key_state() {
+			let tx = kbm_route(app, &dev_key_of(d), default_tx);
 			for key in st.iter() {
 				let code = key.code();
 				// 272..=274 = BTN_LEFT/RIGHT/MIDDLE — released via held_buttons below, never here
 				// (querying them would re-introduce the phantom right/middle-click).
-				if !(272..=274).contains(&code) && released.insert(code) {
-					fwd(tx, InputEvent::Key { code: code as u32, down: false });
+				if !(272..=274).contains(&code) {
+					fwd(&tx, InputEvent::Key { code: code as u32, down: false });
 				}
 			}
 		}
 	}
+	// Held mouse buttons carry no device tag, so route each to the pane owning the mouse that
+	// still reports it down (get_key_state is a routing PROBE only — the emit stays gated by
+	// held_buttons, so no phantom right/middle-click), falling back to the default session.
 	for button in held_buttons.drain() {
-		fwd(tx, InputEvent::PointerButton { button, down: false });
+		let code = 272u16 + button as u16;
+		let tx = grabbed
+			.iter()
+			.find(|d| {
+				d.get_key_state()
+					.map_or(false, |st| st.iter().any(|k| k.code() == code))
+			})
+			.map(|d| kbm_route(app, &dev_key_of(d), default_tx))
+			.unwrap_or_else(|| default_tx.clone());
+		fwd(&tx, InputEvent::PointerButton { button, down: false });
 	}
 }
 
@@ -424,6 +444,11 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 		// genuinely new node appears (real hotplug) — see the comment at the gate.
 		let mut seen_nodes: std::collections::HashSet<std::path::PathBuf> =
 			std::collections::HashSet::new();
+		// Un-shadowed handle to the DEFAULT (focused-session) sender. Inside the batch loop
+		// below `tx` gets SHADOWED per-device by kbm_route; the flush paths (want_suspend /
+		// combos / thread-exit) must route each grabbed device's UPs via kbm_route with THIS as
+		// the fallback, so keep the default reachable under a name the shadow can't hide.
+		let default_tx = tx.clone();
 		while GEN.load(Ordering::SeqCst) == gen {
 			if last_rescan.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 				last_rescan = Some(std::time::Instant::now());
@@ -578,19 +603,10 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 					// was held latched it on the host for the rest of the session. Also drains
 					// held_buttons. get_key_state is valid on ungrabbed-but-open fds (same fds,
 					// just without EVIOCGRAB) — verified by the chord_mods comment above.
-					flush_held(&tx, &grabbed, &mut held_buttons);
-					// And any GENUINELY-held mouse button (a disengage mid-drag otherwise left the
-					// host's uinput holding BTN_LEFT — a stuck drag). Only the buttons actually down,
-					// NOT a blind 0..3 (which released RIGHT+MIDDLE → a phantom context-menu click).
-					for button in held_buttons.drain() {
-						fwd(
-							&tx,
-							InputEvent::PointerButton {
-								button,
-								down: false,
-							},
-						);
-					}
+					// flush_held drains held_buttons too (routing each genuinely-held mouse button
+					// per device — a disengage mid-drag otherwise left the host's uinput holding
+					// BTN_LEFT), so no separate button-release loop is needed here.
+					flush_held(&app, &default_tx, &grabbed, &mut held_buttons);
 					// Drop the tracked modifier state too: after the ungrab the physical key-UPs go to
 					// the LOCAL OS, never to fetch_events, so a held modifier would stay latched here.
 					// lalt was NOT reset before — a stale lalt (after Ctrl+Alt+Z) forced every later
@@ -691,7 +707,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 									// RELEASE control (grab off, session + thread stay alive) —
 									// the next video click re-engages. Ending is Ctrl+Shift+Q.
 									// Release everything held FIRST so no key latches on the host.
-									flush_held(&tx, &grabbed, &mut held_buttons);
+									flush_held(&app, &default_tx, &grabbed, &mut held_buttons);
 									let _ = app.emit("kbd-released", ());
 									ENGAGED.store(false, Ordering::SeqCst);
 									// Explicit detach: don't let a kiosk session auto-re-engage it away.
@@ -725,7 +741,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 									if cmod && amod {
 										// Ctrl+Alt+Z detach: release every held key/button to the
 										// host BEFORE disengaging, or Ctrl/Alt stay latched there.
-										flush_held(&tx, &grabbed, &mut held_buttons);
+										flush_held(&app, &default_tx, &grabbed, &mut held_buttons);
 										let _ = app.emit("kbd-released", ());
 										ENGAGED.store(false, Ordering::SeqCst);
 										// Explicit detach: don't let a kiosk session auto-re-engage it away.
@@ -741,7 +757,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										// the Tauri→JS→overlay_suspend round-trip) — otherwise the
 										// Ctrl+Shift held for this combo stay latched on the host
 										// while the grab suspends + their key-up is swallowed.
-										flush_held(&tx, &grabbed, &mut held_buttons);
+										flush_held(&app, &default_tx, &grabbed, &mut held_buttons);
 										let _ = app.emit("overlay-toggle", ());
 									} else if code == KEY_F12 {
 										// Fullscreen toggle (Ctrl+Shift+F12) -- does NOT end the
@@ -757,7 +773,7 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 										// held chord FIRST (Windows imp.rs does the same before
 										// kbd-leave) so Ctrl/Shift don't latch on the still-alive
 										// host while the session tears down.
-										flush_held(&tx, &grabbed, &mut held_buttons);
+										flush_held(&app, &default_tx, &grabbed, &mut held_buttons);
 										let _ = app.emit("kbd-leave", ());
 										ENGAGED.store(false, Ordering::SeqCst);
 									}
@@ -946,34 +962,54 @@ pub fn enable(app: AppHandle, tx: Sender<InputEvent>, mouse: bool, id: u64, star
 		// We were only forwarding while engaged + not suspended, so only flush then —
 		// otherwise nothing was sent down.
 		if was_engaged && !applied_suspend {
-			// Step 1 — collect held keys while fds are still valid.
-			let mut pending_keys: Vec<InputEvent> = Vec::new();
-			let mut released: std::collections::HashSet<u16> = std::collections::HashSet::new();
+			// Step 1 — collect held keys AND each key's routed sender while the fds/devices
+			// are still valid. Split kbm-lock: a keyboard LOCKED to a pane must flush its UPs
+			// to THAT pane's host, not the focused-session default — otherwise a key still held
+			// at teardown stays latched on the locked pane's uinput. kbm_route reads the lock
+			// map (not the fds), so resolve the route here before `grabbed` is dropped.
+			let mut pending_keys: Vec<(Sender<InputEvent>, InputEvent)> = Vec::new();
 			for d in grabbed.iter() {
 				if let Ok(st) = d.get_key_state() {
+					let route = kbm_route(&app, &dev_key_of(d), &default_tx);
 					for key in st.iter() {
 						let code = key.code();
 						// Mouse buttons (272..=274) are flushed explicitly below as
-						// PointerButton; everything else is a keyboard key.
-						if !(272..=274).contains(&code) && released.insert(code) {
-							pending_keys.push(InputEvent::Key { code: code as u32, down: false });
+						// PointerButton; everything else is a keyboard key. No cross-device
+						// dedup — each device flushes to its own route.
+						if !(272..=274).contains(&code) {
+							pending_keys
+								.push((route.clone(), InputEvent::Key { code: code as u32, down: false }));
 						}
 					}
 				}
 			}
-			// Drain held_buttons now too — the Vec owns the data independently of `grabbed`.
-			let pending_buttons: Vec<u8> = held_buttons.drain().collect();
+			// Held mouse buttons: route each to the mouse that still reports it (probe only —
+			// emit stays gated by held_buttons), else the default session. Owns its data
+			// independently of `grabbed`.
+			let mut pending_buttons: Vec<(Sender<InputEvent>, u8)> = Vec::new();
+			for button in held_buttons.drain() {
+				let code = 272u16 + button as u16;
+				let route = grabbed
+					.iter()
+					.find(|d| {
+						d.get_key_state()
+							.map_or(false, |st| st.iter().any(|k| k.code() == code))
+					})
+					.map(|d| kbm_route(&app, &dev_key_of(d), &default_tx))
+					.unwrap_or_else(|| default_tx.clone());
+				pending_buttons.push((route, button));
+			}
 
 			// Step 2 — release the grab so the local OS regains input NOW.
 			drop(grabbed);
 
-			// Step 3 — best-effort flush to the host (non-blocking; a stalled consumer
-			// may drop some events, but the host's own teardown handles it).
-			for ev in pending_keys {
-				let _ = tx.try_send(ev);
+			// Step 3 — best-effort flush to each device's routed host (non-blocking; a stalled
+			// consumer may drop some events, but the host's own teardown handles it).
+			for (route, ev) in pending_keys {
+				let _ = route.try_send(ev);
 			}
-			for button in pending_buttons {
-				let _ = tx.try_send(InputEvent::PointerButton { button, down: false });
+			for (route, button) in pending_buttons {
+				let _ = route.try_send(InputEvent::PointerButton { button, down: false });
 			}
 		}
 		// `grabbed` already dropped above (or drops here on the non-flush path) →

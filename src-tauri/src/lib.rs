@@ -65,7 +65,7 @@ use commands::{
 	auto_connect_target, available_encoders, connect, controllers, forget_peer, get_config,
 	lan_devices, launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password,
 	node_port, publish_games,
-	relaunch_to_home, run_command, scan_folder, self_update_possible, session_password, set_config,
+	run_command, scan_folder, self_update_possible, session_password, set_config,
 	gamepad_nav_start, gamepad_nav_stop, set_controller_emulation, set_controller_order,
 	set_controller_rumble, set_disabled_controllers, test_controller_rumble, force_ac, default_ui_hwaccel,
 	webview_sw_painted,
@@ -285,9 +285,10 @@ pub fn run() {
 	}
 	{
 		// Parse the auto-connect CLI: `--connect <id|ip> [--connect-pw <pw>] [--mode
-		// game|remote] [--app <name|id>]`. `--mode` defaults to remote (an unrecognized
-		// value silently falls back to remote); `--app` is the host app/game to launch in
-		// game mode (empty / "Desktop" = stream the whole desktop, launch nothing).
+		// game|remote] [--app <name|id>] [--nofullscreen]`. `--mode` defaults to remote (an
+		// unrecognized value silently falls back to remote); `--app` is the host app/game to
+		// launch in game mode (empty / "Desktop" = stream the whole desktop, launch nothing);
+		// `--nofullscreen` (alias `--no-fullscreen`) keeps the kiosk session windowed.
 		let args: Vec<String> = std::env::args().collect();
 		let flag = |n: &str| {
 			args.iter()
@@ -295,6 +296,9 @@ pub fn run() {
 				.and_then(|i| args.get(i + 1))
 				.cloned()
 		};
+		let nofullscreen = args
+			.iter()
+			.any(|a| a == "--nofullscreen" || a == "--no-fullscreen");
 		let target = flag("--connect").map(|id| events::AutoConnect {
 			id,
 			pw: flag("--connect-pw").unwrap_or_default(),
@@ -303,6 +307,7 @@ pub fn run() {
 				.filter(|m| m == "game" || m == "remote")
 				.unwrap_or_else(|| "remote".into()),
 			app: flag("--app").unwrap_or_default(),
+			nofullscreen,
 		});
 		if let Some(ref ac) = target {
 			tracing::info!(id = %ac.id, mode = %ac.mode, app = %ac.app, "auto-connect target set from CLI");
@@ -357,8 +362,8 @@ pub fn run() {
 			// Kiosk auto-engage is ONE-SHOT: arm it only when THIS launch will actually
 			// auto-connect. AUTO_CONNECT alone is the wrong key — app.restart() preserves
 			// argv, so it stays Some for every later manual session of a `--connect`
-			// process — and the `.skip-autoconnect` marker (relaunch_to_home; consumed
-			// later by auto_connect_target) means the frontend will NOT auto-connect.
+			// process — and a `.skip-autoconnect` marker (consumed by auto_connect_target)
+			// means the frontend will NOT auto-connect, so kiosk-engage must stay disarmed too.
 			{
 				let auto = util::AUTO_CONNECT.get().map_or(false, |t| t.is_some());
 				let skip = util::config_path(app.handle())
@@ -460,41 +465,10 @@ pub fn run() {
 					}
 				}
 			}
-			// While fullscreen, stay above the taskbar/other apps ONLY when focused;
-			// drop topmost when alt-tabbed away so other apps come forward normally.
-			WindowEvent::Focused(focused) => {
-				// Main window only — the approval popup (auth.rs) is always-on-top by design
-				// and must not have its flag cleared here. Outside fullscreen this actively
-				// clears topmost, self-healing any path that left the flag set.
-				if window.label() == "main" {
-					let fs = window.state::<AppState>().fs_geom.lock().unwrap().is_some();
-					let _ = window.set_always_on_top(*focused && fs);
-					// Alt+Tab while fullscreen: set_always_on_top(false) re-raises us above ALL
-					// non-topmost windows (HWND_NOTOPMOST), so the app we tabbed to stayed behind.
-					// On blur-while-fullscreen also drop to the BOTTOM so the activated window is on
-					// top (and the taskbar shows); regaining focus re-tops us via the call above.
-					#[cfg(windows)]
-					if fs && !*focused {
-						if let Ok(h) = window.hwnd() {
-							use windows_sys::Win32::Foundation::HWND;
-							use windows_sys::Win32::UI::WindowsAndMessaging::{
-								GetForegroundWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE,
-								SWP_NOSIZE,
-							};
-							unsafe {
-								let me: HWND = h.0 as _;
-								let fg = GetForegroundWindow();
-								// Drop just BELOW whatever took focus — NOT to HWND_BOTTOM, which made
-								// the whole app vanish when you merely pressed the Win key. Below the
-								// new foreground window: an Alt+Tab target shows above us; the Start
-								// menu (topmost) simply overlays us and we stay visible behind it.
-								if !fg.is_null() && fg != me {
-									SetWindowPos(me, fg, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-								}
-							}
-						}
-					}
-				}
+				// Native fullscreen (set_fullscreen) never marks the main window topmost, and
+				// set_window_fullscreen already clears any stray always-on-top on exit, so this
+				// arm no longer manages fullscreen z-order - it only tracks per-window focus below.
+				WindowEvent::Focused(focused) => {
 				// Capture/forward keyboard+mouse + the overlay/leave combos ONLY while
 				// SOME Pulsar window is focused (Linux evdev grab is otherwise global).
 				// See WIN_FOCUS for why the map is OR-ed across all windows.
@@ -569,7 +543,6 @@ pub fn run() {
 			local_ip,
 			node_port,
 			auto_connect_target,
-			relaunch_to_home,
 			self_update_possible,
 			steam_path,
 			scan_folder,

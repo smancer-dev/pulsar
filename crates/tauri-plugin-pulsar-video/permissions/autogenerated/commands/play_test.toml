@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-play-test"
+description = "Enables the play_test command without any pre-configured scope."
+commands.allow = ["play_test"]
+
+[[permission]]
+identifier = "deny-play-test"
+description = "Denies the play_test command without any pre-configured scope."
+commands.deny = ["play_test"]

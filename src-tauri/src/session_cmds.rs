@@ -411,6 +411,14 @@ async fn respawn_render_for_codec(
 					if let Some(idx) = seed.display_idx {
 						let _ = writeln!(si, "display {idx}");
 					}
+					// Replay the last video-placement rect (Windows) so the fresh child covers
+					// only the session's content area — without it VIEW_RECT starts None and the
+					// renderer fills the ENTIRE parent client, burying the title bar/tabs until the
+					// user happens to resize the window (the frontend only re-reports viewrect on a
+					// ResizeObserver / resize / fullscreen toggle, none of which a respawn triggers).
+					if let Some((x, y, w, h)) = seed.viewrect {
+						let _ = writeln!(si, "viewrect {x} {y} {w} {h}");
+					}
 					let _ = si.flush();
 				}
 			}

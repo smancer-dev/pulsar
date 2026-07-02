@@ -252,13 +252,23 @@ impl Encoder {
 		// NOT a periodic tax). A short fps/4 (0.25 s) GOP at 1440p emitted a huge IDR 4×/s; each
 		// big keyframe causes a send burst + an rkmpp decode spike on the Pi → ~150-240 ms
 		// delivery stalls 4×/s → the cursor/typing "teleport" (changed regions freeze until the
-		// next paced frame, static background unaffected). A 4 s safety GOP keeps late-join/
-		// recovery bounded without the per-quarter-second hitch. (env PULSAR_IDR_SEC overrides.)
+		// next paced frame, static background unaffected). A 10 s safety GOP keeps late-join/
+		// recovery bounded while making the periodic big-IDR latency spike rarer still. (env
+		// PULSAR_IDR_SEC overrides.)
+		// A8: chose the SAFE option (longer safety GOP, was 4 s) over switching to NVENC
+		// intra-refresh. The client gates on a real IDR ("drop every packet until a keyframe
+		// decodes"), and intra-refresh emits NO IDR in steady state (recovery is a rolling intra
+		// wave the client's gate wouldn't recognize) — so intra-refresh risks breaking mid-stream
+		// recovery. The connect IDR, the fast-window catch-up IDRs and the on-demand loss-recovery
+		// IDR (submit.rs) are unchanged.
+		// TODO(A8): revisit NVENC intra-refresh (enableIntraRefresh + intraRefreshPeriod=gop +
+		// intraRefreshCnt≈fps) once the client can recover from a recovery-point SEI instead of
+		// requiring a full IDR — it would remove the periodic keyframe spike entirely.
 		let idr_sec = std::env::var("PULSAR_IDR_SEC")
 			.ok()
 			.and_then(|s| s.parse::<u32>().ok())
 			.filter(|&v| v > 0)
-			.unwrap_or(4);
+			.unwrap_or(10);
 		let gop = (fps * idr_sec).max(1);
 		cfg.gopLength = gop;
 		cfg.frameIntervalP = 1; // 1 = no B-frames (IPPP)
@@ -271,6 +281,15 @@ impl Encoder {
 		let vbv = br / fps; // ~1-frame VBV → emit each frame immediately
 		cfg.rcParams.vbvBufferSize = vbv;
 		cfg.rcParams.vbvInitialDelay = vbv;
+		// B11: explicitly PIN the low-latency RC knobs instead of trusting the preset baseline.
+		// multiPass = NV_ENC_MULTI_PASS_DISABLED (0): a multi-pass preset would add an extra
+		// analysis pass per frame = latency. lookaheadDepth = 0: no frame lookahead (lookahead
+		// buffers frames before emitting → latency). Both are public scalar fields, so we set
+		// them directly. (AQ stays off via the ULTRA_LOW_LATENCY / LOW_LATENCY preset baseline —
+		// those presets disable spatial/temporal AQ; the rcParams flags word only exposes an OR
+		// setter, so we don't risk clearing the preset's reserved bits to force it.)
+		cfg.rcParams.multiPass = 0; // NV_ENC_MULTI_PASS_DISABLED
+		cfg.rcParams.lookaheadDepth = 0;
 		// RC flag bits (named, OR'd): zeroReorderDelay (no reorder), no lookahead, no AQ.
 		// Bit positions are stable across NVENC versions (see nvenc consts).
 		cfg.rcParams.set_flags(
@@ -421,6 +440,13 @@ impl Encoder {
 			closed: false,
 			frame_idx: 0,
 			force_idr_once: false,
+			// B3: VideoProcessor view caches start empty; `blt_bgra_to_nv12` fills them lazily
+			// (output view once, input view keyed by source-texture ptr) and sets the stream
+			// rotation once. A rebuilt encoder (resolution/rotation change) gets fresh empties.
+			cached_input_view: None,
+			cached_output_view: None,
+			cached_input_src: ptr::null_mut(),
+			rotation_set: false,
 		})
 	}
 }

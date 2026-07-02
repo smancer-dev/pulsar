@@ -1481,10 +1481,23 @@ pub(crate) async fn start_remote_play(
 				// Second pass: forward each pad at its (possibly remapped) host-facing slot.
 				for r in &fwd_records {
 					let uuid = &r.uuid;
+					// The slot this pad was ACTUALLY forwarded under last tick — read BEFORE we
+					// overwrite prev_slot below. In split mode that is the per-session RENUMBERED slot
+					// (e.g. 0), which differs from the pad's global rank; when routing moves away this
+					// tick the neutral frame must target THAT slot, not the global rank, or the held
+					// state sticks on the real host slot while a phantom pad is plugged at the rank
+					// slot (Bug 1).
+					let last_fwd_slot = prev_slot.get(uuid).copied();
 					// Host-facing slot: remapped in split mode, global rank otherwise. A non-route_here
-					// pad has no fwd_slot_of entry under split; fall back to its global rank for the
-					// prev_slot/last_sent bookkeeping below (it is never forwarded with real input).
-					let fwd_slot = fwd_slot_of.get(uuid).copied().unwrap_or(r.orig_slot);
+					// pad has no fwd_slot_of entry under split; fall back to the slot it was last
+					// forwarded under (so its neutral/disconnect targets that slot), and only to its
+					// global rank if it was never forwarded here at all. route_here pads always have a
+					// fwd_slot_of entry, so this fallback never changes their slot.
+					let fwd_slot = fwd_slot_of
+						.get(uuid)
+						.copied()
+						.or(last_fwd_slot)
+						.unwrap_or(r.orig_slot);
 					prev_slot.insert(uuid.clone(), fwd_slot);
 					// Authoritative reverse map for rumble routing: keyed by the HOST-EMULATED
 					// (forwarded) slot, since host rumble comes back tagged with that slot.

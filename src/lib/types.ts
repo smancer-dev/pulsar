@@ -48,6 +48,8 @@ export interface AutoConnectTarget {
 	pw: string;
 	mode: 'remote' | 'game';
 	app: string;
+	/** `--nofullscreen`: start the kiosk auto-connect session windowed, not fullscreen. */
+	nofullscreen: boolean;
 }
 
 export type DeviceCategory = 'pc' | 'server' | 'console';

@@ -180,8 +180,9 @@ impl Node {
 			}
 			RelayMsg::RelayData { session, payload } => {
 				// Relay-fallback inbound: unwrap the tunnelled PeerMsg.
+				// Move the decoded payload into `deliver` so it can decrypt in place.
 				if let Ok(PeerMsg::Data { seq, payload, .. }) = decode::<PeerMsg>(&payload) {
-					self.deliver(session, seq, &payload).await;
+					self.deliver(session, seq, payload).await;
 				}
 			}
 			RelayMsg::Error { code, message } => {
@@ -385,14 +386,17 @@ impl Node {
 	async fn handle_peer(self: &Arc<Self>, msg: PeerMsg, from: SocketAddr) {
 		match msg {
 			PeerMsg::Punch { session, seq } => {
-				// Ack the connectivity probe regardless (harmless). But a RelayOnly node
-				// must NOT switch the data transport to Direct even if a peer in
-				// Auto/P2pOnly punches us — otherwise traffic would bypass the relay.
-				let _ = self
-					.sock
-					.send_to(&encode(&PeerMsg::PunchAck { session, seq }), from)
-					.await;
+				// A RelayOnly node keeps the session on the relay: it never punches, and it
+				// must NOT ack a peer's Punch either. An ack lets an Auto/P2pOnly peer's
+				// PunchAck arm flip ITS OWN transport to Direct and start sending media
+				// straight to us — bypassing the relay this side explicitly chose (and
+				// direct_ok latches, so it never falls back). So suppress the ack AND skip
+				// adopting Direct locally when RelayOnly.
 				if self.mode != NetworkMode::RelayOnly {
+					let _ = self
+						.sock
+						.send_to(&encode(&PeerMsg::PunchAck { session, seq }), from)
+						.await;
 					let mut g = self.inner.lock().await;
 					if let Some(s) = g.sessions.get_mut(&session) {
 						// SECURITY: only adopt the data path if `from` is one of this
@@ -453,7 +457,7 @@ impl Node {
 				session,
 				seq,
 				payload,
-			} => self.deliver(session, seq, &payload).await,
+			} => self.deliver(session, seq, payload).await,
 			PeerMsg::KeepAlive { .. } => {}
 			PeerMsg::Hello {
 				session,
@@ -633,17 +637,28 @@ impl Node {
 
 	/// Decrypt an inbound payload and hand it to the session's reader.
 	///
-	/// `crypto.open` both authenticates the ciphertext **and** enforces sliding-window
-	/// anti-replay on `seq` (RFC 6479 style, reorder-tolerant since UDP datagrams
-	/// arrive out of order). A failure — bad ciphertext or a replayed/too-old seq — is
-	/// silently dropped, which is the right thing for UDP.
-	async fn deliver(&self, session: SessionId, seq: u64, ciphertext: &[u8]) {
-		let mut g = self.inner.lock().await;
-		if let Some(s) = g.sessions.get_mut(&session) {
-			if let Ok(plain) = s.crypto.open(seq, ciphertext) {
-				if let Some(tx) = &s.data_tx {
-					let _ = tx.send(plain);
-				}
+	/// `crypto.open_in_place` both authenticates the ciphertext **and** enforces
+	/// sliding-window anti-replay on `seq` (RFC 6479 style, reorder-tolerant since UDP
+	/// datagrams arrive out of order). A failure — bad ciphertext or a replayed/too-old
+	/// seq — is silently dropped, which is the right thing for UDP.
+	///
+	/// Takes the ciphertext **by value** so it can be decrypted in place (B7). The
+	/// node lock is held ONLY to clone the (Arc-backed) crypto handle and the data
+	/// sender — the AEAD runs AFTER the lock is released, so recv_loop keeps draining
+	/// the socket during a keyframe burst instead of blocking behind a full decrypt.
+	async fn deliver(&self, session: SessionId, seq: u64, ciphertext: Vec<u8>) {
+		let (crypto, tx) = {
+			let g = self.inner.lock().await;
+			match g.sessions.get(&session) {
+				Some(s) => (s.crypto.clone(), s.data_tx.clone()),
+				None => return,
+			}
+		};
+		// Decrypt in place off-lock; `buf` is truncated to the plaintext on success.
+		let mut buf = ciphertext;
+		if crypto.open_in_place(seq, &mut buf).is_ok() {
+			if let Some(tx) = tx {
+				let _ = tx.send(buf);
 			}
 		}
 	}

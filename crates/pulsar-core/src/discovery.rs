@@ -360,7 +360,30 @@ async fn recv_loop(disc: Weak<Discovery>, cancel: Arc<Notify>, sock: Arc<UdpSock
 				if disc.upgrade().is_none() { return; }
 			}
 			r = sock.recv_from(&mut buf) => {
-				let Ok((n, from)) = r else { return };
+				let (n, from) = match r {
+					Ok(x) => x,
+					// A recv error must NOT permanently kill LAN discovery (announce_loop
+					// would keep beaconing while we never hear a peer again). Mirror the
+					// node/relay recv loops: on Windows an unconnected UDP socket reports a
+					// prior send's ICMP port-unreachable as WSAECONNRESET on the next recv,
+					// and other stacks map ICMP transients to these kinds — all spurious for
+					// a connectionless socket, so keep looping.
+					Err(e) if matches!(
+						e.kind(),
+						std::io::ErrorKind::ConnectionReset
+							| std::io::ErrorKind::ConnectionRefused
+							| std::io::ErrorKind::HostUnreachable
+							| std::io::ErrorKind::NetworkUnreachable
+					) => continue,
+					// Anything else (e.g. a Windows oversized-datagram WSAEMSGSIZE, which a
+					// single on-LAN packet could trigger): yield briefly so a hypothetical
+					// persistent error can't spin at 100% CPU, then keep the receiver alive.
+					Err(e) => {
+						tracing::warn!(?e, "discovery recv_loop: unexpected socket error");
+						tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+						continue;
+					}
+				};
 				match disc.upgrade() {
 					Some(d) => d.on_datagram(&buf[..n], from).await,
 					None => return,

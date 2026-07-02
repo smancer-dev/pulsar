@@ -25,8 +25,9 @@ pub use auth::{
 	send_auth, AuthOutcome, ClientAuth, HostAuth,
 };
 pub use client::{
-	decode_data, is_pong, query_stream_caps, query_windows, request_games, request_launch,
-	request_stream, send_bye, send_data, send_input, send_keepalive,
+	decode_data, decode_windows, is_pong, query_stream_caps, query_windows, request_games,
+	request_launch, request_stream, send_bye, send_data, send_data_via, send_input, send_input_via,
+	send_keepalive, send_query_windows,
 };
 pub use host::{serve, serve_with, DataHandlers};
 pub use wire::{

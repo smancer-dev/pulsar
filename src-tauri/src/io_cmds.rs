@@ -481,14 +481,21 @@ pub(crate) fn native_view_rect(
 			.and_then(|w| w.scale_factor().ok())
 			.unwrap_or(1.0);
 		let px = |v: i32| (v as f64 * scale).round() as i32;
+		let (rx, ry, rw, rh) = (px(x), px(y), px(w), px(h));
 		use std::io::Write as _;
 		// Pull the render_stdin Arc out under the lock, then DROP the plays guard before the
 		// blocking child-stdin write — a full/backed-up pipe must not stall every other
 		// state.plays user (forward() on each input event, the setters). Mirrors render_hint.
-		let stdin = state.plays.lock().unwrap().get(&id).map(|p| p.render_stdin.clone());
+		// Record the rect into RenderSeed under the same lock so a codec/monitor-switch
+		// respawn can replay it — otherwise the fresh child defaults to the whole client
+		// area and buries the app chrome until the user resizes the window.
+		let stdin = state.plays.lock().unwrap().get(&id).map(|p| {
+			p.render_seed.lock().unwrap().viewrect = Some((rx, ry, rw, rh));
+			p.render_stdin.clone()
+		});
 		if let Some(stdin) = stdin {
 			if let Some(si) = stdin.lock().unwrap().as_mut() {
-				let _ = writeln!(si, "viewrect {} {} {} {}", px(x), px(y), px(w), px(h));
+				let _ = writeln!(si, "viewrect {rx} {ry} {rw} {rh}");
 			}
 		}
 	}
