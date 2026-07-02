@@ -1,0 +1,54 @@
+# Pulsar app — Rust workspace (desktop + mobile).
+#
+# Extracted from the Pulsar monorepo. The shared wire protocol and the relay
+# server now live in their own repos and are consumed as git dependencies:
+#   pulsar-proto → github.com/PulsarDesk/pulsar-proto
+#   pulsar-relay → github.com/PulsarDesk/relay   (mobile can run a local relay on-device)
+[workspace]
+resolver = "2"
+members = [
+  "crates/pulsar-core",
+  "crates/pulsar-render",
+  "crates/pulsar-capture",
+  "crates/tauri-plugin-pulsar-video",
+  "src-tauri",
+  "mobile",
+]
+# `cargo test` / `cargo build` only touch the fast, headless core. The Tauri
+# app (which pulls in wry/webkit/gtk/ffmpeg/SDL) is built explicitly with
+# `-p pulsar-tauri`; the mobile shell with `-p pulsar-mobile`.
+default-members = ["crates/pulsar-core"]
+
+[workspace.package]
+version = "0.1.0-dev.27"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Pulsar contributors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+bincode = "1.3"
+rand = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"] }
+socket2 = { version = "0.5", features = ["all"] }
+whoami = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x25519-dalek = "2"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+gilrs = "0.10"
+# Shared crates, now external repos (git dependencies).
+pulsar-proto = { git = "https://github.com/PulsarDesk/pulsar-proto" }
+pulsar-relay = { git = "https://github.com/PulsarDesk/relay" }
+
+# Vendored vigem-client (0.1.4) with the DS4 EXTENDED report added (DS4_REPORT_EX +
+# update_ex + IOCTL_DS4_SUBMIT_REPORT_EX). The published crate only ships the legacy
+# basic DS4 report path, which ViGEmBus doesn't surface the PS button / touchpad through;
+# the EX report does (matches Sunshine). Patch overrides it everywhere (incl. transitive).
+[patch.crates-io]
+vigem-client = { path = "crates/vigem-client" }

@@ -1,0 +1,6 @@
+# Pin the Rust toolchain. Some dependencies require edition 2024 (Rust ≥ 1.85),
+# so the workspace builds on current stable. With a rustup-managed cargo this is
+# selected automatically; otherwise build via `rustup run stable cargo …`.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

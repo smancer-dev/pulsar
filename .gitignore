@@ -1,7 +1,15 @@
 node_modules
+# Workspace-root Cargo target (the workspace lives at the app-repo root now).
+/target
 /build
 /.svelte-kit
 /src-tauri/target
 /src-tauri/gen
+# Tauri mobile generated native project build caches (sources under mobile/gen
+# are committed by mobile/.gitignore's own rules).
+/mobile/gen/android/.gradle
+/mobile/gen/android/app/build
+/mobile/gen/android/build
+/mobile/gen/apple/build
 .DS_Store
 Thumbs.db

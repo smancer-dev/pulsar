@@ -32,7 +32,7 @@ pulsar-core = { path = "../crates/pulsar-core" }
 # Local relay: run the rendezvous/relay server on THIS device (Settings → Ağ →
 # "Yerel relay"). The relay lib is portable (tokio UDP, no host-only deps), so it
 # embeds on Android — other LAN devices then point their relay at this phone.
-pulsar-relay = { path = "../../relay" }
+pulsar-relay.workspace = true
 serde = { workspace = true }
 # Keepalive timer wrapping the session recv (independent of frame arrival).
 tokio = { workspace = true }

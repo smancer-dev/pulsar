@@ -25,7 +25,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 pulsar-core = { path = "../crates/pulsar-core" }
 # Lets the same binary double as a headless relay: `pulsar --relay` (see run_relay).
-pulsar-relay = { path = "../../relay" }
+pulsar-relay.workspace = true
 tokio = { workspace = true }
 socket2 = { workspace = true }
 serde = { workspace = true }

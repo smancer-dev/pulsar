@@ -91,7 +91,7 @@ core-foundation = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time", "net", "sync"] }
-pulsar-relay = { path = "../../../relay" }
+pulsar-relay.workspace = true
 
 # Diagnostic-only: the kbdhook_smoke test probes whether WH_KEYBOARD_LL fires here.
 [target.'cfg(windows)'.dev-dependencies]
