@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Headless Rust core tests on every target OS + arch (incl. ARM Linux for
+  # OrangePi / Raspberry Pi). `cargo test` runs the workspace default-members
+  # (pulsar-core) — the fast headless suite. pulsar-proto/-relay come from git.
+  rust:
+    name: Rust · ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     name: linux-x64 }
+          - { os: ubuntu-22.04-arm, name: linux-arm64 }
+          - { os: windows-latest,   name: windows-x64 }
+          - { os: macos-latest,     name: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # gilrs needs libudev on Linux; the rest match Tauri 2's webkit2gtk-4.1 base.
+      - name: Install Linux deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev libwebkit2gtk-4.1-dev build-essential librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: ${{ matrix.name }}
+
+      # Advisory: the tree predates current-stable rustfmt, so drift is reported
+      # but does not block. (proto/relay are format-gated; the app is not, yet.)
+      - name: rustfmt (advisory)
+        if: matrix.name == 'linux-x64'
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      - name: clippy (headless crate, advisory)
+        if: matrix.name == 'linux-x64'
+        continue-on-error: true
+        run: cargo clippy -p pulsar-core --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked
+
+  # Frontend (SvelteKit) type-check + unit tests. vitest's jsdom chain needs
+  # require(ESM) → Node >= 22.12; bun stays the package manager / script runner.
+  frontend:
+    name: Frontend · svelte-check + unit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: svelte-check
+        run: bun run check
+      - name: Unit tests
+        run: bun run test:unit

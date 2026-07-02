@@ -1,0 +1,268 @@
+name: Release
+
+# Cut from `main`. semantic-release computes the next version from Conventional
+# Commits and creates a git TAG + GitHub Release ONLY — it never commits back to
+# the repo (no @semantic-release/git plugin). The version it computes is stamped
+# into the built installers (scripts/bump-version.mjs), not committed.
+#
+# The heavy signed-installer matrix (build + publish) only runs when the repo
+# variable ENABLE_APP_RELEASE=true AND these secrets are set:
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (updater signing)
+# Until then `prepare` still computes/gate-tests but nothing is released.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 1. Decide the next version from Conventional Commits WITHOUT creating a tag or
+  #    release yet (dry-run). Also the test gate: if tests fail or no release is
+  #    due, nothing downstream runs.
+  prepare:
+    name: Prepare (version + test gate)
+    runs-on: ubuntu-22.04
+    outputs:
+      published: ${{ steps.semrel.outputs.new_release_published }}
+      version: ${{ steps.semrel.outputs.new_release_version }}
+      tag: ${{ steps.semrel.outputs.new_release_git_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install test deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev libwebkit2gtk-4.1-dev build-essential librsvg2-dev
+      - name: Test (gate — no version/build/release if these fail)
+        run: cargo test --locked
+      - name: Compute next version (dry-run — creates NO tag or release)
+        id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          dry_run: true
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@^9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 2. Build the app installers per platform, stamped with the computed version.
+  build:
+    name: Build app · ${{ matrix.name }}
+    needs: prepare
+    if: ${{ needs.prepare.outputs.published == 'true' && vars.ENABLE_APP_RELEASE == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,     name: macos-arm64, args: '--target aarch64-apple-darwin', rust_targets: 'aarch64-apple-darwin', ffmpeg: '' }
+          - { os: macos-latest,     name: macos-x64,   args: '--target x86_64-apple-darwin',  rust_targets: 'x86_64-apple-darwin',  ffmpeg: '--os macos --arch x64' }
+          - { os: windows-latest,   name: windows-x64, args: '', rust_targets: '', ffmpeg: '' }
+          - { os: ubuntu-22.04,     name: linux-x64,   args: '', rust_targets: '', ffmpeg: '' }
+          - { os: ubuntu-22.04-arm, name: linux-arm64, args: '', rust_targets: '', ffmpeg: '' }   # OrangePi / Raspberry Pi
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # libmpv-dev: pulsar-tauri links libmpv on Linux (single-surface renderer);
+      # libxkbcommon-dev: layout-aware key forwarding; libav*-dev: pulsar-render's
+      # ffmpeg-sys-next; libegl1-mesa-dev + libx11-dev: pulsar-render's khronos-egl +
+      # x11; the libasound2-dev … libdbus-1-dev cluster: pulsar-tauri's sdl3-sys is
+      # build-from-source, so CMake compiles SDL3 here and needs its build deps.
+      - name: Install Linux deps (Tauri 2 / webkit2gtk-4.1 + gilrs + mpv + renderer + SDL3)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf libudev-dev libmpv-dev libxkbcommon-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libegl1-mesa-dev libx11-dev \
+            libasound2-dev libpulse-dev \
+            libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
+            libxss-dev libxtst-dev \
+            libgl1-mesa-dev libgles2-mesa-dev libdrm-dev libgbm-dev \
+            libwayland-dev libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: ${{ matrix.name }}
+      - uses: oven-sh/setup-bun@v2
+      - name: Install frontend deps
+        run: bun install --frozen-lockfile
+
+      # Stamp the computed version so the installers report it (no tag exists yet).
+      - name: Stamp version
+        run: bun scripts/bump-version.mjs ${{ needs.prepare.outputs.version }}
+
+      - name: Fetch bundled ffmpeg
+        run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.ffmpeg }}
+
+      # ffplay is the Windows FALLBACK renderer (play.rs spawns it when pulsar-render
+      # is missing); tauri.windows.conf.json bundles resources/ffplay.exe.
+      - name: Fetch bundled ffplay (Windows fallback renderer)
+        if: startsWith(matrix.os, 'windows')
+        run: bun scripts/fetch-player.mjs
+
+      # Windows driver payloads (Interception / ViGEmBus / Virtual-Audio-Driver /
+      # nefcon) land in src-tauri/resources/ and are listed under bundle.resources
+      # in tauri.windows.conf.json — without them the tauri bundler FAILS.
+      - name: Fetch bundled Windows drivers (ViGEm/Interception/Virtual-Audio-Driver/nefcon)
+        if: startsWith(matrix.os, 'windows')
+        run: bun scripts/fetch-drivers.mjs
+
+      # pulsar-render is the DEFAULT video renderer on Windows and Linux, and the
+      # native OVERLAY renderer on macOS. It's a separate workspace crate — tauri-action
+      # only compiles -p pulsar-tauri, so build it here and drop it into resources/.
+      - name: Build native renderer (pulsar-render)
+        shell: bash
+        run: |
+          EXT=''
+          case '${{ matrix.os }}' in windows-*) EXT='.exe' ;; esac
+          if [ -n "${{ matrix.rust_targets }}" ]; then
+            cargo build --release --locked -p pulsar-render --target "${{ matrix.rust_targets }}"
+            BIN="target/${{ matrix.rust_targets }}/release/pulsar-render${EXT}"
+          else
+            cargo build --release --locked -p pulsar-render
+            BIN="target/release/pulsar-render${EXT}"
+          fi
+          mkdir -p src-tauri/resources
+          cp "$BIN" "src-tauri/resources/pulsar-render${EXT}"
+
+      # Point the updater at this branch's channel (build-only edit, not committed).
+      - name: Point updater at this branch's channel
+        shell: bash
+        run: |
+          node -e '
+            const fs=require("fs"); const p="src-tauri/tauri.conf.json";
+            const c=JSON.parse(fs.readFileSync(p));
+            const ch=(process.env.GITHUB_REF_NAME==="dev")
+              ? "updater-dev/latest-dev.json" : "updater-latest/latest.json";
+            c.plugins.updater.endpoints=[
+              `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${ch}`
+            ];
+            fs.writeFileSync(p, JSON.stringify(c,null,2));
+            console.log("endpoint ->", c.plugins.updater.endpoints[0]);
+          '
+
+      - name: Build app bundles
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # Sign the updater artifacts (createUpdaterArtifacts emits a .sig per bundle).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          args: ${{ matrix.args }}
+
+      # Copy ONLY the distributable installers (from artifactPaths), not the bundle
+      # internals (the macOS .app tree, shared libs, helper scripts, …).
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          echo '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]' | while read -r p; do
+            p="${p%$'\r'}"          # strip trailing CR (Windows artifactPaths)
+            if [ -f "$p" ]; then    # copy real installer files; skip the macOS .app directory entry
+              echo "  + $p"
+              cp "$p" release-artifacts/
+            else
+              echo "  - skip (not a file): $p"
+            fi
+          done
+          # macOS updater artifact is named Pulsar.app.tar.gz for BOTH arches, so it
+          # (and its .sig) collide as release assets. Stamp the arch so names are
+          # unique AND match the manifest's darwin-<arch> regexes.
+          case "${{ matrix.name }}" in
+            macos-arm64) MARCH=aarch64 ;;
+            macos-x64)   MARCH=x64 ;;
+            *)           MARCH='' ;;
+          esac
+          if [ -n "$MARCH" ]; then
+            for f in release-artifacts/Pulsar.app.tar.gz release-artifacts/Pulsar.app.tar.gz.sig; do
+              [ -f "$f" ] && mv "$f" "${f/Pulsar.app/Pulsar_${MARCH}.app}"
+            done
+          fi
+          ls -la release-artifacts
+          echo "signatures:"; ls release-artifacts/*.sig 2>/dev/null || echo "  (none — check signing env)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.name }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  # 3. Everything built → NOW create the tag + GitHub release (NO commit) and
+  #    attach all installers + publish the rolling auto-update manifest.
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.published == 'true' && vars.ENABLE_APP_RELEASE == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: semantic-release (create tag + GitHub release, no commit-back)
+        id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@^9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attach installers to the release
+        if: steps.semrel.outputs.new_release_published == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          mapfile -t files < <(find artifacts -type f)
+          printf '%s\n' "${files[@]}"
+          gh release upload "${{ steps.semrel.outputs.new_release_git_tag }}" "${files[@]}" --clobber
+
+      - name: Publish update manifest to the channel release
+        if: steps.semrel.outputs.new_release_published == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [ "${{ github.ref_name }}" = "dev" ]; then CH="latest-dev.json"; CTAG="updater-dev";
+          else CH="latest.json"; CTAG="updater-latest"; fi
+          BASE="https://github.com/${{ github.repository }}/releases/download/${{ steps.semrel.outputs.new_release_git_tag }}"
+          node scripts/gen-update-manifest.mjs \
+            artifacts \
+            "${{ steps.semrel.outputs.new_release_version }}" \
+            "$BASE" \
+            "$CH" \
+            "Pulsar ${{ steps.semrel.outputs.new_release_version }}"
+          cat "$CH"
+          # Fixed-tag channel release holds ONLY the rolling manifest, so its asset
+          # download URL is STABLE (the app's updater endpoint points here).
+          gh release view "$CTAG" >/dev/null 2>&1 || \
+            gh release create "$CTAG" --prerelease --title "Auto-update channel: $CTAG" \
+              --notes "Holds the rolling auto-update manifest ($CH). Do not delete."
+          gh release upload "$CTAG" "$CH" --clobber
