@@ -45,7 +45,7 @@
 	},
 	"plugins": {
 		"updater": {
-			"pubkey": "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklEWXdPVEF5UlRCRU16SkdRa0l4UkRBS1VsZFVVWE5tYzNsRVV6WlJXVXN6VVVKak5XUm5UM1JFVGpCamEyZE9iR3RhWnpSNGRHbzNZMHA2WlZWMlRHWkpRMDg1YzJsWVlTc0s=",
+			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYwOTAyRTBEMzJGQkIxRDAKUldUUXNmc3lEUzZRWUszUUJjNWRnT3RETjBja2dObGtaZzR4dGo3Y0p6ZVV2TGZJQ085c2lYYSsK",
 			"endpoints": [
 				"https://github.com/PulsarDesk/pulsar-desktop/releases/download/updater-dev/latest-dev.json"
 			],
