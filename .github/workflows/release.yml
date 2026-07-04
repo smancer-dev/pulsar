@@ -10,6 +10,7 @@ name: Release
 #   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (updater signing)
 # Until then `prepare` still computes/gate-tests but nothing is released.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
 
