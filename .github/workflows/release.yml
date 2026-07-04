@@ -136,10 +136,10 @@ jobs:
           EXT=''
           case '${{ matrix.os }}' in windows-*) EXT='.exe' ;; esac
           if [ -n "${{ matrix.rust_targets }}" ]; then
-            cargo build --release --locked -p pulsar-render --target "${{ matrix.rust_targets }}"
+            cargo build --release -p pulsar-render --target "${{ matrix.rust_targets }}"
             BIN="target/${{ matrix.rust_targets }}/release/pulsar-render${EXT}"
           else
-            cargo build --release --locked -p pulsar-render
+            cargo build --release -p pulsar-render
             BIN="target/release/pulsar-render${EXT}"
           fi
           mkdir -p src-tauri/resources
