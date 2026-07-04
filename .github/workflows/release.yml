@@ -6,7 +6,7 @@ name: Release
 # into the built installers (scripts/bump-version.mjs), not committed.
 #
 # The heavy signed-installer matrix (build + publish) only runs when the repo
-# variable ENABLE_APP_RELEASE=true AND these secrets are set:
+# variable ENABLE_DESKTOP_RELEASE=true AND these secrets are set:
 #   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (updater signing)
 # Until then `prepare` still computes/gate-tests but nothing is released.
 on:
@@ -60,7 +60,7 @@ jobs:
   build:
     name: Build app · ${{ matrix.name }}
     needs: prepare
-    if: ${{ needs.prepare.outputs.published == 'true' && vars.ENABLE_APP_RELEASE == 'true' }}
+    if: ${{ needs.prepare.outputs.published == 'true' && vars.ENABLE_DESKTOP_RELEASE == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -213,7 +213,7 @@ jobs:
   publish:
     name: Publish release
     needs: [prepare, build]
-    if: ${{ needs.prepare.outputs.published == 'true' && vars.ENABLE_APP_RELEASE == 'true' }}
+    if: ${{ needs.prepare.outputs.published == 'true' && vars.ENABLE_DESKTOP_RELEASE == 'true' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write

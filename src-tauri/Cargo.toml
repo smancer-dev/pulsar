@@ -23,7 +23,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
-pulsar-core = { path = "../crates/pulsar-core" }
+pulsar-core.workspace = true
 # Lets the same binary double as a headless relay: `pulsar --relay` (see run_relay).
 pulsar-relay.workspace = true
 tokio = { workspace = true }

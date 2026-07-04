@@ -1,23 +1,21 @@
-# Pulsar app — Rust workspace (desktop + mobile).
+# Pulsar desktop — Rust workspace (Windows / macOS / Linux app).
 #
-# Extracted from the Pulsar monorepo. The shared wire protocol and the relay
-# server now live in their own repos and are consumed as git dependencies:
-#   pulsar-proto → github.com/PulsarDesk/pulsar-proto
-#   pulsar-relay → github.com/PulsarDesk/relay   (mobile can run a local relay on-device)
+# The desktop Tauri app plus its native helpers. The shared engine now lives in
+# its own repo and is consumed as a git dependency:
+#   pulsar-core  → github.com/PulsarDesk/pulsar-core   (client/host/streaming engine)
+#   pulsar-proto → github.com/PulsarDesk/pulsar-proto  (wire protocol)
+#   pulsar-relay → github.com/PulsarDesk/relay         (the same binary can double as a relay)
 [workspace]
 resolver = "2"
 members = [
-  "crates/pulsar-core",
   "crates/pulsar-render",
   "crates/pulsar-capture",
-  "crates/tauri-plugin-pulsar-video",
   "src-tauri",
-  "mobile",
 ]
-# `cargo test` / `cargo build` only touch the fast, headless core. The Tauri
-# app (which pulls in wry/webkit/gtk/ffmpeg/SDL) is built explicitly with
-# `-p pulsar-tauri`; the mobile shell with `-p pulsar-mobile`.
-default-members = ["crates/pulsar-core"]
+# `cargo test` / `cargo build` default to the light, cross-platform capture crate.
+# The Tauri app (wry/webkit/gtk/ffmpeg/SDL) is built with `-p pulsar-tauri`; the
+# native renderer with `-p pulsar-render`.
+default-members = ["crates/pulsar-capture"]
 
 [workspace.package]
 version = "0.1.0-dev.27"
@@ -43,12 +41,12 @@ chacha20poly1305 = "0.10"
 sha2 = "0.10"
 gilrs = "0.10"
 # Shared crates, now external repos (git dependencies).
+pulsar-core = { git = "https://github.com/PulsarDesk/pulsar-core" }
 pulsar-proto = { git = "https://github.com/PulsarDesk/pulsar-proto" }
 pulsar-relay = { git = "https://github.com/PulsarDesk/relay" }
 
-# Vendored vigem-client (0.1.4) with the DS4 EXTENDED report added (DS4_REPORT_EX +
-# update_ex + IOCTL_DS4_SUBMIT_REPORT_EX). The published crate only ships the legacy
-# basic DS4 report path, which ViGEmBus doesn't surface the PS button / touchpad through;
-# the EX report does (matches Sunshine). Patch overrides it everywhere (incl. transitive).
+# pulsar-core uses the vendored vigem-client fork on Windows (DS4 EXTENDED report).
+# The fork lives in the pulsar-core repo; patch crates.io to it so the ViGEmBus
+# gamepad path resolves the same way it did in the monorepo.
 [patch.crates-io]
-vigem-client = { path = "crates/vigem-client" }
+vigem-client = { git = "https://github.com/PulsarDesk/pulsar-core" }

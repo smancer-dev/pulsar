@@ -1,15 +1,29 @@
 node_modules
-# Workspace-root Cargo target (the workspace lives at the app-repo root now).
+# Workspace-root Cargo target (the workspace lives at the repo root).
 /target
 /build
 /.svelte-kit
 /src-tauri/target
 /src-tauri/gen
-# Tauri mobile generated native project build caches (sources under mobile/gen
-# are committed by mobile/.gitignore's own rules).
-/mobile/gen/android/.gradle
-/mobile/gen/android/app/build
-/mobile/gen/android/build
-/mobile/gen/apple/build
+
+# Bundled binaries fetched per-platform at build time (scripts/fetch-*.mjs) and
+# the native renderer built in CI — never committed.
+/src-tauri/resources/ffmpeg
+/src-tauri/resources/ffmpeg.exe
+/src-tauri/resources/ffplay
+/src-tauri/resources/ffplay.exe
+/src-tauri/resources/pulsar-render
+/src-tauri/resources/pulsar-render.exe
+
+# Windows driver installers (fetch-drivers.mjs) — the small interception.dll is
+# committed as a runtime fallback; the signed installers are not.
+/src-tauri/resources/interception/Interception.zip
+/src-tauri/resources/interception/install-interception.exe
+/src-tauri/resources/ViGEmBus_Setup.exe
+/src-tauri/resources/virtual-audio-driver/
+/src-tauri/resources/nefcon/
+
+# Local machine-specific env workaround (not for committing).
+/envfix.cjs
 .DS_Store
 Thumbs.db

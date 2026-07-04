@@ -16,9 +16,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Headless Rust core tests on every target OS + arch (incl. ARM Linux for
+  # Headless desktop-crate tests on every target OS + arch (incl. ARM Linux for
   # OrangePi / Raspberry Pi). `cargo test` runs the workspace default-members
-  # (pulsar-core) — the fast headless suite. pulsar-proto/-relay come from git.
+  # (pulsar-capture) — the fast cross-platform suite. The Tauri app + native
+  # renderer are compiled in release.yml. pulsar-core/-proto/-relay come from git.
   rust:
     name: Rust · ${{ matrix.name }}
     strategy:
@@ -59,7 +60,7 @@ jobs:
       - name: clippy (headless crate, advisory)
         if: matrix.name == 'linux-x64'
         continue-on-error: true
-        run: cargo clippy -p pulsar-core --all-targets --locked
+        run: cargo clippy -p pulsar-capture --all-targets --locked
 
       - name: Test
         run: cargo test --locked
