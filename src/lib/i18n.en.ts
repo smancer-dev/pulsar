@@ -549,5 +549,7 @@ export const en: Dict = {
 	'approve.allow': 'Allow',
 
 	// Modal
-	'modal.close': 'Close'
+	'modal.close': 'Close',
+	// i18n sweep additions
+	'session.overlayBtn': 'Open the overlay menu',
 };

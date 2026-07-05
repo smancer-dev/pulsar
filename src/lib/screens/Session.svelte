@@ -826,7 +826,7 @@
 	{#if native && ui.overlayButton && !dock.overlayOpen}
 		<button
 			class="ovbtn-hotspot"
-			aria-label="Overlay"
+			aria-label={t('session.overlayBtn')}
 			style="left:{btnCss.x}px; top:{btnCss.y}px"
 			onpointerdown={onBtnDown}
 			onpointermove={onBtnMove}

@@ -548,5 +548,7 @@ export const tr: Dict = {
 	'approve.allow': 'İzin Ver',
 
 	// Modal
-	'modal.close': 'Kapat'
+	'modal.close': 'Kapat',
+	// i18n sweep additions
+	'session.overlayBtn': 'Overlay menüsünü aç',
 };
