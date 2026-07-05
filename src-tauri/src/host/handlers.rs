@@ -1383,6 +1383,10 @@ pub(super) fn make_on_stream(
 	// pollers when a session re-requests while still on the cursorless KMS capture.
 	#[cfg(target_os = "linux")]
 	let mut cursor_alive: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+	// The last request that actually (re)started the Wayland portal+gst capture, kept so a
+	// bitrate-only re-stream (ABR) can be absorbed instead of tearing the live pipeline down.
+	#[cfg(target_os = "linux")]
+	let mut last_wl_req: Option<StreamReq> = None;
 	// The previous request that started a LIVE native (DXGI+NVENC) capture, kept so a re-stream
 	// that only changed `display_idx` can switch the monitor IN PLACE (CaptureHandle::switch_output)
 	// instead of tearing the whole pipeline down. `None` whenever the current stream isn't native
@@ -1406,6 +1410,29 @@ pub(super) fn make_on_stream(
 		apply_screen_adaptation(&req, &adapt_state);
 		// last_req_store is updated below (after native_started is resolved) so the
 		// display-mode watcher only fires for ffmpeg-path sessions on Windows.
+		// WAYLAND BITRATE-ONLY FAST PATH — the client's ABR re-sends the full StreamReq just to
+		// nudge the encode bitrate every couple seconds. gst-launch'd x264enc can't be
+		// reconfigured live, and a full portal+gst restart here SIGKILLs the running gst (killing
+		// the visible video) and then usually can't reach PAUSED because KWin is still tearing down
+		// the old PipeWire cast — permanently black video behind a live session. So if a capture is
+		// already live and ONLY the bitrate differs from the streaming request, keep the live
+		// pipeline running (must be BEFORE the forwarder/audio teardown below, else we'd strand gst
+		// on dead loopback ports). Real geometry/fps/codec/audio-toggle changes fall through.
+		#[cfg(target_os = "linux")]
+		if pulsar_core::capture::is_wayland() && cap_slot.lock().unwrap().is_some() {
+			if let Some(prev) = last_wl_req.as_ref() {
+				let mut probe = prev.clone();
+				probe.bitrate_kbps = req.bitrate_kbps;
+				if probe == req {
+					last_wl_req = Some(req.clone());
+					tracing::info!(
+						bitrate_kbps = req.bitrate_kbps,
+						"wayland restream absorbed (bitrate-only) — kept live capture"
+					);
+					return;
+				}
+			}
+		}
 		// FAST PATH — a live, in-session restream the running native capture can absorb without a
 		// full rebuild: a MONITOR switch (`switch_output` → in-thread re-capture on the new GPU)
 		// and/or an adaptive BITRATE step (`set_bitrate` → live nvEncReconfigureEncoder). Crucially
@@ -1573,6 +1600,9 @@ pub(super) fn make_on_stream(
 		// real screen (and inject input) through the desktop portals.
 		#[cfg(target_os = "linux")]
 		if pulsar_core::capture::is_wayland() {
+			// Record the req that this full (re)start streams, so a later bitrate-only ABR
+			// re-stream is absorbed by the fast path above instead of restarting the pipeline.
+			last_wl_req = Some(req.clone());
 			// A (re-)stream restarts capture: kill any audio ffmpeg already running for
 			// this session before spawning the new one, so a live re-stream (resolution/
 			// codec/fps/audio-toggle change) doesn't stack audio encoders. (The video
