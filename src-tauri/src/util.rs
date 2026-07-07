@@ -163,7 +163,19 @@ fn atomic_write_json(path: &std::path::Path, json: &str) {
 /// Resolve a user-entered `host:port` (IP or DNS name) to a socket address.
 /// Prefers IPv4 — the relay binds `0.0.0.0`, and `localhost` often resolves to
 /// `::1` first, which would never reach an IPv4-only relay.
+///
+/// A host with no port (e.g. just a hostname/IP) gets the standard relay port —
+/// so typing "192.168.1.50" works without also typing ":21116". The stored/
+/// displayed config value is untouched; only the address actually used here
+/// gets the default port.
 pub(crate) async fn resolve_relay(addr: &str) -> Option<SocketAddr> {
+	let with_port;
+	let addr = if addr.contains(':') {
+		addr
+	} else {
+		with_port = format!("{addr}:{}", pulsar_core::proto::DEFAULT_RELAY_PORT);
+		with_port.as_str()
+	};
 	if let Ok(parsed) = addr.parse::<SocketAddr>() {
 		return Some(parsed);
 	}
