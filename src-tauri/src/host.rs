@@ -38,8 +38,8 @@ fn spawn_rumble_forward(
 use pulsar_core::pipeline::{self, CaptureMethod, HwEncoder, StreamPlan};
 use pulsar_core::proto::DeviceId;
 use pulsar_core::service::{
-	accept, need_password, recv_auth, reject, serve_with, DataHandlers, DataMsg, GameInfo,
-	InputEvent, QualityPref, StreamReq,
+	accept, need_password, recv_auth, reject, send_bye_via, serve_with, DataHandlers, DataMsg,
+	GameInfo, InputEvent, QualityPref, StreamReq,
 };
 use pulsar_core::{Discovery, Node};
 use tauri::{AppHandle, Emitter, Manager as _, State};
@@ -757,10 +757,14 @@ pub(crate) async fn go_online(
 				// receives None for stop_tx); it only upgrades the `active` mode + re-inserts
 				// `host_out[sid]` on the first StartStream.
 				//
-				// Mode defaults to Remote; make_on_stream upgrades it to Game/Remote on
-				// the first StartStream (and re-opens/focuses the connections window with
-				// the correct mode). The window opens minimized here so the host's screen
-				// is not disrupted before the session's mode is confirmed.
+				// Mode defaults to Remote; make_on_stream upgrades it to Game/Remote and
+				// OPENS the connections window on the first StartStream (the correct mode
+				// is only known then). We do NOT open the window here at accept time: a
+				// metadata-only connection — the mobile game-library fetch (auth +
+				// request_games + Bye, never a StartStream) — would otherwise flash the
+				// window open and shut on every fetch, though no real session forms. The
+				// session is still REGISTERED here (active/incoming/host_out), so any peer
+				// remains listed + kickable the moment the window is open for a real session.
 				let stop_tx_opt: Option<oneshot::Sender<()>> = {
 					active.lock().unwrap().insert(
 						sid,
@@ -774,9 +778,6 @@ pub(crate) async fn go_online(
 					);
 					incoming.lock().unwrap().insert(sid, (peer.clone(), stop_tx));
 					host_out.lock().unwrap().insert(sid, (peer.clone(), out_tx.clone()));
-					// Minimized: mode unknown until first StartStream; make_on_stream
-					// calls open_or_update again with the real mode.
-					crate::connections::open_or_update(&app_h, crate::connections::Surface::Background);
 					None
 				};
 
@@ -1823,7 +1824,17 @@ pub(crate) async fn go_online(
 				};
 				tokio::select! {
 					_ = serve_with(session, provider, on_launch, on_stream, on_input, handlers) => {}
-					_ = &mut stop_rx => {} // host kicked this client from the UI
+					// Host kicked this client from the UI (disconnect_peer / _all / go-offline
+					// all fire stop_tx). serve_with — and thus the live Session — is still
+					// alive inside THIS branch (select! only drops the other future once the
+					// block finishes), so send an explicit Bye NOW over the cloned sender. Over
+					// a relay the client's recv never returns None when we vanish, so without
+					// this it hangs on the frozen last frame until its silence watchdog; the Bye
+					// ends it at once. A natural serve_with end (the other arm) = the client
+					// already left, so no Bye is sent there.
+					_ = &mut stop_rx => {
+						let _ = send_bye_via(&media_tx).await;
+					}
 				}
 				// Session ended (peer gone or host kicked): kill this session's ffmpeg
 				// so capture/encode stops at once and the GPU is freed. Held mouse
