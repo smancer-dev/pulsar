@@ -154,7 +154,7 @@
 			aria-label={t('chrome.themeToggle')}
 			onclick={onToggleTheme}
 		>
-			<Icon name={dark ? 'sun' : 'monitor'} size={16} />
+			<Icon name={dark ? 'sun' : 'moon'} size={16} />
 		</button>
 		<span class="mono ver">{ver ? `Pulsar v${ver}` : 'Pulsar'}</span>
 		{#if isTauri}
