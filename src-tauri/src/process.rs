@@ -731,6 +731,16 @@ pub struct HostGame {
 /// (headless/no display/timeout) so the client just falls back to an icon. Bounded to a
 /// few seconds so a wedged grab never stalls the games-list reply.
 pub fn desktop_thumb_data_url(ffmpeg: &str) -> Option<String> {
+	// Wayland: `x11grab` of the rootless Xwayland root only ever captures BLACK, and
+	// worse, it blocks up to the deadline below. This runs SYNCHRONOUSLY inside
+	// `serve_with`'s message loop (the games() provider), so a blocking grab stalls
+	// the whole session — long enough that a client's `request_games` (3 s patience)
+	// times out and the games fetch appears to hang. There's no usable Wayland
+	// screenshot here anyway, so skip it fast and let the Desktop card show its icon.
+	#[cfg(target_os = "linux")]
+	if pulsar_core::capture::is_wayland() {
+		return None;
+	}
 	let tmp = std::env::temp_dir().join("pulsar-desk-thumb.jpg");
 	let mut cmd = std::process::Command::new(ffmpeg);
 	cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
@@ -751,7 +761,9 @@ pub fn desktop_thumb_data_url(ffmpeg: &str) -> Option<String> {
 	let mut child = cmd.spawn().ok()?;
 	#[cfg(windows)]
 	crate::job::assign(&child);
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	// Keep this UNDER the client's `request_games` per-message patience (3 s): the grab
+	// runs inside serve_with's message loop, so a longer wait out-stalls the fetch.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
 	let ok = loop {
 		match child.try_wait() {
 			Ok(Some(st)) => break st.success(),
