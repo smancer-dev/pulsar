@@ -120,6 +120,8 @@ pub fn spawn_ffplay(ffplay: &str, sdp: &PathBuf) -> Option<Child> {
 	]);
 	cmd.arg(sdp);
 	crate::no_window(&mut cmd);
+	// Optimus/PRIME: auto-offload the ffplay decode/VO to the NVIDIA GPU.
+	crate::process::apply_nvidia_prime_env(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => {
 			// Kill the fullscreen player too if Pulsar dies abnormally (see job.rs).
@@ -156,6 +158,8 @@ pub fn spawn_vidsink(bin: &str, sdp: &Path, wid: Option<u64>, rotate: u32) -> Op
 	cmd.stdout(std::process::Stdio::piped());
 	// Prefer the host's rkmpp ffmpeg over the AppImage's rkmpp-less bundle on RK3588.
 	crate::process::apply_render_lib_env(&mut cmd);
+	// Optimus/PRIME: auto-offload to the NVIDIA GPU (see apply_nvidia_prime_env).
+	crate::process::apply_nvidia_prime_env(&mut cmd);
 	die_with_parent(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => Some(child),
@@ -196,6 +200,9 @@ pub fn spawn_render(
 	cmd.stdout(std::process::Stdio::piped());
 	// Prefer the host's rkmpp ffmpeg over the AppImage's rkmpp-less bundle on RK3588.
 	crate::process::apply_render_lib_env(&mut cmd);
+	// Optimus/PRIME laptops: offload the renderer to the NVIDIA GPU (auto prime-run) so
+	// CUDA/NVDEC-decoded frames actually present instead of black video on the iGPU.
+	crate::process::apply_nvidia_prime_env(&mut cmd);
 	die_with_parent(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => Some(child),
@@ -545,6 +552,8 @@ pub fn spawn_mpv(sdp: &PathBuf, wid: Option<u64>, ipc: &Path) -> Option<Child> {
 		}
 	}
 	cmd.arg(sdp);
+	// Optimus/PRIME: mpv --hwdec decodes on NVIDIA; offload its GL VO there too.
+	crate::process::apply_nvidia_prime_env(&mut cmd);
 	die_with_parent(&mut cmd);
 	match cmd.spawn() {
 		Ok(child) => Some(child),

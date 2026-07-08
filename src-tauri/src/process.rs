@@ -987,6 +987,31 @@ pub fn render_bin(app: &AppHandle) -> String {
 /// host actually ships a matching `libavcodec.so.58`. `PULSAR_PREFER_SYSTEM_FFMPEG=1`
 /// forces it on (other SoCs); `=0` forces it off. No-op on non-Linux and on x86
 /// desktops without the device, so behaviour is unchanged everywhere else.
+/// Auto-offload the video renderer to the NVIDIA GPU on Optimus/PRIME laptops — the
+/// built-in equivalent of prefixing `prime-run`, so the user never has to. Without it the
+/// renderer runs on the integrated GPU, where VAAPI is frequently unavailable AND a
+/// CUDA/NVDEC-decoded frame can't be presented on the iGPU's GL context → black video (the
+/// exact symptom on a laptop connected to a Windows host). Sets precisely what `prime-run`
+/// sets. No-op when: the NVIDIA kernel module isn't loaded (AMD/Intel-only host — setting
+/// `__GLX_VENDOR_LIBRARY_NAME=nvidia` there would BREAK GL), or the app was already launched
+/// under `prime-run` (respect the explicit choice). On a single-NVIDIA host it's harmless
+/// (offload to the only/primary GPU).
+#[cfg(target_os = "linux")]
+pub fn apply_nvidia_prime_env(cmd: &mut std::process::Command) {
+	if std::env::var_os("__NV_PRIME_RENDER_OFFLOAD").is_some() {
+		return; // already under prime-run
+	}
+	if !std::path::Path::new("/proc/driver/nvidia/version").exists() {
+		return; // no NVIDIA driver loaded → not a PRIME/NVIDIA host
+	}
+	cmd.env("__NV_PRIME_RENDER_OFFLOAD", "1");
+	cmd.env("__GLX_VENDOR_LIBRARY_NAME", "nvidia");
+	cmd.env("__VK_LAYER_NV_optimus", "NVIDIA_only");
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_nvidia_prime_env(_cmd: &mut std::process::Command) {}
+
 pub fn apply_render_lib_env(cmd: &mut std::process::Command) {
 	#[cfg(target_os = "linux")]
 	{
