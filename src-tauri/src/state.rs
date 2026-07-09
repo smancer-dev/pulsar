@@ -48,7 +48,7 @@ pub(crate) struct AppState {
 	pub(crate) next_play: Arc<AtomicU64>,
 	/// Pending Allow/Deny approval requests (request id → decision sender),
 	/// resolved by the approval popup via `respond_request`.
-	pub(crate) pending: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
+	pub(crate) pending: Arc<Mutex<HashMap<u64, oneshot::Sender<crate::auth::AuthDecision>>>>,
 	/// Monotonic id for approval requests / popup windows.
 	pub(crate) next_req: Arc<AtomicU64>,
 	/// Pending client-side password prompts (req id → password sender), resolved by

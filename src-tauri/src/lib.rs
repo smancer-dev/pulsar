@@ -517,7 +517,11 @@ pub fn run() {
 						);
 						let tx = pending.lock().unwrap().remove(&id);
 						if let Some(tx) = tx {
-							let _ = tx.send(false);
+							// Window closed via OS chrome = deny (no control granted).
+							let _ = tx.send(crate::auth::AuthDecision {
+								allow: false,
+								view_only: false,
+							});
 						}
 					}
 				}

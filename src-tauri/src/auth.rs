@@ -408,15 +408,29 @@ fn close_approval_window(app: &AppHandle, id: u64) {
 	}
 }
 
-/// The approval popup's Allow/Deny buttons call this to resolve the request.
+/// The operator's answer to the Allow/Deny popup. `view_only` grants the session but
+/// immediately revokes its CONTROL (the serve loop drops the client's input) — the
+/// popup's de-emphasized secondary action. Only meaningful when `allow` is true.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuthDecision {
+	pub allow: bool,
+	pub view_only: bool,
+}
+
+/// The approval popup's Allow / Allow-view-only / Deny buttons call this to resolve
+/// the request.
 #[tauri::command]
 pub(crate) async fn respond_request(
 	state: State<'_, AppState>,
 	id: u64,
 	allow: bool,
+	view_only: bool,
 ) -> Result<(), String> {
 	if let Some(tx) = state.pending.lock().unwrap().remove(&id) {
-		let _ = tx.send(allow);
+		let _ = tx.send(AuthDecision {
+			allow,
+			view_only: allow && view_only,
+		});
 	}
 	Ok(())
 }
@@ -428,6 +442,9 @@ pub(crate) async fn respond_request(
 pub(crate) struct RaceOutcome {
 	pub approved: bool,
 	pub matched_one_time: bool,
+	/// The operator picked "Allow view-only" — the session is accepted but starts
+	/// with control revoked. False for every non-popup path (password, auto-allow).
+	pub view_only: bool,
 }
 
 /// Host: open the Allow/Deny popup AND, at the same time, race it against a correct
@@ -438,7 +455,7 @@ pub(crate) struct RaceOutcome {
 pub(crate) async fn race_host_auth(
 	session: &mut pulsar_core::Session,
 	app: &AppHandle,
-	pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
+	pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<AuthDecision>>>>,
 	next_req: &Arc<AtomicU64>,
 	peer: &str,
 	accepted_pws: &[String],
@@ -454,11 +471,11 @@ pub(crate) async fn race_host_auth(
 			limit = MAX_CONCURRENT_POPUPS,
 			"auth: concurrent popup cap reached — denying without opening a new window"
 		);
-		return RaceOutcome { approved: false, matched_one_time: false };
+		return RaceOutcome { approved: false, matched_one_time: false, view_only: false };
 	}
 
 	let id = next_req.fetch_add(1, Ordering::SeqCst);
-	let (tx, mut rx) = oneshot::channel::<bool>();
+	let (tx, mut rx) = oneshot::channel::<AuthDecision>();
 	pending.lock().unwrap().insert(id, tx);
 	let _ = app.emit(
 		"session",
@@ -494,19 +511,22 @@ pub(crate) async fn race_host_auth(
 
 	// (approved, matched_one_time): a passwordless Allow never rotates the OTP, a
 	// password match reports whether it was the single-use OTP vs the reusable one.
-	let result: (bool, bool) = loop {
+	let result: (bool, bool, bool) = loop {
 		tokio::select! {
 			biased;
-			d = &mut rx => break (matches!(d, Ok(true)), false),
+			d = &mut rx => break match d {
+				Ok(dec) if dec.allow => (true, false, dec.view_only),
+				_ => (false, false, false),
+			},
 			// Idle timeout: client sent no useful message recently → deny.
 			_ = &mut idle_deadline => {
 				tracing::debug!(%peer, "auth: idle timeout — auto-denying");
-				break (false, false);
+				break (false, false, false);
 			}
 			// Absolute budget exhausted: deny regardless of activity.
 			_ = &mut absolute_deadline => {
 				tracing::warn!(%peer, "auth: absolute time budget exhausted — denying");
-				break (false, false);
+				break (false, false, false);
 			}
 			msg = recv_client_auth(session) => {
 				match msg {
@@ -525,7 +545,7 @@ pub(crate) async fn race_host_auth(
 							.iter()
 							.any(|a| !a.is_empty() && a.as_str() != one_time_pw && secret_eq(&pw, a))
 						{
-							break (true, false);
+							break (true, false, false);
 						}
 						// One-time password: atomically match against the LIVE store and
 						// rotate in a single critical section (try_consume_otp), so two
@@ -534,7 +554,7 @@ pub(crate) async fn race_host_auth(
 						// It rotates internally on success → report matched_one_time=false
 						// so the caller does NOT rotate again.
 						if crate::commands::try_consume_otp(app, &pw) {
-							break (true, false);
+							break (true, false, false);
 						}
 						// Wrong: only count non-empty submissions. An empty pw is the
 						// client's automatic "I have no password yet" probe — the same
@@ -557,7 +577,7 @@ pub(crate) async fn race_host_auth(
 							false
 						};
 						if locked {
-							break (false, false);
+							break (false, false, false);
 						}
 						let _ = need_password(session).await; // wrong → ask client to retry
 					}
@@ -567,7 +587,7 @@ pub(crate) async fn race_host_auth(
 					// absolute deadline above is the only bound for a pure-keepalive
 					// attacker; the idle deadline auto-denies once keepalives stop.
 					ClientAuth::Keepalive => {}
-					ClientAuth::Gone => break (false, false),
+					ClientAuth::Gone => break (false, false, false),
 				}
 			}
 		}
@@ -580,6 +600,7 @@ pub(crate) async fn race_host_auth(
 	RaceOutcome {
 		approved: result.0,
 		matched_one_time: result.1,
+		view_only: result.2,
 	}
 }
 
@@ -781,10 +802,18 @@ pub(crate) async fn disconnect_peer(
 /// (a pure-client personality where nobody may be connected to this machine) — authoritative
 /// over the `incoming` map, so it tears down sessions even if the UI's session list missed one.
 #[tauri::command]
-pub(crate) async fn disconnect_all_peers(state: State<'_, AppState>) -> Result<(), String> {
+pub(crate) async fn disconnect_all_peers(
+	app: AppHandle,
+	state: State<'_, AppState>,
+) -> Result<(), String> {
 	let entries: Vec<_> = state.incoming.lock().unwrap().drain().collect();
 	for (_sid, (_peer, tx)) in entries {
 		let _ = tx.send(());
 	}
+	// Entering gaming mode kicks every inbound session, so the Active Connections
+	// window has nothing left to show — close it. The per-session teardown path
+	// doesn't always reach it (e.g. a window opened manually from the sidebar with
+	// nothing connected), so close it explicitly here.
+	crate::connections::close(&app);
 	Ok(())
 }

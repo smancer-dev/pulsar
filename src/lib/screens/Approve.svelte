@@ -37,10 +37,10 @@
 				: { text: t('approve.pwNone'), cls: 'none', icon: 'shield' }
 	);
 
-	async function decide(allow: boolean) {
+	async function decide(allow: boolean, viewOnly = false) {
 		busy = true;
 		try {
-			await api.respondRequest(id, allow);
+			await api.respondRequest(id, allow, viewOnly);
 		} catch {
 			/* ignore */
 		}
@@ -70,6 +70,11 @@
 		<button class="btn deny" disabled={busy} onclick={() => decide(false)}>{t('approve.deny')} ({secsLeft})</button>
 		<button class="btn allow" disabled={busy} onclick={() => decide(true)}>{t('approve.allow')}</button>
 	</div>
+	<!-- Secondary, deliberately de-emphasized: grants the session but as view-only (no
+	     control). Faint + borderless so it never competes with the primary Allow. -->
+	<button class="viewonly" disabled={busy} onclick={() => decide(true, true)}>
+		{t('approve.allowViewOnly')}
+	</button>
 </div>
 
 <style>
@@ -184,5 +189,27 @@
 	}
 	.allow:hover:not(:disabled) {
 		background: var(--accent-press);
+	}
+	/* Tertiary "view-only" action: faint, borderless, centered — discoverable but
+	   visually subordinate so the operator's eye lands on Deny/Allow first. */
+	.viewonly {
+		margin-top: 10px;
+		align-self: center;
+		background: transparent;
+		border: 0;
+		color: var(--text-faint);
+		font-size: 12px;
+		font-weight: 500;
+		cursor: pointer;
+		padding: 6px 10px;
+		border-radius: var(--r-sm);
+	}
+	.viewonly:hover:not(:disabled) {
+		color: var(--text-muted);
+		text-decoration: underline;
+	}
+	.viewonly:disabled {
+		opacity: 0.5;
+		cursor: default;
 	}
 </style>

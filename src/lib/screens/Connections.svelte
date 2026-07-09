@@ -112,6 +112,18 @@
 		};
 	});
 
+	// Keep the OS window title translated + live. The Rust side sets an initial title
+	// at window-build time from its own (tr/en-only) i18n, so it was wrong for ru/kk and
+	// never updated on a language change. Driving it from the frontend i18n fixes both:
+	// this re-runs whenever the language changes (the cross-window broadcast updates
+	// `i18n.lang` in this window too).
+	$effect(() => {
+		const title = t('host.activeTitle');
+		import('@tauri-apps/api/window')
+			.then(({ getCurrentWindow }) => getCurrentWindow().setTitle(title))
+			.catch(() => {});
+	});
+
 	// Live "for N" elapsed label, refreshed each second.
 	let now = $state(Date.now());
 	$effect(() => {

@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import { isTauri } from '$lib/api';
-	import { t, i18n, cycleLang, LANGS } from '$lib/i18n.svelte';
+	import { t, i18n, setLang, LANGS, type Lang } from '$lib/i18n.svelte';
 	import { gamingNav } from '$lib/gamepadNav.svelte';
 
 	type Props = {
@@ -34,7 +34,8 @@
 		onToggleFullscreen
 	}: Props = $props();
 
-	// Short code (TR/EN) shown on the language toggle button.
+	// Collapsed switcher shows just the short code (TR/EN/RU/KK); the dropdown lists
+	// the full names.
 	const langShort = $derived(LANGS.find((l) => l.value === i18n.lang)?.short ?? 'EN');
 
 	// Real app version (from tauri.conf) instead of a hardcoded string. Empty outside Tauri.
@@ -138,15 +139,23 @@
 		>
 			<Icon name="gaming" size={16} />
 		</button>
-		<button
-			class="lang-btn"
-			use:navItem={gaming}
-			title={t('chrome.language')}
-			aria-label={t('chrome.languageToggle')}
-			onclick={cycleLang}
-		>
-			<Icon name="globe" size={15} /><span class="lang-code mono">{langShort}</span>
-		</button>
+		<label class="lang-select" title={t('chrome.language')}>
+			<Icon name="globe" size={15} />
+			<span class="lang-code mono">{langShort}</span>
+			<!-- The native <select> sits invisibly over the label so the collapsed control
+			     shows only the short code while the dropdown still lists the full names
+			     (and keeps native keyboard / click-outside behaviour). -->
+			<select
+				use:navItem={gaming}
+				aria-label={t('chrome.language')}
+				value={i18n.lang}
+				onchange={(e) => setLang(e.currentTarget.value as Lang)}
+			>
+				{#each LANGS as l (l.value)}
+					<option value={l.value}>{l.label}</option>
+				{/each}
+			</select>
+		</label>
 		<button
 			class="icon-btn"
 			use:navItem={gaming}
@@ -233,7 +242,8 @@
 		border-color: var(--accent);
 		color: var(--accent-press);
 	}
-	.lang-btn {
+	.lang-select {
+		position: relative;
 		display: inline-flex;
 		align-items: center;
 		gap: 5px;
@@ -248,7 +258,7 @@
 			background var(--dur) var(--ease),
 			color var(--dur) var(--ease);
 	}
-	.lang-btn:hover {
+	.lang-select:hover {
 		background: var(--surface-3);
 		color: var(--text);
 	}
@@ -256,6 +266,26 @@
 		font-size: 11px;
 		font-weight: 600;
 		letter-spacing: 0.04em;
+	}
+	/* Invisible native <select> layered over the whole control: it catches the click
+	   and shows the OS dropdown (full names + keyboard nav), while the visible globe +
+	   short code above are all the user actually sees when collapsed. */
+	.lang-select select {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		margin: 0;
+		border: 0;
+		opacity: 0;
+		cursor: pointer;
+		appearance: none;
+	}
+	/* The popup list is drawn by the OS — give its options a real background so they
+	   aren't unreadable. */
+	.lang-select select option {
+		background: var(--surface-1);
+		color: var(--text);
 	}
 	/* Frameless window controls: flush to the top-right corner, full bar height, no border —
 	   the standard custom-title-bar look. `margin-right` cancels the bar's right padding so they

@@ -612,6 +612,9 @@ pub(crate) async fn go_online(
 				if preauthorized {
 					tracing::info!(%peer, "same-device session pre-authorized (existing authorized session) — skipping OTP + popup");
 				}
+				// Set to true only when the operator picks "Allow view-only" in the popup —
+				// the session starts with control revoked (see the ConnInfo insert below).
+				let mut approved_view_only = false;
 				let approved = if require_auth && !preauthorized {
 					if let Some(rem) = crate::auth::throttle::locked_out(&peer) {
 						tracing::warn!(%peer, secs = rem.as_secs(), "auth throttled: rejecting without prompt");
@@ -678,6 +681,7 @@ pub(crate) async fn go_online(
 							if outcome.matched_one_time {
 								crate::commands::rotate_session_password(&app_h);
 							}
+							approved_view_only = outcome.view_only;
 							outcome.approved
 						}
 					}
@@ -773,7 +777,9 @@ pub(crate) async fn go_online(
 							since_ms,
 							// Unknown until StartStream; make_on_stream will overwrite.
 							mode: crate::state::ConnMode::Remote,
-							view_only: false,
+							// "Allow view-only" from the popup starts the session with control
+							// revoked; every other accept path grants control (false).
+							view_only: approved_view_only,
 						},
 					);
 					incoming.lock().unwrap().insert(sid, (peer.clone(), stop_tx));

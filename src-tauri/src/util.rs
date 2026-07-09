@@ -199,6 +199,32 @@ pub(crate) fn parse_target_addr(s: &str) -> Option<SocketAddr> {
 	None
 }
 
+/// Resolve a direct-connect target (`IP`, `IP:port`, `host`, or `host:port`) to a
+/// socket address, defaulting to the node port. Extends [`parse_target_addr`] with
+/// DNS resolution (IPv4 first — the host binds an IPv4 socket) so a hostname target
+/// connects too, not only a literal IP. Returns `None` for a non-address (e.g. a
+/// 9-digit relay ID), so the caller falls through to the relay-ID path.
+pub(crate) async fn resolve_direct_target(s: &str) -> Option<SocketAddr> {
+	if let Some(sa) = parse_target_addr(s) {
+		return Some(sa);
+	}
+	// A bare relay ID (9 digits) has neither a dot nor a colon — skip DNS.
+	if !s.contains('.') && !s.contains(':') {
+		return None;
+	}
+	let with_port = if s.contains(':') {
+		s.to_string()
+	} else {
+		format!("{s}:{}", pulsar_core::proto::DEFAULT_NODE_PORT)
+	};
+	let resolved: Vec<SocketAddr> = tokio::net::lookup_host(&with_port).await.ok()?.collect();
+	resolved
+		.iter()
+		.copied()
+		.find(SocketAddr::is_ipv4)
+		.or_else(|| resolved.first().copied())
+}
+
 /// Resolve a typed target — a 9-digit relay ID, or an IP / IP:port for a direct
 /// (relay-less) connect — and open a session. Returns the session + a display
 /// label (grouped ID or the address). The ID path is unchanged; an IP routes to
@@ -220,9 +246,9 @@ pub(crate) async fn connect_target(
 	relay: &str,
 ) -> Result<(pulsar_core::Session, String), String> {
 	let s = target.trim();
-	if let Some(addr) = parse_target_addr(s) {
-		// An explicit IP target IS a direct connect by definition — honored even in
-		// relay-only mode (there is no relay route to a raw address). No id to pin
+	if let Some(addr) = resolve_direct_target(s).await {
+		// An explicit IP/host target IS a direct connect by definition — honored even
+		// in relay-only mode (there is no relay route to a raw address). No id to pin
 		// against (the address IS the identity here), so no TOFU.
 		let sess = node
 			.connect_direct(addr, None)

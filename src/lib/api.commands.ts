@@ -66,8 +66,8 @@ export const api = {
 	/** Roll a fresh one-time password (invalidates the previous one). */
 	newPassword: () => invoke<string>('new_password'),
 	/** Approval popup → resolve an incoming connection request (Allow/Deny). */
-	respondRequest: (id: number, allow: boolean) =>
-		invoke<void>('respond_request', { id, allow }),
+	respondRequest: (id: number, allow: boolean, viewOnly = false) =>
+		invoke<void>('respond_request', { id, allow, viewOnly }),
 	/** Client password prompt → reply (null = cancelled). */
 	submitPassword: (req: number, password: string | null) =>
 		invoke<void>('submit_password', { req, password }),

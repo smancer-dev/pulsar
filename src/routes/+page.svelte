@@ -24,7 +24,7 @@
 	import { ui, configTick, saveUi } from '$lib/settings.svelte';
 	import { modalCount } from '$lib/overlayModals.svelte';
 	import { initCaps } from '$lib/caps.svelte';
-	import { t, i18n } from '$lib/i18n.svelte';
+	import { t, i18n, i18nReady } from '$lib/i18n.svelte';
 	import { theme, toggleTheme } from '$lib/theme.svelte';
 	import type { Config } from '$lib/types';
 	import Connecting from '$lib/screens/Connecting.svelte';
@@ -405,8 +405,13 @@
 			return;
 		}
 		// Window is up now → keep the splash visible a beat AND until the startup
-		// capability probe lands (≤5 s cap), then cross-fade to the UI.
-		await Promise.all([wait(1300), Promise.race([capsReady, wait(5000)])]);
+		// capability probe + the active language dictionary land (≤5 s cap each), then
+		// cross-fade to the UI (so the first real paint is never a flash of raw keys).
+		await Promise.all([
+			wait(1300),
+			Promise.race([capsReady, wait(5000)]),
+			Promise.race([i18nReady, wait(5000)])
+		]);
 		booting = false; // start the opacity fade
 		await wait(500);
 		splashOn = false; // unmount once faded

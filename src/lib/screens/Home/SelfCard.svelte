@@ -44,6 +44,13 @@
 		onDisconnect = () => {}
 	}: Props = $props();
 
+	// When the relay is unreachable the node still binds + serves locally (LAN peers can
+	// reach us by IP:port), but the 9-digit relay ID only resolves THROUGH the relay — so
+	// it's useless offline. Promote the direct address to the PRIMARY identifier then.
+	const relayless = $derived(!online && !!localIp && nodePort > 0);
+	const primaryLabel = $derived(relayless ? t('home.localIp') : t('home.deviceId'));
+	const primaryValue = $derived(relayless ? `${localIp}:${nodePort}` : selfId);
+
 	// Show the client's pushed device ID when known, else the raw peer key (ip:port on a
 	// direct/same-LAN connect, the grouped relay id otherwise) — and append the pushed
 	// display name in parens when known: "303 036 449 (orangepi)".
@@ -55,7 +62,7 @@
 
 	let copied = $state(false);
 	async function copyId() {
-		const ok = await copyText(selfId.replace(/\s/g, ''));
+		const ok = await copyText(primaryValue.replace(/\s/g, ''));
 		if (ok) {
 			copied = true;
 			setTimeout(() => (copied = false), 1400);
@@ -86,15 +93,17 @@
 			{#if connecting}{t('status.connecting')}{:else if online}{t('home.ready')}{:else}{t('status.offline')}{/if}
 		</span>
 	</div>
-	<div class="lab">{t('home.deviceId')}</div>
+	<div class="lab">{primaryLabel}</div>
 	<div class="row">
-		<span class="bigid mono">{selfId}</span>
+		<span class="bigid mono">{primaryValue}</span>
 		<button class="icon-btn push" onclick={copyId} title={t('home.copy')} aria-label={t('home.copyId')}>
 			<Icon name={copied ? 'check' : 'copy'} size={17} />
 		</button>
 	</div>
-	{#if localIp}
-		<!-- The whole row copies the direct-connect address (same check-flash as the id). -->
+	{#if online && localIp}
+		<!-- Secondary direct-connect address (relay-online only; when offline the address
+		     IS the primary identifier above, so this row would just duplicate it). The
+		     whole row copies it (same check-flash as the id). -->
 		<button
 			class="addr"
 			onclick={copyAddr}

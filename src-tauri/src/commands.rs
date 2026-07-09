@@ -427,10 +427,30 @@ pub(crate) async fn lan_devices(state: State<'_, AppState>) -> Result<Vec<LanDev
 	let Some(disc) = disc else {
 		return Ok(Vec::new());
 	};
-	Ok(disc
-		.peers()
-		.await
-		.into_iter()
+	// Never list OURSELVES. Discovery already drops the same-process echo by nonce, but a
+	// stale beacon from a prior online session (a new go_online mints a fresh nonce while
+	// the old beacon is still winding down) would slip through — it carries a different
+	// nonce but our stable identity pubkey. Filter any beacon bearing our own pubkey.
+	let our_pubkey = state.node.lock().unwrap().as_ref().map(|n| n.public_key());
+	// Collapse a device seen under several beacon nonces (a restart/reconnect mints a
+	// fresh nonce; the stale beacons linger until TTL) into ONE row per identity pubkey,
+	// keeping the freshest — otherwise the list shows duplicate rows for one device that
+	// share its relay id. Self is dropped in the same pass.
+	let mut by_key: std::collections::HashMap<[u8; 32], pulsar_core::discovery::DiscoveredPeer> =
+		std::collections::HashMap::new();
+	for p in disc.peers().await {
+		if our_pubkey.is_some_and(|pk| p.pubkey == pk) {
+			continue; // never list ourselves (see note above)
+		}
+		match by_key.get(&p.pubkey) {
+			Some(kept) if kept.last_seen >= p.last_seen => {}
+			_ => {
+				by_key.insert(p.pubkey, p);
+			}
+		}
+	}
+	let mut list: Vec<LanDevice> = by_key
+		.into_values()
 		.map(|p| LanDevice {
 			id: p.id.map(|d| d.grouped()).unwrap_or_default(),
 			has_id: p.id.is_some(),
@@ -438,7 +458,9 @@ pub(crate) async fn lan_devices(state: State<'_, AppState>) -> Result<Vec<LanDev
 			addr: p.addr.to_string(),
 			platform: p.platform,
 		})
-		.collect())
+		.collect();
+	list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+	Ok(list)
 }
 
 /// Detected physical controllers (DS3/DS4/DS5/Xbox/standard). Best-effort: an
