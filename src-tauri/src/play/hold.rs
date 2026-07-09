@@ -322,6 +322,16 @@ pub(super) async fn hold_session(
 						// link with live video must still trip the timeout below and tear the session
 						// down instead of leaving it frozen-but-grabbed.
 						last_inbound = std::time::Instant::now();
+						// Host sent an explicit Bye (it kicked us / went offline / left): end the
+						// session NOW. Over a relay our recv never returns None when the host
+						// vanishes, so without this the client hangs on the frozen last frame and
+						// shows the stall message until the silence watchdog eventually fires.
+						// Breaking here runs the `play-ended` emit below — a clean, instant
+						// disconnect the UI can act on.
+						if pulsar_core::service::is_bye(&bytes) {
+							tracing::info!(%id, "host sent Bye — ending play session");
+							break;
+						}
 						if pulsar_core::service::is_pong(&bytes) {
 						if let Some(t0) = ping_at.take() {
 							let rtt = t0.elapsed().as_secs_f64() * 1000.0;
