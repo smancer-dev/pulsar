@@ -70,6 +70,11 @@ const HINT_FADE: f32 = 0.5;
 /// Network RTT in tenths of ms (app stdin `rtt <ms>` from the keepalive ping/pong) —
 /// the overlay's "Gecikme" tile shows THIS, not the local present-gap.
 static RTT_DMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// When the last `rtt` stdin line arrived (video::mono_ms clock; 0 = never). The session
+/// keepalive delivers one every ~2 s while the peer is alive, so this doubles as a
+/// session-liveness signal: a STATIC host screen legitimately produces no video frames
+/// (mobile encoders stop on unchanged content), and the stall card must not fire then.
+static RTT_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Whether the evdev capture is ENGAGED (app stdin `engaged 0|1`). The local cursor
 /// hides over the video ONLY while engaged — after Ctrl+Alt+Z the user has their
 /// mouse back, so it must be visible again.
@@ -369,7 +374,13 @@ pub fn run() {
 				// Session ended: hide the video window (reveal the webview) + idle, WITHOUT
 				// exiting — keeps our EGL context alive so WebKit's shared Mali GL isn't corrupted.
 				Some("hide") => IDLE.store(true, Ordering::SeqCst),
-				Some("show") => IDLE.store(false, Ordering::SeqCst),
+				Some("show") => {
+					IDLE.store(false, Ordering::SeqCst);
+					// `show` is sent only when the resident renderer is reused for a NEW host
+					// (before its `reopen`) — reset the view so the previous host's frame isn't
+					// shown under the new session.
+					video::RESET_VIEW.store(true, Ordering::SeqCst);
+				}
 				// Transient helper tooltip ("hint engage|click") — engage/release edges
 				// are app-side knowledge (evdev capture), so the app pushes them here.
 				Some("hint") => arm_hint(it.next().unwrap_or("click")),
@@ -483,6 +494,7 @@ pub fn run() {
 				Some("rtt") => {
 					if let Some(ms) = it.next().and_then(|v| v.parse::<f32>().ok()) {
 						RTT_DMS.store((ms * 10.0) as u32, Ordering::Relaxed);
+						RTT_AT_MS.store(video::mono_ms_pub(), Ordering::Relaxed);
 					}
 				}
 				// Live mode switch for cross-session reconnects (game→remote or remote→game).
@@ -859,7 +871,15 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 			xlib::XSetWMProtocols(xd, win, &mut wm_delete, 1);
 		}
 	}
-	xlib::XMapWindow(xd, win);
+	// Embedded (--wid): do NOT map yet. The window stays UNMAPPED — revealing the
+	// WebKitGTK webview + its "waiting for the host" loader underneath — until the FIRST
+	// decoded frame (mapped on first `have_video` in the draw loop below). So a host that
+	// hasn't started sharing yet (choosing a screen / granting the Wayland/macOS/Android
+	// screen-share permission) shows the waiting UI, not a black window. Standalone has no
+	// webview underneath, so it maps immediately.
+	if standalone {
+		xlib::XMapWindow(xd, win);
+	}
 
 	// Invisible cursor for the video window. While the overlay is CLOSED (gameplay) the local
 	// pointer must not show over the video (input is forwarded to the host); while OPEN we restore
@@ -931,6 +951,9 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 	let mut last_stat = std::time::Instant::now();
 	let mut prev_open = false;
 	let mut prev_idle = false;
+	// Whether the video window is currently mapped. Embedded starts HIDDEN (webview loader
+	// shows) until the first frame; standalone is mapped from the start.
+	let mut win_visible = standalone;
 	let mut cursor_hidden = false;
 	// Overlay UI state (page, chat composer, local file pane) — page resets to the
 	// hub each time the overlay opens; the rest persists across opens.
@@ -945,9 +968,10 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		if idle != prev_idle {
 			if idle {
 				xlib::XUnmapWindow(xd, win);
-			} else {
-				xlib::XMapWindow(xd, win);
+				win_visible = false; // re-hide until the NEXT stream's first frame
 			}
+			// Un-idle (reconnect): do NOT map here — stay hidden (the webview "waiting for
+			// the host" loader shows) until the first frame of the new stream is drawn.
 			xlib::XSync(xd, xlib::False);
 			prev_idle = idle;
 		}
@@ -1255,12 +1279,22 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		// none has arrived for ≥ 3 s (and we're not mid-switch), set STALLED so the
 		// closed-state chrome draws the "stream stopped" indicator over the frozen frame.
 		// STALLED is cleared automatically by Presenter::draw() when a fresh frame arrives.
+		//
+		// Session-aware: while keepalive `rtt` lines keep arriving (~2 s cadence) the PEER is
+		// alive — a frame gap then usually just means the host screen is STATIC (mobile
+		// surface encoders emit nothing on unchanged content; repeat-frame is capped/ignored
+		// per vendor), and the card would spam a healthy idle session. Only fire when the
+		// keepalive is ALSO stale (≥ 6 s → the session itself is dying) or was never fed
+		// (standalone/kiosk without the stdin rtt feed — old behavior preserved).
 		{
 			const STALL_MS: u64 = 3_000;
+			const RTT_STALE_MS: u64 = 6_000;
 			let last = video::LAST_FRAME_MS.load(Ordering::Relaxed);
 			if last != 0 && !video::SWITCHING.load(Ordering::Relaxed) {
 				let now = video::mono_ms_pub();
-				if now.saturating_sub(last) >= STALL_MS {
+				let rtt_at = RTT_AT_MS.load(Ordering::Relaxed);
+				let session_alive = rtt_at != 0 && now.saturating_sub(rtt_at) < RTT_STALE_MS;
+				if now.saturating_sub(last) >= STALL_MS && !session_alive {
 					video::STALLED.store(true, Ordering::Relaxed);
 				}
 			}
@@ -1272,7 +1306,27 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		gl.viewport(0, 0, w as i32, h as i32);
 		gl.clear_color(0.0, 0.0, 0.0, 1.0);
 		gl.clear(glow::COLOR_BUFFER_BIT);
+		// New-host reuse (app sent `show`): drop the previous host's held frame + hide the
+		// window so its last view isn't shown while the new stream spins up (the webview
+		// "waiting" loader shows until the new first frame maps below). Chrome-tab reset.
+		if video::RESET_VIEW.swap(false, Ordering::SeqCst) {
+			presenter.reset();
+			if win_visible {
+				xlib::XUnmapWindow(xd, win);
+				xlib::XSync(xd, xlib::False);
+				win_visible = false;
+			}
+		}
 		let have_video = presenter.draw(&gl, w as i32, h as i32);
+
+		// Reveal the video window the moment the first frame lands. Embedded starts hidden
+		// (the webview "waiting for the host" loader shows) until here, so a not-yet-sharing
+		// host never leaves a black window.
+		if have_video && !win_visible {
+			xlib::XMapWindow(xd, win);
+			xlib::XSync(xd, xlib::False);
+			win_visible = true;
+		}
 
 		// Cursor side-channel: (re)upload the host pointer shape to an egui texture when it
 		// changed, and resolve the screen-point to draw at from the video's letterbox rect.
@@ -1451,11 +1505,17 @@ unsafe fn real_run(wid: u64, mode: Mode) {
 		let _ = have_video;
 
 		// Emit a stats line for the host (~1 Hz): same format the lib.rs parser reads.
+		// The dims field is the STREAM size (video::VID_W/H), NOT the window size — the app
+		// re-emits it as play-dims and the webview maps input over the video letterbox rect
+		// computed from it; feeding the window size there zeroed the correction and the
+		// remote cursor drifted off the video.
 		if last_stat.elapsed().as_millis() >= 1000 {
 			let s = *video::FPS.lock().unwrap();
+			let vw = video::VID_W.load(Ordering::Relaxed);
+			let vh = video::VID_H.load(Ordering::Relaxed);
 			println!(
 				"vidsink-fps {:.1} {}x{} {:.1} {:.0}",
-				s[0], w, h, s[1], s[2]
+				s[0], vw, vh, s[1], s[2]
 			);
 			let _ = std::io::stdout().flush();
 			last_stat = std::time::Instant::now();

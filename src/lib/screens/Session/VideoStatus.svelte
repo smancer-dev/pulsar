@@ -42,10 +42,6 @@
 		<Icon name="shield" size={34} />
 		<div class="stallmsg">{t('session.streamStopped')}</div>
 	</div>
-{:else if native && !embedded}
-	<!-- Native renderer plays in its own child window — show NOTHING behind it.
-	     The old "ghost" (icon + name + click-to-control note) must never appear
-	     (maintainer decision). -->
 {:else if !hasVideo && videoErr && !embedded}
 	<div class="ghost">
 		<Icon name={mode === 'game' ? 'gaming' : 'monitor'} size={46} />
@@ -54,14 +50,23 @@
 		<div class="note err">{videoErr}</div>
 	</div>
 {:else if !hasVideo && !embedded}
-	<!-- Connected, but the host hasn't started sending frames yet — an animated
-	     on-brand pulse-ring loader so this never reads as an error / a dead screen. -->
+	<!-- Connected, but the host hasn't started sending frames yet (it may be choosing a
+	     screen or granting the OS screen-share permission — Wayland/macOS/Android). Show
+	     the animated "waiting for the host" loader so this never reads as an error / a
+	     dead screen. MUST come before the `native` branch below: on Linux the video is a
+	     native child window, and the old order hid this loader entirely (blank/black while
+	     the host was still deciding). The renderer keeps its window unmapped until the
+	     first frame, so this webview loader is visible underneath until video starts. -->
 	<div class="loading" class:game={mode === 'game'}>
 		<div class="pulse" aria-hidden="true"><span></span><span></span><span></span></div>
 		<div class="gname">{target.name}</div>
 		<div class="lstat">{t('session.connecting')}</div>
 		<div class="lhint">{t('session.waiting')}</div>
 	</div>
+{:else if native && !embedded}
+	<!-- Native renderer plays in its own child window (video is up) — show NOTHING behind
+	     it. The old "ghost" (icon + name + click-to-control note) must never appear
+	     (maintainer decision). -->
 {:else if !controlling}
 	<button class="focushint" onpointerdown={onStartControl}>{t('session.clickToControl')}</button>
 {:else}

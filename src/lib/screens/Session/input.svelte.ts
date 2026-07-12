@@ -10,11 +10,37 @@
 import { api } from '$lib/api';
 import { evdevCode } from '$lib/keymap';
 
+// Confine the OS cursor to the app window while controlling (best-effort; no-op where
+// unsupported). Rust command, NOT window.setCursorGrab(): tao's Linux set_cursor_grab
+// is a silent no-op (`Ok(())`), so the backend does a real GDK/X11 pointer grab with
+// confine_to on Linux and falls back to tao's grab (ClipCursor) on Windows/macOS.
+// The VNC-style absolute path deliberately avoids the Pointer Lock API (it froze the
+// webview), but without ANY confinement the cursor walks off the window mid-drag.
+function grabCursor(on: boolean) {
+	import('@tauri-apps/api/core')
+		.then(({ invoke }) => invoke('confine_pointer', { on }))
+		.catch(() => {
+			// not running under Tauri (vite dev / tests)
+		});
+}
+
+// Fire a payload-less Tauri event (same bus the OS-level keyboard hooks use), so the
+// VNC path's combos reuse Session.svelte's existing 'kbd-leave'/'overlay-toggle' handlers.
+function emitTauri(event: string) {
+	import('@tauri-apps/api/event')
+		.then(({ emit }) => emit(event))
+		.catch(() => {});
+}
+
 type Inputs = {
 	playId: () => number;
 	wsPort: () => number;
 	canvas: () => HTMLCanvasElement;
 	mode: () => 'remote' | 'game';
+	native: () => boolean;
+	streamW: () => number;
+	streamH: () => number;
+	fitMode: () => 'fit' | 'stretch' | 'original';
 };
 
 export class SessionInput {
@@ -27,8 +53,15 @@ export class SessionInput {
 	// was reached over loopback — but that wrongly blocked legitimate cases like ASTER
 	// multiseat: a *different* seat on the same box is fine to drive.) A getter (not a
 	// $derived field) so it doesn't dereference #in before the constructor assigns it.
+	//
+	// The native (Linux) renderer decodes directly (no UDP→WS relay), so `wsPort` is 0 there —
+	// which used to leave native REMOTE sessions with no working control path (the evdev grab
+	// is a separate mechanism that no-ops unless its capture thread is up, e.g. controlling a
+	// PHONE host). Allow the VNC-style absolute path on native remote too: it sends continuous
+	// absolute pointer + buttons, which every host (desktop uinput, phone cursor/gesture)
+	// injects. Game mode is untouched — it keeps the relative evdev-grab path for FPS mouselook.
 	get controllable() {
-		return this.#in.wsPort() > 0;
+		return this.#in.wsPort() > 0 || (this.#in.native() && this.#in.mode() === 'remote');
 	}
 
 	#moveDirty = false;
@@ -70,23 +103,58 @@ export class SessionInput {
 			const onBlur = () => {
 				this.#releaseButtons();
 				this.#releaseHeldKeys();
+				// Don't keep the OS cursor confined while another window has focus.
+				grabCursor(false);
 			};
+			const onFocus = () => grabCursor(true);
 			window.addEventListener('keydown', kd, true);
 			window.addEventListener('keyup', ku, true);
 			window.addEventListener('blur', onBlur);
+			window.addEventListener('focus', onFocus);
+			grabCursor(true);
 			return () => {
 				cancelAnimationFrame(raf);
 				window.removeEventListener('keydown', kd, true);
 				window.removeEventListener('keyup', ku, true);
 				window.removeEventListener('blur', onBlur);
+				window.removeEventListener('focus', onFocus);
+				// Covers stopControl AND component unmount while controlling.
+				grabCursor(false);
 			};
 		});
 	}
 
 	#norm(e: PointerEvent) {
 		const r = this.#in.canvas().getBoundingClientRect();
-		this.#nx = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
-		this.#ny = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+		if (r.width <= 0 || r.height <= 0) return;
+		let x = (e.clientX - r.left) / r.width;
+		let y = (e.clientY - r.top) / r.height;
+		// FIT (default): the video is aspect-fit (letterboxed) inside the canvas, so the video
+		// rect is SMALLER than the canvas in one axis. Normalizing over the whole canvas then
+		// mismatches the host's coordinate space — a portrait phone in a wider window is
+		// pillarboxed, so a small vertical mouse move mapped over the short canvas height
+		// over-scaled onto the tall phone screen ("move up a little → cursor jumps"). Map over
+		// the ACTUAL video rect instead. STRETCH fills the canvas (no correction); ORIGINAL is
+		// left as canvas-relative (rare, native-size/cropped — no simple linear rect).
+		const sw = this.#in.streamW();
+		const sh = this.#in.streamH();
+		if (this.#in.fitMode() === 'fit' && sw > 0 && sh > 0) {
+			const canvasAR = r.width / r.height;
+			const videoAR = sw / sh;
+			if (canvasAR > videoAR) {
+				// Pillarbox: bars left/right, video fills the height.
+				const vw = r.height * videoAR;
+				const ox = (r.width - vw) / 2;
+				x = (e.clientX - r.left - ox) / vw;
+			} else {
+				// Letterbox: bars top/bottom, video fills the width.
+				const vh = r.width / videoAR;
+				const oy = (r.height - vh) / 2;
+				y = (e.clientY - r.top - oy) / vh;
+			}
+		}
+		this.#nx = Math.min(1, Math.max(0, x));
+		this.#ny = Math.min(1, Math.max(0, y));
 	}
 	#releaseButtons() {
 		const playId = this.#in.playId();
@@ -111,9 +179,18 @@ export class SessionInput {
 		if (this.controllable && !this.controlling) {
 			this.controlling = true;
 			this.#in.canvas().focus();
-			// Windows: capture OS-reserved keys (Win/Alt+Tab/Ctrl+Esc) for the remote.
+			// Capture OS-reserved keys (Win/Alt+Tab/Ctrl+Esc) for the remote — without an
+			// OS-level hook the local WM swallows them before the webview ever sees a keydown.
+			// KEYBOARD-ONLY (kbdCaptureStart's mouse param defaults to false): the Linux evdev
+			// grab then takes just the keyboards, so the pointer events this VNC path relies on
+			// keep flowing to the webview. (The old blanket "skip on native" predates the
+			// keyboard-only mode — it was avoiding the full kb+mouse grab.) The native grab is
+			// focus-gated and needs an explicit engage; Windows' LL-hook path ignores it.
 			const playId = this.#in.playId();
-			if (playId >= 0) api.kbdCaptureStart(playId).catch(() => {});
+			if (playId >= 0) {
+				api.kbdCaptureStart(playId).catch(() => {});
+				if (this.#in.native()) api.kbdEngage().catch(() => {});
+			}
 		}
 	};
 	stopControl = () => {
@@ -142,7 +219,15 @@ export class SessionInput {
 		if (!this.controlling) {
 			this.startControl();
 			this.#armingClick = true;
-			return; // the focusing click isn't forwarded
+			// Seed the host pointer at the clicked spot (position only — the BUTTON stays
+			// swallowed). Control then starts where the user clicked, and a phone host
+			// creates/shows its cursor overlay immediately instead of only on the first
+			// post-click move. The pump picks #moveDirty up on its first tick.
+			if (this.controlling) {
+				this.#norm(e);
+				this.#moveDirty = true;
+			}
+			return; // the focusing click's press/release isn't forwarded
 		}
 		e.preventDefault();
 		this.#norm(e);
@@ -173,6 +258,31 @@ export class SessionInput {
 		if (down && (e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'F12') {
 			e.preventDefault();
 			this.stopControl();
+			return;
+		}
+		// Ctrl+Alt+Z — the detach combo the engage hint advertises. On desktop-host
+		// sessions the NATIVE hook (evdev grab / WH_KEYBOARD_LL) intercepts it, but this
+		// VNC-style path (phone host / native remote) deliberately never arms that hook —
+		// so handle it here too, otherwise the combo is forwarded to the host and control
+		// never releases. stopControl() releases held keys/buttons (incl. this Ctrl+Alt).
+		if (down && e.ctrlKey && e.altKey && e.code === 'KeyZ') {
+			e.preventDefault();
+			this.stopControl();
+			return;
+		}
+		// Ctrl+Shift+Q (leave/end) and Ctrl+Shift+M (game-overlay toggle) are emitted by
+		// the OS-level hook on desktop-host sessions ('kbd-leave' / 'overlay-toggle').
+		// This VNC-style path never arms that hook, so emit the SAME events from here —
+		// Session.svelte's existing listeners handle both identically.
+		if (down && e.ctrlKey && e.shiftKey && e.code === 'KeyQ') {
+			e.preventDefault();
+			this.stopControl();
+			emitTauri('kbd-leave');
+			return;
+		}
+		if (down && e.ctrlKey && e.shiftKey && e.code === 'KeyM') {
+			e.preventDefault();
+			emitTauri('overlay-toggle');
 			return;
 		}
 		const playId = this.#in.playId();

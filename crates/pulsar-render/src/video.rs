@@ -130,11 +130,22 @@ pub static FPS: Mutex<[f32; 3]> = Mutex::new([0.0; 3]); // fps, mbit, ms (filled
 /// previously live. Cleared the moment a fresh frame arrives again. The render loop
 /// drives this on Windows (per-AU queue); linux.rs drives it from LAST_FRAME_MS.
 pub static STALLED: AtomicBool = AtomicBool::new(false);
+/// Set when the app reuses the resident renderer for a DIFFERENT host (it sends `show`
+/// before `reopen`). The render loop then drops the previous host's held frame so its last
+/// view isn't shown while the new stream spins up — Chrome-tab semantics (each connect is a
+/// fresh view), not the codec-switch "hold the frame" path (which sends `reopen` alone).
+pub static RESET_VIEW: AtomicBool = AtomicBool::new(false);
 /// Monotonic-millis timestamp of the LAST fresh decoded frame handed to the GL
 /// presenter (updated on every `Presenter::draw()` with a non-empty MBX pop).
 /// Used by the Linux render loop to detect a stall without a separate timer thread.
 /// 0 = no frame presented yet.
 pub static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
+/// Live STREAM pixel dimensions (0 = no video yet) — mirrors the `vidsink-dims` stdout
+/// report. The ~1 Hz `vidsink-fps` stats line embeds THESE (not the window size!): the app
+/// re-emits them as `play-dims`, and the webview's input letterbox mapping uses them — the
+/// window size there made the mapping compute a no-op rect and the remote cursor drifted.
+pub static VID_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub static VID_H: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// Human label of the ACTUAL decoder in use (e.g. "h264_rkmpp (HW)") — the egui
 /// overlay displays it read-only; selection is always automatic.
 pub static DEC_LABEL: Mutex<String> = Mutex::new(String::new());
@@ -340,13 +351,19 @@ unsafe fn decode_once(sdp: &CString) {
 		// hits often (measured ~1 lost AU/s). 16 packets covered LAN reorder, but a NACK
 		// retransmit re-enters ~1 RTT later — at 15 Mbit/1200 B that's dozens of packets — so the
 		// window must hold the in-flight stretch or the retransmit lands "too late" and is dropped.
-		// 64 packets ≈ 40 ms of 15 Mbit stream. (env PULSAR_REORDER overrides.)
+		// 64 packets ≈ 40 ms of 15 Mbit stream — measured TOO SMALL against a phone host:
+		// a single IDR spans ~90 packets at 8 Mbit/1100 B, so any gap inside an IDR burst
+		// overflowed the queue ("jitter buffer full") and force-flushed past the hole before
+		// the NACK retransmit landed ("RTP: dropping old packet received too late") →
+		// mosaic/smear every time. 512 packets (~0.5 s @ 8 Mbit, a few hundred KB) holds the
+		// whole burst while a retransmit is in flight; in-order streams are unaffected (the
+		// queue drains immediately when there is no gap). (env PULSAR_REORDER overrides.)
 		// Envs are parsed as numbers (default on garbage): a non-numeric value on a KNOWN
 		// option would fail av_opt_set_dict inside avformat_open_input → permanent black screen.
 		let reorder = std::env::var("PULSAR_REORDER")
 			.ok()
 			.and_then(|v| v.parse::<u64>().ok())
-			.unwrap_or(64);
+			.unwrap_or(512);
 		set(&mut opts, "reorder_queue_size", &reorder.to_string());
 		// UDP socket SO_RCVBUF headroom. NOT a latency delay-line: with nobuffer+low_delay the
 		// decode thread reads packets immediately, so the socket stays drained at steady state
@@ -364,11 +381,15 @@ unsafe fn decode_once(sdp: &CString) {
 		// reference chain → green/mosaic smear until the next keyframe (gop=120 ≈ 2 s). 40 ms
 		// covers the LAN-relay/hairpin NACK round-trip; in-order packets are still delivered
 		// immediately (this delays ONLY when a gap is being waited out), so steady-state latency
-		// is unchanged. (env PULSAR_MAXDELAY overrides, µs.)
+		// is unchanged. Raised 40 → 100 ms: against a phone host over Wi-Fi (+ possibly a
+		// remote relay) the detect→NACK→retransmit→arrive loop measured past 40 ms, so every
+		// retransmit was already "too late" and the picture stayed corrupt until the next
+		// keyframe. 100 ms still only bites while a hole is being waited out.
+		// (env PULSAR_MAXDELAY overrides, µs.)
 		let maxdelay = std::env::var("PULSAR_MAXDELAY")
 			.ok()
 			.and_then(|v| v.parse::<u64>().ok())
-			.unwrap_or(40_000);
+			.unwrap_or(100_000);
 		set(&mut opts, "max_delay", &maxdelay.to_string());
 		// Make avformat_find_stream_info (below) return ASAP instead of sitting in libav's
 		// default ~5 s analyze window. The codec is ALREADY known from the SDP (the m=video
@@ -523,9 +544,8 @@ unsafe fn decode_once(sdp: &CString) {
 			(*dc).get_format = Some(crate::decode::get_format);
 			(*dc).extra_hw_frames = 8;
 			if let Some(dev) = sel.hwdev {
-				let mut hwctx: *mut ff::AVBufferRef = ptr::null_mut();
-				if ff::av_hwdevice_ctx_create(&mut hwctx, dev, ptr::null(), ptr::null_mut(), 0) < 0
-				{
+				let hwctx = crate::decode::create_hwdevice(dev);
+				if hwctx.is_null() {
 					eprintln!("pulsar-render: hw device ctx failed at stream open");
 					break 'decode;
 				}
@@ -560,6 +580,17 @@ unsafe fn decode_once(sdp: &CString) {
 			}
 			// Tier-1 zero-copy: try av_hwframe_map → DRM_PRIME once; on the first failure
 			// fall back to readback (av_hwframe_transfer_data → NV12 upload) permanently.
+			//
+			// VAAPI is forced onto the readback path: AMD's Mesa VAAPI exports NV12 as a
+			// MULTI-LAYER DRM_PRIME descriptor (layer0 = R8 luma, layer1 = GR88 chroma),
+			// unlike rkmpp's single composed NV12 layer. The EGLImage import only reads
+			// layers[0], so it grabbed the Y plane as an R8 image → the external sampler
+			// returned (Y,0,0,1) → a red grayscale screen. Readback (vaGetImage → NV12 CPU
+			// buffer → the known-good NV12 upload path) sidesteps the multi-layer import and
+			// still HW-decodes (the H.264 work stays on the GPU; only a per-frame NV12 copy
+			// is added, sub-ms at 1080p). Zero-copy stays on for rkmpp/others.
+			let force_readback =
+				sel.hwdev == Some(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI);
 			let mut map_failed = false;
 			let mut readback_warned = false;
 			let pkt = ff::av_packet_alloc();
@@ -635,7 +666,7 @@ unsafe fn decode_once(sdp: &CString) {
 						// Zero-copy first: a VAAPI/DRM frame usually maps straight to a
 						// DRM_PRIME dmabuf the EGL path imports with no copy.
 						let mut mapped: *mut ff::AVFrame = ptr::null_mut();
-						if !map_failed {
+						if !map_failed && !force_readback {
 							let mf = ff::av_frame_alloc();
 							(*mf).format = ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
 							if ff::av_hwframe_map(mf, frame, ff::AV_HWFRAME_MAP_READ as c_int) == 0
@@ -989,6 +1020,26 @@ impl Presenter {
 
 	/// Draw the newest decoded frame letterboxed into a `w`x`h` viewport. Returns true if a frame
 	/// was present (so the caller knows video is live).
+	/// Drop the held last frame + any queued frames so the next `draw()` reports NO video
+	/// until the NEW stream delivers one. Used on a new-host switch so the previous host's
+	/// last frame is never shown under the new session.
+	pub unsafe fn reset(&mut self) {
+		if !self.last.is_null() {
+			let mut old = self.last;
+			ff::av_frame_free(&mut old);
+			self.last = ptr::null_mut();
+		}
+		let mut q = MBX.lock().unwrap();
+		while let Some(f) = q.pop_front() {
+			let mut o = f.0;
+			ff::av_frame_free(&mut o);
+		}
+		drop(q);
+		self.vid_dims = (0, 0);
+		VID_W.store(0, Ordering::Relaxed);
+		VID_H.store(0, Ordering::Relaxed);
+	}
+
 	pub unsafe fn draw(&mut self, gl: &glow::Context, w: i32, h: i32) -> bool {
 		use glow::HasContext;
 		// Take the newest decoded frame if there is one; else RE-PRESENT the last frame. The
@@ -1066,6 +1117,8 @@ impl Presenter {
 		// the app can size the session window to the host's aspect ratio.
 		if (vw, vh) != self.vid_dims && vw > 0 && vh > 0 {
 			self.vid_dims = (vw, vh);
+			VID_W.store(vw, Ordering::Relaxed);
+			VID_H.store(vh, Ordering::Relaxed);
 			println!("vidsink-dims {vw}x{vh}");
 			use std::io::Write as _;
 			let _ = std::io::stdout().flush();

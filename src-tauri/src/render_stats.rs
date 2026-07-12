@@ -104,7 +104,23 @@ pub(crate) fn start_render_reader(
 			if let Some(rest) = line.strip_prefix("vidsink-fps ") {
 				let mut it = rest.split_whitespace();
 				let fps = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-				let _dims = it.next();
+				// The stats line carries the live stream dims ("<w>x<h>") — re-emit them as
+				// play-dims EVERY tick (1 Hz, a dozen bytes). The one-shot vidsink-dims print —
+				// and any change-deduped variant — races listener registration: a webview that
+				// (re)mounts after the frame arrived (session restart, HMR, slow load) would
+				// never get dims, leaving the input letterbox mapping at 0×0 = whole-canvas
+				// coords → the remote cursor lands way off / the bars count as video. An
+				// unconditional 1 Hz emit guarantees any listener has dims within a second,
+				// and a rotating phone host's dim change propagates the same way.
+				let dims = it.next().and_then(|s| {
+					let (w, h) = s.split_once('x')?;
+					Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+				});
+				if let Some((w, h)) = dims {
+					if w > 1 && h > 1 {
+						let _ = app.emit("play-dims", (cur_id, w, h));
+					}
+				}
 				let mbps = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 				let ms = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 				tracing::debug!(fps, mbps, decode_ms = ms, "render stats");

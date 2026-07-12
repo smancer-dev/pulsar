@@ -157,9 +157,12 @@ unsafe fn candidates(codec_id: ff::AVCodecID) -> Vec<Candidate> {
 	let stock = ff::avcodec_find_decoder(codec_id);
 	if !stock.is_null() {
 		use ff::AVHWDeviceType::*;
+		// CUDA before VAAPI: a creatable CUDA device means a discrete NVIDIA GPU is
+		// present, whose NVDEC is at least as capable as the iGPU's VAAPI block —
+		// and on hybrid systems the VAAPI default node is often the wrong GPU anyway.
 		for want in [
-			AV_HWDEVICE_TYPE_VAAPI,
 			AV_HWDEVICE_TYPE_CUDA,
+			AV_HWDEVICE_TYPE_VAAPI,
 			AV_HWDEVICE_TYPE_VULKAN,
 			AV_HWDEVICE_TYPE_DRM,
 		] {
@@ -209,6 +212,46 @@ fn hwdev_name(dev: ff::AVHWDeviceType) -> &'static str {
 		AV_HWDEVICE_TYPE_DRM => "drm",
 		_ => "hw",
 	}
+}
+
+/// Create a hwaccel device context for `dev`. VAAPI's default device is
+/// `/dev/dri/renderD128`, which on an Optimus/hybrid laptop is the NVIDIA node — it has
+/// no VA driver, so the default fails while the AMD iGPU's `radeonsi` VA driver lives on a
+/// higher-numbered render node that libva never tries. So for VAAPI: try the default,
+/// then EACH `/dev/dri/renderD*` node, and use the first that initialises — hardware
+/// decode then lands on whichever GPU actually provides VAAPI. Other device types
+/// (CUDA/Vulkan/DRM) use their own default. Returns null when no device could be created.
+pub(crate) unsafe fn create_hwdevice(dev: ff::AVHWDeviceType) -> *mut ff::AVBufferRef {
+	use ff::AVHWDeviceType::*;
+	let mut hwctx: *mut ff::AVBufferRef = ptr::null_mut();
+	if ff::av_hwdevice_ctx_create(&mut hwctx, dev, ptr::null(), ptr::null_mut(), 0) >= 0 {
+		return hwctx;
+	}
+	if dev != AV_HWDEVICE_TYPE_VAAPI {
+		return ptr::null_mut();
+	}
+	// VAAPI default node had no driver — walk the render nodes and use the first that works.
+	if let Ok(rd) = std::fs::read_dir("/dev/dri") {
+		let mut nodes: Vec<std::path::PathBuf> = rd
+			.filter_map(|e| e.ok().map(|e| e.path()))
+			.filter(|p| {
+				p.file_name()
+					.and_then(|n| n.to_str())
+					.is_some_and(|n| n.starts_with("renderD"))
+			})
+			.collect();
+		nodes.sort();
+		for node in nodes {
+			if let Ok(c) = std::ffi::CString::new(node.to_string_lossy().as_bytes()) {
+				let mut hwctx: *mut ff::AVBufferRef = ptr::null_mut();
+				if ff::av_hwdevice_ctx_create(&mut hwctx, dev, c.as_ptr(), ptr::null_mut(), 0) >= 0 {
+					eprintln!("pulsar-render: VAAPI device {}", node.display());
+					return hwctx;
+				}
+			}
+		}
+	}
+	ptr::null_mut()
 }
 
 /// The hw format the validate/get_format callback should accept for the candidate
@@ -339,8 +382,8 @@ unsafe fn validate(cand: &Candidate, fixture: &std::path::Path) -> bool {
 		(*dc).get_format = Some(get_format);
 		let mut hwdev_ok = true;
 		if let Some(dev) = cand.hwdev {
-			let mut hwctx: *mut ff::AVBufferRef = ptr::null_mut();
-			if ff::av_hwdevice_ctx_create(&mut hwctx, dev, ptr::null(), ptr::null_mut(), 0) < 0 {
+			let hwctx = create_hwdevice(dev);
+			if hwctx.is_null() {
 				hwdev_ok = false;
 			} else {
 				(*dc).hw_device_ctx = hwctx;

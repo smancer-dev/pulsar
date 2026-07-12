@@ -110,6 +110,17 @@ pub(super) async fn hold_session(
 	let (mut win_recv, mut win_lost) = (0u32, 0u32);
 	let mut clean_windows = 0u32;
 	let mut last_step = std::time::Instant::now();
+	// ABR ceiling memory: the bitrate at which loss last appeared. Without it the clean-creep
+	// climbed all the way back to base_kbps every ~20 s, slammed into the same bottleneck,
+	// and produced a periodic loss storm (seconds of corruption) — a sawtooth the user saw as
+	// "the picture breaks all the time". The climb now stops at ~85% of the last bad rate and
+	// only re-probes past it slowly (+10% after a long clean stretch at the cap).
+	let mut loss_ceiling: u32 = base_kbps.max(ADAPT_MIN_KBPS);
+	let mut at_cap_windows = 0u32;
+	// Failed-repair keyframe request: when a NACKed packet never arrives (expired from
+	// `missing`), the reference chain is broken until the next keyframe — with long host
+	// GOPs that is seconds of smear. Ask the host for an immediate IDR instead (rate-limited).
+	let mut last_kfreq = std::time::Instant::now();
 	// When the last menu re-request (esp. a monitor switch) fired. The host rebuilds its encoder
 	// for one → a brief packet-loss gap that is NOT congestion; the adaptive controller must
 	// ignore it for a moment, or it steps the bitrate (a full-path restream that churns + slows
@@ -636,8 +647,19 @@ pub(super) async fn hold_session(
 					if last_inbound.elapsed() > std::time::Duration::from_secs(5) {
 						break;
 					}
-				// Retransmits that never arrived stay counted as lost; stop tracking them.
+				// Retransmits that never arrived stay counted as lost; stop tracking them —
+				// and treat any expiry as a FAILED repair: the decoder's reference chain is
+				// broken until a keyframe, so request one now (MediaNack([0]) sentinel, max
+				// 1/s) instead of smearing until the host's next scheduled IDR.
+				let missing_before = missing.len();
 				missing.retain(|_, t| t.elapsed() < std::time::Duration::from_millis(300));
+				if missing.len() < missing_before
+					&& host_nack
+					&& last_kfreq.elapsed() >= std::time::Duration::from_secs(1)
+				{
+					last_kfreq = std::time::Instant::now();
+					let _ = send_data(&sess, &DataMsg::MediaNack(vec![0])).await;
+				}
 				// ---- Adaptive bitrate (auto mode only): step DOWN on sustained loss,
 				// creep back UP after a long clean stretch. Each step re-requests the
 				// stream (the host restarts its encoder — brief, so steps are damped).
@@ -655,6 +677,8 @@ pub(super) async fn hold_session(
 						// above an unknown bottleneck, or a sudden drop below the relay's per-session
 						// cap). HALVE immediately, BYPASSING the cooldown, so it converges in a couple
 						// of 2 s windows (~4 s) instead of ~20 s of garbage with the gentle 0.7× step.
+						loss_ceiling = cur_bitrate.max(ADAPT_MIN_KBPS);
+						at_cap_windows = 0;
 						new_kbps = Some((cur_bitrate / 2).max(ADAPT_MIN_KBPS));
 						clean_windows = 0;
 						last_step = std::time::Instant::now();
@@ -663,13 +687,31 @@ pub(super) async fn hold_session(
 						&& last_step.elapsed().as_secs() >= ADAPT_COOLDOWN_S
 						&& cur_bitrate > ADAPT_MIN_KBPS
 					{
+						loss_ceiling = cur_bitrate.max(ADAPT_MIN_KBPS);
+						at_cap_windows = 0;
 						new_kbps = Some((cur_bitrate * 7 / 10).max(ADAPT_MIN_KBPS));
 						clean_windows = 0;
 					} else if loss < ADAPT_LOSS_CLEAN && total > 0 {
 						clean_windows += 1;
-						if clean_windows >= ADAPT_CLEAN_WINDOWS && cur_bitrate < base_kbps {
-							new_kbps = Some((cur_bitrate * 5 / 4).min(base_kbps));
-							clean_windows = 0;
+						// Climb only to ~85% of the last loss-producing rate (see loss_ceiling
+						// above); re-probe past it by +10% only after a LONG clean stretch at
+						// the cap, so the old climb-to-base→storm sawtooth becomes tiny probes.
+						let cap = ((loss_ceiling as u64 * 85 / 100) as u32)
+							.clamp(ADAPT_MIN_KBPS, base_kbps);
+						if clean_windows >= ADAPT_CLEAN_WINDOWS {
+							if cur_bitrate < cap {
+								new_kbps = Some((cur_bitrate * 5 / 4).min(cap));
+								clean_windows = 0;
+							} else {
+								at_cap_windows += 1;
+								if at_cap_windows >= 3 && cap < base_kbps {
+									// ~3 clean cap-stretches (≈1 min) → probe 10% higher.
+									loss_ceiling =
+										(loss_ceiling * 11 / 10).min(base_kbps * 20 / 17);
+									at_cap_windows = 0;
+								}
+								clean_windows = 0;
+							}
 						}
 					} else {
 						clean_windows = 0;

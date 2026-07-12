@@ -682,3 +682,73 @@ pub(crate) unsafe fn fill_children_to_client(hwnd: windows_sys::Win32::Foundatio
 	};
 	EnumChildWindows(hwnd, Some(cb), &ctx as *const Ctx as LPARAM);
 }
+
+/// Confine the OS pointer to the main window while the VNC-style control path is
+/// engaged (phone hosts / native remote), so the cursor can't walk off the app
+/// mid-drag. tao's Linux `set_cursor_grab` is a silent no-op, so Linux issues a raw
+/// server-side `XGrabPointer` with `confine_to` on the app's own X connection.
+/// NOT `gdk_pointer_grab`: GDK's grab adds a CLIENT-side redirect that reroutes every
+/// button event to the grab window's widget (the toplevel), so the webview stopped
+/// receiving clicks entirely. With a raw X grab and `owner_events=True` the server
+/// delivers events to this client's windows exactly as if no grab were active — the
+/// webview keeps clicking — while the pointer stays confined to the toplevel.
+/// Windows/macOS use tao's grab (ClipCursor / CGAssociateMouseAndMouseCursorPosition).
+#[tauri::command]
+pub(crate) async fn confine_pointer(app: AppHandle, on: bool) -> Result<(), String> {
+	#[cfg(all(unix, not(target_os = "macos")))]
+	{
+		use tauri::Manager;
+		let _ = app.clone().run_on_main_thread(move || unsafe {
+			use gtk::glib::Cast;
+			use gtk::glib::translate::ToGlibPtr;
+			use gtk::prelude::WidgetExt;
+			use x11::xlib;
+			let dpy = gtk::gdk::Display::default()
+				.and_then(|d| d.downcast::<gdkx11::X11Display>().ok())
+				.map(|d| {
+					let stash = ToGlibPtr::<*mut gdkx11::ffi::GdkX11Display>::to_glib_none(&d);
+					gdkx11::ffi::gdk_x11_display_get_xdisplay(stash.0)
+				});
+			let Some(dpy) = dpy else { return }; // not on X11 (native Wayland override)
+			if !on {
+				xlib::XUngrabPointer(dpy, xlib::CurrentTime);
+				xlib::XFlush(dpy);
+				return;
+			}
+			let xid = app
+				.get_webview_window("main")
+				.and_then(|w| w.gtk_window().ok())
+				.and_then(|gw| gw.window())
+				.and_then(|gdkw| gdkw.downcast::<gdkx11::X11Window>().ok())
+				.map(|x| x.xid());
+			let Some(xid) = xid else { return };
+			let mask = (xlib::PointerMotionMask
+				| xlib::ButtonPressMask
+				| xlib::ButtonReleaseMask
+				| xlib::ButtonMotionMask) as u32;
+			let status = xlib::XGrabPointer(
+				dpy,
+				xid,
+				xlib::True,
+				mask,
+				xlib::GrabModeAsync,
+				xlib::GrabModeAsync,
+				xid, // confine_to: the app toplevel
+				0,   // keep the current cursor
+				xlib::CurrentTime,
+			);
+			xlib::XFlush(dpy);
+			if status != xlib::GrabSuccess {
+				tracing::warn!("confine_pointer: XGrabPointer failed status={status}");
+			}
+		});
+	}
+	#[cfg(any(not(unix), target_os = "macos"))]
+	{
+		use tauri::Manager;
+		if let Some(w) = app.get_webview_window("main") {
+			let _ = w.set_cursor_grab(on);
+		}
+	}
+	Ok(())
+}

@@ -372,7 +372,11 @@
 		// Split mode: a click anywhere in this pane focuses it (routes keyboard/mouse +
 		// unlocked controllers here) before the engage/pointer handling below.
 		onPaneFocus?.();
-		if (native && !nativeEngaged) {
+		// GAME mode only: engage the evdev grab (relative mouselook) on the click. REMOTE mode
+		// drives control through the canvas VNC path (input.onDown → absolute pointer + buttons)
+		// instead — the grab is fragile (needs its capture thread up) and useless for a phone
+		// host, and its relative motion never reached hosts where the grab didn't engage.
+		if (native && mode === 'game' && !nativeEngaged) {
 			api.kbdEngage().catch(() => {});
 			// Start the host cursor where the user clicked: map the click into the video
 			// rect (normalized 0..1) and send it as one absolute move before the relative
@@ -393,14 +397,36 @@
 	// Size the windowed session to the HOST's aspect ratio on the first decoded frame
 	// (`play-dims` from the native renderer): keep the current window width, set the
 	// height so the video area matches the stream's w:h exactly (16:9 host → 16:9
-	// video, 4:3 → 4:3). Once per session; skipped in fullscreen/maximized.
+	// video, 4:3 → 4:3). Re-fires when the host's ORIENTATION flips (portrait↔landscape) —
+	// e.g. a phone host rotating mid-session re-encodes at swapped dims, and the window
+	// should follow so the video isn't stuck letterboxed in the old shape. Skipped in
+	// fullscreen/maximized (and for minor AR jitter — only a portrait↔landscape flip re-sizes).
+	// Live decoded stream dimensions (from `play-dims`), used by the input engine to map the
+	// cursor over the real video rect (letterbox-aware).
+	let streamW = $state(0);
+	let streamH = $state(0);
 	let sizedToHost = false;
+	let sizedLandscape: boolean | null = null;
 	$effect(() => {
 		if (!native || playId < 0) return;
 		const scope = listenScope();
 		scope.add(onPlayDims(async (e) => {
-			if (e.id !== playId || sizedToHost || fullscreen || e.w <= 0 || e.h <= 0) return;
+			if (e.id !== playId || e.w <= 0 || e.h <= 0) return;
+			// Track the live stream dims so the input engine maps the cursor over the ACTUAL
+			// video letterbox rect (a portrait phone in a wider window is pillarboxed — mapping
+			// over the whole canvas would over-scale one axis). Always updated, even fullscreen.
+			if (streamW !== e.w || streamH !== e.h) {
+				console.warn(`[session] stream dims ${e.w}x${e.h} (input letterbox mapping active)`);
+			}
+			streamW = e.w;
+			streamH = e.h;
+			if (fullscreen) return;
+			const landscape = e.w >= e.h;
+			// First frame, or an orientation flip → (re)size; otherwise leave the window alone
+			// so the user's manual resize sticks.
+			if (sizedToHost && sizedLandscape === landscape) return;
 			sizedToHost = true;
+			sizedLandscape = landscape;
 			try {
 				const { getCurrentWindow } = await import('@tauri-apps/api/window');
 				const { LogicalSize } = await import('@tauri-apps/api/dpi');
@@ -442,7 +468,11 @@
 		playId: () => playId,
 		wsPort: () => wsPort,
 		canvas: () => canvas,
-		mode: () => mode
+		mode: () => mode,
+		native: () => native,
+		streamW: () => streamW,
+		streamH: () => streamH,
+		fitMode: () => fitMode
 	});
 	function stopControl() {
 		input.stopControl();
@@ -788,6 +818,7 @@
 		bind:this={canvas}
 		class="video {fitMode}"
 		class:on={media.hasVideo}
+		class:nativeinput={native}
 		class:control={input.controlling}
 		tabindex="0"
 		onpointerdown={input.onDown}
@@ -872,6 +903,20 @@
 	.video.on {
 		display: block;
 	}
+	/* Native (Linux) renderer: the canvas is never drawn to (the video is a native child
+	   window composited over the webview) but it IS the VNC input surface — the pointer
+	   handlers live on it. Without this it was an unsized 300×150 box, hidden until vstats
+	   flowed (display:none) — clicks/moves mostly missed it, so control never started and
+	   the phone cursor never appeared. Make it a transparent full-bleed input layer that is
+	   always hittable while a native session is up. */
+	.video.nativeinput {
+		display: block;
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		background: transparent;
+	}
 	/* AnyDesk-style fit modes */
 	.video.fit {
 		max-width: 100%;
@@ -895,6 +940,11 @@
 	.video.control {
 		outline: 2px solid var(--accent);
 		outline-offset: -2px;
+		/* While controlling, the HOST's cursor (rendered into the stream) is the pointer —
+		   hide the local one over the video so there aren't two arrows fighting (and any
+		   sub-frame offset between them is invisible). Leaving the video/stopping control
+		   restores the normal cursor. */
+		cursor: none;
 	}
 	.filepick {
 		display: none;
