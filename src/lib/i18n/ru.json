@@ -500,5 +500,17 @@
 	"approve.allow": "Разрешить",
 	"approve.allowViewOnly": "Разрешить только просмотр",
 	"modal.close": "Закрыть",
-	"session.overlayBtn": "Открыть меню оверлея"
+	"session.overlayBtn": "Открыть меню оверлея",
+	"settings.autoUpdate": "Устанавливать обновления автоматически",
+	"settings.autoUpdateDesc": "При появлении новой версии скачивает, устанавливает и перезапускает без вопросов. Если выключено, обновление показывается значком в верхней панели, установка — по вашему решению.",
+	"update.available": "Доступно обновление",
+	"update.notes": "Что нового",
+	"update.install": "Установить",
+	"update.retry": "Повторить",
+	"update.close": "Закрыть",
+	"update.downloading": "Загрузка…",
+	"update.installing": "Установка…",
+	"update.restarting": "Перезапуск…",
+	"update.error": "Ошибка обновления",
+	"update.noSelfUpdate": "Эта установка не может обновиться сама (пакетный менеджер/Flatpak или AppImage без FUSE). Обновите через пакетный менеджер или скачайте новую версию со страницы GitHub Releases."
 }

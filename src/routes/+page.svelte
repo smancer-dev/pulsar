@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import PulsarMark from '$lib/PulsarMark.svelte';
-	import { silentUpdateCheck } from '$lib/updater';
+	import { silentUpdateCheck, checkForUpdateUi } from '$lib/updater';
 	import {
 		api,
 		isTauri,
@@ -42,6 +42,7 @@
 	import Tabs from './page/Tabs.svelte';
 	import HomeView from './page/HomeView.svelte';
 	import PasswordModal from './page/PasswordModal.svelte';
+	import UpdateModal from './page/UpdateModal.svelte';
 	import { SessionManager } from './page/sessions.svelte';
 
 	// When opened as the Allow/Deny approval popup (a separate window), render only
@@ -621,15 +622,10 @@
 			// fullscreen sticks. Scoped to game mode so remote never reopens fullscreen.
 			if (mode === 'game' && ui.gamingFullscreen && !sm.fullscreen) sm.toggleFullscreen();
 			setTimeout(() => {
-				// Re-check session state at fire time: the user may have connected (client
-				// session) or a peer may have connected to control this host within the 3s
-				// window. The updater must never tear down a live session.
-				if (sm.sessions.length === 0 && hostSessions.length === 0)
-					// Re-check at fire time (above) AND inside silentUpdateCheck after the
-					// slow manifest fetch: a session can begin during the check→install gap.
-					void silentUpdateCheck({
-						isBusy: () => sm.sessions.length > 0 || hostSessions.length > 0
-					});
+				// Consent-based UX (default): surface the update in the chrome badge +
+				// modal; download/install only on user action. The autoUpdate setting
+				// (default OFF) restores the silent install, still session-guarded.
+				void checkForUpdateUi(() => sm.sessions.length > 0 || hostSessions.length > 0);
 			}, 3000);
 		}
 	});
@@ -967,6 +963,8 @@
 				onCancel={cancelPw}
 			/>
 		{/if}
+
+		<UpdateModal />
 
 		{#if showSplitPicker}
 			<SplitPicker

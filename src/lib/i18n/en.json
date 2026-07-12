@@ -500,5 +500,17 @@
 	"approve.allow": "Allow",
 	"approve.allowViewOnly": "Allow view-only",
 	"modal.close": "Close",
-	"session.overlayBtn": "Open the overlay menu"
+	"session.overlayBtn": "Open the overlay menu",
+	"settings.autoUpdate": "Install updates automatically",
+	"settings.autoUpdateDesc": "When a new version is found, download, install and relaunch without asking. When off, updates show as a badge in the top bar and installing is up to you.",
+	"update.available": "Update available",
+	"update.notes": "What's new",
+	"update.install": "Install",
+	"update.retry": "Retry",
+	"update.close": "Close",
+	"update.downloading": "Downloading…",
+	"update.installing": "Installing…",
+	"update.restarting": "Restarting…",
+	"update.error": "Update failed",
+	"update.noSelfUpdate": "This install can't update itself (package-manager/Flatpak install, or an AppImage launched without FUSE). Update via your package manager, or download the new version from the GitHub Releases page."
 }

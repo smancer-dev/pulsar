@@ -500,5 +500,17 @@
 	"approve.allow": "İzin Ver",
 	"approve.allowViewOnly": "Sadece izleme olarak izin ver",
 	"modal.close": "Kapat",
-	"session.overlayBtn": "Overlay menüsünü aç"
+	"session.overlayBtn": "Overlay menüsünü aç",
+	"settings.autoUpdate": "Güncellemeleri otomatik kur",
+	"settings.autoUpdateDesc": "Yeni sürüm bulunduğunda sormadan indirip kurar ve uygulamayı yeniden başlatır. Kapalıyken güncelleme üst çubukta rozet olarak gösterilir, kurulum sana sorulur.",
+	"update.available": "Güncelleme mevcut",
+	"update.notes": "Değişiklikler",
+	"update.install": "Kur",
+	"update.retry": "Tekrar dene",
+	"update.close": "Kapat",
+	"update.downloading": "İndiriliyor…",
+	"update.installing": "Kuruluyor…",
+	"update.restarting": "Yeniden başlatılıyor…",
+	"update.error": "Güncelleme başarısız",
+	"update.noSelfUpdate": "Bu kurulum kendini güncelleyemiyor (paket yöneticisi/Flatpak kurulumu ya da FUSE olmadan çalıştırılan AppImage). Yeni sürümü paket yöneticinden güncelle veya GitHub Releases sayfasından indirip kur."
 }

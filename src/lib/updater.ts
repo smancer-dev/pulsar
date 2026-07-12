@@ -1,6 +1,8 @@
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { api } from './api.commands';
+import { update as updateState } from './update.svelte';
+import { ui } from './settings.svelte';
 
 /**
  * Silently check for a newer release on this build's channel and, if found,
@@ -100,5 +102,74 @@ export async function silentUpdateCheck(opts?: {
 		// Offline / no endpoint / signature mismatch / download stall / browser mock:
 		// log + continue. Never throw into launch.
 		console.warn('[updater] skipped:', e);
+	}
+}
+
+/**
+ * Idle-launch update check with EXPLICIT-consent UX (the non-kiosk path):
+ * finds a newer release and surfaces it in the `update` store — the chrome badge
+ * lights up and the modal shows version + notes + an Install button. Nothing is
+ * downloaded or installed unless the user clicks Install, EXCEPT when the
+ * `autoUpdate` setting (default OFF) is on AND this install can self-update —
+ * then it behaves like the old silent flow (download+install+relaunch), still
+ * respecting `isBusy` so a live session is never interrupted.
+ *
+ * Installs that CANNOT self-update (flatpak / package manager / raw binary /
+ * non-FUSE AppImage) still get the badge + modal — being outdated must be
+ * visible — but with the Install button disabled and manual instructions shown.
+ */
+export async function checkForUpdateUi(isBusy?: () => boolean): Promise<void> {
+	try {
+		const update = await check({ timeout: 15000 });
+		if (!update) return; // up to date
+		updateState.handle = update;
+		updateState.from = update.currentVersion;
+		updateState.to = update.version;
+		updateState.notes = update.body ?? '';
+		updateState.installable = await api.selfUpdatePossible().catch(() => true);
+		updateState.available = true;
+		if (ui.autoUpdate && updateState.installable && !isBusy?.()) {
+			await installUpdate(isBusy);
+		}
+	} catch (e) {
+		console.warn('[updater] check skipped:', e);
+	}
+}
+
+/**
+ * Download + install the pending update (from `checkForUpdateUi`), streaming
+ * progress into the `update` store for the modal's download/install/restart
+ * stages. Aborts before each destructive step if `isBusy` reports a live session.
+ */
+export async function installUpdate(isBusy?: () => boolean): Promise<void> {
+	const u = updateState.handle;
+	if (!u || !updateState.installable) return;
+	if (updateState.phase === 'downloading' || updateState.phase === 'installing') return;
+	try {
+		updateState.error = '';
+		updateState.phase = 'downloading';
+		updateState.received = 0;
+		updateState.total = 0;
+		await u.download((ev) => {
+			if (ev.event === 'Started') updateState.total = ev.data.contentLength ?? 0;
+			else if (ev.event === 'Progress') updateState.received += ev.data.chunkLength;
+			else if (ev.event === 'Finished') updateState.received = updateState.total || updateState.received;
+		});
+		// The download can be slow — never tear down a session that started meanwhile.
+		// (On Windows install() spawns the NSIS installer and exits the process, so this
+		// pre-install guard is the only effective one there.)
+		if (isBusy?.()) {
+			updateState.phase = 'idle';
+			console.warn('[updater] downloaded but a session is live — deferring install');
+			return;
+		}
+		updateState.phase = 'installing';
+		await u.install();
+		updateState.phase = 'restarting';
+		await relaunch();
+	} catch (e) {
+		updateState.phase = 'error';
+		updateState.error = String(e);
+		console.warn('[updater] install failed:', e);
 	}
 }

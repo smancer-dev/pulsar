@@ -4,6 +4,7 @@
 	import { isTauri } from '$lib/api';
 	import { t, i18n, setLang, LANGS, type Lang } from '$lib/i18n.svelte';
 	import { gamingNav } from '$lib/gamepadNav.svelte';
+	import { update } from '$lib/update.svelte';
 
 	type Props = {
 		title: string;
@@ -102,6 +103,21 @@
 <div class="chrome" data-tauri-drag-region>
 	<div class="ctitle">{title}</div>
 	<div class="cright">
+		{#if update.available}
+			<!-- Update badge: sits LEFT of the split button; pulses until the user opens
+			     the modal. Shown even when this install can't self-update (the modal then
+			     explains how to update manually). -->
+			<button
+				class="game-btn upd"
+				use:navItem={gaming}
+				title={t('update.available')}
+				aria-label={t('update.available')}
+				onclick={() => (update.open = true)}
+			>
+				<Icon name="download" size={16} />
+				<span class="upd-dot"></span>
+			</button>
+		{/if}
 		{#if onSplit}
 			<button
 				class="game-btn"
@@ -214,6 +230,31 @@
 	.cright .ver {
 		font-size: 11.5px;
 		color: var(--text-faint);
+	}
+	.upd {
+		position: relative;
+		color: var(--accent);
+	}
+	.upd-dot {
+		position: absolute;
+		top: 3px;
+		right: 3px;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--accent);
+		animation: upd-pulse 1.6s ease-in-out infinite;
+	}
+	@keyframes upd-pulse {
+		0%,
+		100% {
+			opacity: 1;
+			transform: scale(1);
+		}
+		50% {
+			opacity: 0.45;
+			transform: scale(0.8);
+		}
 	}
 	.game-btn {
 		display: inline-flex;

@@ -69,6 +69,11 @@ export interface UiSettings {
 	 * shell (bottom dock, centered ID + numpad, no hosting). Toggled from the top bar;
 	 * the CLI `--mode game` overrides it on launch. Default 'remote'. */
 	appMode: 'remote' | 'game';
+	/** Auto-install app updates (download + install + relaunch silently at idle
+	 * launch). Default OFF — updates are surfaced in the chrome badge + modal and
+	 * installed only on explicit user action. Kiosk (--connect) boots always
+	 * auto-update regardless (appliance behavior, unchanged). */
+	autoUpdate: boolean;
 	/** Whether GAMING mode was left in fullscreen — persisted so the app reopens
 	 * fullscreen in game mode the way the user last had it (the bottom-dock button /
 	 * F11 toggle writes this; restored at startup only when appMode==='game'). Scoped
@@ -146,6 +151,7 @@ const DEFAULTS: UiSettings = {
 	controllerDisabled: {},
 	touchpadAsMouse: true,
 	appMode: 'remote',
+	autoUpdate: false,
 	gamingFullscreen: false
 };
 

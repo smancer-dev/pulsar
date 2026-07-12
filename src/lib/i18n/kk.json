@@ -500,5 +500,17 @@
 	"approve.allow": "Рұқсат ету",
 	"approve.allowViewOnly": "Тек көру үшін рұқсат ету",
 	"modal.close": "Жабу",
-	"session.overlayBtn": "Оверлей мәзірін ашу"
+	"session.overlayBtn": "Оверлей мәзірін ашу",
+	"settings.autoUpdate": "Жаңартуларды автоматты орнату",
+	"settings.autoUpdateDesc": "Жаңа нұсқа табылғанда сұрамай жүктеп, орнатып, қолданбаны қайта іске қосады. Өшірулі болса, жаңарту жоғарғы жолақта белгіше ретінде көрсетіледі, орнату өзіңізге байланысты.",
+	"update.available": "Жаңарту бар",
+	"update.notes": "Не өзгерді",
+	"update.install": "Орнату",
+	"update.retry": "Қайталау",
+	"update.close": "Жабу",
+	"update.downloading": "Жүктелуде…",
+	"update.installing": "Орнатылуда…",
+	"update.restarting": "Қайта іске қосылуда…",
+	"update.error": "Жаңарту сәтсіз",
+	"update.noSelfUpdate": "Бұл орнатым өзін жаңарта алмайды (пакет менеджері/Flatpak немесе FUSE-сыз іске қосылған AppImage). Пакет менеджері арқылы жаңартыңыз немесе жаңа нұсқаны GitHub Releases бетінен жүктеп алыңыз."
 }
