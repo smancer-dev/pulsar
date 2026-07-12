@@ -10,6 +10,7 @@ resolver = "2"
 members = [
   "crates/pulsar-render",
   "crates/pulsar-capture",
+  "crates/pulsar-setup",
   "src-tauri",
 ]
 # `cargo test` / `cargo build` default to the light, cross-platform capture crate.

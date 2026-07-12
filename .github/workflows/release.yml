@@ -203,6 +203,28 @@ jobs:
           ls -la release-artifacts
           echo "signatures:"; ls release-artifacts/*.sig 2>/dev/null || echo "  (none — check signing env)"
 
+      # Branded bootstrapper (crates/pulsar-setup): a Discord-style single-window
+      # installer with the app EMBEDDED as a zip — offered alongside the NSIS
+      # installer (which remains the updater's install vehicle). Payload mirrors
+      # what NSIS installs: the app exe + the bundled resources tree.
+      - name: Build branded setup (pulsar-setup, embedded payload)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          set -e
+          mkdir -p setup-payload/resources/interception setup-payload/resources/virtual-audio-driver setup-payload/resources/nefcon/x64 setup-payload/resources/nefcon/arm64
+          # Tauri renames the main binary to the productName.
+          cp target/release/Pulsar.exe setup-payload/pulsar.exe 2>/dev/null || cp target/release/pulsar.exe setup-payload/pulsar.exe
+          cp src-tauri/resources/ffmpeg.exe src-tauri/resources/pulsar-render.exe src-tauri/resources/ffplay.exe setup-payload/resources/
+          cp src-tauri/resources/interception/interception.dll setup-payload/resources/interception/
+          cp src-tauri/resources/virtual-audio-driver/* setup-payload/resources/virtual-audio-driver/
+          cp src-tauri/resources/nefcon/x64/nefconw.exe setup-payload/resources/nefcon/x64/
+          cp src-tauri/resources/nefcon/arm64/nefconw.exe setup-payload/resources/nefcon/arm64/
+          (cd setup-payload && 7z a -tzip ../setup-payload.zip . >/dev/null)
+          PULSAR_SETUP_PAYLOAD="$PWD/setup-payload.zip" cargo build --release -p pulsar-setup
+          cp target/release/pulsar-setup.exe "release-artifacts/Pulsar-Setup_${{ needs.prepare.outputs.version }}_x64.exe"
+          ls -la release-artifacts
+
       - uses: actions/upload-artifact@v4
         with:
           name: app-${{ matrix.name }}
