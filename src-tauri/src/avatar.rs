@@ -372,7 +372,7 @@ pub(crate) async fn self_avatar(
 	)
 }
 
-/// The OS user's display name (e.g. "Ahmet Enes Duruer") for the sidebar identity
+/// The OS user's display name (e.g. "Jane Doe") for the sidebar identity
 /// chip — replaces the generic "Bu cihaz" label with who is actually here.
 #[tauri::command]
 pub(crate) fn device_user_name() -> String {

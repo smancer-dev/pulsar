@@ -51,7 +51,7 @@ export const api = {
 	 * setting) as a `data:image/png;base64,…` URL, or null when none resolves —
 	 * the UI keeps its textual chip then. */
 	selfAvatar: () => invoke<string | null>('self_avatar'),
-	/** The OS user's display name (e.g. "Ahmet Enes Duruer") for the identity chip. */
+	/** The OS user's display name (e.g. "Jane Doe") for the identity chip. */
 	deviceUserName: () => invoke<string>('device_user_name'),
 	/** Path to an installed Steam launcher, or empty if Steam isn't found. */
 	steamPath: () => invoke<string>('steam_path'),

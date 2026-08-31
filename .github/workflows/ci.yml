@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # gilrs needs libudev on Linux; the rest match Tauri 2's webkit2gtk-4.1 base.
+      # libudev for input/uinput on Linux; the rest match Tauri 2's webkit2gtk-4.1 base.
       - name: Install Linux deps
         if: startsWith(matrix.os, 'ubuntu')
         run: |
@@ -82,3 +82,15 @@ jobs:
         run: bun run check
       - name: Unit tests
         run: bun run test:unit
+      - name: Dependency audit (advisory)
+        continue-on-error: true
+        run: bun audit
+
+  audit:
+    name: Security audit (RustSec)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

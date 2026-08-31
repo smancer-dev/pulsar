@@ -375,7 +375,7 @@ pub(crate) async fn go_online(
 	let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
 	// Identity advertised on the network: the user's chosen device name, or — when
 	// it's the generic default — the OS user's name, so relay-less peers are still
-	// recognizable ("Ahmet Enes Duruer" instead of "Pulsar Cihazı").
+	// recognizable ("Jane Doe" instead of "Pulsar Cihazı").
 	let announce_name = {
 		let n = cfg.device_name.trim();
 		if n.is_empty() || n == "Pulsar Cihazı" {

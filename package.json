@@ -16,22 +16,22 @@
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-static": "^3.0.10",
-		"@sveltejs/kit": "^2.57.0",
-		"@sveltejs/vite-plugin-svelte": "^7.0.0",
-		"@tauri-apps/cli": "^2.4.0",
-		"@testing-library/jest-dom": "^6.9.1",
-		"@testing-library/svelte": "^5.3.1",
+		"@sveltejs/kit": "^2.70.3",
+		"@sveltejs/vite-plugin-svelte": "^7.3.0",
+		"@tauri-apps/cli": "^2.11.4",
+		"@testing-library/jest-dom": "^6.10.0",
+		"@testing-library/svelte": "^5.4.2",
 		"jsdom": "^29.1.1",
-		"svelte": "^5.55.2",
-		"svelte-check": "^4.4.6",
-		"typescript": "^6.0.2",
-		"vite": "^8.0.7",
-		"vitest": "^4.1.8"
+		"svelte": "^5.57.0",
+		"svelte-check": "^4.7.6",
+		"typescript": "^6.0.3",
+		"vite": "^8.2.2",
+		"vitest": "^4.1.11"
 	},
 	"dependencies": {
-		"@tauri-apps/api": "^2.4.0",
+		"@tauri-apps/api": "^2.11.1",
 		"@tauri-apps/plugin-process": "^2.3.1",
-		"@tauri-apps/plugin-updater": "^2.10.1"
+		"@tauri-apps/plugin-updater": "^2.11.0"
 	},
 	"overrides": {
 		"undici": "^7.28.0",
