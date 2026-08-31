@@ -89,6 +89,9 @@ jobs:
   audit:
     name: Security audit (RustSec)
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      checks: write # audit-check posts its result as a check run
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
