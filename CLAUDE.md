@@ -1,312 +1,266 @@
 # Pulsar desktop app
 
 Cross-platform (Windows/macOS/Linux) remote-desktop + game-streaming app. See
-`../CLAUDE.md` for the product and architecture.
+`../CLAUDE.md` (umbrella dir) for the product and multi-repo architecture.
 
-**Stack:** **Tauri 2** shell · **SvelteKit (Svelte 5)** UI · **Rust** core
-(`crates/pulsar-core`). One app is both the *client* (connect to others) and the
-*host* (share this machine).
+**Stack:** **Tauri 2** shell · **SvelteKit (Svelte 5)** UI · **Rust**. One app is
+both the *client* (connect to others) and the *host* (share this machine).
 
-> `cargo` here is a rustup proxy that honors `../rust-toolchain.toml`, so it
-> resolves to current stable automatically (run `rustup update stable` once if you
-> hit an edition-2024 error). Use **`bun run tauri dev`** to run the app — `cargo
-> tauri` would need a separately-installed `cargo-tauri`.
+> **The shared engine is NOT in this repo.** `pulsar-core`, `pulsar-proto` and
+> `pulsar-relay` are **git dependencies** (`Cargo.toml` `[workspace.dependencies]`),
+> plus `[patch.crates-io] vigem-client = { git = …/pulsar-core }`. After pushing
+> pulsar-core/proto, bump this repo with `cargo update`. A sibling checkout lives at
+> `../pulsar-core/` but is *not* a path dep.
 
-> **Package manager: bun, not npm** (project-wide — see the root `CLAUDE.md`).
-> The Tauri config's `beforeDevCommand`/`beforeBuildCommand` call `bun run …`.
+> This repo has its **own `rust-toolchain.toml`** (stable; some deps need
+> edition 2024 — run `rustup update stable` if you hit an edition error). Use
+> **`bun run tauri dev`** to run the app — `cargo tauri` would need a
+> separately-installed `cargo-tauri`. **Package manager: bun, never npm.**
 
 ## Layout
 
 ```
-desktop-app/
-  crates/pulsar-core/   # the performant core (lib, fully unit + e2e tested)
-    src/config.rs       #   configurable relay + network mode, persisted
-    src/crypto.rs       #   X25519 + ChaCha20-Poly1305 E2E
-    src/connection.rs   #   Node: register→ID→P2P hole-punch→relay fallback
-    src/input.rs        #   controllers: DS3/4/5/Xbox/standard + virtual pad
-    src/media.rs        #   capture→encode→transport→decode→present pipeline
-    tests/e2e.rs        #   relay + 2 nodes: P2P, relay-only, relay-down survival
-    tests/streaming.rs  #   frames streamed over the encrypted session
-  src-tauri/            # Tauri commands bridging UI ↔ pulsar-core
-    src/lib.rs          #   get/set_config, go_online, connect, controllers, …
-    tauri.conf.json     #   frameless 1200×780 window
-  src/                  # SvelteKit frontend
-    routes/+page.svelte #   app shell: frameless chrome + sidebar + screen router
-    lib/api.ts          #   Tauri invoke bridge (+ browser mock for `vite dev`)
-    lib/screens/*.svelte#   Home, Devices, Settings, Connecting, Session, Gaming
+pulsar-desktop/
+  crates/pulsar-capture/  # Windows-only native capture+encode: DXGI Desktop
+                          #   Duplication (+ WGC) → NVENC SDK → hand-rolled RTP
+                          #   (the Sunshine technique, no ffmpeg). Also
+                          #   nvenc_codecs() real-silicon probe via nvEncodeAPI64.dll.
+  crates/pulsar-render/   # native renderer PROCESS for ALL platforms: Linux
+                          #   rkmpp/EGL, Windows Media Foundation + D3D11 zero-copy
+                          #   decode, egui in-session overlay, `--probe` decoder probe.
+  crates/pulsar-setup/    # egui branded Windows bootstrapper installer
+                          #   (Discord-style, embedded payload, silent/uninstall).
+  src-tauri/              # `pulsar-tauri` crate (bin name `pulsar`)
+    src/lib.rs            #   command registration / glue
+    src/host.rs,host/     #   host side; handlers.rs = capture/encode/audio spawn
+    src/caps.rs           #   startup capability probe (see below)
+    src/process.rs        #   ffmpeg spawning, ffmpeg_bin(), encoder validation
+    src/viewer.rs         #   UDP→WebSocket relay (now audio-only path to webview)
+    src/native_view*/     #   embedded native video (spawn.rs: spawn_mpv & co.)
+    src/kbdhook.rs,kbdhook/ # OS-key capture: Windows Interception/LL-hook, Linux evdev
+    src/relay_mode.rs     #   `pulsar --relay …` — the app can run as a relay
+    src/{auth,avatar,connections,files,fs_browse,audio_io,io_cmds,…}.rs
+    tauri.conf.json       #   frameless 1200×780 window; updater plugin (minisign)
+  src/                    # SvelteKit frontend
+    routes/+page.svelte   #   shell; routes/page/{Tabs,SplitPicker,Chrome,Sidebar,
+                          #     GamingShell,UpdateModal,…}.svelte — multi-session
+                          #     tabs + split view
+    lib/api.ts            #   bridge, split into api.{commands,dom,events,invoke,types}.ts
+    lib/i18n/             #   4-language lazy i18n: en/tr/ru/kk (+ src-tauri/lang/)
+    lib/screens/          #   Home, Devices, Settings/(4 tabs), Connecting, Session/,
+                          #     Gaming/(6 comps), Games/, Approve, Connections,
+                          #     FilesWindow, HostChat
+  scripts/                # fetch-ffmpeg.mjs, fetch-drivers.mjs, fetch-player.mjs,
+                          #   gen-update-manifest.mjs, bump-version.mjs
 ```
 
 ## Core concepts
 
-- **`Node`** (`connection.rs`) is the heart: `register()` gets the relay-assigned
-  ID; `connect()` does the rendezvous + hole-punch and returns a `Session` whose
-  `transport()` is `Direct` or `Relay`. `Session::send/recv` are encrypted.
-- **Configurable relay**: `Config.relay` (host:port) + `Config.network_mode`
-  (`auto` / `p2p-only` / `relay-only`) are user-editable in Settings → Ağ and
-  persisted to the app config dir.
-- **UI ↔ core**: `lib/api.ts` calls Tauri commands when running in Tauri, and
-  falls back to a deterministic mock otherwise, so `vite dev` + tests work without
-  the native shell.
+- **`Node`** (pulsar-core `connection`) is the heart: `register()` gets the
+  relay-assigned ID; `connect()` does rendezvous + hole-punch and returns a
+  `Session` (`Direct` or `Relay` transport, E2E encrypted).
+- **Configurable relay**: `Config.relay` + `Config.network_mode`
+  (`auto`/`p2p-only`/`relay-only`), user-editable in Settings → Ağ, persisted.
+- **UI ↔ core**: `lib/api.ts` calls Tauri commands in Tauri, falls back to a
+  deterministic mock so `vite dev` + tests work without the native shell.
 
 ## Run & build
 
 ```bash
 bun install
-bun run tauri dev      # run the real app (Rust + webview). NOT `cargo tauri` —
-                       # that needs a separately-installed cargo-tauri binary;
-                       # we ship the JS CLI via @tauri-apps/cli.
-bun run tauri build    # package installers (bundles ffmpeg — see below)
-
-bun run dev            # UI only in a browser (uses the mock)
-bun run build          # static SPA → build/ (Tauri frontendDist)
+bun run tauri dev      # the real app (NOT `cargo tauri`)
+bun run tauri build    # installers (bundles ffmpeg — see below)
+bun run dev            # UI only in a browser (mock)
+bun run build          # static SPA → build/
 ```
 
-> **Bundled ffmpeg:** the host captures+encodes the screen with ffmpeg, which is
-> **shipped inside the app** (no user install, works offline). The binary lives at
-> `src-tauri/resources/ffmpeg[.exe]` — git-ignored and fetched per-platform by
-> `scripts/fetch-ffmpeg.mjs` (run it once before `tauri build`; CI runs it
-> automatically). At runtime `ffmpeg_bin()` (in `src-tauri/src/lib.rs`) resolves the
-> bundled copy first, falling back to a system `ffmpeg` on PATH.
-
-> Plain `cargo` here is a rustup proxy that honors `../rust-toolchain.toml`, so it
-> already resolves to stable (≥1.85). If you ever see an edition-2024 error, run
-> `rustup update stable` once.
+> **Bundled ffmpeg:** host capture/encode fallback ships ffmpeg inside the app at
+> `src-tauri/resources/ffmpeg[.exe]` — git-ignored, fetched per-platform by
+> `scripts/fetch-ffmpeg.mjs` (CI runs it automatically). At runtime `ffmpeg_bin()`
+> (`src-tauri/src/process.rs`) resolves the bundled copy first, then PATH.
 
 ## Test
 
 ```bash
-# Rust core (fast, headless): connection, crypto, controllers, media, e2e
-cargo test -p pulsar-core
-# UI components
-bun run test:unit
-# Tauri bridge compiles against the core
-cargo check -p pulsar-tauri
+cargo check -p pulsar-tauri     # Tauri bridge compiles against the engine
+cargo test -p pulsar-capture    # workspace default-member tests
+bun run test:unit               # UI components (vitest)
+bun run check                   # svelte-check
+# engine tests live in ../pulsar-core (its own repo): cargo test there
 ```
 
-## Screen capture (host side)
+## Host capture/encode paths
 
-The host picks a capture method by platform/session:
+- **Windows, NVENC present** — `crates/pulsar-capture`: DXGI Desktop Duplication
+  (or WGC) → NVENC SDK directly → hand-rolled RTP packetizer. No ffmpeg in the hot
+  path; falls back to ffmpeg if init fails.
+- **X11 / Windows (non-NVENC) / macOS** — ffmpeg (`x11grab`/`ddagrab`/`gdigrab`/
+  `avfoundation` → HW encode or libx264 → RTP). Arg builders are pure functions in
+  pulsar-core `pipeline/` (unit-tested); spawning is here (`process.rs`, `host/`).
+- **Wayland (KDE/GNOME)** — pulsar-core `capture` (Linux-only module): XDG
+  ScreenCast portal (`ashpd`) → PipeWire → GStreamer
+  (`pipewiresrc ! queue leaky=downstream ! x264enc(zerolatency) ! rtph264pay`).
+  `x11grab` of rootless Xwayland is **always black**, so this is required. Restore
+  token skips the share dialog after first connect. Software x264 (no gst HW
+  plugins); leaky queue bounds latency. **Input injection is uinput**
+  (`DesktopInput`), NOT the RemoteDesktop portal (its `Start` hangs on this KDE);
+  needs the user in the `input` group.
 
-- **X11 / Windows / macOS** — ffmpeg (`pipeline.rs`): `x11grab` / `gdigrab` /
-  `avfoundation` → HW encode (NVENC via `prime-run`, VAAPI, QSV, VideoToolbox) or
-  `libx264`, sent as MPEG-TS over UDP to the client's `ffplay`.
-- **Wayland (KDE/GNOME)** — `capture.rs`: the **XDG ScreenCast portal** (`ashpd`)
-  → a PipeWire node fed to **GStreamer** (`pipewiresrc ! queue leaky=downstream !
-  x264enc(zerolatency,bframes=0) ! rtph264pay ! udpsink`). `x11grab` of rootless
-  Xwayland is **always black**, so this is required. First connect shows the share
-  dialog; a restore token (in `AppState`) skips it after. No gst HW-encoder plugins
-  here → **software x264** — the leaky queue drops stale frames so latency stays
-  bounded when the CPU can't keep up (fps drops instead of lag growing).
-  **Input injection is via uinput** (`input::DesktopInput`: absolute pointer +
-  keyboard), NOT the RemoteDesktop portal — that portal's `Start` hangs with no
-  dialog on this KDE. uinput works on Wayland/X11 (kernel-level); needs the user
-  in the `input` group.
+All paths emit **RTP/H.264(+HEVC/AV1) over UDP**.
 
-Both paths emit **RTP/H.264 over UDP** to the connecting client. `is_wayland()`
-(in `capture.rs`) selects between them; `lib.rs`'s `on_stream` branches on it.
+## Capability probe (`src-tauri/src/caps.rs`) — read before touching codecs
 
-## Client video — embedded WebCodecs (no separate window)
+Moonlight-model startup probe, re-run every launch, no persistence:
 
-The remote screen renders **inside the app**, not a separate `ffplay` window:
+- Windows NVENC: `pulsar_capture::nvenc_codecs()` opens a real NVENC session and
+  enumerates codec GUIDs — **instead of** the ffmpeg one-frame probe, which targets
+  the display GPU (wrong on hybrid laptops) and lists encoders on GPUs with no
+  NVENC silicon (GP108/MX). Advertising HEVC there → client SDP says HEVC, host
+  degrades wire to H.264 → **permanent black screen**. Families with zero
+  validated codecs are dropped.
+- Decoders: `pulsar-render --probe` decodes real keyframes headlessly (replaced
+  the old hardcoded "MF decodes X" assumption).
+- `DecoderCap.incompatible_with` blacklists bad host-encoder × client-decoder
+  combos (e.g. rkmpp-HEVC × nvenc on RK3588).
+- `process.rs` keeps a Sunshine-style one-frame `probe_encoder_codec` +
+  `resolve_codec_validated` with an unreliable-probe guard for hybrid laptops.
 
-- `src-tauri/src/viewer.rs` runs a local **UDP→WebSocket relay**: it binds an
-  ephemeral UDP port (where the host streams RTP), and re-broadcasts each datagram
-  over a loopback WebSocket. `start_remote_play` returns that `ws_port`.
-- `src/lib/h264.ts` + `Session.svelte`: the webview opens the WebSocket, runs an
-  RTP/H.264 depacketizer (single-NAL / STAP-A / FU-A; derives the `avc1.*` codec
-  string from the SPS), and decodes each access unit with **WebCodecs
-  `VideoDecoder`** onto a `<canvas>`. Low latency, hardware-accelerated.
-- Why not WebRTC: this WebKitGTK is **compiled without WebRTC** (`RTCPeerConnection`
-  is undefined even with `enable-webrtc`). WebCodecs gives equivalent low latency.
-  Verified: a real RTP/H.264 stream decoded 60/60 frames, 0 errors, in the webview.
+## Client video — native renderer everywhere (webview video is GONE)
+
+The old in-webview WebCodecs video path (`h264.ts`) was **removed — too slow**.
+Video renders **natively on every platform** via the separate `pulsar-render`
+process: Linux rkmpp/EGL zero-copy, Windows MF+D3D11 zero-copy (DXVA), macOS
+mpv/VideoToolbox. The egui overlay draws on the video natively. **Only Opus
+audio still decodes in the webview** (`src/lib/opus-audio.ts`, fed by
+`viewer.rs`'s UDP→WebSocket relay). Don't resurrect a webview video path.
 
 ## Windows drivers: keyboard capture + virtual gamepad
 
-Two host/client features need kernel drivers on Windows; both are **bundled and
-auto-installed** so the user never installs anything by hand (the GPLv3 build is
-license-clear to redistribute them — see below).
+Both are **bundled and auto-installed** (GPLv3 build is license-clear):
 
-- **Keyboard capture under ASTER** (`src-tauri/src/kbdhook.rs`). The client must
-  capture OS-reserved keys (Win, Alt+Tab, Ctrl+Esc) to forward + suppress them.
-  `WH_KEYBOARD_LL` works on normal machines but **ASTER multiseat injects physical
-  keys below the LL-hook chain**, so it's bypassed there. We load the
-  **Interception** driver's `interception.dll` at runtime (via `libloading`) and
-  capture below the hook layer (proven to see ASTER's physical keys). It's the
-  primary path when the driver is present; otherwise we fall back to
-  `WH_KEYBOARD_LL`. Set-1 scancodes → evdev via `scancode_to_evdev`; the
-  Ctrl+Alt+Shift leave combo + suppress/forward logic is shared (`handle_key`) with
-  the hook path. Interception is **LGPL-3.0 for non-commercial use with explicit
-  redistribution rights for the driver+installer** — fine for GPLv3 Pulsar; a
-  commercial Pulsar would need Interception's commercial license.
-- **Virtual gamepad** (`pulsar-core::input`, `vigem_backend`). The host replays the
-  client's controller via **ViGEmBus** (Xbox 360 emulation, read through XInput by
-  every game), using the pure-Rust `vigem-client`. Linux uses uinput; macOS + ARM
-  Windows fall back to a recording stub. Buttons map through `xinput_buttons`
-  (XInput bitmask) — pure + unit-tested.
+- **Keyboard capture under ASTER** (`src-tauri/src/kbdhook.rs` + `kbdhook/imp.rs`).
+  `WH_KEYBOARD_LL` misses ASTER-multiseat physical keys, so we load the
+  **Interception** driver's `interception.dll` at runtime (`libloading`) and
+  capture below the hook layer; LL-hook is the fallback. Set-1 scancodes → evdev
+  via `scancode_to_evdev`; leave-combo + suppress/forward logic shared
+  (`handle_key`). Interception: LGPL-3.0 non-commercial w/ redistribution — fine
+  for GPLv3; commercial Pulsar would need their commercial license.
+- **Virtual gamepad** (pulsar-core `input`, `vigem.rs`): **ViGEmBus** (X360 + DS4
+  via the vendored `vigem-client` fork). Linux uses uinput; macOS is a no-op stub.
 
-**Driver bundling / auto-install:** `interception.dll` is shipped next to the exe
-(loaded at runtime). The **NSIS installer** runs the Interception + ViGEmBus
-silent installers during Pulsar's install (it already elevates) and shows a
-**"restart required"** notice (kernel drivers need one reboot). Driver payloads are
-fetched by `scripts/fetch-drivers.mjs` (like `fetch-ffmpeg.mjs`) into
-`src-tauri/resources/` so a dev clone + CI build needs no manual step.
+**Bundling:** `interception.dll` ships next to the exe; the NSIS installer runs
+the Interception + ViGEmBus silent installers (elevated) with a "restart
+required" notice. Payloads fetched by `scripts/fetch-drivers.mjs` into
+`src-tauri/resources/`.
 
 ## Audio streaming (host → client)
 
-A second Opus/RTP stream runs **parallel to the video** (not over the JSON control
-channel, which would bloat with PCM): the host captures its system audio, encodes
-**Opus**, and sends **RTP** to a second UDP port. `viewer.rs` relays it over a second
-loopback WebSocket; `src/lib/opus-audio.ts` decodes with WebCodecs `AudioDecoder` and
-plays via WebAudio (degrades to silent video if the webview lacks audio WebCodecs).
+A second Opus/RTP stream parallel to video. Implementation lives in
+**pulsar-core `audio/`**; this repo spawns it from `src-tauri/src/host/handlers.rs`
+(`spawn_loopback_audio`, `run_loopback_capture_tracking`, `opus_rtp_output_layout`,
+`audio_command_layout`, `set_host_muted`).
 
-Capture has two paths:
+- **Windows default: WASAPI loopback** of the default render endpoint (the
+  OBS/Sunshine approach — no virtual-audio-capturer/Stereo Mix needed). Rust
+  thread pipes PCM into ffmpeg `pipe:0`; ffmpeg does Opus/RTP. Silence-filled so
+  the timeline tracks wall-clock.
+- **dshow / Pulse `.monitor` / AVFoundation** on Linux/macOS, or when the user
+  names a device (`Config::audio_input` non-empty → `audio_loopback()` false).
 
-- **Windows (default): WASAPI loopback** of the *default render endpoint*
-  (`audio::run_loopback_capture` — `IAudioClient` + `AUDCLNT_STREAMFLAGS_LOOPBACK`),
-  the OBS/Sunshine approach. It taps whatever is playing on the host's output, so it
-  **works with no `virtual-audio-capturer` / Stereo Mix device installed** (the old
-  dshow default silently produced nothing on machines lacking that device). A Rust
-  thread writes the endpoint's raw mix PCM into an ffmpeg reading `pipe:0`
-  (`spawn_loopback_audio` in `src-tauri/src/lib.rs`); ffmpeg does the Opus/RTP encode
-  (`audio::opus_rtp_output`, shared with the dshow path). Silence is filled so the
-  audio timeline tracks wall-clock and never drifts ahead of the video.
-- **dshow / Pulse `.monitor` / AVFoundation** (`audio::audio_command`): used on
-  Linux/macOS, and on Windows when the user names a specific capture device in
-  Settings (`Config::audio_input` non-empty → `audio_loopback()` is false).
+Config toggles: `transmit_audio`, `mute_host_audio`. **Game mode forces
+`transmit` on but NOT `mute_host`** (`AudioSettings::policy`, unit-tested):
+on common codecs the WASAPI loopback tap is post-mute/post-volume, so a capture
+opened *into* a muted endpoint latches **pure silence** (verified live, −91 dBFS,
+fixed 2026-06-13). Never force-mute the captured endpoint; user-set `mute_host`
+is still honored (mid-session muting is safe). Windows mute = endpoint **mute
+flag**, NOT volume-0. Un-muted on teardown. Client-side Pulse buffer capped
+(~80 ms `-buffer_duration` in `native_view/spawn.rs::spawn_native_audio`).
+Mic/voice-call side-channel PCM lives in `src-tauri/src/audio_io.rs`.
 
-Two `Config` toggles drive it: `transmit_audio` (send host→client) and
-`mute_host_audio` (silence the host's local output — Windows endpoint mute via
-`IAudioEndpointVolume::SetMute`, `pactl set-sink-mute` on Linux, `osascript` on
-macOS — `audio::set_host_muted`). **Game mode forces `transmit` on but NOT
-`mute_host`** (`AudioSettings::policy`, unit-tested): the host silences itself by
-muting the *same render endpoint its WASAPI loopback captures*, and on common
-codecs (e.g. Realtek) that loopback tap is **post-mute / post-master-volume**, so a
-capture opened while the endpoint is muted (or at volume 0) streams **pure
-silence** — the client went dead silent in game mode (verified live Pi←PC, −91 dBFS;
-fixed 2026-06-13). So we never force-mute the captured endpoint — Sunshine's
-default too (it streams the host's audio and leaves the host playing). The
-`mute_host` toggle is still honored if the user sets it, ideally mid-session (muting
-an already-live capture is safe; opening *into* a mute is what latches silence).
-Windows mute uses the endpoint **mute flag**, NOT `SetMasterVolumeLevelScalar(0)`
-(volume-0 also silences this loopback). Host is un-muted on session teardown.
-Client-side (Linux native player), the PulseAudio output buffer is capped
-(`-buffer_duration` in `spawn_native_audio`, ~80 ms) — the default queued ~2 s,
-adding seconds of audio lag behind the video.
+## Stable device ID
 
-## Stable device ID (identity persistence)
-
-The relay assigns the 9-digit ID, but it now **maps pubkey → id** (`by_pubkey` in
-`relay/src/lib.rs`) so a returning device keeps the same ID. The client persists
-its X25519 identity per-user via `Identity::load_or_create` (in
-`<app_config_dir>/identity.key`), passed to `Node::bind_with_identity`. Result: the
-ID is **stable across restarts** and **distinct per OS user** (ASTER seats keep
-separate IDs). A per-session single-instance guard (Windows `Local\` named mutex)
-stops a second Pulsar per user while still allowing one per seat/user.
+The relay maps **pubkey → id** (`by_pubkey` in the `relay` repo), so a returning
+device keeps its 9-digit ID. Client persists its X25519 identity per-user
+(`Identity::load_or_create` → `<app_config_dir>/identity.key`,
+`Node::bind_with_identity`). ID is stable across restarts, distinct per OS user
+(ASTER seats keep separate IDs). Per-user single-instance guard (Windows `Local\`
+named mutex).
 
 ## Two usage modes (product direction — keep consistent everywhere)
 
 Pulsar is ONE app with **two mode-aware personalities**, chosen at connect time
-(`startConnect(target, mode: 'remote' | 'game')`). The mode drives **menu content,
+(`startConnect(target, mode: 'remote' | 'game')`). Mode drives **menu content,
 overlay content, the look, and the encode profile**:
 
 | | **Remote Desktop** (AnyDesk/RustDesk) | **Game Streaming** (Moonlight/Parsec) |
 | - | - | - |
 | Focus | general remote control + management | lowest latency, gaming |
-| Menu | **full**: resolution/quality · codec/encoder · **file transfer · clipboard · multi-monitor** · chat · mic · reverse-direction · settings | **slim, game-only**: codec · bitrate (Mbit) · **fps** · resolution · quality/perf · encoder/decoder · controllers · end. **NO file/clipboard/mic/multi-monitor** (irrelevant in-game) |
+| Menu | **full**: resolution/quality · codec/encoder · **file transfer · clipboard · multi-monitor** · chat · mic · reverse-direction · settings | **slim, game-only**: codec · bitrate (Mbit) · **fps** · resolution · quality/perf · encoder/decoder · controllers · end. **NO file/clipboard/mic/multi-monitor** |
 | Overlay | thin info strip (connection/transport) | perf HUD (latency/fps/bitrate) + controller status + leave-combo hint |
-| Look | neutral/general | gaming (cyan accent, minimal, immersive — `data-gaming`) |
-| Encode | quality-focused | low-latency (already mode-aware on the host) |
+| Look | neutral/general | gaming (cyan accent, immersive — `data-gaming`) |
+| Encode | quality-focused | low-latency (mode-aware on the host) |
 
-Established earlier with the maintainer: **entering game streaming makes the whole
-app gaming-focused; remote desktop makes it general remote-control-focused.**
+Established with the maintainer: **entering game streaming makes the whole app
+gaming-focused; remote desktop makes it general remote-control-focused.**
 
 ## CLI / headless start (kiosk / appliance — esp. Orange Pi)
 
-`pulsar --connect <id|ip> [--connect-pw <pw>]` auto-connects on launch — **splash
-shows, but NO home screen**; it goes straight into the connection (headless-style;
-already wired via `AppState.auto_connect` + `+page.svelte` onMount). Today this starts
-in **remote** mode. PLANNED CLI surface:
-- a **mode** flag so the CLI can start a **game** session (default is **remote**);
-- for game mode, a **target app** to launch — **default is "Desktop"**. *Desktop is
-  always present and is NOT deletable* (established earlier — every host always exposes
-  a "Desktop" entry to stream the whole desktop).
+`pulsar --connect <id|ip> [--connect-pw <pw>] [--mode game]` auto-connects on
+launch (splash, no home screen; `AppState.auto_connect`). Game mode's target app
+defaults to **"Desktop"** — *always present, NOT deletable* (every host exposes a
+"Desktop" entry). `pulsar --relay --session-rate 10mbit …` runs the app as a
+relay (`relay_mode.rs`, same `pulsar_relay::Limits` flags as the relay repo).
 
 ## Gaming overlay (in-session, game mode)
 
-The advanced overlay is **hidden by default and opened with a key combo** (so it never
-clutters gameplay). When open it shows a **rich, game-focused menu** — encoder/decoder
-selection, codec, **fps**, quality/performance, **bitrate (Mbit)**, etc. — and
-explicitly **NOT** file manager / mic / clipboard (those are remote-desktop-only).
-While the overlay is open the **video may pause/freeze and resume after** — acceptable;
-the priority is **Moonlight-class low latency + performance** during play. The overlay
-may even be *injected* onto the video to display it **as long as it costs no
-performance**.
+Hidden by default, opened with a key combo. Drawn **natively by pulsar-render
+(egui)** on the video — controller-navigable; rich game-only menu
+(encoder/decoder, codec, fps, quality/perf, bitrate), **NOT**
+file/mic/clipboard. Video may pause while the rich menu screen is open —
+acceptable; priority is Moonlight-class latency during play.
 
 ## Linux / RK3588 (Orange Pi 5) renderer — the reality (IMPORTANT)
 
-On Linux the webview path is NOT viable for video and the in-app overlay differs from
-Windows — keep this straight:
-
-- **WebKitGTK can't hardware-decode** the stream (no usable WebCodecs HW path on RK3588;
-  it would software-decode + glitch). So on Linux the video MUST be **native**:
-  **mpv with `--hwdec` → `h264_rkmpp`/`hevc_rkmpp`** (zero-copy EGL), the same decode
-  Moonlight uses. Default is embedded **`mpv --wid=<app window XID>`** (renders inside the
-  Pulsar window). `--untimed --no-correct-pts --video-sync=desync` are load-bearing for
-  low latency — RTP has no usable PTS, so without them mpv paces to a made-up 30fps
-  (adds latency). `native_view.rs::spawn_mpv`.
-- **The webview can NOT be composited transparently over the native video** on this
-  GTK3/WebKitGTK stack (the reparented wry webview renders OPAQUE black over a GtkGLArea
-  even with `set_background_color(0)` + an RGBA window visual — a fresh webview works,
-  wry's drops alpha). Proven with a magenta-clear probe. **So do NOT build a "rich webview
-  UI over the live video" path on Linux.** Follow **Moonlight's model** (verified in
-  `_ref/moonlight-qt`): one native renderer for *both* windowed and fullscreen (just a
-  window flag), and the overlay is **drawn natively on the video** (`OverlayManager` →
-  `renderOverlay()`), NOT a rich UI composite. The rich menu is a separate screen you
-  toggle to (video pauses) — exactly the gaming-overlay-via-combo above.
-  - A libmpv-render-API → `GtkGLArea` "single surface" is implemented but gated **opt-in**
-    behind `PULSAR_SINGLE_SURFACE=1` (it renders rkmpp + controls, but the webview-overlay
-    is blocked by the transparency wall above).
-  - **Windows/macOS keep the in-webview WebCodecs path** (WebView2/WKWebView HW-decode), so
-    there the rich menu CAN live over the video. The two-mode UX is shared; only the
-    video+overlay *mechanism* is platform-specific.
-- **Control on Linux** = `kbdhook.rs` Linux module: grabs local keyboard+mouse via
-  **evdev (EVIOCGRAB)**, hotplug-aware, forwards `InputEvent` to the host (analog of the
-  Windows Interception path). **Leave combo: Ctrl+Shift+Q** (F12 is unreliable — media-mode
-  keyboards like Logitech MX Keys don't emit `KEY_F12`).
-- **Rendezvous gotcha:** a host that serves LAN clients must register with the relay using
-  its **LAN IP**, not `127.0.0.1` — otherwise the relay hands clients a loopback address and
-  P2P/auth never completes (`Config.relay`).
-- **Auto-update → the appliance runs the AppImage, not the raw binary.** Tauri's Linux
-  updater self-replaces the running **AppImage** (`$APPIMAGE`), so the deployed Orange Pi
-  kiosk launches the release's `Pulsar_<ver>_aarch64.AppImage` (FUSE/libfuse2 required), e.g.
-  `setsid env DISPLAY=:0 … ./Pulsar.AppImage --connect <id> --mode game`. A `--connect` kiosk
-  checks for updates **on boot, before connecting** (8 s timeout), so it self-updates between
-  sessions and never mid-session. The raw `--no-bundle` binary is still fine for fast dev test
-  loops, but it CANNOT self-update. See `docs/superpowers/specs/2026-06-14-auto-update-design.md`.
+- **WebKitGTK can't hardware-decode** the stream. Video MUST be native:
+  historically `mpv --wid=<XID>` with `--hwdec` → `h264_rkmpp`/`hevc_rkmpp`
+  (`--untimed --no-correct-pts --video-sync=desync` are load-bearing — RTP has no
+  usable PTS), now the `pulsar-render` rkmpp/EGL path. `native_view/spawn.rs`.
+- **The webview can NOT be composited transparently over native video** on this
+  GTK3/WebKitGTK stack (wry webview renders opaque black over GtkGLArea; proven
+  with a magenta-clear probe). **Do NOT build a "rich webview UI over live
+  video" path on Linux.** Moonlight's model: one native renderer, overlay drawn
+  natively; the rich menu is a separate screen you toggle to. (A libmpv-render →
+  GtkGLArea single-surface exists behind `PULSAR_SINGLE_SURFACE=1`, still blocked
+  by the transparency wall.)
+- **Control on Linux** = `kbdhook/linux.rs`: grabs local keyboard+mouse via
+  **evdev (EVIOCGRAB)**, hotplug-aware. **Leave combo: Ctrl+Shift+Q** (F12
+  unreliable on media-mode keyboards).
+- **Rendezvous gotcha:** a host serving LAN clients must register with its
+  **LAN IP**, not `127.0.0.1`, or the relay hands clients a loopback addr.
+- **Auto-update → the appliance runs the AppImage** (`$APPIMAGE` self-replace;
+  FUSE required). A `--connect` kiosk checks updates on boot before connecting
+  (8 s timeout). Raw `--no-bundle` binary can't self-update. Updater UX in-app:
+  `@tauri-apps/plugin-updater` + minisign key in `tauri.conf.json`,
+  `src/lib/updater.ts`, `routes/page/UpdateModal.svelte`,
+  `scripts/gen-update-manifest.mjs` (consent-based: badge, changelog, progress).
 
 ## What's complete vs. scaffolded
 
-**Complete + tested:** relay protocol, register→ID→P2P→relay-fallback (incl.
-relay-down survival), **client heartbeats** (every 10s; the relay evicts devices
-after `DEVICE_TTL`=30s, so without these `connect()` fails with `BadToken`), E2E
-crypto, configurable relay, **one-time-password auth** on the session (host issues
-a `7yf2-qk`-style password on `go_online`; client must send a matching `Auth`
-first or the host refuses — `unattended_access` skips it), controller detection +
-state normalization + virtual-pad trait (real uinput backend on Linux), the
-streaming pipeline (X11 ffmpeg + Wayland portal/GStreamer; gst→ffmpeg loopback
-verified), the service protocol over the encrypted session (auth, list/launch
-games, start stream, controller input), the SvelteKit UI, and the Tauri bridge.
+**Complete + tested:** relay protocol + heartbeats (10 s; relay evicts at 30 s),
+register→ID→P2P→relay-fallback + relay-down survival, E2E crypto, one-time-password
+auth (`unattended_access` skips), Approve/view-only consent flow, controller
+detection/normalization + virtual pads (uinput + ViGEmBus), capture/encode paths
+above, native render + overlay, **side channels — clipboard, file transfer (+
+file browser `fs_browse.rs` + Files window), chat, mic, voice call**
+(`Session/sidechannels.svelte.ts`), multi-session **tabs + split view**
+(`sessions.svelte.ts`), 4-language i18n, LAN discovery UI (`Home/LanDevices`),
+Games library + folder scan, gamepad-driven UI nav (`gamepadNav.svelte.ts`),
+auto-updater, relay mode, VNC-mode client path (`io_cmds.rs`), the SvelteKit UI
+and the Tauri bridge.
 
-Remote control: the client captures mouse/keyboard over the video canvas
-(`Session.svelte`, evdev keymap in `keymap.ts`) → `input_*` Tauri commands →
-`InputEvent` over the held session → host injects (Wayland RemoteDesktop portal;
-gamepad via uinput). Input forwarding is unified through one `mpsc<InputEvent>`
-per remote-play session.
-
-**Scaffolded / known gaps:** Windows/macOS `VirtualGamepad` + mouse/keyboard
-injection (Linux is real — uinput pad + Wayland portal; X11/Win/Mac input
-injection not yet wired); HW-accelerated encode on the Wayland path (needs gst
-VAAPI/NVENC plugins, else software x264); media-over-the-session for symmetric-NAT
-(today media is a direct UDP RTP flow to the peer addr, fine for LAN/cone-NAT/
-relay-direct); the session toolbar's clipboard/file/chat/mic buttons are disabled
-placeholders (only End works).
+**Scaffolded / known gaps:** macOS virtual gamepad (no-op stub); HW encode on
+the Wayland/gst path (software x264 only); media-over-the-session for
+symmetric-NAT (media is a direct UDP RTP flow today — fine for LAN/cone-NAT/
+relay-direct). Windows↔Windows blackscreen debugging is ACTIVE WIP — see the
+dirty-tree work around `caps.rs`/`pulsar-capture`/`win/decode.rs` and the
+project memory note before touching encoder/decoder selection.
