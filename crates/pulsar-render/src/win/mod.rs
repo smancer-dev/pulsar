@@ -214,6 +214,8 @@ static BTN_DRAG: Mutex<Option<(f32, f32, f32, f32, bool)>> = Mutex::new(None);
 const HINT_SECS: f32 = 3.0;
 const HINT_FADE: f32 = 0.5;
 const TOAST_SECS: f32 = 6.0;
+/// "banner" text never expires on its own — the app clears it explicitly.
+const BANNER_SECS: f32 = 1.0e9;
 
 fn arm_hint(kind: &str) {
 	let text = crate::i18n::t(if kind == "engage" {
@@ -315,6 +317,17 @@ fn stdin_control() {
 				*HINT.lock().unwrap() =
 					Some((rest.to_string(), std::time::Instant::now(), TOAST_SECS));
 			}
+		} else if l.trim() == "banner" {
+			*HINT.lock().unwrap() = None;
+		} else if let Some(rest) = l.strip_prefix("banner ") {
+			// Persistent status banner (empty text clears it): the app's no-video /
+			// decode-failed diagnostics — the only text the viewer can see over the video.
+			let rest = rest.trim();
+			*HINT.lock().unwrap() = if rest.is_empty() {
+				None
+			} else {
+				Some((rest.to_string(), std::time::Instant::now(), BANNER_SECS))
+			};
 		} else if let Some(rest) = l.strip_prefix("fit ") {
 			// View-fit mode pushed by the frontend (persisted value / respawn re-seed).
 			present::set_fit(rest.trim());

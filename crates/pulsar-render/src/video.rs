@@ -518,66 +518,21 @@ unsafe fn decode_once(sdp: &CString) {
 			// by spawn.rs::write_sdp from the negotiated codec) sets codec_id.
 			let st = *(*fmt).streams.add(vs as usize);
 			let codec_id = (*(*st).codecpar).codec_id;
-			let sel = match crate::decode::select(codec_id) {
+			// Decoders already tried on THIS stream (by name) — the zero-output fallback
+			// below re-runs the tier walk with them excluded.
+			let mut skip: Vec<String> = Vec::new();
+			let mut sel = match crate::decode::select_skipping(codec_id, &skip) {
 				Some(s) => s.sel,
 				None => {
 					eprintln!("pulsar-render: no decoder validated for this codec");
 					break 'decode;
 				}
 			};
-			let dec = crate::decode::find_decoder(&sel, codec_id);
-			if dec.is_null() {
-				eprintln!("pulsar-render: selected decoder disappeared");
+			dc = open_decoder(st, codec_id, &sel);
+			if dc.is_null() {
 				break 'decode;
 			}
-			dc = ff::avcodec_alloc_context3(dec);
-			ff::avcodec_parameters_to_context(dc, (*st).codecpar);
-			// Decoder low-delay: emit frames without reorder buffering when the SPS lacks
-			// bitstream_restriction. This is a codec-context flag — an AVFormatContext has
-			// no "flags" AVOption, so it can't ride the demuxer dict above.
-			(*dc).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as c_int;
-			crate::decode::set_wanted_hw_fmt(if sel.tier == crate::decode::Tier::HwAccel {
-				sel.hw_fmt
-			} else {
-				ff::AVPixelFormat::AV_PIX_FMT_NONE
-			});
-			(*dc).get_format = Some(crate::decode::get_format);
-			(*dc).extra_hw_frames = 8;
-			if let Some(dev) = sel.hwdev {
-				let hwctx = crate::decode::create_hwdevice(dev);
-				if hwctx.is_null() {
-					eprintln!("pulsar-render: hw device ctx failed at stream open");
-					break 'decode;
-				}
-				(*dc).hw_device_ctx = hwctx;
-			}
-			// Software decoders (desktop x86, AV1): slice threading only — frame threading would
-			// add a frame of latency per extra thread. No-op for HW decoders.
-			(*dc).thread_count = 0;
-			(*dc).thread_type = ff::FF_THREAD_SLICE as c_int;
-			if ff::avcodec_open2(dc, dec, ptr::null_mut()) < 0 {
-				eprintln!("pulsar-render: avcodec_open2 failed");
-				break 'decode;
-			}
-			let dec_name = sel.name.clone();
-			let hw = if sel.tier == crate::decode::Tier::Software {
-				"sw"
-			} else {
-				"hw"
-			};
-			eprintln!(
-				"pulsar-render: decoder={dec_name} tier={}",
-				sel.tier.as_str()
-			);
-			// Tell the app which decoder is REALLY in use (the UI shows it read-only —
-			// there is no decoder picker; selection is always automatic).
-			{
-				use std::io::Write;
-				println!("vidsink-dec {dec_name} {hw} {}", sel.tier.as_str());
-				let _ = std::io::stdout().flush();
-				*DEC_LABEL.lock().unwrap() =
-					format!("{dec_name} ({})", if hw == "hw" { "HW" } else { "SW" });
-			}
+			announce_decoder(&sel);
 			// Tier-1 zero-copy: try av_hwframe_map → DRM_PRIME once; on the first failure
 			// fall back to readback (av_hwframe_transfer_data → NV12 upload) permanently.
 			//
@@ -589,7 +544,7 @@ unsafe fn decode_once(sdp: &CString) {
 			// buffer → the known-good NV12 upload path) sidesteps the multi-layer import and
 			// still HW-decodes (the H.264 work stays on the GPU; only a per-frame NV12 copy
 			// is added, sub-ms at 1080p). Zero-copy stays on for rkmpp/others.
-			let force_readback =
+			let mut force_readback =
 				sel.hwdev == Some(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI);
 			let mut map_failed = false;
 			let mut readback_warned = false;
@@ -602,6 +557,11 @@ unsafe fn decode_once(sdp: &CString) {
 			// the next IDR (GOP≈2 s). Dropping pre-keyframe packets makes the presenter HOLD the
 			// last good frame across the switch instead of flashing green.
 			let mut seen_key = false;
+			// Zero-output fallback bookkeeping for the CURRENT decoder instance: video AUs
+			// fed since it was opened vs frames it produced.
+			let mut au_since_open: u32 = 0;
+			let mut frames_since_open: u64 = 0;
+			let mut fallback_exhausted = false;
 			while !STOP.load(Ordering::Relaxed) && !REOPEN.load(Ordering::Relaxed) {
 				let r = ff::av_read_frame(fmt, pkt);
 				// A switch that never produced its first keyframe within SWITCH_TIMEOUT_MS:
@@ -645,6 +605,7 @@ unsafe fn decode_once(sdp: &CString) {
 					VBYTES.fetch_add((*pkt).size.max(0) as u64, Ordering::Relaxed);
 					let t0 = std::time::Instant::now();
 					ff::avcodec_send_packet(dc, pkt);
+					au_since_open = au_since_open.saturating_add(1);
 					Some(t0)
 				} else {
 					None
@@ -653,6 +614,7 @@ unsafe fn decode_once(sdp: &CString) {
 				let mut got_frames: u64 = 0;
 				while ff::avcodec_receive_frame(dc, frame) == 0 {
 					got_frames += 1;
+					frames_since_open += 1;
 					// Route by output class: DRM_PRIME → zero-copy present; tier-1 hwaccel
 					// frames → map to DRM_PRIME (zero-copy) or read back to NV12; software
 					// planar/NV12 → GL upload. Anything else is undisplayable → skip.
@@ -740,6 +702,49 @@ unsafe fn decode_once(sdp: &CString) {
 						last_pub_pace = pubt;
 					}
 				}
+				// ZERO-OUTPUT FALLBACK: ~2 s of video AUs in (120 at 60 fps), not one frame
+				// out = this decoder validated on the canned keyframe but cannot decode THIS
+				// stream (a profile/level the hwaccel rejects, a driver that wedges). Walk the
+				// tier chain again with it excluded and re-sync on the next keyframe. Without
+				// this the session stayed black forever while the bitrate tile said video
+				// was flowing — the Linux twin of the Windows renderer's sync-MFT rebuild.
+				if au_since_open >= 120 && frames_since_open == 0 && !fallback_exhausted {
+					skip.push(sel.name.clone());
+					eprintln!(
+						"pulsar-render: decoder {} consumed {au_since_open} AUs with zero output — trying the next candidate",
+						sel.name
+					);
+					let mut reopened = false;
+					while !reopened {
+						match crate::decode::select_skipping(codec_id, &skip) {
+							Some(p) => {
+								ff::avcodec_free_context(&mut dc);
+								dc = open_decoder(st, codec_id, &p.sel);
+								if dc.is_null() {
+									skip.push(p.sel.name.clone());
+									continue;
+								}
+								sel = p.sel;
+								announce_decoder(&sel);
+								force_readback = sel.hwdev
+									== Some(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI);
+								map_failed = false;
+								seen_key = false;
+								au_since_open = 0;
+								frames_since_open = 0;
+								reopened = true;
+							}
+							None => break,
+						}
+					}
+					if !reopened {
+						eprintln!("pulsar-render: every decoder candidate failed on this stream");
+						fallback_exhausted = true;
+						if dc.is_null() {
+							break 'decode;
+						}
+					}
+				}
 				if let Some(t0) = dec_t0 {
 					if got_frames > 0 {
 						let us = t0.elapsed().as_micros() as u64 / got_frames;
@@ -768,6 +773,69 @@ unsafe fn decode_once(sdp: &CString) {
 /// drain+free (`stop_decode`) must be done from the main thread after the render loop ends, where
 /// MBX is not held — calling stop_decode() from the signal handler can deadlock on the MBX mutex
 /// the main thread holds every frame in `Presenter::draw`.
+/// Allocate + open a codec context for `sel` on stream `st` (the decoder the tier walk
+/// picked). Null on failure (the failure is already logged). Shared by the initial open
+/// and the runtime zero-output fallback so both configure the context identically.
+unsafe fn open_decoder(
+	st: *mut ff::AVStream,
+	codec_id: ff::AVCodecID,
+	sel: &crate::decode::Selected,
+) -> *mut ff::AVCodecContext {
+	let dec = crate::decode::find_decoder(sel, codec_id);
+	if dec.is_null() {
+		eprintln!("pulsar-render: selected decoder {} disappeared", sel.name);
+		return ptr::null_mut();
+	}
+	let mut dc = ff::avcodec_alloc_context3(dec);
+	ff::avcodec_parameters_to_context(dc, (*st).codecpar);
+	// Decoder low-delay: emit frames without reorder buffering when the SPS lacks
+	// bitstream_restriction. This is a codec-context flag — an AVFormatContext has
+	// no "flags" AVOption, so it can't ride the demuxer dict.
+	(*dc).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as c_int;
+	crate::decode::set_wanted_hw_fmt(if sel.tier == crate::decode::Tier::HwAccel {
+		sel.hw_fmt
+	} else {
+		ff::AVPixelFormat::AV_PIX_FMT_NONE
+	});
+	(*dc).get_format = Some(crate::decode::get_format);
+	(*dc).extra_hw_frames = 8;
+	if let Some(dev) = sel.hwdev {
+		let hwctx = crate::decode::create_hwdevice(dev);
+		if hwctx.is_null() {
+			eprintln!("pulsar-render: hw device ctx failed at stream open ({})", sel.name);
+			ff::avcodec_free_context(&mut dc);
+			return ptr::null_mut();
+		}
+		(*dc).hw_device_ctx = hwctx;
+	}
+	// Software decoders (desktop x86, AV1): slice threading only — frame threading would
+	// add a frame of latency per extra thread. No-op for HW decoders.
+	(*dc).thread_count = 0;
+	(*dc).thread_type = ff::FF_THREAD_SLICE as c_int;
+	if ff::avcodec_open2(dc, dec, ptr::null_mut()) < 0 {
+		eprintln!("pulsar-render: avcodec_open2 failed ({})", sel.name);
+		ff::avcodec_free_context(&mut dc);
+		return ptr::null_mut();
+	}
+	dc
+}
+
+/// Tell the app (stdout) and the HUD which decoder is REALLY in use — the UI shows it
+/// read-only; there is no decoder picker, selection is always automatic.
+fn announce_decoder(sel: &crate::decode::Selected) {
+	use std::io::Write;
+	let hw = if sel.tier == crate::decode::Tier::Software {
+		"sw"
+	} else {
+		"hw"
+	};
+	eprintln!("pulsar-render: decoder={} tier={}", sel.name, sel.tier.as_str());
+	println!("vidsink-dec {} {hw} {}", sel.name, sel.tier.as_str());
+	let _ = std::io::stdout().flush();
+	*DEC_LABEL.lock().unwrap() =
+		format!("{} ({})", sel.name, if hw == "hw" { "HW" } else { "SW" });
+}
+
 pub fn signal_stop() {
 	STOP.store(true, Ordering::Relaxed);
 }

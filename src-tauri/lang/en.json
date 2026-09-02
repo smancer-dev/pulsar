@@ -23,5 +23,6 @@
 	"err.badTarget": "Invalid ID or IP",
 	"host.gstFailed": "(gst failed to start)",
 	"host.ffmpegFailed": "(ffmpeg failed to start)",
+	"host.encodeFailed": "Video encoder failed to start — no encoder worked; tried",
 	"err.identityChanged": "The identity behind this device has changed. Accept the new identity and reconnect?"
 }

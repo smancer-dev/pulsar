@@ -192,6 +192,21 @@
 		return scope.dispose;
 	});
 
+	// Video diagnostics → the native renderer's persistent banner. The webview sits UNDER
+	// the video surface on the native path, so VideoStatus's DOM overlays are invisible
+	// there; the renderer is the only place the viewer can read why the screen is black.
+	$effect(() => {
+		if (!native) return;
+		const text = media.videoErr
+			? media.videoErr
+			: media.stalled
+				? media.mbps > 0
+					? t('session.noDecode')
+					: t('session.streamStopped')
+				: '';
+		api.renderBanner(playId, text).catch(() => {});
+	});
+
 	// Live engage state of the native capture (drives the status hint): a video click
 	// engages (kbd-engaged), the release combo (Ctrl+Alt+Z / 3×RightCtrl) or focus loss
 	// disengages. Each edge also pushes a transient helper tooltip onto the renderer

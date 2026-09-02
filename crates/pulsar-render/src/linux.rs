@@ -66,6 +66,8 @@ static HINT: std::sync::Mutex<Option<(String, std::time::Instant, f32)>> =
 /// toasts pass their own longer duration.
 const HINT_SECS: f32 = 3.0;
 const TOAST_SECS: f32 = 6.0;
+/// "banner" text never expires on its own — the app clears it explicitly.
+const BANNER_SECS: f32 = 1.0e9;
 const HINT_FADE: f32 = 0.5;
 /// Network RTT in tenths of ms (app stdin `rtt <ms>` from the keepalive ping/pong) —
 /// the overlay's "Gecikme" tile shows THIS, not the local present-gap.
@@ -450,6 +452,17 @@ pub fn run() {
 						*HINT.lock().unwrap() =
 							Some((rest.to_string(), std::time::Instant::now(), TOAST_SECS));
 					}
+				}
+				// Persistent status banner ("banner <text>"; empty text clears it): the app's
+				// no-video / decode-failed diagnostics. The webview sits UNDER the video
+				// surface, so this is the only place the viewer can read them.
+				Some("banner") => {
+					let rest = line.splitn(2, ' ').nth(1).unwrap_or("").trim();
+					*HINT.lock().unwrap() = if rest.is_empty() {
+						None
+					} else {
+						Some((rest.to_string(), std::time::Instant::now(), BANNER_SECS))
+					};
 				}
 				// Live engage state (cursor visibility) — same app-side edges.
 				Some("engaged") => {

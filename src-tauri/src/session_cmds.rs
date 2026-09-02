@@ -1147,6 +1147,32 @@ pub(crate) async fn render_toast(
 	Ok(())
 }
 
+/// Set (or, with empty `text`, clear) the renderer's persistent status banner — the
+/// session's video diagnostics ("no video from host", "decoder rejected the stream").
+/// The webview sits under the native video surface, so this is the only readable
+/// channel for them. No-op when there is no renderer stdin (ffplay / mpv fallbacks).
+#[tauri::command]
+pub(crate) async fn render_banner(
+	state: State<'_, AppState>,
+	id: u64,
+	text: String,
+) -> Result<(), String> {
+	let stdin = state
+		.plays
+		.lock()
+		.unwrap()
+		.get(&id)
+		.map(|p| p.render_stdin.clone());
+	if let Some(stdin) = stdin {
+		use std::io::Write;
+		if let Some(si) = stdin.lock().unwrap().as_mut() {
+			let _ = writeln!(si, "banner {}", text.replace('\n', " ").trim());
+			let _ = si.flush();
+		}
+	}
+	Ok(())
+}
+
 /// Client (game mode): open/close the in-session gaming overlay menu. Opening ungrabs
 /// the local keyboard/mouse so they drive the webview overlay (without ending the
 /// session) and pauses the embedded `--wid` mpv on Linux (keeping the last frame visible

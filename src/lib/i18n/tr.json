@@ -392,6 +392,8 @@
 	"connecting.slowHint": "Beklenenden uzun sürüyor — host çevrimdışı olabilir ya da bir güvenlik duvarı bağlantıyı engelliyor olabilir.",
 	"session.videoErr": "Video bağlantısı kurulamadı.",
 	"session.streamStopped": "Yayın durdu — host ekran paylaşımını durdurmuş olabilir.",
+	"session.noVideo": "Görüntü gelmiyor — host kodlayıcıyı başlatamamış olabilir (host tarafında Ayarlar → Kodlayıcı: Software dene).",
+	"session.noDecode": "Veri geliyor ama çözülemiyor — bu cihazın çözücüsü yayını açamadı; başka bir codec dene.",
 	"session.connecting": "Bağlanılıyor…",
 	"session.waiting": "Host görüntüyü hazırlıyor — ekran paylaşım iznini onayla.",
 	"session.secVideo": "Görüntü",

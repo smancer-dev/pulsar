@@ -473,11 +473,21 @@ pub struct Probed {
 /// zero-copy SoC → hwaccel → software), then probe that SAME decoder against every
 /// committed encoder-family sample to learn which real-world bitstreams it rejects.
 pub fn select(codec_id: ff::AVCodecID) -> Option<Probed> {
+	select_skipping(codec_id, &[])
+}
+
+/// [`select`] with candidates excluded by name — the runtime zero-output fallback in
+/// video.rs walks the same tier chain again with the decoder that just failed on the
+/// live stream (and every one before it) left out.
+pub fn select_skipping(codec_id: ff::AVCodecID, skip: &[String]) -> Option<Probed> {
 	let fixtures = fixtures_for(codec_id);
 	let baseline = fixtures.iter().find(|f| f.family.is_empty())?;
 	let baseline_path = write_fixture(baseline)?;
 	unsafe {
 		for cand in candidates(codec_id) {
+			if skip.iter().any(|s| *s == cand.name) {
+				continue;
+			}
 			if !validate(&cand, &baseline_path) {
 				eprintln!("pulsar-render: decoder {} failed validation", cand.name);
 				continue;

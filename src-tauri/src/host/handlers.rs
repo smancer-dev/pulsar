@@ -2652,12 +2652,21 @@ pub(super) fn make_on_stream(
 			};
 			// Every candidate died: tell the CLIENT too (Stats travels the session), not just
 			// the host toast — a viewer stuck on black with zero feedback was the old bug.
+			let tried = candidates
+				.iter()
+				.map(|(e, _)| e.label())
+				.collect::<Vec<_>>()
+				.join(", ");
 			let app_fail = app_h.clone();
 			let peer_fail = peer.clone();
 			let stats_fail = stats_out.clone();
 			let on_failed = move || {
-				let msg = crate::i18n::t("host.ffmpegFailed").to_string();
-				let _ = stats_fail.try_send(DataMsg::Stats(msg.clone()));
+				let msg = format!("{} ({tried})", crate::i18n::t("host.encodeFailed"));
+				// A leading "!" marks a stream ERROR on the Stats channel — the one host→client
+				// text path every peer already speaks, so no wire change: a current client
+				// shows it as the session's video error (and on its renderer banner), an
+				// older one merely prints it in its stats panel.
+				let _ = stats_fail.try_send(DataMsg::Stats(format!("!{msg}")));
 				let _ = app_fail.emit(
 					"session",
 					SessionEvent {

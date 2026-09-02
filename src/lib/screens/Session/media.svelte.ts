@@ -13,6 +13,13 @@
 // video path was removed (too slow). Only audio still decodes in the webview (WebAudio).
 import { startOpusAudio } from '$lib/opus-audio';
 import { onPlayDecoder, onPlayRtt, onPlayStats, onPlayVStats } from '$lib/api';
+import { t } from '$lib/i18n.svelte';
+
+// First-frame watchdog: seconds without ANY video after the stream was requested before
+// the session says so (instead of a silent black canvas). Generous: a cold HW encoder +
+// the host's own encoder fallback chain (4 s per dead candidate) can legitimately take
+// this long; the host's verdict ("!" Stats) overrides the generic text when it arrives.
+const NO_VIDEO_SECS = 12;
 import { listenScope } from '$lib/api.events';
 
 type Inputs = {
@@ -41,6 +48,7 @@ export class SessionMedia {
 	// reports 0, which would otherwise mask a frozen stream as healthy forever.
 	#rawFps = 0;
 	#lastVStatsAt = 0;
+	#noVideoSecs = 0;
 	// Rolling fps samples (one per second) for the perf hover graph.
 	fpsHistory = $state<number[]>([]);
 	// Live performance metrics shown in the in-session stats panel. Client-side video numbers
@@ -114,6 +122,8 @@ export class SessionMedia {
 					// faked; 0 when mpv can't report it. Feeds the Decode-time row + the overlay HUD.
 					this.decodeMs = Math.round(e.decodeMs * 10) / 10;
 					if (e.mbps > 0 || e.fps > 0) this.hasVideo = true; // video is flowing
+					// Real frames again → whatever diagnostic was showing is stale.
+					if (e.fps > 0) this.videoErr = '';
 				})
 			);
 			return scope.dispose;
@@ -150,7 +160,14 @@ export class SessionMedia {
 					if (e.id === playId) this.rttMs = Math.round(e.rtt);
 				}),
 				onPlayStats((e) => {
-					if (e.id === playId) this.hostStats = e.label;
+					if (e.id !== playId) return;
+					// A leading "!" marks a stream ERROR from the host (every encoder candidate
+					// died): it is the session's video error, not a stats row.
+					if (e.label.startsWith('!')) {
+						this.videoErr = e.label.slice(1);
+						return;
+					}
+					this.hostStats = e.label;
 				})
 			);
 			return scope.dispose;
@@ -178,6 +195,15 @@ export class SessionMedia {
 					// never trip, permanently disarming it for the rest of the session.
 					this.#rawFps = 0;
 					return;
+				}
+				if (!this.hasVideo) {
+					// First-frame watchdog (see NO_VIDEO_SECS). Host-reported errors win.
+					this.#noVideoSecs++;
+					if (this.#noVideoSecs >= NO_VIDEO_SECS && !this.videoErr) {
+						this.videoErr = t('session.noVideo');
+					}
+				} else {
+					this.#noVideoSecs = 0;
 				}
 				if (this.hasVideo) {
 					const statsSilent =

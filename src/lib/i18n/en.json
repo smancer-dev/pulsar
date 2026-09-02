@@ -392,6 +392,8 @@
 	"connecting.slowHint": "Taking longer than expected — the host may be offline, or a firewall may be blocking the connection.",
 	"session.videoErr": "Could not establish the video connection.",
 	"session.streamStopped": "Stream stopped — the host may have stopped screen sharing.",
+	"session.noVideo": "No video yet — the host may have failed to start its encoder (on the host try Settings → Encoder: Software).",
+	"session.noDecode": "Data is arriving but cannot be decoded — this device\u2019s decoder rejected the stream; try another codec.",
 	"session.connecting": "Connecting…",
 	"session.waiting": "The host is preparing the video — approve the screen-share permission.",
 	"session.secVideo": "Video",

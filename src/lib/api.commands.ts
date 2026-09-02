@@ -217,6 +217,8 @@ export const api = {
 	/** Free-text toast on the native renderer (bottom-center, ~6 s) — inbound chat
 	 * surfaces here because the video occludes the webview. */
 	renderToast: (id: number, text: string) => invoke<void>('render_toast', { id, text }),
+	/** Persistent renderer status banner (empty text clears it). */
+	renderBanner: (id: number, text: string) => invoke<void>('render_banner', { id, text }),
 	/** One chat line into the native overlay's Chat view ('in' = from the host,
 	 * 'out' = ours — both echoed so the renderer's log is the single truth). */
 	renderChat: (id: number, dir: 'in' | 'out', text: string) =>
