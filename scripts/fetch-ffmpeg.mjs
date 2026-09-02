@@ -6,6 +6,7 @@
 // GPL ffmpeg builds below are license-compatible. Each chosen build includes
 // the screen-capture indev + libx264 we need:
 //   - Windows x64 : gdigrab     + libx264   (BtbN GPL)
+//   - Windows arm64: gdigrab    + libx264 + h264_mf (BtbN GPL, winarm64)
 //   - Linux  x64  : x11grab     + libx264   (BtbN GPL)
 //   - Linux  arm64: x11grab     + libx264   (BtbN GPL)
 //   - macOS  x64  : avfoundation+ libx264   (evermeet.cx)
@@ -78,6 +79,13 @@ const SOURCES = {
     url: `${BTBN}/ffmpeg-master-latest-win64-gpl.zip`,
     kind: "zip",
     // archive layout: ffmpeg-*-win64-gpl/bin/ffmpeg.exe
+    member: /\/bin\/ffmpeg\.exe$/i,
+  },
+  // Windows on ARM (Snapdragon X): BtbN ships a native winarm64 GPL build. No NVENC
+  // there; the hardware path is Media Foundation (`h264_mf`), x264 is the fallback.
+  "windows/arm64": {
+    url: `${BTBN}/ffmpeg-master-latest-winarm64-gpl.zip`,
+    kind: "zip",
     member: /\/bin\/ffmpeg\.exe$/i,
   },
   "linux/x64": {

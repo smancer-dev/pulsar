@@ -7,6 +7,7 @@ import { join } from 'node:path';
 // (the bundle, NOT its .sig). createUpdaterArtifacts emits these names.
 const TARGETS = [
 	{ key: 'windows-x86_64', re: /_x64-setup\.exe$/ },
+	{ key: 'windows-aarch64', re: /_arm64-setup\.exe$/ },
 	{ key: 'linux-x86_64', re: /_amd64\.AppImage$/ },
 	{ key: 'linux-aarch64', re: /_aarch64\.AppImage$/ },
 	{ key: 'darwin-aarch64', re: /aarch64\.app\.tar\.gz$/ },

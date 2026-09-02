@@ -758,18 +758,38 @@ pub(crate) async fn start_remote_play(
 							// the control channel come up; only the video is missing — so this is a
 							// degraded-not-fatal notice, NOT a `play-ended` teardown.
 							None => {
-								tracing::error!("macOS: mpv failed to spawn — video unavailable (install mpv: brew install mpv)");
-								// Turkish UI copy (project default). Kept inline rather than as an i18n
-								// key so this stays within the renderer-wiring change set; if an EN
-								// catalog entry is wanted later, swap to crate::i18n::t.
-								let _ = app.emit(
-									"host-stats",
-									crate::events::PlayStats {
-										id,
-										label: "Video yok — mpv kurulu değil (brew install mpv)"
-											.to_string(),
-									},
-								);
+								// No mpv: fall back to the BUNDLED ffplay (software decode, its own
+								// window) so a fresh Mac shows video with nothing installed. mpv stays
+								// the preferred player (VideoToolbox zero-copy) whenever it is present.
+								let ffplay = process::ffplay_bin(&app);
+								match native_view::spawn_ffplay(&ffplay, &sdp) {
+									Some(c) => {
+										tracing::warn!(
+											pid = c.id(),
+											port = vport,
+											"macOS: mpv unavailable — bundled ffplay renders the video (software decode)"
+										);
+										native_child = Some(c);
+										video_port = vport;
+									}
+									None => {
+										// Neither player could be spawned. Say so on the `host-stats` label
+										// (the channel the session UI already renders as a status string)
+										// rather than leaving a silent black session; the overlay + control
+										// channel still come up, so this is degraded-not-fatal.
+										tracing::error!(
+											"macOS: neither mpv nor the bundled ffplay could be spawned — video unavailable (brew install mpv)"
+										);
+										let _ = app.emit(
+											"host-stats",
+											crate::events::PlayStats {
+												id,
+												label: "Video yok — mpv kurulu değil (brew install mpv)"
+													.to_string(),
+											},
+										);
+									}
+								}
 							}
 						}
 
