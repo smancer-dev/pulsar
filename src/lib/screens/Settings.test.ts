@@ -9,7 +9,9 @@ describe('Settings screen', () => {
 		await fireEvent.click(screen.getByRole('button', { name: /Ağ/ }));
 		const relay = await screen.findByLabelText('Relay sunucusu adresi');
 		// loaded from the (mock) core config
-		expect((relay as HTMLInputElement).value).toContain(':');
+		// A bare host is the normal value now: the relay port is implied unless the
+		// operator runs on a non-default one.
+		expect((relay as HTMLInputElement).value.length).toBeGreaterThan(0);
 	});
 
 	it('changing the network mode persists it through the api', async () => {

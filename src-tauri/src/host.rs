@@ -8,7 +8,9 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pulsar_core::input::{create_virtual_pad_target, EmulationTarget, GamepadKind, ResolvedTarget, VirtualGamepad};
+use pulsar_core::input::{
+	create_virtual_pad_target, EmulationTarget, GamepadKind, ResolvedTarget, VirtualGamepad,
+};
 
 /// Spawn a thread that forwards the game's rumble from a virtual pad back to the client's
 /// physical controller (as [`DataMsg::Rumble`]). No-op when the backend has no rumble
@@ -24,8 +26,16 @@ fn spawn_rumble_forward(
 		tracing::info!(slot, "rumble: DS4 notifier thread started (host)");
 		std::thread::spawn(move || {
 			while let Some((large, small)) = reader.next() {
-				tracing::info!(slot, large, small, "rumble: host got from game → forwarding");
-				if tx.blocking_send(DataMsg::Rumble { slot, large, small }).is_err() {
+				tracing::info!(
+					slot,
+					large,
+					small,
+					"rumble: host got from game → forwarding"
+				);
+				if tx
+					.blocking_send(DataMsg::Rumble { slot, large, small })
+					.is_err()
+				{
 					break;
 				}
 			}
@@ -55,9 +65,9 @@ use crate::process::{
 use crate::state::AppState;
 use crate::util::{config_path, display_rotation, identity_path, resolve_relay, DDAGRAB_ZEROCOPY};
 
-mod handlers;
 #[cfg(target_os = "linux")]
 pub(crate) mod cursor;
+mod handlers;
 use handlers::{make_on_audio, make_on_file, make_on_stream};
 
 /// Transport features this host advertises in its `StreamCaps` reply: it can carry
@@ -127,8 +137,19 @@ struct SessionCleanupGuard {
 	/// Connections window and +page.svelte's `hostSessions` do not show phantom
 	/// peers and so the auto-updater liveness gate is not permanently suppressed.
 	/// These are all the same Arcs captured in the session closure.
-	incoming: Arc<Mutex<std::collections::HashMap<u64, (String, tokio::sync::oneshot::Sender<()>)>>>,
-	host_out: Arc<Mutex<std::collections::HashMap<u64, (String, tokio::sync::mpsc::Sender<pulsar_core::service::DataMsg>)>>>,
+	incoming:
+		Arc<Mutex<std::collections::HashMap<u64, (String, tokio::sync::oneshot::Sender<()>)>>>,
+	host_out: Arc<
+		Mutex<
+			std::collections::HashMap<
+				u64,
+				(
+					String,
+					tokio::sync::mpsc::Sender<pulsar_core::service::DataMsg>,
+				),
+			>,
+		>,
+	>,
 	active: Arc<Mutex<std::collections::HashMap<u64, crate::state::ConnInfo>>>,
 	peer_meta: Arc<Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>>,
 	peer: String,
@@ -192,7 +213,8 @@ impl Drop for SessionCleanupGuard {
 			// which dismisses the picker (capture.rs's SessionCloseGuard). Covers the
 			// abort() teardown path, where serve_with's own cleanup (which also bumps
 			// cap_gen) is skipped.
-			self.cap_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			self.cap_gen
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 			if let Some(cap) = self.cap_slot.lock().unwrap().take() {
 				let _ = tokio::spawn(cap.stop());
 			}
@@ -269,6 +291,7 @@ pub(crate) async fn go_online(
 	// A fresh one-shot TOTP/2FA code for a relay that requires it (v4 relay auth). The UI
 	// passes it only when the user just typed it; it is never stored. `None`/empty on an
 	// open or password-only relay.
+	relay_password: Option<String>,
 	relay_totp: Option<String>,
 ) -> Result<String, String> {
 	// Pre-warm ALL encoder probes off the hot path: the first QueryStreamCaps must
@@ -369,10 +392,22 @@ pub(crate) async fn go_online(
 	// session ended left the host output muted. Unmute iff our marker says we set it
 	// (never touches a mute the user set independently). No-op for a clean exit.
 	handlers::restore_stale_mute_fallback();
-	tracing::info!(relay = %cfg.relay, "go_online: resolving relay");
-	let relay = resolve_relay(&cfg.relay)
-		.await
-		.ok_or_else(|| format!("{}: {}", crate::i18n::t("err.relayResolve"), cfg.relay))?;
+	// Relay selection. With the in-app relay toggled on (Settings → Ağ) we run one
+	// ourselves and register against it on loopback — the configured address is ignored,
+	// because a local relay has no address for the user to type. Starting it here (rather
+	// than only from the toggle) also covers launch: the setting is persisted, so the
+	// first go_online of the next run brings the relay back up before registering.
+	let relay = if cfg.use_local_relay {
+		let status = crate::local_relay::ensure_running(&app, 0).await?;
+		let addr: SocketAddr = ([127, 0, 0, 1], status.port).into();
+		tracing::info!(%addr, "go_online: using the in-app relay");
+		addr
+	} else {
+		tracing::info!(relay = %cfg.relay, "go_online: resolving relay");
+		resolve_relay(&cfg.relay)
+			.await
+			.ok_or_else(|| format!("{}: {}", crate::i18n::t("err.relayResolve"), cfg.relay))?
+	};
 	tracing::info!(%relay, "go_online: binding node + registering");
 	let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
 	// Identity advertised on the network: the user's chosen device name, or — when
@@ -392,23 +427,33 @@ pub(crate) async fn go_online(
 	// fallback made those rules quietly useless). Unset (0) = a RANDOM ephemeral port
 	// every launch — the LAN beacon and the Home screen's "ip:port" always carry the
 	// real port, so discovery/direct connects keep working.
-	let preferred = SocketAddr::new(local.ip(), cfg.node_port);
+	// A pinned port is used as-is. For the "random" default we re-prefer the port this run
+	// already bound (see `AppState::sticky_port`) so repeated go_online calls don't keep
+	// moving our address; 0 (a fresh ephemeral) only on the first bind of the process.
+	let sticky = state.sticky_port.load(std::sync::atomic::Ordering::SeqCst);
+	let want_port = if cfg.node_port != 0 {
+		cfg.node_port
+	} else {
+		sticky
+	};
+	let preferred = SocketAddr::new(local.ip(), want_port);
 	// Persisted per-user identity → the relay hands back the SAME 9-digit ID every
 	// launch (stable device ID). Different OS users keep separate identity files.
 	let identity = pulsar_core::crypto::Identity::load_or_create(identity_path(&app));
-	// Credentials for a relay with an auth policy (v4). The password is persisted in the
-	// config (turned into a nonce-bound proof, never sent as-is); the 2FA code is a fresh
-	// one-shot value from the UI. Empty on the public/open relay.
-	let relay_creds = pulsar_core::RelayCreds {
-		password: {
-			let p = cfg.relay_password.trim();
-			(!p.is_empty()).then(|| p.to_string())
-		},
-		totp: relay_totp
-			.as_deref()
+	// Credentials for a relay with an auth policy (v4/v5). Normal case: we already hold an
+	// ACCESS KEY for this relay from a previous authentication, so registration is silent.
+	// The password and 2FA code are one-shot values typed into the connect-time prompt —
+	// neither is ever persisted; the key the relay issues in return is (see below).
+	let one_shot = |v: &Option<String>| {
+		v.as_deref()
 			.map(str::trim)
 			.filter(|s| !s.is_empty())
-			.map(str::to_string),
+			.map(str::to_string)
+	};
+	let relay_creds = pulsar_core::RelayCreds {
+		key: cfg.relay_key_for(&cfg.relay).map(str::to_string),
+		password: one_shot(&relay_password),
+		totp: one_shot(&relay_totp),
 	};
 	let node = match Node::bind_with_identity_creds(
 		preferred,
@@ -428,6 +473,34 @@ pub(crate) async fn go_online(
 				cfg.node_port
 			));
 		}
+		// The remembered ephemeral port is a preference, not a promise: if something else
+		// took it meanwhile, fall back to a fresh one rather than failing to go online.
+		Err(_) if want_port != 0 => {
+			tracing::info!(
+				port = want_port,
+				"remembered node port unavailable — taking a fresh one"
+			);
+			state
+				.sticky_port
+				.store(0, std::sync::atomic::Ordering::SeqCst);
+			match Node::bind_with_identity_creds(
+				SocketAddr::new(local.ip(), 0),
+				relay,
+				cfg.network_mode,
+				announce_name.clone(),
+				identity.clone(),
+				pulsar_core::RelayCreds {
+					key: cfg.relay_key_for(&cfg.relay).map(str::to_string),
+					password: one_shot(&relay_password),
+					totp: one_shot(&relay_totp),
+				},
+			)
+			.await
+			{
+				Ok(n) => n,
+				Err(e) => return Err(e.to_string()),
+			}
+		}
 		Err(e) => return Err(e.to_string()),
 	};
 
@@ -435,6 +508,12 @@ pub(crate) async fn go_online(
 	// unreachable (offline mode): we announce ourselves (id-less) and find peers on
 	// the local network regardless of relay state. Replaces any prior beacon.
 	let node_port = node.local_addr().map(|a| a.port()).unwrap_or(0);
+	// Remember it so the next go_online in this run re-binds the SAME port.
+	if node_port != 0 {
+		state
+			.sticky_port
+			.store(node_port, std::sync::atomic::Ordering::SeqCst);
+	}
 	// Surface the live port to the UI (Home shows "ip:port" for direct connects):
 	// state for late mounts + an event for screens already up.
 	state
@@ -560,30 +639,30 @@ pub(crate) async fn go_online(
 					_ => return,
 				};
 				// Gaming mode (pure client): the user put this device into a personality
-					// where it may NOT be a host, so refuse every inbound connection right
-					// here — before any Allow/Deny popup or password race — and tell the UI.
-					// Registration with the relay stays alive (outbound connects still work);
-					// only inbound serving is gated. Active sessions are kicked separately by
-					// the UI when the mode is entered.
-					if app_h
-						.state::<AppState>()
-						.hosting_disabled
-						.load(std::sync::atomic::Ordering::Relaxed)
-					{
-						let _ = reject(&mut session).await;
-						tracing::info!(%peer, "inbound refused — hosting disabled (gaming mode)");
-						let _ = app_h.emit(
-							"session",
-							SessionEvent {
-								kind: "rejected".into(),
-								peer: peer.clone(),
-								sid,
-								detail: String::new(),
-							},
-						);
-						return;
-					}
-					// Auth: a correct up-front password is accepted immediately. Otherwise
+				// where it may NOT be a host, so refuse every inbound connection right
+				// here — before any Allow/Deny popup or password race — and tell the UI.
+				// Registration with the relay stays alive (outbound connects still work);
+				// only inbound serving is gated. Active sessions are kicked separately by
+				// the UI when the mode is entered.
+				if app_h
+					.state::<AppState>()
+					.hosting_disabled
+					.load(std::sync::atomic::Ordering::Relaxed)
+				{
+					let _ = reject(&mut session).await;
+					tracing::info!(%peer, "inbound refused — hosting disabled (gaming mode)");
+					let _ = app_h.emit(
+						"session",
+						SessionEvent {
+							kind: "rejected".into(),
+							peer: peer.clone(),
+							sid,
+							detail: String::new(),
+						},
+					);
+					return;
+				}
+				// Auth: a correct up-front password is accepted immediately. Otherwise
 				// the host's Allow/Deny popup AND the client's password prompt appear
 				// at the SAME time; accept on whichever lands first (so the host can
 				// approve passwordlessly). Unattended hosts auto-allow. The persistent
@@ -661,8 +740,8 @@ pub(crate) async fn go_online(
 						// rotates under one lock, eliminating the read→compare→rotate TOCTOU
 						// race where two concurrent tasks could both match the same live OTP.
 						let otp_accepted = crate::commands::try_consume_otp(&app_h, &provided);
-						let custom_accepted = !custom_pw.is_empty()
-							&& crate::auth::secret_eq(&provided, &custom_pw);
+						let custom_accepted =
+							!custom_pw.is_empty() && crate::auth::secret_eq(&provided, &custom_pw);
 						if !accepted.is_empty() && (otp_accepted || custom_accepted) {
 							true
 						} else {
@@ -802,8 +881,14 @@ pub(crate) async fn go_online(
 							view_only: approved_view_only,
 						},
 					);
-					incoming.lock().unwrap().insert(sid, (peer.clone(), stop_tx));
-					host_out.lock().unwrap().insert(sid, (peer.clone(), out_tx.clone()));
+					incoming
+						.lock()
+						.unwrap()
+						.insert(sid, (peer.clone(), stop_tx));
+					host_out
+						.lock()
+						.unwrap()
+						.insert(sid, (peer.clone(), out_tx.clone()));
 					None
 				};
 
@@ -910,8 +995,7 @@ pub(crate) async fn go_online(
 										// Re-read the freshest StreamReq AFTER the confirm sleep so
 										// we don't clobber a client request that arrived during those
 										// 700 ms (e.g. monitor switch, codec change, resolution pick).
-										let fresh_req =
-											last_req_store.lock().unwrap().clone();
+										let fresh_req = last_req_store.lock().unwrap().clone();
 										let Some(fresh_req) = fresh_req else {
 											// Session was torn down during the sleep — nothing to do.
 											continue;
@@ -946,10 +1030,14 @@ pub(crate) async fn go_online(
 											Ok(_) => {
 												baseline = Some((idx, size));
 											}
-											Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+											Err(tokio::sync::mpsc::error::TrySendError::Full(
+												_,
+											)) => {
 												// Don't update baseline — next poll must still see the delta.
 											}
-											Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+											Err(
+												tokio::sync::mpsc::error::TrySendError::Closed(_),
+											) => {
 												break;
 											}
 										}
@@ -1076,7 +1164,8 @@ pub(crate) async fn go_online(
 							if let Some(pid) = launch_host_game(&g) {
 								let slot = launched_hwnd.clone();
 								std::thread::spawn(move || {
-									if let Some(hwnd) = crate::process::resolve_launched_window(pid) {
+									if let Some(hwnd) = crate::process::resolve_launched_window(pid)
+									{
 										*slot.lock().unwrap() = Some(hwnd);
 									}
 								});
@@ -1126,11 +1215,13 @@ pub(crate) async fn go_online(
 				// mouse/keyboard into a uinput desktop injector — both created lazily.
 				let on_input = {
 					// One virtual pad per player slot (0-based). The legacy `Gamepad` variant
-						// maps to slot 0; `GamepadSlot`/`GamepadDisconnect` address slots directly.
-						// Pads are created lazily on the first frame for a slot and dropped on
-						// disconnect so the host releases the emulated device (ViGEm/uinput).
-						let mut pads: std::collections::HashMap<u8, (ResolvedTarget, Box<dyn VirtualGamepad>)> =
-							std::collections::HashMap::new();
+					// maps to slot 0; `GamepadSlot`/`GamepadDisconnect` address slots directly.
+					// Pads are created lazily on the first frame for a slot and dropped on
+					// disconnect so the host releases the emulated device (ViGEm/uinput).
+					let mut pads: std::collections::HashMap<
+						u8,
+						(ResolvedTarget, Box<dyn VirtualGamepad>),
+					> = std::collections::HashMap::new();
 					let mut desktop: Option<pulsar_core::input::DesktopInput> = None;
 					let mut tried = false;
 					// PHASE 3B (same-host co-op): per-WINDOW input target. When THIS session captures
@@ -1227,15 +1318,29 @@ pub(crate) async fn go_online(
 							// Legacy single-pad variant → Player 1 (slot 0), Xbox emulation.
 							InputEvent::Gamepad(state) => {
 								pads.entry(0)
-									.or_insert_with(|| (ResolvedTarget::Xbox360, create_virtual_pad_target(GamepadKind::Xbox, EmulationTarget::Auto)))
-									.1.apply(&state);
+									.or_insert_with(|| {
+										(
+											ResolvedTarget::Xbox360,
+											create_virtual_pad_target(
+												GamepadKind::Xbox,
+												EmulationTarget::Auto,
+											),
+										)
+									})
+									.1
+									.apply(&state);
 							}
 							// Slot-tagged controller (multi-pad). The `target` field carries the
 							// client's chosen emulation target (Auto/Xbox360/Ds4). create_virtual_pad_target
 							// now honors the resolved (kind, target) — DS4 target gives a DS4 backend,
 							// Xbox360 (or Auto+Xbox) gives Xbox360. The pad is recreated only when the
 							// resolved target changes, so ViGEm/uinput replug is bounded and rare.
-							InputEvent::GamepadSlot { slot, kind, target, state } => {
+							InputEvent::GamepadSlot {
+								slot,
+								kind,
+								target,
+								state,
+							} => {
 								if slot >= MAX_PADS {
 									return;
 								}
@@ -1245,7 +1350,8 @@ pub(crate) async fn go_online(
 									None => true,
 								};
 								if need_create {
-									if pads.len() >= MAX_PADS as usize && !pads.contains_key(&slot) {
+									if pads.len() >= MAX_PADS as usize && !pads.contains_key(&slot)
+									{
 										// At the cap: refuse to create a BRAND-NEW slot's
 										// virtual device. An in-place recreate of an EXISTING
 										// slot (its emulation target changed) does NOT grow the
@@ -1305,7 +1411,11 @@ pub(crate) async fn go_online(
 										};
 									}
 									// Drop a dead window's injector so a closed game falls back to global.
-									if window_input.as_ref().map(|w| !w.is_alive()).unwrap_or(false) {
+									if window_input
+										.as_ref()
+										.map(|w| !w.is_alive())
+										.unwrap_or(false)
+									{
 										window_input = None;
 									}
 									if let Some(w) = window_input.as_mut() {
@@ -1360,19 +1470,22 @@ pub(crate) async fn go_online(
 												// its current_output atom only AFTER each confirmed build (including
 												// reverts), so reading it gives the monitor actually being streamed. When
 												// no native handle is active (ffmpeg path), fall back to cur_display. (C4)
-												let (idx, gen) = {
-													let out_guard = native_out_arc.lock().unwrap();
-													let gen_guard = native_gen_arc.lock().unwrap();
-													let idx = match out_guard.as_ref() {
+												let (idx, gen) =
+													{
+														let out_guard =
+															native_out_arc.lock().unwrap();
+														let gen_guard =
+															native_gen_arc.lock().unwrap();
+														let idx = match out_guard.as_ref() {
 														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
 														None => cur_display.load(std::sync::atomic::Ordering::Relaxed),
 													};
-													let gen = match gen_guard.as_ref() {
+														let gen = match gen_guard.as_ref() {
 														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
 														None => 0,
 													};
-													(idx, gen)
-												};
+														(idx, gen)
+													};
 												// Re-resolve the monitor geometry when the index changes (different
 												// monitor selected) OR when the build generation advances (same-index
 												// resolution change — the virtual-desktop layout shifts and the old
@@ -1382,19 +1495,23 @@ pub(crate) async fn go_online(
 												// during a TDR/hotplug/mode-switch) is retried on the next pointer event
 												// instead of latching the primary-only fallback permanently (C23).
 												if idx != applied_display || gen != applied_gen {
-													if let Some(r) = pulsar_capture::display_rect(idx) {
+													if let Some(r) =
+														pulsar_capture::display_rect(idx)
+													{
 														applied_display = idx;
 														applied_gen = gen;
-														d.set_monitor(Some(pulsar_core::input::MonitorRect {
-															mon_left: r.mon_left,
-															mon_top: r.mon_top,
-															mon_width: r.mon_width,
-															mon_height: r.mon_height,
-															virt_left: r.virt_left,
-															virt_top: r.virt_top,
-															virt_width: r.virt_width,
-															virt_height: r.virt_height,
-														}));
+														d.set_monitor(Some(
+															pulsar_core::input::MonitorRect {
+																mon_left: r.mon_left,
+																mon_top: r.mon_top,
+																mon_width: r.mon_width,
+																mon_height: r.mon_height,
+																virt_left: r.virt_left,
+																virt_top: r.virt_top,
+																virt_width: r.virt_width,
+																virt_height: r.virt_height,
+															},
+														));
 													}
 													// If display_rect returned None, we leave applied_display/applied_gen
 													// unchanged so the next PointerMotion retries the resolve.
@@ -1410,33 +1527,40 @@ pub(crate) async fn go_online(
 											// Mirrors the PointerMotion resolve above (same C4/C8/C23 reasoning).
 											#[cfg(windows)]
 											{
-												let (idx, gen) = {
-													let out_guard = native_out_arc.lock().unwrap();
-													let gen_guard = native_gen_arc.lock().unwrap();
-													let idx = match out_guard.as_ref() {
+												let (idx, gen) =
+													{
+														let out_guard =
+															native_out_arc.lock().unwrap();
+														let gen_guard =
+															native_gen_arc.lock().unwrap();
+														let idx = match out_guard.as_ref() {
 														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
 														None => cur_display.load(std::sync::atomic::Ordering::Relaxed),
 													};
-													let gen = match gen_guard.as_ref() {
+														let gen = match gen_guard.as_ref() {
 														Some(arc) => arc.load(std::sync::atomic::Ordering::Relaxed),
 														None => 0,
 													};
-													(idx, gen)
-												};
+														(idx, gen)
+													};
 												if idx != applied_display || gen != applied_gen {
-													if let Some(r) = pulsar_capture::display_rect(idx) {
+													if let Some(r) =
+														pulsar_capture::display_rect(idx)
+													{
 														applied_display = idx;
 														applied_gen = gen;
-														d.set_monitor(Some(pulsar_core::input::MonitorRect {
-															mon_left: r.mon_left,
-															mon_top: r.mon_top,
-															mon_width: r.mon_width,
-															mon_height: r.mon_height,
-															virt_left: r.virt_left,
-															virt_top: r.virt_top,
-															virt_width: r.virt_width,
-															virt_height: r.virt_height,
-														}));
+														d.set_monitor(Some(
+															pulsar_core::input::MonitorRect {
+																mon_left: r.mon_left,
+																mon_top: r.mon_top,
+																mon_width: r.mon_width,
+																mon_height: r.mon_height,
+																virt_left: r.virt_left,
+																virt_top: r.virt_top,
+																virt_width: r.virt_width,
+																virt_height: r.virt_height,
+															},
+														));
 													}
 												}
 											}
@@ -1450,10 +1574,10 @@ pub(crate) async fn go_online(
 										InputEvent::Key { code, down } => d.key(code, down),
 										InputEvent::Char(c) => d.type_char(c),
 										// Controller variants are routed to virtual pads in the outer
-											// match and never reach the desktop injector.
-											InputEvent::Gamepad(_)
-											| InputEvent::GamepadSlot { .. }
-											| InputEvent::GamepadDisconnect { .. } => {}
+										// match and never reach the desktop injector.
+										InputEvent::Gamepad(_)
+										| InputEvent::GamepadSlot { .. }
+										| InputEvent::GamepadDisconnect { .. } => {}
 									}
 								}
 							}
@@ -1491,7 +1615,10 @@ pub(crate) async fn go_online(
 								log.drain(..excess);
 							}
 						}
-						crate::connections::open_or_update(&app_h, crate::connections::Surface::Forward);
+						crate::connections::open_or_update(
+							&app_h,
+							crate::connections::Surface::Forward,
+						);
 						let _ = app_h.emit(
 							"host-chat",
 							DataPayload {
@@ -1978,6 +2105,22 @@ pub(crate) async fn go_online(
 		}
 	};
 	tracing::info!(%id, "go_online: registered with relay");
+	// The relay hands back a durable ACCESS KEY the first time this device satisfies its
+	// password/2FA prompt. Persist it against the relay address so every later launch
+	// registers silently — the prompt is a once-per-device event, not a stored password.
+	if let Some(key) = node.issued_relay_key().await {
+		let path = config_path(&app);
+		let mut guard = state.config.lock().unwrap();
+		let relay_addr = guard.relay.clone();
+		guard.set_relay_key(&relay_addr, Some(key));
+		let snapshot = guard.clone();
+		drop(guard);
+		if let Err(e) = snapshot.save(&path) {
+			tracing::warn!(error = %e, "could not persist the relay access key");
+		} else {
+			tracing::info!("relay access key stored — this device won't be prompted again");
+		}
+	}
 	// Tell the UI whether this relay advertises E2E as required (v4). Pulsar always
 	// encrypts, so this only drives a "relay forces E2E" lock indicator in Settings.
 	let _ = app.emit("relay-e2e", node.relay_e2e_required().await);
@@ -2031,7 +2174,9 @@ pub(crate) async fn go_online(
 			if weak.upgrade().is_none() {
 				return;
 			}
-			tracing::warn!("relay rejected re-registration: incompatible protocol version — going offline");
+			tracing::warn!(
+				"relay rejected re-registration: incompatible protocol version — going offline"
+			);
 			// Clear the relay id from the LAN beacon so it stops advertising a dead id.
 			if let Some(d) = &watch_disc {
 				d.set_id(None).await;

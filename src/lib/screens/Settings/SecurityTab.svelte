@@ -42,13 +42,22 @@
 		onclick={() => { ui.twofa = !ui.twofa; saveUi(); }}><span class="knob"></span></button>
 </div>
 <div class="srow">
-	<div class="st"><b>{t('settings.connectPw')}</b><span>{t('settings.connectPwDesc')}</span></div>
+	<div class="st">
+		<b>{t('settings.connectPw')}</b><span>{t('settings.connectPwDesc')}</span>
+		<!-- Same rule as two-factor: unattended access skips authentication entirely
+		     (`require_auth = !unattended_access` in host.rs), so the host never consults
+		     this password. Leaving it editable implied a protection that isn't applied. -->
+		{#if config?.unattended_access}
+			<span class="blocked">{t('settings.connectPwBlocked')}</span>
+		{/if}
+	</div>
 	<div class="field" style="width:220px">
 		{#if config}
 			<input
 				type="password"
 				value={config.connect_password ?? ''}
 				placeholder={t('settings.connectPwPlaceholder')}
+				disabled={config.unattended_access}
 				onchange={(e) => { if (config) { config.connect_password = (e.currentTarget as HTMLInputElement).value.trim(); saveConfig?.(); } }}
 				aria-label={t('settings.connectPw')}
 			/>

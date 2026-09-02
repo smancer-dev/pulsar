@@ -30,61 +30,6 @@ pub(crate) async fn open_log_dir() -> Result<String, String> {
 	crate::logging::open_log_dir()
 }
 
-/// One 2FA (TOTP) enrollment, as shown in Settings → Network. Field names are snake_case
-/// to match the other command DTOs (`LocalCaps`, `Config`).
-#[derive(serde::Serialize)]
-pub(crate) struct TotpEnrollmentDto {
-	/// The base32 shared secret — what the RELAY must run with (`--auth-totp <secret>`).
-	secret: String,
-	/// The same secret in 4-character groups, for typing into an authenticator by hand
-	/// when the QR can't be scanned.
-	secret_grouped: String,
-	/// `otpauth://totp/…` setup URI (what the QR encodes).
-	uri: String,
-	/// The URI rendered as a scannable QR, as a self-contained inline SVG document.
-	qr_svg: String,
-}
-
-/// Mint (or re-display) a 2FA enrollment for a relay the user operates.
-///
-/// `relay` is only the label shown inside the authenticator app (the configured relay
-/// address is used when it's blank). Passing a non-empty `existing` base32 secret
-/// re-displays THAT enrollment instead of rotating it, so a lost QR can be recovered
-/// without invalidating everyone. Nothing is stored here — the secret only takes effect
-/// when the relay is started with it.
-#[tauri::command]
-pub(crate) async fn generate_relay_totp(
-	state: State<'_, AppState>,
-	relay: String,
-	existing: Option<String>,
-) -> Result<TotpEnrollmentDto, String> {
-	let label = {
-		let r = relay.trim();
-		if r.is_empty() {
-			state.config.lock().unwrap().relay.clone()
-		} else {
-			r.to_string()
-		}
-	};
-	let e = match existing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-		Some(s) => {
-			// Validate before echoing it back: a typo'd secret would otherwise produce a QR
-			// that enrolls fine but can never verify.
-			pulsar_relay::base32_decode(s)
-				.filter(|b| !b.is_empty())
-				.ok_or_else(|| crate::i18n::t("err.totpSecret").to_string())?;
-			pulsar_relay::enrollment_from_secret(s, &label, "Pulsar")
-		}
-		None => pulsar_relay::generate_totp(&label, "Pulsar"),
-	};
-	Ok(TotpEnrollmentDto {
-		secret: e.secret,
-		secret_grouped: e.secret_grouped,
-		uri: e.uri,
-		qr_svg: e.qr_svg,
-	})
-}
-
 #[tauri::command]
 pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<Config, String> {
 	tracing::info!("get_config invoked (frontend JS is running)");
@@ -141,8 +86,8 @@ pub(crate) async fn forget_peer(
 	state: State<'_, AppState>,
 	id: String,
 ) -> Result<(), String> {
-	let device_id =
-		pulsar_core::proto::DeviceId::parse(&id).ok_or_else(|| crate::i18n::t("err.badTarget").to_string())?;
+	let device_id = pulsar_core::proto::DeviceId::parse(&id)
+		.ok_or_else(|| crate::i18n::t("err.badTarget").to_string())?;
 	let relay = state.config.lock().unwrap().relay.clone();
 	forget_peer_key(&app, &relay, &device_id);
 	Ok(())
@@ -407,7 +352,8 @@ pub(crate) async fn list_remote_games(
 		let cfg = state.config.lock().unwrap();
 		(cfg.network_mode, cfg.relay.clone())
 	};
-	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
+	let (mut sess, peer_label) =
+		connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
 	// Timeout on the auth handshake: a host that never returns a definitive
 	// auth result (Allow/Deny/NeedPassword) would park this future indefinitely,
 	// holding a half-open Session and accumulating stuck futures on repeated
@@ -444,7 +390,8 @@ pub(crate) async fn launch_remote_game(
 		let cfg = state.config.lock().unwrap();
 		(cfg.network_mode, cfg.relay.clone())
 	};
-	let (mut sess, peer_label) = connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
+	let (mut sess, peer_label) =
+		connect_target(&app, &node, disc, &target, net_mode, &relay).await?;
 	// Same auth-timeout guard as list_remote_games and start_remote_play.
 	let auth_result = tokio::time::timeout(
 		AUTH_TIMEOUT,
@@ -804,8 +751,13 @@ pub(crate) fn gamepad_nav_start(app: AppHandle, state: State<'_, AppState>) {
 		let mut beat: u32 = 0;
 		while flag.load(Ordering::SeqCst) && gen.load(Ordering::SeqCst) == my_gen {
 			// Mimic the old (kind, state) snapshot shape so the nav mapping below is unchanged.
-			let pads: Vec<(pulsar_core::input::GamepadKind, pulsar_core::input::GamepadState)> =
-				mgr.snapshot().into_iter().map(|p| (p.kind, p.state)).collect();
+			let pads: Vec<(
+				pulsar_core::input::GamepadKind,
+				pulsar_core::input::GamepadState,
+			)> = mgr.snapshot()
+				.into_iter()
+				.map(|p| (p.kind, p.state))
+				.collect();
 			// `left_y` is up-positive (see input/hub.rs), so up = positive deflection.
 			let nav = pads
 				.first()
@@ -991,4 +943,3 @@ pub(crate) async fn test_controller_rumble(uuid: String) -> Result<(), String> {
 	}
 	Ok(())
 }
-

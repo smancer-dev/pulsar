@@ -24,9 +24,9 @@
 	import { setPeerIdentity } from '$lib/peers.svelte';
 	import {
 		relayAuth,
-		markAuthRequired,
-		markAuthFailed,
-		clearAuthPrompts
+		promptRelayAuth,
+		markRelayAuthFailed,
+		clearRelayAuth
 	} from '$lib/relayAuth.svelte';
 	import { gameStore } from '$lib/games.svelte';
 	import { ui, configTick, saveUi } from '$lib/settings.svelte';
@@ -51,6 +51,7 @@
 	import HomeView from './page/HomeView.svelte';
 	import PasswordModal from './page/PasswordModal.svelte';
 	import UpdateModal from './page/UpdateModal.svelte';
+	import RelayAuthModal from './page/RelayAuthModal.svelte';
 	import { SessionManager } from './page/sessions.svelte';
 
 	// When opened as the Allow/Deny approval popup (a separate window), render only
@@ -306,7 +307,10 @@
 
 	// Bind + register with the configured relay. Re-runnable: called on startup,
 	// on manual retry, and whenever the relay/network settings change.
-	async function goOnline() {
+	// `creds` carries what the relay-auth PROMPT collected, for this one attempt only —
+	// it is never stored. On success the relay issues a durable access key that the Rust
+	// side persists, so later launches register with no prompt at all.
+	async function goOnline(creds?: { password?: string; totp?: string }) {
 		// A user-initiated or config-driven goOnline call clears the version-blocked
 		// guard so the auto-retry effect can resume if the new registration also fails
 		// for a transient reason (not a version mismatch).
@@ -315,11 +319,8 @@
 		connError = '';
 		try {
 			config = await api.getConfig();
-			// One-shot relay 2FA code (v4 relay auth), consumed on this attempt.
-			const totp = relayAuth.totp;
-			relayAuth.totp = '';
-			selfId = await api.goOnline(totp);
-			clearAuthPrompts();
+			selfId = await api.goOnline(creds?.password ?? '', creds?.totp ?? '');
+			clearRelayAuth();
 			selfPw = await api.sessionPassword();
 			online = true;
 		} catch (e) {
@@ -330,16 +331,19 @@
 			// v4 relay auth: the relay wants a credential (RELAY_AUTH_REQUIRED:<pw>:<totp>)
 			// or rejected the one we sent (RELAY_AUTH_FAILED). Surface it in Settings → Ağ,
 			// where the password / 2FA inputs live, and don't spin the auto-retry loop.
+			// v5 relay auth: the relay wants a credential we don't hold. Ask for it in a
+			// PROMPT, right now — not as a permanent field in Settings. What the user
+			// types is used once; the access key the relay returns is what gets stored.
 			if (msg.startsWith('RELAY_AUTH_REQUIRED:')) {
 				const [, pw, totp2] = msg.split(':');
-				markAuthRequired(pw === 'true', totp2 === 'true');
+				promptRelayAuth(pw === 'true', totp2 === 'true', config?.relay ?? '');
 				versionBlocked = true;
 				connError = t('relayAuth.required');
 				connecting = false;
 				return;
 			}
 			if (msg === 'RELAY_AUTH_FAILED') {
-				markAuthFailed();
+				markRelayAuthFailed();
 				versionBlocked = true;
 				connError = t('relayAuth.failed');
 				connecting = false;
@@ -1040,6 +1044,10 @@
 		{/if}
 
 		<UpdateModal />
+		<!-- Relay authentication prompt: shown only when a relay actually demands a
+		     credential. What the user types is used for that one registration; the relay's
+		     access key is what persists, so this is a once-per-device dialog. -->
+		<RelayAuthModal onSubmit={(password, totp) => goOnline({ password, totp })} />
 
 		{#if showSplitPicker}
 			<SplitPicker

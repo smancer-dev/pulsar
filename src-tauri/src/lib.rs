@@ -14,13 +14,14 @@
 
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
-mod logging;
 mod audio_io;
 mod auth;
 mod avatar;
 mod caps;
 mod commands;
 mod connections;
+mod local_relay;
+mod logging;
 // Host-side "screen adaptation" (Parsec-style): switch a captured monitor to the
 // best-fit display mode for a client split-pane and revert on teardown. Windows-only
 // implementation; no-op stubs elsewhere.
@@ -28,9 +29,9 @@ mod display_mode;
 mod events;
 mod files;
 mod files_window;
-mod i18n;
 mod fs_browse;
 mod host;
+mod i18n;
 mod io_cmds;
 #[cfg(windows)]
 mod job;
@@ -63,15 +64,13 @@ pub(crate) use process::no_window;
 use auth::{disconnect_all_peers, disconnect_peer, respond_request, submit_password};
 use avatar::{device_user_name, self_avatar};
 use commands::{
-	auto_connect_target, available_encoders, connect, controllers, forget_peer, generate_relay_totp,
-	get_config, log_dir_path, open_log_dir,
-	lan_devices, launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password,
-	node_port, publish_games,
-	run_command, scan_folder, self_update_possible, session_password, set_config,
-	gamepad_nav_start, gamepad_nav_stop, set_controller_emulation, set_controller_order,
-	set_controller_rumble, set_disabled_controllers, test_controller_rumble, force_ac, default_ui_hwaccel,
-	webview_sw_painted,
-	set_host_serving, set_language, set_stream_settings, set_tray, steam_path,
+	auto_connect_target, available_encoders, connect, controllers, default_ui_hwaccel, force_ac,
+	forget_peer, gamepad_nav_start, gamepad_nav_stop, get_config, lan_devices, launch_remote_game,
+	list_audio_sources, list_remote_games, local_ip, log_dir_path, new_password, node_port,
+	open_log_dir, publish_games, run_command, scan_folder, self_update_possible, session_password,
+	set_config, set_controller_emulation, set_controller_order, set_controller_rumble,
+	set_disabled_controllers, set_host_serving, set_language, set_stream_settings, set_tray,
+	steam_path, test_controller_rumble, webview_sw_painted,
 };
 use connections::{list_connections, set_view_only, show_connections};
 use files_window::open_files_window;
@@ -79,18 +78,18 @@ use fs_browse::local_ls;
 use host::go_online;
 use io_cmds::{
 	chat_log, confine_pointer, host_send_chat, input_button, input_char, input_key, input_pointer,
-	input_scroll, kbd_capture_start, kbd_capture_stop, kbd_engage, mic_start, mic_stop, native_view_rect,
-	read_clipboard_text, send_chat, send_clipboard, send_file, send_file_path, set_active_session,
-	list_input_devices, set_controller_lock, set_kbm_lock, set_pane_count, set_window_fullscreen,
-	write_clipboard_text,
+	input_scroll, kbd_capture_start, kbd_capture_stop, kbd_engage, list_input_devices, mic_start,
+	mic_stop, native_view_rect, read_clipboard_text, send_chat, send_clipboard, send_file,
+	send_file_path, set_active_session, set_controller_lock, set_kbm_lock, set_pane_count,
+	set_window_fullscreen, write_clipboard_text,
 };
 use play::{start_remote_play, stop_stream};
 use session_cmds::{
-	fs_get, fs_list, host_window_list, render_chat, render_fs, render_hint, render_kin, render_nav,
-	render_banner, render_toast, reverse_play, set_frame_pacing, set_overlay, set_overlay_button,
-	set_overlay_button_pos, set_play_adapt, set_play_audio, set_play_bitrate, set_play_codec,
-	set_play_encoder, set_play_fps, set_play_monitor, set_play_quality, set_play_resolution,
-	set_play_window, set_stats_hud,
+	fs_get, fs_list, host_window_list, render_banner, render_chat, render_fs, render_hint,
+	render_kin, render_nav, render_toast, reverse_play, set_frame_pacing, set_overlay,
+	set_overlay_button, set_overlay_button_pos, set_play_adapt, set_play_audio, set_play_bitrate,
+	set_play_codec, set_play_encoder, set_play_fps, set_play_monitor, set_play_quality,
+	set_play_resolution, set_play_window, set_stats_hud,
 };
 
 // Headless `pulsar --relay` mode lives in its own module to keep this file focused.
@@ -319,6 +318,7 @@ pub fn run() {
 	}
 
 	tauri::Builder::default()
+		.manage(local_relay::LocalRelay::default())
 		.manage(AppState::new())
 		.plugin(tauri_plugin_process::init())
 		.plugin(tauri_plugin_updater::Builder::new().build())
@@ -381,8 +381,10 @@ pub fn run() {
 			// the window hides it (see on_window_event); the only full exit is the
 			// tray's quit item. (Tray labels pick the language at startup — a language
 			// change applies to them after a restart.)
-			let show = MenuItem::with_id(app, "show", crate::i18n::t("tray.show"), true, None::<&str>)?;
-			let quit = MenuItem::with_id(app, "quit", crate::i18n::t("tray.quit"), true, None::<&str>)?;
+			let show =
+				MenuItem::with_id(app, "show", crate::i18n::t("tray.show"), true, None::<&str>)?;
+			let quit =
+				MenuItem::with_id(app, "quit", crate::i18n::t("tray.quit"), true, None::<&str>)?;
 			let menu = Menu::with_items(app, &[&show, &quit])?;
 			let mut tray = TrayIconBuilder::with_id("main")
 				.tooltip("Pulsar")
@@ -462,10 +464,10 @@ pub fn run() {
 					}
 				}
 			}
-				// Native fullscreen (set_fullscreen) never marks the main window topmost, and
-				// set_window_fullscreen already clears any stray always-on-top on exit, so this
-				// arm no longer manages fullscreen z-order - it only tracks per-window focus below.
-				WindowEvent::Focused(focused) => {
+			// Native fullscreen (set_fullscreen) never marks the main window topmost, and
+			// set_window_fullscreen already clears any stray always-on-top on exit, so this
+			// arm no longer manages fullscreen z-order - it only tracks per-window focus below.
+			WindowEvent::Focused(focused) => {
 				// Capture/forward keyboard+mouse + the overlay/leave combos ONLY while
 				// SOME Pulsar window is focused (Linux evdev grab is otherwise global).
 				// See WIN_FOCUS for why the map is OR-ed across all windows.
@@ -509,9 +511,7 @@ pub fn run() {
 						// is fully dropped before the MutexGuard is created. Then pull
 						// the sender out of the map and drop the guard before sending,
 						// which is what the borrow checker requires here.
-						let pending = std::sync::Arc::clone(
-							&window.state::<AppState>().pending,
-						);
+						let pending = std::sync::Arc::clone(&window.state::<AppState>().pending);
 						let tx = pending.lock().unwrap().remove(&id);
 						if let Some(tx) = tx {
 							// Window closed via OS chrome = deny (no control granted).
@@ -527,8 +527,9 @@ pub fn run() {
 		})
 		.invoke_handler(tauri::generate_handler![
 			get_config,
-			generate_relay_totp,
 			log_dir_path,
+			local_relay::set_local_relay,
+			local_relay::local_relay_status,
 			open_log_dir,
 			set_config,
 			set_language,

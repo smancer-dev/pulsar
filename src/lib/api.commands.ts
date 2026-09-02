@@ -9,11 +9,23 @@ import { invoke } from './api.invoke';
 export const api = {
 	getConfig: () => invoke<Config>('get_config'),
 	setConfig: (config: Config) => invoke<void>('set_config', { config }),
-	/** Bind the node and register with the relay; returns this device's ID. `relayTotp` is a
-	 * fresh one-shot 2FA code for a relay that requires it (v4 relay auth); omit otherwise. */
-	goOnline: (relayTotp?: string) =>
-		invoke<string>('go_online', { relayTotp: relayTotp && relayTotp.trim() ? relayTotp.trim() : null }),
+	/** Bind the node and register with the relay; returns this device's ID.
+	 * `relayPassword`/`relayTotp` are ONE-SHOT values from the relay-auth prompt, used for
+	 * this registration and never persisted — on success the relay's durable access key is
+	 * stored by the backend, so later calls need neither. */
+	goOnline: (relayPassword = '', relayTotp = '') =>
+		invoke<string>('go_online', {
+			relayPassword: relayPassword.trim() ? relayPassword.trim() : null,
+			relayTotp: relayTotp.trim() ? relayTotp.trim() : null
+		}),
 	connect: (target: string) => invoke<ConnInfo>('connect', { target }),
+	/** Run the relay inside this app (Settings → Ağ). While on, registration goes to
+	 * loopback and the configured relay address is ignored. */
+	setLocalRelay: (enabled: boolean) =>
+		invoke<{ running: boolean; port: number; lanAddr: string }>('set_local_relay', { enabled }),
+	/** Whether the in-app relay is currently running, and on what address. */
+	localRelayStatus: () =>
+		invoke<{ running: boolean; port: number; lanAddr: string }>('local_relay_status'),
 	/** Pulsar devices auto-discovered on the local network (multicast beacon). */
 	lanDevices: () => invoke<LanDevice[]>('lan_devices'),
 	controllers: () => invoke<ControllerInfo[]>('controllers'),
@@ -219,15 +231,6 @@ export const api = {
 	/** Free-text toast on the native renderer (bottom-center, ~6 s) — inbound chat
 	 * surfaces here because the video occludes the webview. */
 	renderToast: (id: number, text: string) => invoke<void>('render_toast', { id, text }),
-	/** Mint (or, with `existing`, re-display) a 2FA enrollment for a relay the user runs:
-	 *  the base32 secret the RELAY must start with, its manual-entry form, the setup URI
-	 *  and a scannable QR (inline SVG). Nothing is stored — starting the relay with the
-	 *  secret is what activates it. */
-	generateRelayTotp: (relay: string, existing?: string) =>
-		invoke<{ secret: string; secret_grouped: string; uri: string; qr_svg: string }>(
-			'generate_relay_totp',
-			{ relay, existing }
-		),
 	/** Path of the app log directory. */
 	logDirPath: () => invoke<string>('log_dir_path'),
 	/** Open the app log directory in the file manager; resolves to its path. */

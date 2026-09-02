@@ -8,7 +8,11 @@ export interface Config {
 	relay: string;
 	/** Password for a relay that requires one (v4 relay auth). Empty = open relay. Never
 	 * sent as-is — the client sends a nonce-bound proof; 2FA is a one-shot code, not stored. */
-	relay_password: string;
+	/** Durable per-relay access keys (relay address → key), issued by the relay after a
+	 * successful password/2FA prompt. Never a password: that is prompted and discarded. */
+	relay_keys: Record<string, string>;
+	/** Run the relay inside this app and register against it (Settings → Ağ toggle). */
+	use_local_relay: boolean;
 	network_mode: NetworkMode;
 	device_name: string;
 	language: Language;

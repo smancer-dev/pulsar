@@ -9,8 +9,9 @@ export const isTauri =
 	'__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
 
 const DEFAULT_CONFIG: Config = {
-	relay: 'relay.pulsardesk.com:21116',
-	relay_password: '',
+	relay: 'relay.pulsardesk.com',
+	relay_keys: {},
+	use_local_relay: false,
 	network_mode: 'auto',
 	device_name: 'Bu Cihaz',
 	language: 'tr',
@@ -123,19 +124,10 @@ function mock<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		case 'auto_connect_target':
 			// No CLI auto-connect target in the browser mock (silences the reject log).
 			return Promise.resolve(null as unknown as T);
-		case 'generate_relay_totp':
-			// Browser mock: a fixed, obviously-fake enrollment so the Settings panel can be
-			// laid out without a Tauri backend. The QR is a placeholder square, not scannable.
-			return Promise.resolve({
-				secret: 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP',
-				secret_grouped: 'JBSW Y3DP EHPK 3PXP JBSW Y3DP EHPK 3PXP',
-				uri: 'otpauth://totp/Pulsar:mock?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Pulsar',
-				qr_svg:
-					'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8" shape-rendering="crispEdges">' +
-					'<rect width="8" height="8" fill="#fff"/><rect x="1" y="1" width="2" height="2"/>' +
-					'<rect x="5" y="1" width="2" height="2"/><rect x="1" y="5" width="2" height="2"/>' +
-					'<rect x="4" y="4" width="1" height="1"/></svg>'
-			} as unknown as T);
+		case 'local_relay_status':
+		case 'set_local_relay':
+			// The browser mock has no relay to run; report it stopped so the toggle renders.
+			return Promise.resolve({ running: false, port: 0, lanAddr: '' } as unknown as T);
 		case 'self_update_possible':
 			// The browser mock isn't an AppImage; pretend self-update is possible so the
 			// preview behaves like a normal in-place-updatable build.

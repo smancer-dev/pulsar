@@ -10,7 +10,10 @@ describe('api bridge (browser mock)', () => {
 
 	it('returns a default config with a relay endpoint', async () => {
 		const c = await api.getConfig();
-		expect(c.relay).toContain(':');
+		// The address carries no port by default — the relay port is implied and filled
+		// in when it's resolved, so what the user sees and types is just a hostname.
+		expect(c.relay.length).toBeGreaterThan(0);
+		expect(c.relay).not.toContain(':');
 		expect(['auto', 'p2p-only', 'relay-only']).toContain(c.network_mode);
 	});
 

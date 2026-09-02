@@ -25,5 +25,6 @@
 	"host.gstFailed": "(gst başlamadı)",
 	"host.ffmpegFailed": "(ffmpeg başlamadı)",
 	"host.encodeFailed": "Ekran kodlayıcısı başlatılamadı — hiçbir kodlayıcı çalışmadı; denenenler",
-	"err.identityChanged": "Bu cihazın kimliği değişti. Yeni kimliği kabul edip yeniden bağlanmak ister misiniz?"
+	"err.identityChanged": "Bu cihazın kimliği değişti. Yeni kimliği kabul edip yeniden bağlanmak ister misiniz?",
+	"err.localRelayBind": "Yerel relay başlatılamadı (port kullanımda olabilir)"
 }

@@ -1,39 +1,58 @@
-// Shared relay-authentication state (v4). The relay password lives in the persisted
-// config; this holds the transient pieces the register flow and the Network settings UI
-// exchange: a one-shot 2FA code, which factors the relay is asking for, whether the last
-// attempt was rejected, and whether the relay advertises E2E as required.
+// Relay-authentication state (v5).
 //
-// It's a tiny module-level rune store so NetworkTab (deep in the Settings tree) and the
-// shell's goOnline() can share it without threading callbacks through every layer.
+// The design is deliberately NOT "fields in Settings". A relay's credentials are asked
+// for ONCE, in a prompt, at the moment the relay actually demands them — and the answer
+// is never stored. What IS stored is the durable ACCESS KEY the relay issues in return
+// (in the Rust config, keyed by relay address), so every later launch registers silently.
+// The prompt therefore reappears only when the operator rotates the relay's credentials,
+// which invalidates the key.
+//
+// This tiny module-level rune store is what the shell's goOnline() and the prompt dialog
+// share, without threading callbacks through every layer.
+
 export const relayAuth = $state({
-	/** One-shot TOTP/2FA code the user typed; consumed (cleared) on each go_online attempt. */
-	totp: '',
-	/** The relay asked for a password we didn't have (from a RELAY_AUTH_REQUIRED reply). */
+	/** The prompt is open. */
+	open: false,
+	/** The relay is asking for a password. */
 	needPassword: false,
-	/** The relay asked for a 2FA code we didn't have. */
+	/** The relay is asking for a 2FA code. */
 	needTotp: false,
-	/** The last attempt supplied a credential the relay rejected (wrong password / 2FA). */
+	/** The previous answer was rejected (wrong password / 2FA) — shown inside the prompt. */
 	failed: false,
+	/** A retry is in flight (registration is being attempted with what was typed). */
+	busy: false,
+	/** The relay address the prompt is for, shown so the user knows what they're unlocking. */
+	relay: '',
 	/** The relay advertises end-to-end encryption as required (drives the lock badge). */
-	e2eRequired: false
+	e2eRequired: false,
+	/** Set once a key has been stored for this relay — Settings shows "bu cihaz yetkili". */
+	authorized: false
 });
 
-/** Note a RELAY_AUTH_REQUIRED:<password>:<totp> error string from go_online. */
-export function markAuthRequired(password: boolean, totp: boolean) {
+/** Open the prompt for a `RELAY_AUTH_REQUIRED:<password>:<totp>` reply from go_online. */
+export function promptRelayAuth(password: boolean, totp: boolean, relay: string) {
 	relayAuth.needPassword = password;
 	relayAuth.needTotp = totp;
+	relayAuth.relay = relay;
 	relayAuth.failed = false;
+	relayAuth.busy = false;
+	relayAuth.open = true;
 }
 
-/** Note a rejected credential (RELAY_AUTH_FAILED). */
-export function markAuthFailed() {
+/** The credential just tried was rejected — keep the prompt open and say so. */
+export function markRelayAuthFailed() {
 	relayAuth.failed = true;
+	relayAuth.busy = false;
+	relayAuth.open = true;
 }
 
-/** A successful registration clears the transient auth prompts (keeps e2eRequired,
- * which the relay-e2e event owns). */
-export function clearAuthPrompts() {
+/** Registration succeeded: close the prompt. The access key is now stored by the backend,
+ * so this device won't be asked again. */
+export function clearRelayAuth() {
+	relayAuth.open = false;
+	relayAuth.failed = false;
+	relayAuth.busy = false;
 	relayAuth.needPassword = false;
 	relayAuth.needTotp = false;
-	relayAuth.failed = false;
+	relayAuth.authorized = true;
 }

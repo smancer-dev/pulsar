@@ -110,6 +110,14 @@ pub(crate) struct AppState {
 	/// (also emitted as the `node-port` event); the Home screen shows it next to the
 	/// local IP so a copy-able direct `ip:port` target is always visible.
 	pub(crate) node_port: std::sync::atomic::AtomicU16,
+	/// The ephemeral port the node last bound successfully, remembered for the lifetime of
+	/// this app run. When the config pins no port (`node_port == 0`) a rebind — every
+	/// `go_online`, e.g. after a settings change or a relay retry — would otherwise land on
+	/// a DIFFERENT random port each time, so the address peers were told to reach us on
+	/// (Home's `ip:port`, the LAN beacon, a port-forward someone just set up) kept moving
+	/// under them even though the host never restarted. Re-preferring the same port keeps
+	/// it stable; if it is genuinely taken the bind still falls back to a fresh ephemeral.
+	pub(crate) sticky_port: std::sync::atomic::AtomicU16,
 	/// When `true` the main window QUITS on close instead of hiding to the tray.
 	/// Synced from the UI's `ui.tray` setting via `set_tray` (tray_disabled = !ui.tray).
 	/// Default `false` (tray enabled) — preserves the existing behavior on first launch.
@@ -382,8 +390,9 @@ pub(crate) struct PlaySession {
 	/// window picker. The whole session's control traffic is single-threaded through the
 	/// hold loop, so routing the query through it (rather than sharing the `Session`) keeps
 	/// the held session single-owner.
-	pub(crate) windows_query_tx:
-		tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Vec<pulsar_core::service::WindowInfo>>>,
+	pub(crate) windows_query_tx: tokio::sync::mpsc::Sender<
+		tokio::sync::oneshot::Sender<Vec<pulsar_core::service::WindowInfo>>,
+	>,
 }
 
 /// Host-side stream settings pushed from the UI.
