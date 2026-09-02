@@ -48,6 +48,29 @@ pub fn run_relay(args: &[String]) {
 		per_session_bps: rate("--session-rate", "PULSAR_RELAY_SESSION_RATE"),
 		per_session_total: size("--session-data", "PULSAR_RELAY_SESSION_DATA"),
 	};
+	// Operator auth policy (v4). Default: open relay. A base32 2FA secret is decoded up
+	// front so a typo fails fast at startup rather than silently rejecting every login.
+	// `pulsar --relay --auth-password s3cret --auth-totp JBSWY3DPEHPK3PXP --require-e2e`.
+	let auth_password = flag("--auth-password").or_else(|| std::env::var("PULSAR_RELAY_AUTH_PASSWORD").ok());
+	let totp_secret = flag("--auth-totp")
+		.or_else(|| std::env::var("PULSAR_RELAY_AUTH_TOTP").ok())
+		.map(|s| {
+			pulsar_relay::base32_decode(&s)
+				.filter(|b| !b.is_empty())
+				.unwrap_or_else(|| panic!("invalid --auth-totp (expected a base32 secret): {s:?}"))
+		});
+	let require_e2e = args.iter().any(|a| a == "--require-e2e")
+		|| std::env::var("PULSAR_RELAY_REQUIRE_E2E").is_ok();
+	let auth = pulsar_relay::RelayAuth {
+		password: auth_password,
+		totp_secret,
+		require_e2e,
+	};
+	let auth_summary = (
+		auth.password.is_some(),
+		auth.totp_secret.is_some(),
+		auth.require_e2e,
+	);
 	tracing_subscriber::fmt()
 		.with_env_filter(
 			tracing_subscriber::EnvFilter::try_from_default_env()
@@ -59,8 +82,13 @@ pub fn run_relay(args: &[String]) {
 		let relay = pulsar_relay::Relay::bind(addr)
 			.await
 			.expect("relay failed to bind")
-			.with_limits(limits);
-		tracing::info!(%addr, ?limits, "Pulsar relay listening (UDP) — headless --relay mode");
+			.with_limits(limits)
+			.with_auth(auth);
+		tracing::info!(
+			%addr, ?limits,
+			password = auth_summary.0, totp = auth_summary.1, require_e2e = auth_summary.2,
+			"Pulsar relay listening (UDP) — headless --relay mode"
+		);
 		relay.run().await.expect("relay loop exited with error");
 	});
 }

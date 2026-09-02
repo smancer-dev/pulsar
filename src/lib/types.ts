@@ -6,6 +6,9 @@ export type Language = 'tr' | 'en';
 
 export interface Config {
 	relay: string;
+	/** Password for a relay that requires one (v4 relay auth). Empty = open relay. Never
+	 * sent as-is — the client sends a nonce-bound proof; 2FA is a one-shot code, not stored. */
+	relay_password: string;
 	network_mode: NetworkMode;
 	device_name: string;
 	language: Language;

@@ -20,7 +20,14 @@
 		onNodeVersionError,
 		onSessionPassword
 	} from '$lib/api';
+	import { onRelayE2e } from '$lib/api';
 	import { setPeerIdentity } from '$lib/peers.svelte';
+	import {
+		relayAuth,
+		markAuthRequired,
+		markAuthFailed,
+		clearAuthPrompts
+	} from '$lib/relayAuth.svelte';
 	import { gameStore } from '$lib/games.svelte';
 	import { ui, configTick, saveUi } from '$lib/settings.svelte';
 	import { modalCount } from '$lib/overlayModals.svelte';
@@ -308,7 +315,11 @@
 		connError = '';
 		try {
 			config = await api.getConfig();
-			selfId = await api.goOnline();
+			// One-shot relay 2FA code (v4 relay auth), consumed on this attempt.
+			const totp = relayAuth.totp;
+			relayAuth.totp = '';
+			selfId = await api.goOnline(totp);
+			clearAuthPrompts();
 			selfPw = await api.sessionPassword();
 			online = true;
 		} catch (e) {
@@ -316,6 +327,24 @@
 			selfId = '—';
 			selfPw = '';
 			const msg = e instanceof Error ? e.message : String(e);
+			// v4 relay auth: the relay wants a credential (RELAY_AUTH_REQUIRED:<pw>:<totp>)
+			// or rejected the one we sent (RELAY_AUTH_FAILED). Surface it in Settings → Ağ,
+			// where the password / 2FA inputs live, and don't spin the auto-retry loop.
+			if (msg.startsWith('RELAY_AUTH_REQUIRED:')) {
+				const [, pw, totp2] = msg.split(':');
+				markAuthRequired(pw === 'true', totp2 === 'true');
+				versionBlocked = true;
+				connError = t('relayAuth.required');
+				connecting = false;
+				return;
+			}
+			if (msg === 'RELAY_AUTH_FAILED') {
+				markAuthFailed();
+				versionBlocked = true;
+				connError = t('relayAuth.failed');
+				connecting = false;
+				return;
+			}
 			// The relay replied with a version-mismatch error during initial registration
 			// (ErrCode::Protocol mapped to ConnError::IncompatibleVersion in node.rs).
 			// Show the clean "update required" message and block auto-retry — every retry
@@ -488,6 +517,11 @@
 		// screen would keep showing the dead old one. Adopt the rotated ID live.
 		onNodeId((id) => {
 			if (online) selfId = id;
+		});
+		// The relay we registered with advertises E2E as required (v4 policy). Pulsar always
+		// encrypts, so this only lights the "relay forces E2E" lock badge in Settings → Ağ.
+		onRelayE2e((required) => {
+			relayAuth.e2eRequired = required;
 		});
 		// The relay was redeployed with a newer protocol version while we were
 		// already online. The Rust backend has taken the node offline; mirror that

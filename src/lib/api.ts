@@ -67,7 +67,8 @@ export {
 	onControllerConnected,
 	onNodeId,
 	onNodeVersionError,
-	onSessionPassword
+	onSessionPassword,
+	onRelayE2e
 } from './api.events';
 
 export { copyText, setFullscreen, readClipboard, windowControl } from './api.dom';

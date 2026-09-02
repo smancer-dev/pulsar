@@ -78,6 +78,10 @@ export const onNodeVersionError = (cb: () => void) => listenTo<null>('node-versi
  * Home SelfCard updates instantly instead of waiting for the next poll. */
 export const onSessionPassword = (cb: (pw: string) => void) =>
 	listenTo<string>('session-password', cb);
+/** The relay this node just registered with advertises E2E as REQUIRED (v4 relay policy).
+ * Pulsar always encrypts, so this only drives a "relay forces E2E" lock indicator. */
+export const onRelayE2e = (cb: (required: boolean) => void) =>
+	listenTo<boolean>('relay-e2e', cb);
 /** Client: a chat line arrived from the host (`peer` = play id as string). */
 export const onChatMsg = (cb: (e: DataText) => void) => listenTo<DataText>('chat-msg', cb);
 /** Host: a chat line arrived from a connected client. */

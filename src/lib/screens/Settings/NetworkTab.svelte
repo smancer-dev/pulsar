@@ -5,15 +5,26 @@
 	import { api, onNodePort } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
+	import { relayAuth } from '$lib/relayAuth.svelte';
+
 	let {
 		config = $bindable(),
 		saveConfig,
-		setMode
+		setMode,
+		onReconnect
 	}: {
 		config: Config | null;
 		saveConfig: () => void;
 		setMode: (m: NetworkMode) => void;
+		onReconnect?: () => void;
 	} = $props();
+
+	// v4 relay auth: submit the one-shot 2FA code (held in the shared relayAuth store) by
+	// re-registering. The password is saved into config and re-registers via saveConfig's
+	// reconnect key; 2FA is never stored.
+	function submitTotp() {
+		if (relayAuth.totp.trim()) onReconnect?.();
+	}
 
 	// When no port is pinned (node_port == 0) the box shows the ACTUAL random port
 	// in use as its placeholder. Snapshot at mount; the node-port event keeps it
@@ -63,6 +74,61 @@
 				style="font-family:var(--font-mono);font-size:12.5px"
 			/>
 		{/if}
+	</div>
+</div>
+
+<!-- Relay authentication (v4). Only needed for a relay whose operator set a password
+     and/or 2FA; leaving these empty is correct for the public / open relay. -->
+<div class="srow">
+	<div class="st">
+		<b>
+			{t('settings.relayAuth')}
+			{#if relayAuth.e2eRequired}
+				<span class="e2ebadge" title={t('settings.relayE2eDesc')}>
+					<Icon name="shield" size={12} />
+					{t('settings.relayE2e')}
+				</span>
+			{/if}
+		</b>
+		<span>{t('settings.relayAuthDesc')}</span>
+		{#if relayAuth.failed}
+			<span class="authmsg err">{t('relayAuth.failed')}</span>
+		{:else if relayAuth.needPassword || relayAuth.needTotp}
+			<span class="authmsg warn">{t('relayAuth.required')}</span>
+		{/if}
+	</div>
+	<div class="authcol">
+		<div class="field authfield" class:want={relayAuth.needPassword}>
+			<Icon name="shield" size={15} />
+			{#if config}
+				<input
+					type="password"
+					bind:value={config.relay_password}
+					onchange={saveConfig}
+					placeholder={t('settings.relayPassword')}
+					aria-label={t('settings.relayPassword')}
+					autocomplete="off"
+					style="font-family:var(--font-mono);font-size:12.5px"
+				/>
+			{/if}
+		</div>
+		<div class="field authfield" class:want={relayAuth.needTotp}>
+			<Icon name="shield" size={15} />
+			<input
+				type="text"
+				inputmode="numeric"
+				maxlength="8"
+				bind:value={relayAuth.totp}
+				onkeydown={(e) => e.key === 'Enter' && submitTotp()}
+				placeholder={t('settings.relayTotp')}
+				aria-label={t('settings.relayTotp')}
+				autocomplete="off"
+				style="font-family:var(--font-mono);font-size:12.5px;letter-spacing:2px"
+			/>
+			<button class="verify" onclick={submitTotp} disabled={!relayAuth.totp.trim()}>
+				{t('settings.relayTotpVerify')}
+			</button>
+		</div>
 	</div>
 </div>
 <div class="srow">
@@ -121,5 +187,66 @@
 	}
 	.relayfield {
 		width: 250px;
+	}
+	.authcol {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		width: 250px;
+	}
+	.authfield {
+		width: 100%;
+	}
+	/* Highlight the input the relay is actually asking for (from a RELAY_AUTH_REQUIRED reply). */
+	.authfield.want {
+		border-color: var(--accent);
+		box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 25%, transparent);
+	}
+	.verify {
+		margin-left: 6px;
+		padding: 3px 10px;
+		font-size: 12px;
+		font-weight: 600;
+		border: 1px solid var(--border);
+		border-radius: var(--r-sm, 8px);
+		background: var(--surface-2, transparent);
+		color: var(--text);
+		cursor: pointer;
+		white-space: nowrap;
+	}
+	.verify:hover:not(:disabled) {
+		border-color: var(--accent);
+		color: var(--accent);
+	}
+	.verify:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+	.e2ebadge {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		margin-left: 8px;
+		padding: 1px 7px;
+		font-size: 10.5px;
+		font-weight: 700;
+		letter-spacing: 0.03em;
+		text-transform: uppercase;
+		color: var(--accent);
+		border: 1px solid color-mix(in oklab, var(--accent) 45%, transparent);
+		border-radius: 999px;
+		vertical-align: middle;
+	}
+	.authmsg {
+		display: block;
+		margin-top: 5px;
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.authmsg.warn {
+		color: var(--accent);
+	}
+	.authmsg.err {
+		color: oklch(0.62 0.2 25);
 	}
 </style>

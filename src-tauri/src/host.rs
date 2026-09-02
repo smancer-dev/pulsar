@@ -266,6 +266,10 @@ impl Drop for SessionCleanupGuard {
 pub(crate) async fn go_online(
 	app: AppHandle,
 	state: State<'_, AppState>,
+	// A fresh one-shot TOTP/2FA code for a relay that requires it (v4 relay auth). The UI
+	// passes it only when the user just typed it; it is never stored. `None`/empty on an
+	// open or password-only relay.
+	relay_totp: Option<String>,
 ) -> Result<String, String> {
 	// Pre-warm ALL encoder probes off the hot path: the first QueryStreamCaps must
 	// answer within the client's 2 s window, but a cold probe chain (one-frame ffmpeg
@@ -392,12 +396,27 @@ pub(crate) async fn go_online(
 	// Persisted per-user identity → the relay hands back the SAME 9-digit ID every
 	// launch (stable device ID). Different OS users keep separate identity files.
 	let identity = pulsar_core::crypto::Identity::load_or_create(identity_path(&app));
-	let node = match Node::bind_with_identity(
+	// Credentials for a relay with an auth policy (v4). The password is persisted in the
+	// config (turned into a nonce-bound proof, never sent as-is); the 2FA code is a fresh
+	// one-shot value from the UI. Empty on the public/open relay.
+	let relay_creds = pulsar_core::RelayCreds {
+		password: {
+			let p = cfg.relay_password.trim();
+			(!p.is_empty()).then(|| p.to_string())
+		},
+		totp: relay_totp
+			.as_deref()
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.map(str::to_string),
+	};
+	let node = match Node::bind_with_identity_creds(
 		preferred,
 		relay,
 		cfg.network_mode,
 		announce_name.clone(),
 		identity.clone(),
+		relay_creds,
 	)
 	.await
 	{
@@ -1943,12 +1962,25 @@ pub(crate) async fn go_online(
 	// same-network devices still appear AND can connect.
 	let id = match node.register().await {
 		Ok(id) => id,
+		// v4 relay auth: the relay wants a credential we don't (yet) have. Report exactly
+		// which factors are still missing so the UI prompts for just those and retries.
+		Err(pulsar_core::ConnError::RelayAuthRequired { password, totp }) => {
+			tracing::info!(password, totp, "relay requires authentication — prompting");
+			return Err(format!("RELAY_AUTH_REQUIRED:{password}:{totp}"));
+		}
+		Err(pulsar_core::ConnError::RelayAuthFailed) => {
+			tracing::warn!("relay authentication failed (wrong password / 2FA)");
+			return Err("RELAY_AUTH_FAILED".to_string());
+		}
 		Err(e) => {
 			tracing::info!(error = %e, "relay unreachable — staying offline, LAN discovery + serving still active");
 			return Err(e.to_string());
 		}
 	};
 	tracing::info!(%id, "go_online: registered with relay");
+	// Tell the UI whether this relay advertises E2E as required (v4). Pulsar always
+	// encrypts, so this only drives a "relay forces E2E" lock indicator in Settings.
+	let _ = app.emit("relay-e2e", node.relay_e2e_required().await);
 	// Now that we have a relay id, advertise it on the LAN too.
 	if let Some(d) = &discovery {
 		d.set_id(Some(id)).await;

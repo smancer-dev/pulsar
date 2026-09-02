@@ -9,8 +9,10 @@ import { invoke } from './api.invoke';
 export const api = {
 	getConfig: () => invoke<Config>('get_config'),
 	setConfig: (config: Config) => invoke<void>('set_config', { config }),
-	/** Bind the node and register with the relay; returns this device's ID. */
-	goOnline: () => invoke<string>('go_online'),
+	/** Bind the node and register with the relay; returns this device's ID. `relayTotp` is a
+	 * fresh one-shot 2FA code for a relay that requires it (v4 relay auth); omit otherwise. */
+	goOnline: (relayTotp?: string) =>
+		invoke<string>('go_online', { relayTotp: relayTotp && relayTotp.trim() ? relayTotp.trim() : null }),
 	connect: (target: string) => invoke<ConnInfo>('connect', { target }),
 	/** Pulsar devices auto-discovered on the local network (multicast beacon). */
 	lanDevices: () => invoke<LanDevice[]>('lan_devices'),

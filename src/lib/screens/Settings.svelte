@@ -49,7 +49,8 @@
 
 	// Only these fields affect the relay registration — anything else (audio,
 	// unattended, avatar…) saves without tearing the node down and re-registering.
-	const reconnectKey = (c: Config) => `${c.relay}|${c.network_mode}|${c.node_port}|${c.device_name}`;
+	const reconnectKey = (c: Config) =>
+		`${c.relay}|${c.relay_password}|${c.network_mode}|${c.node_port}|${c.device_name}`;
 	let lastReconnectKey = '';
 
 	onMount(async () => {
@@ -151,7 +152,7 @@
 				{toggleMute}
 			/>
 		{:else if tab === 'network'}
-			<NetworkTab bind:config {saveConfig} {setMode} />
+			<NetworkTab bind:config {saveConfig} {setMode} {onReconnect} />
 		{:else if tab === 'security'}
 			<SecurityTab bind:config {toggleUnattended} {saveConfig} />
 		{:else}
