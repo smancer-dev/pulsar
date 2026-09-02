@@ -9,7 +9,7 @@ export const isTauri =
 	'__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
 
 const DEFAULT_CONFIG: Config = {
-	relay: '127.0.0.1:21116',
+	relay: 'relay.pulsardesk.com:21116',
 	network_mode: 'auto',
 	device_name: 'Bu Cihaz',
 	language: 'tr',
