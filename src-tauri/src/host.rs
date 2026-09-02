@@ -92,6 +92,12 @@ fn media_features() -> Vec<String> {
 /// normal teardown) is safe.
 struct SessionCleanupGuard {
 	procs: Arc<Mutex<Vec<Child>>>,
+	/// Stream-generation counter, bumped with every `procs` drain (`process::drain_procs`).
+	/// The encode fallback chain spawns its candidates on its own thread, so without this
+	/// a teardown landing between two candidates would leave the next ffmpeg alive and
+	/// untracked — still capturing this host's screen and streaming it to a client that
+	/// is already gone.
+	proc_epoch: crate::process::ProcEpoch,
 	/// The RTP forwarder tasks for this session's current stream (vh/ah).  Each holds
 	/// a strong `Arc<Node>` clone (via `SessionSender`), so without an abort here
 	/// a `JoinHandle::abort()` of the *session* task cancels the session future but
@@ -145,19 +151,11 @@ impl Drop for SessionCleanupGuard {
 	fn drop(&mut self) {
 		// Kill any live ffmpeg encoder children. `std::process::Child::drop` does NOT
 		// kill the OS process, so the orphan-NVENC-100%-GPU failure mode requires an
-		// explicit `kill()`. After draining, the normal teardown block finds the vec
-		// empty and is a no-op (safe double-call).
-		for mut child in self.procs.lock().unwrap().drain(..) {
-			let _ = child.kill();
-			// wait() right after SIGKILL returns immediately (the process is already
-			// dead) and reaps the zombie entry from the kernel process table.
-			// Skipping wait() would leave a <defunct> zombie per encoder for the
-			// entire app lifetime — Unix does NOT auto-reap children unless the
-			// parent calls wait() or exits; Tokio has no SIGCHLD reaper for
-			// std::process::Child zombies (confirmed: no SIGCHLD handler in codebase).
-			// This mirrors the normal teardown block at the tokio::select! exit path.
-			let _ = child.wait();
-		}
+		// explicit `kill()`. Draining through `drain_procs` also bumps the epoch, which
+		// is what stops an in-flight encode fallback chain from spawning one more
+		// candidate into this dead session. After draining, the normal teardown block
+		// finds the vec empty and is a no-op (safe double-call).
+		crate::process::drain_procs(&self.procs, &self.proc_epoch);
 		// Abort the RTP media-forwarder tasks (vh/ah).  Each holds a strong
 		// `Arc<Node>` clone (via `SessionSender`) and blocks in `vsock/asock.recv()`;
 		// without this abort they keep the old `Node` alive after the session task is
@@ -482,6 +480,9 @@ pub(crate) async fn go_online(
 			// ffmpeg children for THIS session live here and are killed on teardown
 			// below — never in a global pool, so a client's exit can't orphan them.
 			let procs: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+			// Stream generation for THIS session's children — see `process::drain_procs`.
+			let proc_epoch: crate::process::ProcEpoch =
+				Arc::new(std::sync::atomic::AtomicU64::new(0));
 			// Native DXGI+NVENC capture handle for this session (Windows), when the native path
 			// is used instead of ffmpeg. Stopped at the same drain sites as `procs`.
 			#[cfg(windows)]
@@ -1067,6 +1068,7 @@ pub(crate) async fn go_online(
 				let on_stream = make_on_stream(
 					stream_cfg.clone(),
 					procs.clone(),
+					proc_epoch.clone(),
 					active.clone(),
 					incoming.clone(),
 					host_out.clone(),
@@ -1809,6 +1811,7 @@ pub(crate) async fn go_online(
 				// are sid-guarded so they silently no-op when already cleared).
 				let _cleanup_guard = SessionCleanupGuard {
 					procs: procs.clone(),
+					proc_epoch: proc_epoch.clone(),
 					fwd_slot: fwd_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_slot: cap_slot.clone(),
@@ -1847,10 +1850,7 @@ pub(crate) async fn go_online(
 				// buttons / modifier keys are released by DesktopInput's Drop (the
 				// on_input closure is dropped when serve_with's future ends above).
 				// (SessionCleanupGuard above also covers these for the abort() path.)
-				for mut child in procs.lock().unwrap().drain(..) {
-					let _ = child.kill();
-					let _ = child.wait();
-				}
+				crate::process::drain_procs(&procs, &proc_epoch);
 				// Stop the media-over-session forwarder tasks (their session is gone).
 				for h in fwd_slot.lock().unwrap().drain(..) {
 					h.abort();

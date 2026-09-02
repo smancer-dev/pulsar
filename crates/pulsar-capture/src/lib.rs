@@ -226,6 +226,17 @@ pub use window::{
 pub(crate) mod dxgi;
 #[cfg(windows)]
 mod encode;
+#[cfg(windows)]
+pub use encode::{nvenc_codecs, nvenc_supported};
+/// Off-Windows stubs — the native NVENC SDK path is Windows-only.
+#[cfg(not(windows))]
+pub fn nvenc_supported() -> bool {
+	false
+}
+#[cfg(not(windows))]
+pub fn nvenc_codecs() -> &'static [Codec] {
+	&[]
+}
 // Per-window Windows Graphics Capture source (Phase 2b) — an alternative to `dxgi` that
 // produces the same per-frame BGRA ID3D11Texture2D the encoder consumes (see wgc.rs).
 #[cfg(windows)]

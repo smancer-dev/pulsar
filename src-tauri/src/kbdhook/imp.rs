@@ -14,8 +14,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
 	CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-	TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP, MSG,
-	WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+	TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP,
+	LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN,
+	WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+	WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 mod keymap;
@@ -56,6 +58,11 @@ struct Globals {
 	/// focus-loss, disable) would otherwise leave the button stuck DOWN on the host —
 	/// the up-stroke never gets forwarded because the gate has already closed.
 	held_buttons: std::collections::HashSet<u8>,
+	/// Main Tauri window HWND (raw, as isize), cached on engage. The WH_MOUSE_LL hook
+	/// (Interception-less path) normalizes the cursor's absolute screen position against
+	/// this window's client rect to send absolute `PointerMotion` — reading it in the hook
+	/// callback avoids a Tauri window lookup on the LowLevelHooksTimeout-bounded thread.
+	video_hwnd: isize,
 }
 
 static GLOBALS: OnceLock<Mutex<Globals>> = OnceLock::new();
@@ -104,6 +111,7 @@ fn globals() -> &'static Mutex<Globals> {
 			held_buttons: std::collections::HashSet::new(),
 			combo_held: std::collections::HashSet::new(),
 			combo_active: std::collections::HashSet::new(),
+			video_hwnd: 0,
 		})
 	})
 }
@@ -252,6 +260,7 @@ fn confine_to_video(app: &AppHandle, on: bool) {
 
 	if !on {
 		*CONFINE.lock().unwrap() = None;
+		globals().lock().unwrap().video_hwnd = 0;
 		unsafe {
 			ClipCursor(std::ptr::null());
 		}
@@ -264,6 +273,8 @@ fn confine_to_video(app: &AppHandle, on: bool) {
 	else {
 		return;
 	};
+	// Cache the window for the WH_MOUSE_LL absolute-pointer normalization (see handle_mouse_wh).
+	globals().lock().unwrap().video_hwnd = main_hwnd as isize;
 	unsafe {
 		let mon = MonitorFromWindow(main_hwnd, MONITOR_DEFAULTTONEAREST);
 		let mut mi: MONITORINFO = std::mem::zeroed();
@@ -791,6 +802,114 @@ fn handle_mouse(state: u16, flags: u16, rolling: i16, x: i32, y: i32) -> bool {
 	true
 }
 
+/// WH_MOUSE_LL analogue of `handle_mouse` for the Interception-LESS path. The LL mouse
+/// hook delivers ABSOLUTE screen coordinates (not the relative deltas Interception gives),
+/// so we normalize the cursor position against the video window's client rect and send
+/// absolute `PointerMotion` (0..1) — the same event the webview canvas used to send, which
+/// the host injects as an absolute pointer. Without this, a machine without the Interception
+/// driver captures NO mouse at all (the native renderer occludes the webview, so the JS
+/// pointer path is dead too), leaving the viewer unable to control the remote. `msg` is the
+/// WM_* message; `data` is MSLLHOOKSTRUCT.mouseData (wheel delta in the high word). Returns
+/// true to SUPPRESS the event locally (engaged → the cursor only drives the remote).
+fn handle_mouse_wh(msg: u32, x: i32, y: i32, data: u32) -> bool {
+	use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+	use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+	use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+	// Only the native-renderer path captures the mouse (webview sessions read the pointer
+	// from the canvas instead — mirrors the Interception filter gate at set_capture_filter).
+	if !MOUSE_CAPTURE.load(Ordering::SeqCst) {
+		return false;
+	}
+	if !ENGAGED.load(Ordering::SeqCst) {
+		return false; // disengaged → local mouse untouched (click-to-engage gate)
+	}
+	let mut g = globals().lock().unwrap();
+	let Some(tx) = g.tx.clone() else {
+		return false;
+	};
+	let hwnd = g.video_hwnd as HWND;
+	// Keep the cursor trapped to the streamed screen (the OS drops ClipCursor on the render
+	// child's focus flaps), mirroring handle_mouse.
+	reassert_confine();
+	match msg {
+		WM_MOUSEMOVE => {
+			// Normalize the absolute screen position against the video window's client rect.
+			if hwnd.is_null() {
+				return true;
+			}
+			let normalized = unsafe {
+				let mut rc: RECT = std::mem::zeroed();
+				if GetClientRect(hwnd, &mut rc) == 0 || rc.right <= rc.left || rc.bottom <= rc.top {
+					None
+				} else {
+					let mut tl = POINT { x: rc.left, y: rc.top };
+					let mut br = POINT { x: rc.right, y: rc.bottom };
+					ClientToScreen(hwnd, &mut tl);
+					ClientToScreen(hwnd, &mut br);
+					if br.x <= tl.x || br.y <= tl.y {
+						None
+					} else {
+						let nx = ((x - tl.x) as f64 / (br.x - tl.x) as f64).clamp(0.0, 1.0);
+						let ny = ((y - tl.y) as f64 / (br.y - tl.y) as f64).clamp(0.0, 1.0);
+						Some((nx, ny))
+					}
+				}
+			};
+			drop(g);
+			if let Some((nx, ny)) = normalized {
+				let _ = tx.try_send(InputEvent::PointerMotion { x: nx, y: ny });
+			}
+		}
+		WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+		| WM_MBUTTONUP => {
+			let (button, down) = match msg {
+				WM_LBUTTONDOWN => (0u8, true),
+				WM_LBUTTONUP => (0, false),
+				WM_RBUTTONDOWN => (1, true),
+				WM_RBUTTONUP => (1, false),
+				WM_MBUTTONDOWN => (2, true),
+				_ => (2, false),
+			};
+			if down {
+				g.held_buttons.insert(button);
+			} else {
+				g.held_buttons.remove(&button);
+			}
+			drop(g);
+			fwd(&tx, InputEvent::PointerButton { button, down });
+		}
+		WM_MOUSEWHEEL => {
+			// High word of mouseData is a signed WHEEL_DELTA multiple (120 per notch).
+			let delta = (data >> 16) as i16 as f64 / 120.0;
+			drop(g);
+			if delta != 0.0 {
+				let _ = tx.try_send(InputEvent::Scroll { dx: 0.0, dy: delta });
+			}
+		}
+		_ => {
+			drop(g);
+		}
+	}
+	true // engaged → suppress locally; the event only acts on the remote
+}
+
+/// The LL mouse callback (Interception-less path). Runs on the hook thread for every mouse
+/// event system-wide; forwards to `handle_mouse_wh` and suppresses locally when engaged.
+unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+	if ncode < 0 || !ENABLED.load(Ordering::SeqCst) {
+		return CallNextHookEx(std::ptr::null_mut(), ncode, wparam, lparam);
+	}
+	let ms = &*(lparam as *const MSLLHOOKSTRUCT);
+	// Never consume injected events (our own ClipCursor side effects, accessibility tools).
+	if ms.flags & LLMHF_INJECTED != 0 {
+		return CallNextHookEx(std::ptr::null_mut(), ncode, wparam, lparam);
+	}
+	if handle_mouse_wh(wparam as u32, ms.pt.x, ms.pt.y, ms.mouseData) {
+		return 1; // SUPPRESS locally — the event only acts on the remote.
+	}
+	CallNextHookEx(std::ptr::null_mut(), ncode, wparam, lparam)
+}
+
 /// Arm capture for `tx`'s session. The first call picks a mechanism: the
 /// Interception driver if present (works under ASTER), else WH_KEYBOARD_LL. Later
 /// calls just swap in the active sender + app handle and flip ENABLED.
@@ -961,6 +1080,13 @@ fn hook_thread() {
 			THREAD_STARTED.store(false, Ordering::SeqCst);
 			return;
 		}
+		// MOUSE hook alongside the keyboard hook: without the Interception driver this is the
+		// ONLY way the viewer captures the mouse (the native renderer occludes the webview, so
+		// the JS pointer path is dead). Non-fatal if it fails — keyboard still works.
+		let mouse_hook: HHOOK = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), hmod, 0);
+		if mouse_hook.is_null() {
+			tracing::warn!("WH_MOUSE_LL hook install failed — mouse capture unavailable (keyboard still active)");
+		}
 		let my_tid = GetCurrentThreadId();
 		globals().lock().unwrap().hook_thread_id = my_tid;
 		// Required: LL hooks deliver via this thread's message queue.
@@ -969,6 +1095,9 @@ fn hook_thread() {
 		while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
 			TranslateMessage(&msg);
 			DispatchMessageW(&msg);
+		}
+		if !mouse_hook.is_null() {
+			UnhookWindowsHookEx(mouse_hook);
 		}
 		UnhookWindowsHookEx(hook);
 		// Compare-and-clear: a fast disable()→enable() churn can spawn a NEW hook

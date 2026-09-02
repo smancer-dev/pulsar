@@ -95,6 +95,102 @@ pub use encoder::Encoder;
 /// accept in `nvEncOpenEncodeSessionEx`). 0x1002 = AMD, 0x8086 = Intel (display owners).
 const VENDOR_NVIDIA: u32 = 0x10DE;
 
+/// Which codecs THIS machine's NVENC can actually encode — asked of the NVENC SDK itself
+/// (open a session, enumerate its encode GUIDs, close). Empty = no usable NVENC at all.
+///
+/// This is the only oracle that answers correctly on both classes name/ffmpeg detection
+/// gets wrong: a GP108 (GeForce MX1xx–MX3xx) has NO NVENC silicon yet ffmpeg lists
+/// `h264_nvenc`, while a hybrid laptop HAS NVENC yet an `ffmpeg -c:v h264_nvenc` one-frame
+/// probe can fail because ffmpeg targets the display GPU. It is also per-CODEC, so a
+/// Kepler/GM107 card (H.264-only NVENC) is never advertised as an HEVC encoder — claiming
+/// HEVC there and then silently degrading the wire to H.264 is exactly the codec mismatch
+/// that renders a permanent black screen on the viewer. Cached for the process lifetime.
+pub fn nvenc_codecs() -> &'static [Codec] {
+	use std::sync::OnceLock;
+	static CACHE: OnceLock<Vec<Codec>> = OnceLock::new();
+	CACHE.get_or_init(|| match unsafe { probe_nvenc_codecs() } {
+		Ok(c) => {
+			cap_dbg(&format!("nvenc_codecs: {c:?}"));
+			c
+		}
+		Err(e) => {
+			cap_dbg(&format!("nvenc_codecs: unsupported ({e})"));
+			Vec::new()
+		}
+	})
+}
+
+/// True when NVENC can encode anything at all on this machine.
+pub fn nvenc_supported() -> bool {
+	!nvenc_codecs().is_empty()
+}
+
+/// Open one NVENC session on a fresh NVIDIA D3D11 device, enumerate the encode GUIDs it
+/// supports, close it. Err = no usable NVENC (no NVIDIA adapter, no driver DLL, or no
+/// encode silicon).
+unsafe fn probe_nvenc_codecs() -> Result<Vec<Codec>, String> {
+	use windows_core::Interface;
+	// Keep the device alive for the whole session — NVENC does not AddRef it.
+	let (device, _ctx) = d3d::create_nvidia_device()?;
+	let lib =
+		libloading::Library::new("nvEncodeAPI64.dll").map_err(|e| format!("nvenc dll: {e}"))?;
+	let create_instance: libloading::Symbol<
+		unsafe extern "C" fn(*mut nvenc::NV_ENCODE_API_FUNCTION_LIST) -> nvenc::NVENCSTATUS,
+	> = lib
+		.get(b"NvEncodeAPICreateInstance\0")
+		.map_err(|e| format!("nvenc CreateInstance sym: {e}"))?;
+	let mut fns: Box<nvenc::NV_ENCODE_API_FUNCTION_LIST> = Box::new(std::mem::zeroed());
+	fns.version = nvenc::NV_ENCODE_API_FUNCTION_LIST_VER;
+	d3d::chk(create_instance(&mut *fns), &fns, std::ptr::null_mut())
+		.map_err(|e| format!("NvEncodeAPICreateInstance: {e}"))?;
+	let mut open: nvenc::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = std::mem::zeroed();
+	open.version = nvenc::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+	open.deviceType = nvenc::NV_ENC_DEVICE_TYPE_DIRECTX;
+	open.device = device.as_raw();
+	open.apiVersion = nvenc::NVENCAPI_VERSION;
+	let mut enc: *mut std::ffi::c_void = std::ptr::null_mut();
+	let open_fn = fns
+		.nvEncOpenEncodeSessionEx
+		.ok_or("nvenc: nvEncOpenEncodeSessionEx missing")?;
+	d3d::chk(open_fn(&mut open, &mut enc), &fns, std::ptr::null_mut())
+		.map_err(|e| format!("nvEncOpenEncodeSessionEx: {e}"))?;
+	// From here every exit must DestroyEncoder — collect into a Result and destroy once.
+	let guids = (|| -> Result<Vec<windows_core::GUID>, String> {
+		let count_fn = fns
+			.nvEncGetEncodeGUIDCount
+			.ok_or("nvenc: nvEncGetEncodeGUIDCount missing")?;
+		let list_fn = fns
+			.nvEncGetEncodeGUIDs
+			.ok_or("nvenc: nvEncGetEncodeGUIDs missing")?;
+		let mut n: u32 = 0;
+		d3d::chk(count_fn(enc, &mut n), &fns, enc).map_err(|e| format!("GetEncodeGUIDCount: {e}"))?;
+		if n == 0 {
+			return Ok(Vec::new());
+		}
+		let mut buf: Vec<windows_core::GUID> = vec![windows_core::GUID::zeroed(); n as usize];
+		let mut got: u32 = 0;
+		d3d::chk(list_fn(enc, buf.as_mut_ptr(), n, &mut got), &fns, enc)
+			.map_err(|e| format!("GetEncodeGUIDs: {e}"))?;
+		buf.truncate(got as usize);
+		Ok(buf)
+	})();
+	if let Some(destroy) = fns.nvEncDestroyEncoder {
+		let _ = destroy(enc);
+	}
+	let guids = guids?;
+	let mut codecs = Vec::new();
+	for (guid, codec) in [
+		(nvenc::NV_ENC_CODEC_H264_GUID, Codec::H264),
+		(nvenc::NV_ENC_CODEC_HEVC_GUID, Codec::H265),
+		(nvenc::NV_ENC_CODEC_AV1_GUID, Codec::Av1),
+	] {
+		if guids.contains(&guid) {
+			codecs.push(codec);
+		}
+	}
+	Ok(codecs)
+}
+
 /// Diagnostic log to a fixed file (the native encoder runs in the GUI host with no console).
 fn cap_dbg(msg: &str) {
 	use std::io::Write;

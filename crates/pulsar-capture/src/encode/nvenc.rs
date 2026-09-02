@@ -185,6 +185,11 @@ pub type PFN_LockBitstream =
 pub type PFN_UnlockBitstream = unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS;
 pub type PFN_DestroyEncoder = unsafe extern "C" fn(*mut c_void) -> NVENCSTATUS;
 pub type PFN_GetLastErrorString = unsafe extern "C" fn(*mut c_void) -> *const i8;
+// Which codecs THIS GPU's NVENC can encode: `count` first, then fill an array of that
+// size. Kepler/GM107 report H.264 only; HEVC arrives with GM20x, AV1 with Ada.
+pub type PFN_GetEncodeGUIDCount = unsafe extern "C" fn(*mut c_void, *mut u32) -> NVENCSTATUS;
+pub type PFN_GetEncodeGUIDs =
+	unsafe extern "C" fn(*mut c_void, *mut GUID, u32, *mut u32) -> NVENCSTATUS;
 
 // NV_ENCODE_API_FUNCTION_LIST as laid out in nvEncodeAPI.h (12.x). Slots we don't
 // call are opaque pointers so we never mis-spell a signature; ORDER is what matters.
@@ -193,10 +198,10 @@ pub struct NV_ENCODE_API_FUNCTION_LIST {
 	pub version: u32,
 	pub reserved: u32,
 	pub nvEncOpenEncodeSession: *mut c_void, // deprecated entrypoint
-	pub nvEncGetEncodeGUIDCount: *mut c_void,
+	pub nvEncGetEncodeGUIDCount: Option<PFN_GetEncodeGUIDCount>,
 	pub nvEncGetEncodeProfileGUIDCount: *mut c_void,
 	pub nvEncGetEncodeProfileGUIDs: *mut c_void,
-	pub nvEncGetEncodeGUIDs: *mut c_void,
+	pub nvEncGetEncodeGUIDs: Option<PFN_GetEncodeGUIDs>,
 	pub nvEncGetInputFormatCount: *mut c_void,
 	pub nvEncGetInputFormats: *mut c_void,
 	pub nvEncGetEncodeCaps: *mut c_void,

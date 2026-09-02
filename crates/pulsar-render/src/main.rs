@@ -61,6 +61,13 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn main() {
+	// `--probe`: headless capability probe (which codecs have a SYNC decoder MFT this
+	// renderer can drive) printing JSON for the app's startup detection — the Windows
+	// analogue of the Linux probe above.
+	if std::env::args().any(|a| a == "--probe") {
+		println!("{}", win::decode::probe_json());
+		return;
+	}
 	apply_lang();
 	win::run();
 }

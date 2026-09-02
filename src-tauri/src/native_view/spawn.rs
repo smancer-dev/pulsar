@@ -198,6 +198,7 @@ pub fn spawn_render(
 	// from the frontend); without stdin piped, set_frame_pacing can't reach the renderer.
 	cmd.stdin(std::process::Stdio::piped());
 	cmd.stdout(std::process::Stdio::piped());
+	cmd.stderr(std::process::Stdio::piped());
 	// Prefer the host's rkmpp ffmpeg over the AppImage's rkmpp-less bundle on RK3588.
 	crate::process::apply_render_lib_env(&mut cmd);
 	// Optimus/PRIME laptops: offload the renderer to the NVIDIA GPU (auto prime-run) so
@@ -205,8 +206,27 @@ pub fn spawn_render(
 	crate::process::apply_nvidia_prime_env(&mut cmd);
 	die_with_parent(&mut cmd);
 	match cmd.spawn() {
-		Ok(child) => Some(child),
+		Ok(mut child) => {
+			pipe_stderr_to_tracing(&mut child);
+			Some(child)
+		}
 		Err(_) => None,
+	}
+}
+
+/// Forward the renderer's stderr into tracing. All of pulsar-render's failure reporting
+/// (decoder init failed, decode error, present init failed, device removed) is `eprintln!`;
+/// with stderr inherited it vanishes in a release GUI launch — piping it here is what makes
+/// a black-screen cause visible in the app log at all.
+#[cfg(any(all(unix, not(target_os = "macos")), windows))]
+fn pipe_stderr_to_tracing(child: &mut Child) {
+	if let Some(err) = child.stderr.take() {
+		std::thread::spawn(move || {
+			use std::io::BufRead;
+			for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+				tracing::warn!(target: "pulsar_render", "{line}");
+			}
+		});
 	}
 }
 
@@ -234,10 +254,12 @@ pub fn spawn_render_win(
 	cmd.arg("--lang").arg(lang);
 	cmd.stdin(std::process::Stdio::piped());
 	cmd.stdout(std::process::Stdio::piped());
+	cmd.stderr(std::process::Stdio::piped());
 	crate::no_window(&mut cmd);
 	match cmd.spawn() {
-		Ok(child) => {
+		Ok(mut child) => {
 			crate::job::assign(&child);
+			pipe_stderr_to_tracing(&mut child);
 			Some(child)
 		}
 		Err(_) => None,

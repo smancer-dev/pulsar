@@ -285,12 +285,28 @@ pub(crate) async fn start_remote_play(
 		})
 		.cloned()
 		.collect();
-	let codec = if codec.is_empty() || codec == "auto" {
+	let auto_pick = || {
 		["av1", "h265", "h264"]
 			.iter()
 			.find(|c| allowed.iter().any(|a| a == **c))
 			.map(|c| c.to_string())
 			.unwrap_or_else(|| "h264".to_string())
+	};
+	let forced = std::env::var("PULSAR_FORCE_CODEC").is_ok();
+	let codec = if codec.is_empty() || codec == "auto" {
+		auto_pick()
+	} else if !forced && !allowed.is_empty() && !allowed.iter().any(|a| *a == codec) {
+		// An explicit (session-menu-persisted) codec outside the negotiated set means the
+		// host can't encode it or this client can't decode the host's bitstream for it.
+		// Honoring it verbatim puts one codec in the renderer's SDP and another on the
+		// wire → the decoder consumes AUs forever without emitting a frame (permanent
+		// black screen). Degrade to the auto pick instead; PULSAR_FORCE_CODEC still
+		// bypasses this for testing. An EMPTY `allowed` means we learned nothing (caps
+		// timed out / old host), not "nothing is supported" — honor the request then and
+		// let the host's own validate+degrade do its job, as it did before this clamp.
+		let picked = auto_pick();
+		tracing::warn!(requested = %codec, ?allowed, %picked, "requested codec not in negotiated set — degraded");
+		picked
 	} else {
 		codec
 	};

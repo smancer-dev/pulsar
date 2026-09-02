@@ -723,6 +723,13 @@ struct Renderer {
 	bytes: u64,
 	dec_ms_acc: f32,
 	dec_n: u32,
+	// ZERO-OUTPUT WATCHDOG state: AUs fed to / frames emitted by the CURRENT decoder
+	// instance. An async-only HW MFT driven synchronously eats input forever without
+	// ever producing a frame (permanent black); when that signature shows up the
+	// decoder is rebuilt once with the async fallback disabled (sync/inbox MFT only).
+	au_since_dec: u32,
+	dec_frames: u64,
+	dec_rebuilt: bool,
 	// Side-channel cursor: uploaded egui texture + hotspot/dims (points come from the
 	// statics fed over stdin; re-uploaded when CURSOR_IMG_GEN moves).
 	cursor_tex: Option<egui::TextureHandle>,
@@ -819,6 +826,9 @@ impl Renderer {
 			bytes: 0,
 			dec_ms_acc: 0.0,
 			dec_n: 0,
+			au_since_dec: 0,
+			dec_frames: 0,
+			dec_rebuilt: false,
 			cursor_tex: None,
 			cursor_gen: 0,
 			cursor_hot: (0.0, 0.0),
@@ -1287,7 +1297,9 @@ impl Renderer {
 						use std::io::Write;
 						let _ = std::io::stdout().flush();
 					}
-					self.decoder = Some(d)
+					self.decoder = Some(d);
+					self.au_since_dec = 0;
+					self.dec_frames = 0;
 				}
 				Err(e) => {
 					eprintln!("pulsar-render(win): decoder init failed: {e}");
@@ -1295,6 +1307,27 @@ impl Renderer {
 				}
 			}
 		}
+		// ZERO-OUTPUT WATCHDOG: ~2 s of AUs in, not one frame out = the async-MFT-driven-
+		// synchronously black hole (or an MFT wedged on this stream). Rebuild ONCE with the
+		// async fallback disabled so a sync/inbox MFT must be picked; it re-syncs on the
+		// next IDR. Without this the session stays black forever with zero diagnostics.
+		if self.au_since_dec >= 120 && self.dec_frames == 0 && !self.dec_rebuilt {
+			self.dec_rebuilt = true;
+			eprintln!(
+				"pulsar-render(win): decoder consumed {} AUs with zero output — rebuilding with a sync-only MFT",
+				self.au_since_dec
+			);
+			match decode::Decoder::new_ex(&self.device, self.codec, 1920, 1080, 60, false) {
+				Ok(d) => {
+					self.decoder = Some(d);
+					self.au_since_dec = 0;
+				}
+				Err(e) => {
+					eprintln!("pulsar-render(win): sync-only decoder rebuild failed: {e}");
+				}
+			}
+		}
+		self.au_since_dec = self.au_since_dec.saturating_add(1);
 		self.bytes += au.data.len() as u64;
 		let dec_t0 = std::time::Instant::now();
 		let texs = match self.decoder.as_mut().unwrap().decode(au) {
@@ -1306,6 +1339,7 @@ impl Renderer {
 		};
 		self.dec_ms_acc += dec_t0.elapsed().as_secs_f32() * 1000.0;
 		self.dec_n += 1;
+		self.dec_frames = self.dec_frames.saturating_add(texs.len() as u64);
 		// Present EVERY decoded frame in order: a single decode() drain can yield more than one
 		// NV12 texture (multi-frame batch), and dropping all but the last silently loses frames
 		// (micro-stutter). In steady state this is exactly one frame, so the loop is a no-op there.

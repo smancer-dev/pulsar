@@ -248,7 +248,7 @@ fn probe_ok(mut cmd: std::process::Command) -> bool {
 	};
 	// Assign the probe child to the Windows Job Object so it dies with Pulsar on
 	// abnormal exit (crash / taskkill), honouring job.rs's "assign every spawned
-	// child" invariant.  spawn_tracked / spawn_tracked_enc_paced already do this;
+	// child" invariant.  spawn_tracked / spawn_encode_with_fallback already do this;
 	// probes previously did not, leaving an orphaned ffmpeg.exe on abnormal exit.
 	#[cfg(windows)]
 	crate::job::assign(&child);
@@ -645,60 +645,218 @@ pub fn spawn_tracked(
 	}
 }
 
-/// Spawn the stream-encode ffmpeg like `spawn_tracked`, but with `-nostats -progress
-/// pipe:2` injected and stderr piped to a parser thread that measures the ENCODE PACE:
-/// per-frame wall time between progress ticks (Δt/Δframes, ms). Realtime capture pins
-/// this near the frame budget while the encoder keeps up; it RISES when encoding falls
-/// behind — the host-side number the client's "Kodlama ms" tile shows. The thread calls
-/// `on_ms` (~2 Hz) and exits when ffmpeg does.
-pub fn spawn_tracked_enc_paced(
+/// How long a freshly spawned encode ffmpeg gets to produce its first `-progress` tick
+/// before the fallback chain declares it dead. Generous on purpose: a cold HW-encoder
+/// init (QSV driver load, VAAPI on a busy GPU) can take a couple of seconds, while the
+/// failure mode this guards against — encoder listed but can't init (GP108 `h264_nvenc`)
+/// — exits within ~100 ms and is caught by the child-exit poll long before the deadline.
+const ENC_HEALTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Generation counter for one session's `procs` vec, bumped by EVERY drain site
+/// (`drain_procs`). An encode fallback chain captures the generation it was started for
+/// and re-checks it under the `procs` lock before adopting/registering anything — so a
+/// teardown or re-stream that lands mid-chain can never leave an orphan ffmpeg streaming
+/// the host's screen into a dead session, and a recycled OS pid can never make a stale
+/// chain adopt (and kill) the NEXT stream's healthy encoder.
+pub type ProcEpoch = Arc<std::sync::atomic::AtomicU64>;
+
+/// Kill + reap every tracked child of this session and invalidate any in-flight encode
+/// fallback chain. The epoch bump happens UNDER the `procs` lock, which is the same lock
+/// the chain takes to register a child — that ordering is what makes "drain, then the
+/// chain spawns one more" impossible.
+pub fn drain_procs(procs: &Arc<Mutex<Vec<Child>>>, epoch: &ProcEpoch) {
+	let mut g = procs.lock().unwrap();
+	epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+	for mut child in g.drain(..) {
+		let _ = child.kill();
+		// wait() right after kill reaps the zombie (Unix does not auto-reap).
+		let _ = child.wait();
+	}
+}
+
+/// Spawn the stream-encode ffmpeg with a runtime HEALTH WATCHDOG and automatic encoder
+/// fallback. `candidates` is the ordered (encoder, capture) preference list; each is
+/// spawned via `mk_args` and watched: a child that exits, or produces no ENCODED FRAME
+/// within `ENC_HEALTH_DEADLINE`, is killed and the next candidate tried. Name/probe
+/// detection can never be fully trusted (an encoder can be listed yet unable to init on
+/// THIS GPU, and a probe can false-fail on a hybrid box) — watching the real encode
+/// child is the only signal that is authoritative on every machine. Runs on its own
+/// thread so StartStream returns immediately and the stream self-heals in the
+/// background. `on_settled(encoder)` fires once a candidate proves healthy; `on_failed()`
+/// fires when every candidate died.
+///
+/// `epoch`/`epoch_at_spawn` bind the chain to ONE stream generation: every candidate is
+/// registered under the `procs` lock only while the epoch still matches, and the watchdog
+/// bails the moment it doesn't. Without that, a teardown/re-stream landing between two
+/// candidates would leave a screen-capturing ffmpeg alive with nobody tracking it.
+pub fn spawn_encode_with_fallback(
 	procs: &Arc<Mutex<Vec<Child>>>,
+	epoch: &ProcEpoch,
+	epoch_at_spawn: u64,
 	program: &str,
-	args: &[String],
-	on_ms: impl Fn(f32) + Send + 'static,
-) -> Result<(), String> {
-	let mut cmd = std::process::Command::new(program);
-	// Global options — must precede everything else on the command line.
-	cmd.args(["-nostats", "-progress", "pipe:2"]);
-	cmd.args(args);
-	cmd.stderr(std::process::Stdio::piped());
-	no_window(&mut cmd);
-	#[cfg(target_os = "linux")]
-	die_with_parent(&mut cmd);
-	match cmd.spawn() {
-		Ok(mut child) => {
+	candidates: Vec<(HwEncoder, CaptureMethod)>,
+	mk_args: impl Fn(HwEncoder, CaptureMethod) -> Vec<String> + Send + 'static,
+	on_ms: impl Fn(f32) + Send + Sync + Clone + 'static,
+	on_settled: impl Fn(HwEncoder) + Send + 'static,
+	on_failed: impl FnOnce() + Send + 'static,
+) {
+	use std::sync::atomic::Ordering;
+	let procs = procs.clone();
+	let epoch = epoch.clone();
+	let program = program.to_string();
+	std::thread::spawn(move || {
+		let total = candidates.len();
+		for (i, (enc, cap)) in candidates.into_iter().enumerate() {
+			// Cheap pre-check; the authoritative one is under the lock after the spawn.
+			if epoch.load(Ordering::SeqCst) != epoch_at_spawn {
+				return;
+			}
+			let args = mk_args(enc, cap);
+			let mut cmd = std::process::Command::new(&program);
+			// Global options — must precede everything else on the command line.
+			cmd.args(["-nostats", "-progress", "pipe:2"]);
+			cmd.args(&args);
+			cmd.stderr(std::process::Stdio::piped());
+			no_window(&mut cmd);
+			#[cfg(target_os = "linux")]
+			die_with_parent(&mut cmd);
+			let mut child = match cmd.spawn() {
+				Ok(c) => c,
+				Err(e) => {
+					tracing::warn!(encoder = ?enc, capture = ?cap, error = %e, "encode ffmpeg failed to spawn — trying next candidate");
+					continue;
+				}
+			};
 			#[cfg(windows)]
 			crate::job::assign(&child);
+			// First `-progress` tick with frame >= 1 = the encoder initialized AND is
+			// emitting frames. `frame=0` ticks are NOT proof of life: ffmpeg's progress
+			// blocks are wall-clock-paced off the transcode loop, so an encoder that
+			// accepts input but never outputs (wedged HW session) prints frame=0 forever.
+			let ticked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+			// Rolling tail of NON-progress stderr lines: this is exactly the ffmpeg error
+			// text that was silently discarded before (the "dead stream with no trace" bug).
+			let errtail = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
 			if let Some(stderr) = child.stderr.take() {
+				let ticked = ticked.clone();
+				let errtail = errtail.clone();
+				let on_ms = on_ms.clone();
 				std::thread::spawn(move || {
 					use std::io::BufRead;
 					let reader = std::io::BufReader::new(stderr);
 					let mut last: Option<(u64, std::time::Instant)> = None;
 					for line in reader.lines() {
 						let Ok(line) = line else { break };
-						let Some(v) = line.strip_prefix("frame=") else {
-							continue;
-						};
-						let Ok(frame) = v.trim().parse::<u64>() else {
-							continue;
-						};
-						let now = std::time::Instant::now();
-						if let Some((f0, t0)) = last {
-							let df = frame.saturating_sub(f0);
-							if df > 0 {
-								let ms = now.duration_since(t0).as_secs_f32() * 1000.0 / df as f32;
-								on_ms(ms);
+						if let Some(v) = line.strip_prefix("frame=") {
+							let Ok(frame) = v.trim().parse::<u64>() else {
+								continue;
+							};
+							if frame >= 1 {
+								ticked.store(true, std::sync::atomic::Ordering::Relaxed);
 							}
+							let now = std::time::Instant::now();
+							if let Some((f0, t0)) = last {
+								let df = frame.saturating_sub(f0);
+								if df > 0 {
+									let ms =
+										now.duration_since(t0).as_secs_f32() * 1000.0 / df as f32;
+									on_ms(ms);
+								}
+							}
+							last = Some((frame, now));
+						} else if !line.contains('=') || line.contains("rror") {
+							// Progress blocks are `key=value` lines; keep everything else
+							// (banner-suppressed builds only emit real diagnostics here).
+							let mut t = errtail.lock().unwrap();
+							if t.len() >= 14 {
+								t.pop_front();
+							}
+							t.push_back(line);
 						}
-						last = Some((frame, now));
 					}
 				});
 			}
-			procs.lock().unwrap().push(child);
-			Ok(())
+			let pid = child.id();
+			// REGISTER under the lock, but only if this stream generation is still the live
+			// one: a teardown/re-stream that drained `procs` bumped the epoch under this same
+			// lock, so either we see it here and kill our own child, or the drain sees our
+			// child in the vec and kills it. There is no window in between.
+			{
+				let mut ps = procs.lock().unwrap();
+				if epoch.load(Ordering::SeqCst) != epoch_at_spawn {
+					drop(ps);
+					let _ = child.kill();
+					let _ = child.wait();
+					return;
+				}
+				ps.push(child);
+			}
+			// Watchdog: poll for the first encoded frame / an early exit / session teardown.
+			let deadline = std::time::Instant::now() + ENC_HEALTH_DEADLINE;
+			let mut exited = false;
+			let healthy = loop {
+				if ticked.load(std::sync::atomic::Ordering::Relaxed) {
+					break true;
+				}
+				{
+					let mut ps = procs.lock().unwrap();
+					// Epoch first: a recycled OS pid could otherwise make us adopt (and later
+					// kill) the NEXT stream's healthy child.
+					if epoch.load(Ordering::SeqCst) != epoch_at_spawn {
+						return;
+					}
+					match ps.iter_mut().find(|c| c.id() == pid) {
+						// Our child is gone but the epoch stands: someone else killed it.
+						None => return,
+						Some(c) => {
+							if matches!(c.try_wait(), Ok(Some(_))) {
+								exited = true;
+							}
+						}
+					}
+				}
+				if exited || std::time::Instant::now() >= deadline {
+					break false;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(100));
+			};
+			if healthy {
+				if i > 0 {
+					tracing::info!(encoder = ?enc, capture = ?cap, attempt = i + 1, "encode fallback settled on a working encoder");
+				}
+				on_settled(enc);
+				return;
+			}
+			// Dead candidate: kill it (if it hasn't exited already), drop it from `procs`,
+			// and surface the stderr it died with.
+			{
+				let mut ps = procs.lock().unwrap();
+				if epoch.load(Ordering::SeqCst) != epoch_at_spawn {
+					return;
+				}
+				if let Some(pos) = ps.iter().position(|c| c.id() == pid) {
+					let mut c = ps.remove(pos);
+					let _ = c.kill();
+					let _ = c.wait();
+				} else {
+					// Someone else killed it — stop quietly.
+					return;
+				}
+			}
+			let tail: Vec<String> = errtail.lock().unwrap().iter().cloned().collect();
+			tracing::warn!(
+				encoder = ?enc,
+				capture = ?cap,
+				attempt = i + 1,
+				total,
+				exited,
+				stderr = %tail.join(" | "),
+				"encode ffmpeg produced no frames — trying next candidate"
+			);
 		}
-		Err(e) => Err(format!("{program} {}: {e}", crate::i18n::t("err.spawn"))),
-	}
+		tracing::error!("all encode candidates failed — no video stream for this session");
+		on_failed();
+	});
 }
 
 /// A host game/app, as sent from the UI's games store.

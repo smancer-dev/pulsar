@@ -1317,6 +1317,9 @@ fn apply_screen_adaptation(
 pub(super) fn make_on_stream(
 	stream_cfg: Arc<Mutex<crate::state::StreamCfg>>,
 	procs: Arc<Mutex<Vec<Child>>>,
+	// Stream generation for `procs` — bumped by every drain so an in-flight encode
+	// fallback chain can't outlive the stream it was started for.
+	proc_epoch: crate::process::ProcEpoch,
 	active: Arc<Mutex<std::collections::HashMap<u64, crate::state::ConnInfo>>>,
 	incoming: Arc<Mutex<std::collections::HashMap<u64, (String, oneshot::Sender<()>)>>>,
 	host_out: Arc<
@@ -1607,10 +1610,7 @@ pub(super) fn make_on_stream(
 			// this session before spawning the new one, so a live re-stream (resolution/
 			// codec/fps/audio-toggle change) doesn't stack audio encoders. (The video
 			// capture is restarted separately via `cap_slot` in the async task below.)
-			for mut child in procs.lock().unwrap().drain(..) {
-				let _ = child.kill();
-				let _ = child.wait();
-			}
+			crate::process::drain_procs(&procs, &proc_epoch);
 			let ip = vdest.ip().to_string();
 			let port = vdest.port();
 			// Client-requested bitrate wins; 0 falls back to the host config.
@@ -1780,13 +1780,13 @@ pub(super) fn make_on_stream(
 			return;
 		}
 
-		// A (re-)stream request restarts capture: kill any ffmpeg already
-		// running for this session before spawning the new one (this is how
-		// a live resolution change from the client takes effect).
-		for mut child in procs.lock().unwrap().drain(..) {
-			let _ = child.kill();
-			let _ = child.wait();
-		}
+		// A (re-)stream request restarts capture: kill any ffmpeg already running for this
+		// session before spawning the new one (this is how a live resolution change from the
+		// client takes effect). The epoch bump inside also retires the PREVIOUS stream's
+		// encode fallback chain, if one is still walking its candidate list.
+		crate::process::drain_procs(&procs, &proc_epoch);
+		// The generation THIS stream's children (and its fallback chain) belong to.
+		let stream_epoch = proc_epoch.load(std::sync::atomic::Ordering::SeqCst);
 		// Same for the native capture thread, if the prior (re)stream used it.
 		#[cfg(windows)]
 		if let Some(h) = native_slot.lock().unwrap().take() {
@@ -1878,6 +1878,49 @@ pub(super) fn make_on_stream(
 		// HEVC/AV1 request on a build lacking it falls back instead of failing.
 		let enc_text = crate::process::encoders_text(&ffmpeg);
 		let encoder = pipeline::resolve(encoder_from_str(&enc_pref), &pipeline::detect(&enc_text));
+		// An AUTO pick refined by the startup probe (Windows): name detection lists every
+		// family the ffmpeg build was compiled with — on a GP108 box `h264_nvenc` is listed
+		// with no NVENC silicon behind it, so the quality-order pick lands on a dead encoder
+		// every session. The startup probe (real one-frame encodes + the native NVENC SDK
+		// session check) already knows which families actually work here; when it has
+		// finished, resolve Auto against THAT set so the first spawn is a working one. An
+		// explicit client/host pick is honored unchanged (the runtime fallback chain below
+		// rescues it if it turns out dead). Off-Windows, resolve_encoder_validated performs
+		// the equivalent degrade a few lines down.
+		#[cfg(windows)]
+		let encoder = {
+			let is_auto = matches!(encoder_from_str(&enc_pref), pipeline::HwEncoder::Auto);
+			let probed = tauri::Manager::state::<AppState>(&app_h)
+				.local_caps
+				.lock()
+				.unwrap()
+				.clone();
+			match (is_auto, probed) {
+				(true, Some(lc)) => {
+					let validated: Vec<pipeline::HwEncoder> = lc
+						.encoders
+						.iter()
+						.filter(|e| !e.codecs.is_empty())
+						.map(|e| encoder_from_str(&e.id))
+						.filter(|e| *e != pipeline::HwEncoder::Auto)
+						.collect();
+					if validated.is_empty() {
+						encoder
+					} else {
+						let refined = pipeline::resolve(pipeline::HwEncoder::Auto, &validated);
+						if refined != encoder {
+							tracing::info!(
+								name_pick = ?encoder,
+								probe_pick = ?refined,
+								"auto encoder refined by startup probe"
+							);
+						}
+						refined
+					}
+				}
+				_ => encoder,
+			}
+		};
 		// [vk-ddagrab-1] Windows + Ddagrab: Vulkan and VAAPI encoders are incompatible with
 		// the ddagrab capture path. ddagrab uses `-filter_complex` (complex filtergraph) while
 		// command.rs unconditionally appends `-vf format=...,hwupload` for Vulkan — ffmpeg refuses
@@ -2260,6 +2303,11 @@ pub(super) fn make_on_stream(
 		// unless PULSAR_FFMPEG_CAPTURE=1. Init happens inside the capture thread
 		// and is reported back synchronously — Ok ⇒ streaming started; Err ⇒ fall
 		// back to ffmpeg with zero behaviour change.
+		// Set when the native attempt failed for an NVENC-specific reason: the ffmpeg
+		// fallback chain must then not waste its first ~candidate on h264_nvenc (if the
+		// SDK can't open a session, ffmpeg's nvenc will die the same way).
+		#[allow(unused_mut, unused_variables)]
+		let mut native_nvenc_failed = false;
 		// G2: holds the native NVENC encode-us atom (set in the Windows Ok(h) arm below) so the
 		// post-resolve `if native_started` branch can spawn the encode-stat reporter thread.
 		#[allow(unused_mut)]
@@ -2347,7 +2395,15 @@ pub(super) fn make_on_stream(
 					*native_slot.lock().unwrap() = Some(h);
 					true
 				}
-				Err(_) => false,
+				Err(e) => {
+					// This error string was silently discarded for months — a GP108 (no NVENC
+					// silicon) host produced a dead stream with zero trace anywhere. Log it,
+					// and remember an nvenc-shaped failure so the ffmpeg chain skips nvenc.
+					let msg = e.to_string();
+					tracing::warn!(error = %msg, "native DXGI+NVENC capture failed — falling back to ffmpeg");
+					native_nvenc_failed = msg.contains("nvenc") || msg.contains("nvEnc");
+					false
+				}
 			}
 		} else {
 			false
@@ -2477,16 +2533,153 @@ pub(super) fn make_on_stream(
 			}
 			true
 		} else {
-			let (_, args) = pipeline::encode_command(&plan);
-			// Encode-pace meter: ffmpeg `-progress` ticks → per-frame wall ms → re-push
-			// the Stats label with a live "kodlama" part (~2 Hz, tiny control message).
+			// Runtime-fallback candidate list, quality order: the resolved pick first, then
+			// every other name-detected family that can emit `codec` (the client's SDP is
+			// already written for this codec — it CANNOT change mid-chain), Software as the
+			// terminal candidate. Name/probe detection alone is not trustworthy (an encoder
+			// can be listed with no working hardware behind it), so each candidate is
+			// spawned under a health watchdog and the chain moves on until one produces
+			// real frames. Windows gets a gdigrab+software absolute last resort: ddagrab
+			// needs DXGI duplication access, which protected content or another duplication
+			// owner can deny while GDI capture still works.
+			let mut candidates: Vec<(pipeline::HwEncoder, pipeline::CaptureMethod)> = Vec::new();
+			{
+				let mut avail = pipeline::detect(&enc_text);
+				#[cfg(windows)]
+				{
+					if capture == CaptureMethod::Ddagrab {
+						avail.retain(|e| {
+							!matches!(e, pipeline::HwEncoder::Vulkan | pipeline::HwEncoder::Vaapi)
+						});
+					}
+					// The SDK couldn't even open a session — ffmpeg's nvenc dies the same way.
+					if native_nvenc_failed {
+						avail.retain(|e| *e != HwEncoder::Nvenc);
+					}
+				}
+				if !(native_nvenc_failed && encoder == HwEncoder::Nvenc) {
+					candidates.push((encoder, capture));
+				}
+				loop {
+					if avail.is_empty() {
+						break;
+					}
+					let best = pipeline::resolve(pipeline::HwEncoder::Auto, &avail);
+					if !avail.contains(&best) {
+						// resolve()'s terminal Software fallback isn't actually in `avail`.
+						break;
+					}
+					avail.retain(|e| *e != best);
+					if best != encoder && best.available_codecs(&enc_text).contains(&codec) {
+						candidates.push((best, capture));
+					}
+				}
+				let sw_ok =
+					pipeline::HwEncoder::Software.available_codecs(&enc_text).contains(&codec);
+				if sw_ok && !candidates.iter().any(|(e, _)| *e == pipeline::HwEncoder::Software) {
+					candidates.push((pipeline::HwEncoder::Software, capture));
+				}
+				#[cfg(windows)]
+				if sw_ok && capture == CaptureMethod::Ddagrab {
+					candidates.push((pipeline::HwEncoder::Software, CaptureMethod::Gdigrab));
+				}
+			}
+			// Rebuild the ffmpeg command per candidate. The zerocopy graph is the
+			// ddagrab→CUDA→NVENC mapping — only valid for the original NVENC plan; every
+			// fallback takes the generic path.
+			let mk_args = {
+				let base = plan;
+				move |enc: pipeline::HwEncoder, cap: pipeline::CaptureMethod| {
+					let p = pipeline::StreamPlan {
+						encoder: enc,
+						codec: base.codec,
+						width: base.width,
+						height: base.height,
+						fps: base.fps,
+						bitrate_kbps: base.bitrate_kbps,
+						capture: cap,
+						display: base.display.clone(),
+						vaapi_device: base.vaapi_device.clone(),
+						dest: base.dest.clone(),
+						low_latency: base.low_latency,
+						gpu_zerocopy: base.gpu_zerocopy
+							&& enc == pipeline::HwEncoder::Nvenc
+							&& cap == base.capture,
+						output_idx: base.output_idx,
+						hdr: base.hdr,
+						yuv444: base.yuv444,
+					};
+					pipeline::encode_command(&p).1
+				}
+			};
+			// The stats label must follow the encoder the chain SETTLES on, not the initial
+			// pick — the pace meter re-reads it per tick and a fallback re-pushes it.
+			let live_label = std::sync::Arc::new(std::sync::Mutex::new(base_label.clone()));
 			let stats_enc = stats_out.clone();
-			let label_enc = base_label.clone();
-			crate::process::spawn_tracked_enc_paced(&procs, &ffmpeg, &args, move |ms| {
-				let _ =
-					stats_enc.try_send(DataMsg::Stats(format!("{label_enc} · {ms:.1} {}", crate::i18n::t("stream.msEncode"))));
-			})
-			.is_ok()
+			let label_ms = live_label.clone();
+			let on_ms = move |ms: f32| {
+				let l = label_ms.lock().unwrap().clone();
+				let _ = stats_enc.try_send(DataMsg::Stats(format!(
+					"{l} · {ms:.1} {}",
+					crate::i18n::t("stream.msEncode")
+				)));
+			};
+			let stats_settle = stats_out.clone();
+			let label_settle = live_label.clone();
+			let codec_lbl = vcodec_label(codec);
+			let res_settle = res_part.clone();
+			let fps_settle = fps_part.clone();
+			let mbit_settle = (eff_bitrate as f32 / 1000.0).round() as u32;
+			// Compare against the encoder the label was BUILT with, not the chain's attempt
+			// index: when the native NVENC failure pruned nvenc, candidate 0 is already a
+			// different encoder, and the stats panel would otherwise claim NVENC forever.
+			let labeled_enc = encoder;
+			let on_settled = move |enc: pipeline::HwEncoder| {
+				if enc == labeled_enc {
+					return;
+				}
+				let new_label = format!(
+					"{} · {} · {} · {} · {} {}",
+					codec_lbl,
+					enc.label(),
+					res_settle,
+					fps_settle,
+					mbit_settle,
+					crate::i18n::t("stream.mbitTarget")
+				);
+				*label_settle.lock().unwrap() = new_label.clone();
+				let _ = stats_settle.try_send(DataMsg::Stats(new_label));
+			};
+			// Every candidate died: tell the CLIENT too (Stats travels the session), not just
+			// the host toast — a viewer stuck on black with zero feedback was the old bug.
+			let app_fail = app_h.clone();
+			let peer_fail = peer.clone();
+			let stats_fail = stats_out.clone();
+			let on_failed = move || {
+				let msg = crate::i18n::t("host.ffmpegFailed").to_string();
+				let _ = stats_fail.try_send(DataMsg::Stats(msg.clone()));
+				let _ = app_fail.emit(
+					"session",
+					SessionEvent {
+						kind: "stream".into(),
+						peer: peer_fail,
+						sid,
+						detail: msg,
+					},
+				);
+			};
+			crate::process::spawn_encode_with_fallback(
+				&procs,
+				&proc_epoch,
+				stream_epoch,
+				&ffmpeg,
+				candidates,
+				mk_args,
+				on_ms,
+				on_settled,
+				on_failed,
+			);
+			true
 		};
 		let _ = stats_out.try_send(DataMsg::Stats(base_label));
 		// Tell the client our display orientation so it can render the video upright even if

@@ -74,6 +74,20 @@ unsafe impl Send for Decoder {}
 
 impl Decoder {
 	pub fn new(device: &ID3D11Device, codec: Codec, w: u32, h: u32, fps: u32) -> Result<Self> {
+		Self::new_ex(device, codec, w, h, fps, true)
+	}
+
+	/// Like `new`, but `allow_async: false` refuses the async-HW-MFT last resort: an async
+	/// MFT driven synchronously accepts input forever and never emits a frame, so the
+	/// zero-output watchdog rebuilds the decoder through here to force a sync (inbox) MFT.
+	pub fn new_ex(
+		device: &ID3D11Device,
+		codec: Codec,
+		w: u32,
+		h: u32,
+		fps: u32,
+		allow_async: bool,
+	) -> Result<Self> {
 		unsafe {
 			// 1. Init Media Foundation (idempotent; guarded so multiple decoders are fine).
 			MF_INIT.call_once(|| {
@@ -88,7 +102,7 @@ impl Decoder {
 
 			// 2. Find the decoder MFT for this input subtype. Prefer a hardware DXVA MFT (sync
 			//    or async); fall back to a software MFT so the path works on any GPU.
-			let transform = create_decoder_mft(subtype)?;
+			let transform = create_decoder_mft(subtype, allow_async)?;
 
 			// 3. Multithread-protect the caller's D3D11 device (it was created WITHOUT it), then
 			//    build the DXGI device manager and hand it to the MFT for zero-copy output.
@@ -243,7 +257,7 @@ impl Decoder {
 /// (`MF_TRANSFORM_ASYNC_UNLOCK` is mandatory before any call, else every call fails
 /// `MF_E_TRANSFORM_ASYNC_LOCKED`) and keep the first as a LAST-RESORT fallback for hardware that
 /// registers only async decoders (e.g. Qualcomm ARM64), but a sync MFT wins whenever one exists.
-unsafe fn create_decoder_mft(subtype: GUID) -> Result<IMFTransform> {
+unsafe fn create_decoder_mft(subtype: GUID, allow_async: bool) -> Result<IMFTransform> {
 	let in_info = MFT_REGISTER_TYPE_INFO {
 		guidMajorType: MFMediaType_Video,
 		guidSubtype: subtype,
@@ -309,13 +323,44 @@ unsafe fn create_decoder_mft(subtype: GUID) -> Result<IMFTransform> {
 
 	// No synchronous MFT anywhere — fall back to the unlocked async HW MFT (hardware-only
 	// clients). It may still not decode under the synchronous drive, but it is the only option.
-	if let Some(t) = async_fallback {
-		return Ok(t);
+	if allow_async {
+		if let Some(t) = async_fallback {
+			return Ok(t);
+		}
 	}
 
 	Err(windows::core::Error::from(
 		windows::Win32::Foundation::E_FAIL,
 	))
+}
+
+/// Headless capability probe — the Windows analogue of the Linux tiered probe (main.rs
+/// `--probe`). Reports, per codec, whether a decoder MFT this renderer can actually drive
+/// exists: `ok` requires a SYNCHRONOUS MFT (the drive model is ProcessInput→ProcessOutput;
+/// an async-only MFT accepts input forever and never emits a frame — the black-screen
+/// trap). JSON schema matches the Linux probe so the app's caps parser needs no changes.
+pub fn probe_json() -> String {
+	unsafe {
+		MF_INIT.call_once(|| {
+			let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+		});
+	}
+	let mut entries = Vec::new();
+	for (name, subtype) in [
+		("h264", MFVideoFormat_H264),
+		("h265", MFVideoFormat_HEVC),
+		("av1", MFVideoFormat_AV1),
+	] {
+		let sync_ok = unsafe { create_decoder_mft(subtype, false).is_ok() };
+		entries.push(format!(
+			concat!(
+				"{{\"codec\":\"{}\",\"ok\":{},\"decoder\":\"mediafoundation\",",
+				"\"hw\":true,\"tier\":\"hwaccel\",\"incompatible_with\":[]}}"
+			),
+			name, sync_ok
+		));
+	}
+	format!("[{}]", entries.join(","))
 }
 
 /// True if an activated MFT is asynchronous. All hardware MFTs are async; they must be unlocked
