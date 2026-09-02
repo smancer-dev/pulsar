@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import PulsarMark from '$lib/PulsarMark.svelte';
 	import { silentUpdateCheck, checkForUpdateUi } from '$lib/updater';
+	import { update as updateStore } from '$lib/update.svelte';
 	import {
 		api,
 		isTauri,
@@ -239,6 +240,46 @@
 			};
 		}
 	});
+
+	// DEV-ONLY update-modal preview. Nothing shows on its own (the live updater finds no
+	// newer release in dev). Press Ctrl+Alt+U to step through: available → downloading →
+	// installing → restarting → error → noSelfUpdate → off. This entire block is behind
+	// `import.meta.env.DEV`, a compile-time constant, so it is dead-code-eliminated from
+	// release builds — the shortcut exists ONLY in dev.
+	if (import.meta.env.DEV) {
+		$effect(() => {
+			const states = [
+				'off', 'available', 'downloading', 'installing', 'restarting', 'error', 'noSelfUpdate'
+			];
+			let i = 0;
+			const onKey = (e: KeyboardEvent) => {
+				if (!(e.ctrlKey && e.altKey && (e.key === 'U' || e.key === 'u'))) return;
+				e.preventDefault();
+				const st = states[(i = (i + 1) % states.length)];
+				// Drive the store fields directly — +page holds the same singleton the modal reads.
+				const u = updateStore;
+				u.from = '0.7.3';
+				u.to = '0.8.0';
+				u.notes =
+					'• Windows: encoder fallback chain — a dead NVENC/AMF pick no longer leaves a black screen\n' +
+					'• Viewer shows why there is no video (host verdict, first-frame watchdog)\n' +
+					'• Daily log file, openable from Settings → General\n' +
+					'• macOS: bundled ffplay fallback when mpv is not installed';
+				u.installable = st !== 'noSelfUpdate';
+				u.error = st === 'error' ? 'signature verification failed (updater-latest/latest.json)' : '';
+				u.received = st === 'downloading' ? 37 * 1024 * 1024 : 0;
+				u.total = st === 'downloading' ? 86 * 1024 * 1024 : 0;
+				u.phase =
+					st === 'downloading' || st === 'installing' || st === 'restarting' || st === 'error'
+						? (st as typeof u.phase)
+						: 'idle';
+				u.available = st !== 'off';
+				u.open = st !== 'off';
+			};
+			window.addEventListener('keydown', onKey);
+			return () => window.removeEventListener('keydown', onKey);
+		});
+	}
 
 	// Host-side activity: who's connected + a recent event log. Keyed by SESSION id (a
 	// device can hold several concurrent sessions — couch co-op / split panes), with the

@@ -106,7 +106,7 @@
 		max-height: calc(100vh - 96px);
 		display: flex;
 		flex-direction: column;
-		background: var(--surface-1);
+		background: var(--surface);
 		border: 1px solid var(--border);
 		border-radius: var(--r-md);
 		padding: 18px 20px;

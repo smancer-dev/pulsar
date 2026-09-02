@@ -40,6 +40,7 @@
 	--r-xs: 6px;
 	--r-sm: 9px;
 	--r: 13px;
+	--r-md: 13px; /* alias of --r — Controllers/Connections/UpdateModal reference it */
 	--r-lg: 18px;
 	--r-xl: 26px;
 	--r-pill: 999px;

@@ -37,3 +37,35 @@ class UpdateStore {
 }
 
 export const update = new UpdateStore();
+
+// Dev-only design hook: drive the badge/modal states from the browser console in the
+// `vite dev` mock (no Tauri, no real updater), e.g.
+//   __pulsarUpdate.mock('downloading')   // 'available' | 'downloading' | 'installing' |
+//                                        // 'restarting' | 'error' | 'noSelfUpdate' | 'off'
+if (import.meta.env.DEV && typeof window !== 'undefined') {
+	(window as unknown as { __pulsarUpdate: unknown }).__pulsarUpdate = {
+		store: update,
+		mock(state: string) {
+			update.from = '0.7.3';
+			update.to = '0.8.0';
+			update.notes =
+				'• Windows: encoder fallback chain — a dead NVENC/AMF pick no longer leaves a black screen\n' +
+				'• Viewer shows why there is no video (host verdict, first-frame watchdog)\n' +
+				'• Daily log file, openable from Settings → General\n' +
+				'• macOS: bundled ffplay fallback when mpv is not installed';
+			update.installable = state !== 'noSelfUpdate';
+			update.error = state === 'error' ? 'signature verification failed (updater-latest/latest.json)' : '';
+			update.received = state === 'downloading' ? 37 * 1024 * 1024 : 0;
+			update.total = state === 'downloading' ? 86 * 1024 * 1024 : 0;
+			update.phase =
+				state === 'downloading' || state === 'installing' || state === 'restarting' || state === 'error'
+					? state
+					: 'idle';
+			update.available = state !== 'off';
+			update.open = state !== 'off' && state !== 'badge';
+		}
+	};
+	// `?mockUpdate=<state>` applies a state on load (headless screenshots / design review).
+	const q = new URLSearchParams(window.location.search).get('mockUpdate');
+	if (q) (window as unknown as { __pulsarUpdate: { mock(s: string): void } }).__pulsarUpdate.mock(q);
+}

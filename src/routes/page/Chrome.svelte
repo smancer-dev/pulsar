@@ -325,7 +325,7 @@
 	/* The popup list is drawn by the OS — give its options a real background so they
 	   aren't unreadable. */
 	.lang-select select option {
-		background: var(--surface-1);
+		background: var(--surface);
 		color: var(--text);
 	}
 	/* Frameless window controls: flush to the top-right corner, full bar height, no border —

@@ -143,6 +143,32 @@ export async function checkForUpdateUi(isBusy?: () => boolean): Promise<void> {
  */
 export async function installUpdate(isBusy?: () => boolean): Promise<void> {
 	const u = updateState.handle;
+	// DEV-only mock: the design preview (Ctrl+Alt+U / ?mockUpdate) sets the store fields but
+	// no real Update handle, so Install here drives a SIMULATED download → install → restart
+	// with zero contact with the real updater — it can never actually replace the binary.
+	// Compiled out of release builds; the real path below is untouched.
+	if (import.meta.env.DEV && !u && updateState.available && updateState.installable) {
+		if (updateState.phase === 'downloading' || updateState.phase === 'installing') return;
+		const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+		updateState.error = '';
+		updateState.phase = 'downloading';
+		updateState.total = 86 * 1024 * 1024;
+		updateState.received = 0;
+		const step = updateState.total / 24;
+		while (updateState.received < updateState.total) {
+			await sleep(70);
+			updateState.received = Math.min(updateState.total, updateState.received + step);
+		}
+		updateState.phase = 'installing';
+		await sleep(1100);
+		updateState.phase = 'restarting';
+		await sleep(1400);
+		// A real restart relaunches the app; the mock just closes so it can be replayed.
+		updateState.phase = 'idle';
+		updateState.open = false;
+		updateState.available = false;
+		return;
+	}
 	if (!u || !updateState.installable) return;
 	if (updateState.phase === 'downloading' || updateState.phase === 'installing') return;
 	try {
