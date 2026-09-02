@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import Icon from '$lib/Icon.svelte';
 	import type { Config, NetworkMode } from '$lib/types';
-	import { api, onNodePort } from '$lib/api';
+	import { api, copyText, onNodePort } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
 
 	import { relayAuth } from '$lib/relayAuth.svelte';
@@ -24,6 +24,36 @@
 	// reconnect key; 2FA is never stored.
 	function submitTotp() {
 		if (relayAuth.totp.trim()) onReconnect?.();
+	}
+
+	// --- 2FA enrollment (for a relay the USER runs) -------------------------------
+	// Collapsed by default: the normal path (public relay, no 2FA) never sees it.
+	type Enrollment = { secret: string; secret_grouped: string; uri: string; qr_svg: string };
+	let enroll = $state<Enrollment | null>(null);
+	let enrollBusy = $state(false);
+	let enrollErr = $state('');
+	let copied = $state('');
+
+	/** Mint a fresh secret. The app never stores the relay's secret, so every call
+	 *  rotates — re-displaying an EXISTING enrollment is the relay CLI's job
+	 *  (`--generate-totp --auth-totp <secret>`). */
+	async function openEnroll() {
+		enrollBusy = true;
+		enrollErr = '';
+		try {
+			enroll = await api.generateRelayTotp(config?.relay ?? '');
+		} catch (e) {
+			enrollErr = String(e) || t('settings.relayTotpFailed');
+		} finally {
+			enrollBusy = false;
+		}
+	}
+
+	async function copy(what: string, text: string) {
+		if (await copyText(text)) {
+			copied = what;
+			setTimeout(() => (copied = copied === what ? '' : copied), 1500);
+		}
 	}
 
 	// When no port is pinned (node_port == 0) the box shows the ACTUAL random port
@@ -129,8 +159,65 @@
 				{t('settings.relayTotpVerify')}
 			</button>
 		</div>
+		<!-- Enrollment is for the OPERATOR of a relay, not for connecting — kept as a
+		     quiet link so the ordinary no-2FA path stays uncluttered. -->
+		{#if !enroll}
+			<button class="enrolllink" onclick={() => openEnroll()} disabled={enrollBusy}>
+				{t('settings.relayTotpSetup')}
+			</button>
+		{/if}
+		{#if enrollErr}
+			<span class="authmsg err">{enrollErr}</span>
+		{/if}
 	</div>
 </div>
+
+{#if enroll}
+	<!-- 2FA enrollment panel: QR to scan + the manual code when a QR can't be read. -->
+	<div class="srow enrollrow">
+		<div class="st">
+			<b>{t('settings.relayTotpSetup')}</b>
+			<span>{t('settings.relayTotpSetupDesc')}</span>
+		</div>
+		<div class="enrollpanel">
+			<!-- The SVG is produced by OUR OWN Rust (pulsar_relay::generate_totp renders the
+			     otpauth URI with the qrcode crate) and never contains user input, so {@html}
+			     carries no injection surface here. -->
+			<div class="qr">{@html enroll.qr_svg}</div>
+			<div class="enrollinfo">
+				<span class="hint">{t('settings.relayTotpScan')}</span>
+
+				<span class="lbl">{t('settings.relayTotpManual')}</span>
+				<div class="copyrow">
+					<code class="mono sel">{enroll.secret_grouped}</code>
+					<button class="verify" onclick={() => copy('secret', enroll?.secret ?? '')}>
+						{copied === 'secret' ? t('settings.relayTotpCopied') : t('settings.relayTotpCopy')}
+					</button>
+				</div>
+
+				<span class="lbl">{t('settings.relayTotpFlag')}</span>
+				<div class="copyrow">
+					<code class="mono sel">--auth-totp {enroll.secret}</code>
+					<button
+						class="verify"
+						onclick={() => copy('flag', `--auth-totp ${enroll?.secret ?? ''}`)}
+					>
+						{copied === 'flag' ? t('settings.relayTotpCopied') : t('settings.relayTotpCopy')}
+					</button>
+				</div>
+
+				<div class="enrollacts">
+					<button class="verify" onclick={() => openEnroll()} disabled={enrollBusy}>
+						{t('settings.relayTotpRegen')}
+					</button>
+					<button class="verify" onclick={() => (enroll = null)}>
+						{t('settings.relayTotpClose')}
+					</button>
+				</div>
+			</div>
+		</div>
+	</div>
+{/if}
 <div class="srow">
 	<div class="st">
 		<b>{t('settings.nodePort')}</b>
@@ -248,5 +335,91 @@
 	}
 	.authmsg.err {
 		color: oklch(0.62 0.2 25);
+	}
+	/* 2FA enrollment ---------------------------------------------------------- */
+	.enrolllink {
+		align-self: flex-start;
+		padding: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--accent);
+		cursor: pointer;
+		text-decoration: underline;
+		text-underline-offset: 2px;
+	}
+	.enrolllink:disabled {
+		opacity: 0.5;
+		cursor: progress;
+	}
+	.enrollrow {
+		align-items: flex-start;
+	}
+	.enrollpanel {
+		display: flex;
+		gap: 16px;
+		width: 460px;
+		padding: 14px;
+		border: 1px solid var(--border);
+		border-radius: var(--r-md);
+		background: var(--surface-2);
+	}
+	/* The generated SVG has no intrinsic size cap — pin it to a scannable square. */
+	.qr {
+		flex-shrink: 0;
+		width: 148px;
+		height: 148px;
+		padding: 6px;
+		background: #fff;
+		border-radius: var(--r-sm, 8px);
+	}
+	.qr :global(svg) {
+		display: block;
+		width: 100%;
+		height: 100%;
+	}
+	.enrollinfo {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		min-width: 0;
+		flex: 1;
+	}
+	.enrollinfo .hint {
+		font-size: 12px;
+		color: var(--text-faint);
+		line-height: 1.45;
+	}
+	.enrollinfo .lbl {
+		margin-top: 4px;
+		font-size: 10.5px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+		color: var(--text-faint);
+	}
+	.copyrow {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.copyrow code {
+		flex: 1;
+		min-width: 0;
+		font-size: 11.5px;
+		line-height: 1.5;
+		word-break: break-all;
+		color: var(--text);
+	}
+	/* Selectable so the code can be copied by hand when the button is unavailable. */
+	.sel {
+		user-select: text;
+	}
+	.enrollacts {
+		display: flex;
+		gap: 8px;
+		margin-top: 10px;
 	}
 </style>

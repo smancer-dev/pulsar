@@ -219,6 +219,15 @@ export const api = {
 	/** Free-text toast on the native renderer (bottom-center, ~6 s) — inbound chat
 	 * surfaces here because the video occludes the webview. */
 	renderToast: (id: number, text: string) => invoke<void>('render_toast', { id, text }),
+	/** Mint (or, with `existing`, re-display) a 2FA enrollment for a relay the user runs:
+	 *  the base32 secret the RELAY must start with, its manual-entry form, the setup URI
+	 *  and a scannable QR (inline SVG). Nothing is stored — starting the relay with the
+	 *  secret is what activates it. */
+	generateRelayTotp: (relay: string, existing?: string) =>
+		invoke<{ secret: string; secret_grouped: string; uri: string; qr_svg: string }>(
+			'generate_relay_totp',
+			{ relay, existing }
+		),
 	/** Path of the app log directory. */
 	logDirPath: () => invoke<string>('log_dir_path'),
 	/** Open the app log directory in the file manager; resolves to its path. */

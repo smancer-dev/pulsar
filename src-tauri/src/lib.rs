@@ -63,8 +63,8 @@ pub(crate) use process::no_window;
 use auth::{disconnect_all_peers, disconnect_peer, respond_request, submit_password};
 use avatar::{device_user_name, self_avatar};
 use commands::{
-	auto_connect_target, available_encoders, connect, controllers, forget_peer, get_config,
-	log_dir_path, open_log_dir,
+	auto_connect_target, available_encoders, connect, controllers, forget_peer, generate_relay_totp,
+	get_config, log_dir_path, open_log_dir,
 	lan_devices, launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password,
 	node_port, publish_games,
 	run_command, scan_folder, self_update_possible, session_password, set_config,
@@ -527,6 +527,7 @@ pub fn run() {
 		})
 		.invoke_handler(tauri::generate_handler![
 			get_config,
+			generate_relay_totp,
 			log_dir_path,
 			open_log_dir,
 			set_config,

@@ -20,6 +20,7 @@
 	"stream.msEncode": "ms encode",
 	"err.portInUse": "Port is in use — pick a different one in Settings → Network, or leave it empty",
 	"err.relayResolve": "Could not resolve the relay server",
+	"err.totpSecret": "Invalid 2FA secret (base32 expected)",
 	"err.badTarget": "Invalid ID or IP",
 	"host.gstFailed": "(gst failed to start)",
 	"host.ffmpegFailed": "(ffmpeg failed to start)",

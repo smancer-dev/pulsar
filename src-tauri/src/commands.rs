@@ -30,6 +30,61 @@ pub(crate) async fn open_log_dir() -> Result<String, String> {
 	crate::logging::open_log_dir()
 }
 
+/// One 2FA (TOTP) enrollment, as shown in Settings → Network. Field names are snake_case
+/// to match the other command DTOs (`LocalCaps`, `Config`).
+#[derive(serde::Serialize)]
+pub(crate) struct TotpEnrollmentDto {
+	/// The base32 shared secret — what the RELAY must run with (`--auth-totp <secret>`).
+	secret: String,
+	/// The same secret in 4-character groups, for typing into an authenticator by hand
+	/// when the QR can't be scanned.
+	secret_grouped: String,
+	/// `otpauth://totp/…` setup URI (what the QR encodes).
+	uri: String,
+	/// The URI rendered as a scannable QR, as a self-contained inline SVG document.
+	qr_svg: String,
+}
+
+/// Mint (or re-display) a 2FA enrollment for a relay the user operates.
+///
+/// `relay` is only the label shown inside the authenticator app (the configured relay
+/// address is used when it's blank). Passing a non-empty `existing` base32 secret
+/// re-displays THAT enrollment instead of rotating it, so a lost QR can be recovered
+/// without invalidating everyone. Nothing is stored here — the secret only takes effect
+/// when the relay is started with it.
+#[tauri::command]
+pub(crate) async fn generate_relay_totp(
+	state: State<'_, AppState>,
+	relay: String,
+	existing: Option<String>,
+) -> Result<TotpEnrollmentDto, String> {
+	let label = {
+		let r = relay.trim();
+		if r.is_empty() {
+			state.config.lock().unwrap().relay.clone()
+		} else {
+			r.to_string()
+		}
+	};
+	let e = match existing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+		Some(s) => {
+			// Validate before echoing it back: a typo'd secret would otherwise produce a QR
+			// that enrolls fine but can never verify.
+			pulsar_relay::base32_decode(s)
+				.filter(|b| !b.is_empty())
+				.ok_or_else(|| crate::i18n::t("err.totpSecret").to_string())?;
+			pulsar_relay::enrollment_from_secret(s, &label, "Pulsar")
+		}
+		None => pulsar_relay::generate_totp(&label, "Pulsar"),
+	};
+	Ok(TotpEnrollmentDto {
+		secret: e.secret,
+		secret_grouped: e.secret_grouped,
+		uri: e.uri,
+		qr_svg: e.qr_svg,
+	})
+}
+
 #[tauri::command]
 pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<Config, String> {
 	tracing::info!("get_config invoked (frontend JS is running)");

@@ -28,6 +28,37 @@ pub fn run_relay(args: &[String]) {
 				.expect("invalid --host/--port")
 		}
 	};
+	// 2FA enrollment: `pulsar --relay --generate-totp` prints a scannable QR + the
+	// manual-entry code and exits WITHOUT starting the relay, so an operator never has to
+	// invent a base32 secret by hand. Same output as the standalone binary's flag.
+	// (Windows: this build has no console — use the standalone `pulsar-relay` there.)
+	if args.iter().any(|a| a == "--generate-totp") {
+		let label = addr.to_string();
+		// Re-display an existing secret if one was passed, else mint a fresh one — so an
+		// operator can recover a lost QR without invalidating everyone's enrollment.
+		let e = match flag("--auth-totp").or_else(|| std::env::var("PULSAR_RELAY_AUTH_TOTP").ok()) {
+			Some(s) => {
+				pulsar_relay::base32_decode(&s)
+					.filter(|b| !b.is_empty())
+					.unwrap_or_else(|| {
+						panic!("invalid --auth-totp (expected a base32 secret): {s:?}")
+					});
+				pulsar_relay::enrollment_from_secret(&s, &label, "Pulsar")
+			}
+			None => pulsar_relay::generate_totp(&label, "Pulsar"),
+		};
+		println!("{}", e.qr_terminal);
+		println!("Pulsar relay 2FA (TOTP) enrollment");
+		println!("  Scan the QR above with any authenticator app (Google Authenticator, Aegis, 1Password, …).");
+		println!("  Can't scan? Enter this code by hand:");
+		println!("      {}", e.secret_grouped);
+		println!("  Setup URI: {}", e.uri);
+		println!();
+		println!("  Then start the relay with:");
+		println!("      pulsar --relay --auth-totp {}", e.secret);
+		println!("  (add --auth-password <pw> to require BOTH factors)");
+		return;
+	}
 	// Operator bandwidth limits (same flags + env as the standalone `pulsar-relay`).
 	// Default unlimited; e.g. `pulsar --relay --user-rate 10mbit --user-data 5gb`.
 	let rate = |name: &str, env: &str| {
