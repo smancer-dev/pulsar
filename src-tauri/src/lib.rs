@@ -14,6 +14,7 @@
 
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
+mod logging;
 mod audio_io;
 mod auth;
 mod avatar;
@@ -63,6 +64,7 @@ use auth::{disconnect_all_peers, disconnect_peer, respond_request, submit_passwo
 use avatar::{device_user_name, self_avatar};
 use commands::{
 	auto_connect_target, available_encoders, connect, controllers, forget_peer, get_config,
+	log_dir_path, open_log_dir,
 	lan_devices, launch_remote_game, list_audio_sources, list_remote_games, local_ip, new_password,
 	node_port, publish_games,
 	run_command, scan_folder, self_update_possible, session_password, set_config,
@@ -266,13 +268,8 @@ pub fn rumble_selftest() {
 }
 
 pub fn run() {
-	tracing_subscriber::fmt()
-		.with_env_filter(
-			tracing_subscriber::EnvFilter::try_from_default_env()
-				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-		)
-		.init();
-	tracing::info!("Pulsar starting");
+	logging::init();
+	tracing::info!(version = env!("CARGO_PKG_VERSION"), "Pulsar starting");
 	#[cfg(windows)]
 	unsafe {
 		// Children inherit the error mode: a crashing ffmpeg encoder probe (h264_vulkan
@@ -530,6 +527,8 @@ pub fn run() {
 		})
 		.invoke_handler(tauri::generate_handler![
 			get_config,
+			log_dir_path,
+			open_log_dir,
 			set_config,
 			set_language,
 			go_online,

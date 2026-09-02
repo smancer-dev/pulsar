@@ -16,6 +16,20 @@ use crate::process::{detect_encoders, ffmpeg_bin, HostGame};
 use crate::state::{AppState, StreamCfg};
 use crate::util::{config_path, connect_target, forget_peer_key, is_executable, AUTO_CONNECT};
 
+/// Where the app log lives (Settings shows it next to the "open" button).
+#[tauri::command]
+pub(crate) async fn log_dir_path() -> Result<String, String> {
+	crate::logging::log_dir()
+		.map(|d| d.to_string_lossy().into_owned())
+		.ok_or_else(|| "log directory unavailable".to_string())
+}
+
+/// Open the log directory in the file manager; returns its path.
+#[tauri::command]
+pub(crate) async fn open_log_dir() -> Result<String, String> {
+	crate::logging::open_log_dir()
+}
+
 #[tauri::command]
 pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<Config, String> {
 	tracing::info!("get_config invoked (frontend JS is running)");

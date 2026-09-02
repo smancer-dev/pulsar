@@ -26,6 +26,21 @@
 			.catch(() => {});
 	}
 
+	// App log directory (file logging is always on; this is where a black-screen
+	// report comes from). The path is shown so it can be found even when no file
+	// manager opens.
+	let logDir = $state('');
+	if (isTauri) {
+		api.logDirPath()
+			.then((p) => (logDir = p))
+			.catch(() => {});
+	}
+	function openLogs() {
+		api.openLogDir()
+			.then((p) => (logDir = p))
+			.catch(() => {});
+	}
+
 	// Display name defaults: an unset name falls back to the OS user's name on the
 	// wire (host.rs/play.rs already do this), so the input mirrors that — the OS
 	// name is the PLACEHOLDER, and a value equal to it (or the legacy "Pulsar
@@ -99,11 +114,37 @@
 	<button class="toggle" aria-label={t('settings.uiHwaccel')} class:on={hwaccelOn} aria-pressed={hwaccelOn} onclick={toggleHwaccel}><span class="knob"></span></button>
 </div>
 <div class="srow">
+	<div class="st">
+		<b>{t('settings.logs')}</b>
+		<span>{t('settings.logsDesc')}{#if logDir} <span class="mono path">{logDir}</span>{/if}</span>
+	</div>
+	<button class="act" onclick={openLogs}>{t('settings.openLogs')}</button>
+</div>
+<div class="srow">
 	<div class="st"><b>{t('settings.version')}</b><span>{t('settings.versionDesc')}</span></div>
 	<span class="mono ver">Pulsar v{version}</span>
 </div>
 
 <style>
+	.act {
+		flex-shrink: 0;
+		padding: 8px 14px;
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		background: var(--surface, transparent);
+		color: var(--text);
+		font: inherit;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.act:hover {
+		border-color: var(--accent);
+		color: var(--accent);
+	}
+	.path {
+		word-break: break-all;
+		opacity: 0.8;
+	}
 	.srow {
 		display: flex;
 		align-items: center;
