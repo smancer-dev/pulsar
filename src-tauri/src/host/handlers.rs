@@ -1956,12 +1956,12 @@ pub(super) fn make_on_stream(
 				encoder
 			}
 		};
-		// Off-Windows, ffmpeg is the ONLY encode path, so an encoder ffmpeg merely *lists* (a generic
-		// build lists h264_nvenc even with no NVIDIA GPU) but can't initialize here must be dropped,
-		// not used — else it fails at spawn and sends no video (the Orange-Pi-as-host case:
-		// h264_nvenc → "Cannot load libcuda.so.1"). Validate + degrade to a working encoder
-		// (ultimately libx264). Windows keeps its native-NVENC path + hybrid guard (compiled out here).
-		#[cfg(not(windows))]
+		// An encoder ffmpeg merely *lists* (a generic build lists h264_nvenc even with no NVIDIA
+		// GPU) but can't initialize here must be dropped, not used — else it fails at spawn and
+		// sends no video (the Orange-Pi-as-host case: h264_nvenc → "Cannot load libcuda.so.1";
+		// the GP108/AMD-Windows case: nvenc picked by name, no silicon). Validate + degrade to
+		// a working encoder (ultimately libx264) on every platform; on Windows the nvenc verdict
+		// is the NVENC SDK's. The runtime fallback chain below remains the second safety net.
 		let encoder = crate::process::resolve_encoder_validated(
 			&ffmpeg,
 			encoder,

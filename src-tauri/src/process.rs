@@ -303,25 +303,17 @@ pub fn encoder_wire_id(e: HwEncoder) -> &'static str {
 }
 
 /// Encoder backends that ACTUALLY work on this machine, preference-ordered, always
-/// ending with Software (which needs no probe). Off-Windows each candidate must pass
-/// the cached one-frame probe (a generic ffmpeg build LISTS h264_nvenc on a GPU-less
-/// SBC); on Windows ffmpeg probes are unreliable on hybrid boxes and the native NVENC
-/// SDK path exists, so the name-detected list is trusted as-is.
+/// ending with Software (which needs no probe). Every candidate must have at least one
+/// codec that passes `validated_codecs` — the cached one-frame probe (a generic ffmpeg
+/// build LISTS h264_nvenc on a GPU-less SBC), or on Windows the NVENC SDK session check
+/// for nvenc. This is the ONE source of "which families work here": the startup caps,
+/// the host's QueryStreamCaps reply and the stream-time degrade all read it, so a dead
+/// family can never be advertised to a client and then die at spawn.
 pub fn validated_encoders(ffmpeg: &str, vaapi_device: &str) -> Vec<HwEncoder> {
 	let mut out: Vec<HwEncoder> = detect_encoders(ffmpeg)
 		.into_iter()
 		.filter(|&e| e != HwEncoder::Software)
-		.filter(|&e| {
-			#[cfg(windows)]
-			{
-				let _ = (&e, vaapi_device);
-				true
-			}
-			#[cfg(not(windows))]
-			{
-				!validated_codecs(ffmpeg, e, vaapi_device).is_empty()
-			}
-		})
+		.filter(|&e| !validated_codecs(ffmpeg, e, vaapi_device).is_empty())
 		.collect();
 	out.push(HwEncoder::Software);
 	out
@@ -507,9 +499,30 @@ fn probe_encoder_codec(
 }
 
 /// Which codecs an encoder can ACTUALLY encode on this machine, VALIDATED by a real
-/// one-frame probe (not just ffmpeg's `-encoders` listing). Falls back to the name-presence
-/// set if probing is somehow unavailable.
+/// one-frame probe (not just ffmpeg's `-encoders` listing).
+///
+/// Windows NVENC is the exception: the ffmpeg probe is the wrong oracle there — it
+/// targets the display GPU, so on a hybrid laptop `h264_nvenc` fails while the native
+/// SDK path (explicit NVIDIA device) works, and it passes on GP108 MX cards that have
+/// no NVENC silicon at all. The NVENC SDK itself is asked instead (open a session,
+/// enumerate its encode GUIDs — per codec, so a Kepler card is never offered HEVC).
 pub fn validated_codecs(ffmpeg: &str, encoder: HwEncoder, vaapi_device: &str) -> Vec<VCodec> {
+	#[cfg(windows)]
+	if encoder == HwEncoder::Nvenc {
+		let _ = vaapi_device;
+		let listed = encoder.available_codecs(&encoders_text(ffmpeg));
+		return pulsar_capture::nvenc_codecs()
+			.iter()
+			.map(|c| match c {
+				pulsar_capture::Codec::H264 => VCodec::H264,
+				pulsar_capture::Codec::H265 => VCodec::H265,
+				pulsar_capture::Codec::Av1 => VCodec::Av1,
+			})
+			// The SDK says the silicon can; the bundled ffmpeg must still have the
+			// encoder compiled in for the ffmpeg fallback path to use it.
+			.filter(|c| listed.contains(c))
+			.collect();
+	}
 	let listed = encoder.available_codecs(&encoders_text(ffmpeg));
 	listed
 		.into_iter()
@@ -528,15 +541,10 @@ pub fn resolve_codec_validated(
 ) -> VCodec {
 	let text = encoders_text(ffmpeg);
 	let avail = validated_codecs(ffmpeg, encoder, vaapi_device);
-	// UNRELIABLE-PROBE GUARD: if H.264 is listed for this encoder but fails to validate, the
-	// probe is testing the wrong thing — classic on a HYBRID laptop, where `ffmpeg -c:v
-	// h264_nvenc` reports "no encode device" because ffmpeg targets the AMD display GPU, not
-	// the NVIDIA dGPU (the native SDK path uses the explicit dGPU device and works fine). In
-	// that case trust the name-based listing instead of spuriously downgrading the codec.
-	let h264_listed = encoder.available_codecs(&text).contains(&VCodec::H264);
-	if h264_listed && !avail.contains(&VCodec::H264) {
-		return pipeline::resolve_codec(encoder, requested, &text);
-	}
+	// (The former "unreliable-probe guard" — trust the name listing when H.264 fails to
+	// validate — existed for Windows hybrid laptops, where the ffmpeg nvenc probe targets
+	// the wrong GPU. `validated_codecs` now asks the NVENC SDK there, so a failed probe
+	// is authoritative on every platform and the guard would only re-admit dead codecs.)
 	if avail.contains(&requested) {
 		requested
 	} else if avail.contains(&VCodec::H264) {
@@ -554,10 +562,10 @@ pub fn resolve_codec_validated(
 /// encoder if it can't — ending at `Software` (libx264), which always works. ffmpeg merely
 /// *lists* an encoder if it's compiled in (a generic build lists `h264_nvenc` even with no
 /// NVIDIA GPU), so name detection alone picks unusable encoders on machines like an ARM SBC host
-/// (`h264_nvenc` → "Cannot load libcuda.so.1" → no video). This is **off-Windows only**: there
-/// ffmpeg is the sole encode path, so a failed probe is authoritative. Windows keeps its native
-/// NVENC SDK path + the hybrid-laptop probe guard (`resolve_codec_validated`) untouched.
-#[cfg(not(windows))]
+/// (`h264_nvenc` → "Cannot load libcuda.so.1" → no video). On Windows the nvenc verdict comes
+/// from the NVENC SDK (see `validated_codecs`), so the same degrade is correct there too: a
+/// GP108 box goes nvenc → amf/qsv/mf → software here, BEFORE the first spawn, and the runtime
+/// fallback chain (`spawn_encode_with_fallback`) stays the second safety net.
 pub fn resolve_encoder_validated(
 	ffmpeg: &str,
 	chosen: HwEncoder,

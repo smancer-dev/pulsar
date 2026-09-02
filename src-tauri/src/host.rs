@@ -1625,7 +1625,6 @@ pub(crate) async fn go_online(
 							crate::process::encoder_from_str(&cfg.encoder),
 							&pulsar_core::pipeline::detect(&enc_text),
 						);
-						#[cfg(not(windows))]
 						let encoder = crate::process::resolve_encoder_validated(
 							&ffmpeg,
 							encoder,
