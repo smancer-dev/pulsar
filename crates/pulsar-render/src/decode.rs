@@ -109,6 +109,32 @@ unsafe fn decoder_name(dec: *const ff::AVCodec) -> String {
 		.into_owned()
 }
 
+/// Does `dec` list `want` among its native output pixel formats?
+///
+/// ffmpeg 9 removed `AVCodec::pix_fmts`; its replacement,
+/// `avcodec_get_supported_config()`, exists since 7.1. `ffmpeg_supported_config`
+/// is set by build.rs from the libavcodec version ffmpeg-sys-next detected.
+#[cfg(ffmpeg_supported_config)]
+unsafe fn pix_fmts_contain(dec: *const ff::AVCodec, want: ff::AVPixelFormat) -> bool {
+	let mut list: *const std::ffi::c_void = ptr::null();
+	let mut n: std::ffi::c_int = 0;
+	let rc = ff::avcodec_get_supported_config(
+		ptr::null(),
+		dec,
+		ff::AVCodecConfig::AV_CODEC_CONFIG_PIX_FORMAT,
+		0,
+		&mut list,
+		&mut n,
+	);
+	// NULL means "unconstrained" — the same case the old `pix_fmts == NULL` path
+	// treated as "not a DRM_PRIME-native decoder"; keep that behaviour.
+	if rc < 0 || list.is_null() || n <= 0 {
+		return false;
+	}
+	std::slice::from_raw_parts(list as *const ff::AVPixelFormat, n as usize).contains(&want)
+}
+
+#[cfg(not(ffmpeg_supported_config))]
 unsafe fn pix_fmts_contain(dec: *const ff::AVCodec, want: ff::AVPixelFormat) -> bool {
 	let mut p = (*dec).pix_fmts;
 	if p.is_null() {
