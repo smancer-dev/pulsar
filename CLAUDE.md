@@ -258,6 +258,12 @@ Games library + folder scan, gamepad-driven UI nav (`gamepadNav.svelte.ts`),
 auto-updater, relay mode, VNC-mode client path (`io_cmds.rs`), the SvelteKit UI
 and the Tauri bridge.
 
+**Next major task — adaptive streaming rework:** design + phased plan live in
+`../pulsar-core/docs/adaptive-streaming.md` (pointer in `../pulsar-core/AGENTS.md`).
+The client controller is `src-tauri/src/play/hold.rs` (bitrate-only, loss-only,
+2 s GOP in remote mode → mid-stream freezes on lossy paths); Phase 0 there first,
+then the shared `pulsar-core::adapt` ladder. Do not push behaviour changes untested.
+
 **Scaffolded / known gaps:** macOS virtual gamepad (no-op stub); HW encode on
 the Wayland/gst path (software x264 only); media-over-the-session for
 symmetric-NAT (media is a direct UDP RTP flow today — fine for LAN/cone-NAT/
