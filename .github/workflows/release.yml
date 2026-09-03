@@ -88,6 +88,9 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
+          # GitHub's ubuntu-22.04 image ships libunwind-14-dev, which conflicts with the
+          # libunwind-dev that libgstreamer1.0-dev depends on ("held broken packages").
+          sudo apt-get remove -y libunwind-14-dev || true
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
