@@ -405,6 +405,17 @@ impl NV_ENC_CONFIG_HEVC {
 /// HEVC `repeatSPSPPS` bit (bit 7 of the HEVC bitfield word) — re-emit VPS/SPS/PPS in-band
 /// on each IDR so a late-joining RTP client (no out-of-band SDP) always has parameter sets.
 pub const NV_ENC_HEVC_FLAG_REPEAT_SPSPPS: u32 = 1 << 7;
+/// HEVC `enableIntraRefresh` (bit 8 of the HEVC bitfield word, see the layout comment).
+pub const NV_ENC_HEVC_FLAG_INTRA_REFRESH: u32 = 1 << 8;
+/// H.264 `enableIntraRefresh` (bit 10 of the H.264 bitfield word: …outputFramePackingSEI:8,
+/// outputRecoveryPointSEI:9, enableIntraRefresh:10, enableConstrainedEncoding:11,
+/// repeatSPSPPS:12 — consistent with the `1 << 12` the code already uses for repeatSPSPPS).
+pub const NV_ENC_H264_FLAG_INTRA_REFRESH: u32 = 1 << 10;
+/// AV1 `enableIntraRefresh` (bit 5 of the AV1 bitfield word, see the layout comment).
+pub const NV_ENC_AV1_FLAG_INTRA_REFRESH: u32 = 1 << 5;
+/// `NVENC_INFINITE_GOPLENGTH`: intra refresh requires an infinite GOP (no scheduled IDRs —
+/// recovery is the rolling wave, plus the on-demand forced IDR).
+pub const NVENC_INFINITE_GOPLENGTH: u32 = 0xFFFF_FFFF;
 /// HEVC `chromaFormatIDC` = 1 (4:2:0) packed at bits 9..10.
 pub const NV_ENC_HEVC_CHROMA_420: u32 = 1 << 9;
 

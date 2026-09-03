@@ -1041,18 +1041,13 @@ pub(crate) async fn start_remote_play(
 	// Only the Linux libav renderer can resume on a partially intra-refreshed picture; the
 	// Windows/macOS depacketizer waits for an IDR and gets a short GOP instead.
 	acfg.ir_capable = cfg!(target_os = "linux");
+	// Resolution and fps are FIXED for the session (settings / display) — maintainer's
+	// decision: only the bitrate adapts within them (the ladder stays available, off).
+	acfg.ladder = false;
 	let ctl = pulsar_core::adapt::Controller::new(acfg);
-	let (req_w, req_h, req_fps, req_kbps) = if mos {
-		// Media-over-session carries the per-packet measurements the controller runs on.
-		let p = ctl.point();
-		let top = ctl.points().first() == Some(&p);
-		let known_native = native_dims.0 > 0 && native_dims.1 > 0;
-		let (w, h) = if known_native || !top { (p.width, p.height) } else { (req_w, req_h) };
-		let fps = if req_fps > 0 || !top { p.fps } else { 0 };
-		(w, h, fps, ctl.encoder_kbps())
-	} else {
-		(req_w, req_h, req_fps, req_kbps)
-	};
+	// Media-over-session carries the per-packet measurements the controller runs on; the
+	// first request already uses its start rate (the per-peer memory hint, or the cap).
+	let req_kbps = if mos { ctl.encoder_kbps() } else { req_kbps };
 	tracing::info!(
 		native = ?native_dims,
 		cap = cap_for_ctl,
@@ -1121,8 +1116,10 @@ pub(crate) async fn start_remote_play(
 		// Every session starts with the normal GOP; the hold-loop's controller flips this
 		// on the first sustained loss (adaptive streaming Phase 0).
 		loss_recovery: pulsar_core::service::LossRecovery::Normal,
-		// Ask for XOR parity (Phase 2.1) — the host sends it only once we report loss.
+		// Ask for FEC parity (Phase 2.1) — the host sends it only once we report loss;
+		// Reed-Solomon (several losses per frame) preferred, XOR for older hosts.
 		fec: mos,
+		fec_rs: mos,
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
 		// Park ANY live pulsar-render child instead of killing it — regardless of whether

@@ -146,6 +146,9 @@ pub(super) async fn hold_session(
 	// FEC (Phase 2.1): the host sends XOR parity over the video packets once we report loss;
 	// the decoder keeps the recent packets and rebuilds a group's single missing one.
 	let mut fec_dec = media::FecDecoder::default();
+	// Reed-Solomon parity (preferred: several losses per frame); the XOR decoder above stays
+	// for hosts that only have the single-loss groups.
+	let mut fec_rs = media::RsFecDecoder::default();
 	let mut win_fec_ok = 0u32;
 	// Delay-gradient sampling (Phase 3): per video FRAME (RTP timestamp), the arrival time of
 	// its last packet on a session-local ms clock feeds the controller's trendline estimator.
@@ -300,6 +303,7 @@ pub(super) async fn hold_session(
 				audio_layout: cur_audio_layout,
 				loss_recovery: cur_recovery,
 				fec: mos,
+				fec_rs: mos,
 			}
 		};
 	}
@@ -337,6 +341,22 @@ pub(super) async fn hold_session(
 						// arrived (late: the reorder buffer slots it in). Also the only place we
 						// learn the host's group size, which the controller deducts from the
 						// encoder rate so the wire rate stays at the target.
+						if tag == media::TAG_FEC_RS {
+							for (seq, pkt) in fec_rs.on_parity(rtp) {
+								if let Some(s) = fwd_sock.as_ref() {
+									let _ = s.send_to(&pkt, v_dest).await;
+								}
+								if missing.remove(&seq).is_some() {
+									win_lost = win_lost.saturating_sub(1);
+								}
+								win_fec_ok += 1;
+							}
+							let r = fec_rs.last_ratio();
+							if (r - ctl.fec_overhead()).abs() > 1e-3 {
+								ctl.set_fec_overhead(r);
+							}
+							continue;
+						}
 						if tag == media::TAG_FEC {
 							if let Some((seq, pkt)) = fec_dec.on_parity(rtp) {
 								if let Some(s) = fwd_sock.as_ref() {
@@ -347,8 +367,10 @@ pub(super) async fn hold_session(
 								}
 								win_fec_ok += 1;
 							}
-							if fec_dec.last_n() != ctl.fec_n() {
-								ctl.set_fec_n(fec_dec.last_n());
+							let n = fec_dec.last_n();
+							let r = if n == 0 { 0.0 } else { 1.0 / n as f32 };
+							if (r - ctl.fec_overhead()).abs() > 1e-3 {
+								ctl.set_fec_overhead(r);
 							}
 							continue;
 						}
@@ -368,6 +390,7 @@ pub(super) async fn hold_session(
 						if tag == media::TAG_VIDEO {
 							if let Some(seq) = media::rtp_seq(rtp) {
 								fec_dec.on_packet(seq, rtp);
+								fec_rs.on_packet(seq, rtp);
 								// Frame boundary = a new RTP timestamp: the previous frame is
 								// complete, sample its send-vs-arrival delay for the estimator.
 								if rtp.len() >= 8 {
@@ -413,6 +436,7 @@ pub(super) async fn hold_session(
 										// rebuilds it). Resync cleanly to the new base.
 										missing.clear();
 										fec_dec.reset();
+										fec_rs.reset();
 										ctl.on_stream_restart();
 										frame_ts = None;
 										last_vseq = Some(seq);
@@ -429,6 +453,7 @@ pub(super) async fn hold_session(
 											// session. Resync cleanly to the new base instead.
 											missing.clear();
 											fec_dec.reset();
+											fec_rs.reset();
 											ctl.on_stream_restart();
 											frame_ts = None;
 											last_vseq = Some(seq);
@@ -917,7 +942,7 @@ pub(super) async fn hold_session(
 							ceiling = ctl.ceiling(),
 							probe_wait = ctl.probe_wait(),
 							noise_pct = ctl.noise_loss() * 100.0,
-							fec_n = ctl.fec_n(),
+							fec_pct = ctl.fec_overhead() * 100.0,
 							recovery = ?cur_recovery,
 							manual = manual_bitrate,
 							reason = d.reason,

@@ -45,6 +45,11 @@ pub struct CaptureConfig {
 	pub output_idx: u32,
 	/// `plan.low_latency` → preset/tune/rc selection.
 	pub low_latency: bool,
+	/// Periodic intra refresh instead of scheduled IDRs (adaptive streaming: a lost
+	/// reference heals within one refresh wave, no keyframe bitrate spike). Only for clients
+	/// that resume on a partially-refreshed picture (`StreamReq::loss_recovery ==
+	/// IntraRefresh`); the on-demand IDR (`request_idr`) keeps working either way.
+	pub intra_refresh: bool,
 	/// Composite the cursor (v1: parsed but no-op unless `cursor.rs` landed).
 	pub draw_mouse: bool,
 	/// PER-WINDOW capture (Phase 2b): when `Some(hwnd)`, the native path captures that single
@@ -504,6 +509,7 @@ pub fn start_capture_encode(cfg: CaptureConfig) -> io::Result<CaptureHandle> {
 						dest: cfg.dest.clone(),
 						codec: cfg.codec,
 						low_latency: cfg.low_latency,
+						intra_refresh: cfg.intra_refresh,
 						rotation,
 					},
 				) {

@@ -220,6 +220,8 @@ pub struct EncParams {
 	pub dest: String, // "rtp://10.0.0.5:9000"
 	pub codec: Codec, // native NVENC: H264 + HEVC + AV1 (AV1 needs Ada/Ampere+; else Err → ffmpeg)
 	pub low_latency: bool,
+	/// Periodic intra refresh (rolling intra wave) instead of scheduled IDRs.
+	pub intra_refresh: bool,
 	/// Host display rotation (degrees CW: 0/90/180/270). The BGRA→NV12 Blt rotates the captured
 	/// frame by this so the STREAM is already upright for the viewer (no client-side rotation).
 	pub rotation: u32,

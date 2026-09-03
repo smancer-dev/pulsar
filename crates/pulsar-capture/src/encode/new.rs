@@ -271,6 +271,17 @@ impl Encoder {
 			.unwrap_or(10);
 		let gop = (fps * idr_sec).max(1);
 		cfg.gopLength = gop;
+		// Adaptive streaming: the client asked for a rolling intra refresh — NVENC requires
+		// an infinite GOP for it (no scheduled IDRs; the wave refreshes the picture within
+		// `intraRefreshPeriod` frames, spread over `intraRefreshCnt` frames). The on-demand
+		// forced IDR (`request_idr`) still works, so a lost reference the wave cannot heal
+		// in time is still recovered by the client's keyframe request.
+		let intra_refresh = p.intra_refresh;
+		if intra_refresh {
+			cfg.gopLength = nvenc::NVENC_INFINITE_GOPLENGTH;
+		}
+		let refresh_period = fps.max(1); // one full wave per second
+		let refresh_cnt = (fps / 2).max(1); // spread over half a second
 		cfg.frameIntervalP = 1; // 1 = no B-frames (IPPP)
 
 		// Rate control: CBR at the requested bitrate, tiny VBV for low latency.
@@ -307,6 +318,12 @@ impl Encoder {
 				// client (no out-of-band SDP fmtp) always has parameter sets. Matches the CLI.
 				h264.set_flags(1u32 << 12);
 				h264.idrPeriod = gop; // IDR every gopLength frames (finite GOP)
+				if intra_refresh {
+					h264.set_flags(nvenc::NV_ENC_H264_FLAG_INTRA_REFRESH);
+					h264.idrPeriod = nvenc::NVENC_INFINITE_GOPLENGTH;
+					h264.intraRefreshPeriod = refresh_period;
+					h264.intraRefreshCnt = refresh_cnt;
+				}
 				h264.set_entropyCodingMode(nvenc::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC);
 				h264.maxNumRefFrames = 1;
 				h264.set_numRefL0(1);
@@ -324,6 +341,12 @@ impl Encoder {
 				);
 				hevc.idrPeriod = gop;
 				hevc.maxNumRefFramesInDPB = 1;
+				if intra_refresh {
+					hevc.set_flags(nvenc::NV_ENC_HEVC_FLAG_INTRA_REFRESH);
+					hevc.idrPeriod = nvenc::NVENC_INFINITE_GOPLENGTH;
+					hevc.intraRefreshPeriod = refresh_period;
+					hevc.intraRefreshCnt = refresh_cnt;
+				}
 			}
 			Codec::Av1 => {
 				// NV_ENC_CONFIG_AV1: repeatSeqHdr re-emits the sequence header OBU on each key
@@ -336,6 +359,12 @@ impl Encoder {
 				av1.set_flags(nvenc::NV_ENC_AV1_FLAG_REPEAT_SEQ_HDR | nvenc::NV_ENC_AV1_CHROMA_420);
 				av1.idrPeriod = gop;
 				av1.maxNumRefFramesInDPB = 1;
+				if intra_refresh {
+					av1.set_flags(nvenc::NV_ENC_AV1_FLAG_INTRA_REFRESH);
+					av1.idrPeriod = nvenc::NVENC_INFINITE_GOPLENGTH;
+					av1.intraRefreshPeriod = refresh_period;
+					av1.intraRefreshCnt = refresh_cnt;
+				}
 			}
 		}
 
@@ -430,7 +459,10 @@ impl Encoder {
 			height: h,
 			rotation: p.rotation,
 			fps,
-			idr_interval: gop,
+			// With intra refresh there are no scheduled IDRs (the wave heals; the on-demand
+			// IDR stays): make the periodic forced IDR effectively never fire (frame 0 and the
+			// fast startup window still do).
+			idr_interval: if intra_refresh { u32::MAX } else { gop },
 			_kept_device: Some(kept_device),
 			_kept_context: Some(kept_context),
 			_kept_vdevice: Some(kept_vdevice),

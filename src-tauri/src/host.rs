@@ -68,13 +68,20 @@ use crate::util::{config_path, display_rotation, identity_path, resolve_relay, D
 #[cfg(target_os = "linux")]
 pub(crate) mod cursor;
 mod handlers;
+#[cfg(target_os = "linux")]
+mod libav;
 use handlers::{make_on_audio, make_on_file, make_on_stream};
 
 /// Transport features this host advertises in its `StreamCaps` reply: it can carry
 /// the RTP media inside the session (single socket) and honors NACK retransmits.
 fn media_features() -> Vec<String> {
-	use pulsar_core::service::media::{FEAT_FEC, FEAT_MOS, FEAT_NACK};
-	vec![FEAT_MOS.to_string(), FEAT_NACK.to_string(), FEAT_FEC.to_string()]
+	use pulsar_core::service::media::{FEAT_FEC, FEAT_FEC_RS, FEAT_MOS, FEAT_NACK};
+	vec![
+		FEAT_MOS.to_string(),
+		FEAT_NACK.to_string(),
+		FEAT_FEC.to_string(),
+		FEAT_FEC_RS.to_string(),
+	]
 }
 
 /// RAII guard that ensures per-session resources are released when the session task
@@ -120,6 +127,9 @@ struct SessionCleanupGuard {
 	fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 	#[cfg(target_os = "linux")]
 	cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
+	/// The in-process libav encode (Linux X11 hosts), stopped with the session.
+	#[cfg(target_os = "linux")]
+	libav_slot: Arc<Mutex<Option<libav::LibavHost>>>,
 	/// This session's capture generation counter (shared with on_stream). Bumped in
 	/// Drop so a capture::start task still in the portal picker — when cap_slot is
 	/// empty — observes the change and aborts, dismissing the dialog.
@@ -215,6 +225,9 @@ impl Drop for SessionCleanupGuard {
 			// cap_gen) is skipped.
 			self.cap_gen
 				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			if let Some(engine) = self.libav_slot.lock().unwrap().take() {
+				engine.stop();
+			}
 			if let Some(cap) = self.cap_slot.lock().unwrap().take() {
 				let _ = tokio::spawn(cap.stop());
 			}
@@ -902,16 +915,21 @@ pub(crate) async fn go_online(
 				// re-stream aborts + replaces them (same lifecycle as `procs`).
 				let fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
 					Arc::new(Mutex::new(Vec::new()));
-				// FEC group size for the video forwarder (0 = no parity): sized from the loss
-				// the client reports in its stats (adaptive streaming Phase 2.1 / 2.4), read
-				// live by the forwarder, only sent when the client asked (`StreamReq::fec`).
-				let fec_n: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(0));
+				// FEC parity ratio for the video forwarder in ‰ (0 = no parity): sized from the
+				// loss the client reports in its stats (adaptive streaming Phase 2.1 / 2.4), read
+				// live by the forwarder — Reed-Solomon per frame for clients that decode it
+				// (`StreamReq::fec_rs`), XOR groups of `1/ratio` for XOR-only clients.
+				let fec_n: Arc<std::sync::atomic::AtomicU16> = Arc::new(std::sync::atomic::AtomicU16::new(0));
 
 				// Per-session: hold the screen capture so it can be stopped when this
 				// client disconnects. (Input injection is via uinput in `on_input`.)
 				#[cfg(target_os = "linux")]
 				let cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>> =
 					Arc::new(Mutex::new(None));
+				// The in-process libav encode for X11 hosts (adaptive streaming decision 1):
+				// bitrate + recovery apply live, keyframes are forced on request — no restart.
+				#[cfg(target_os = "linux")]
+				let libav_slot: Arc<Mutex<Option<libav::LibavHost>>> = Arc::new(Mutex::new(None));
 				// Generation guard for the async portal-capture task: capture::start can
 				// sit in the portal dialog for seconds, racing teardown and overlapping
 				// re-streams. Every (re-)stream bumps + captures it, teardown bumps it,
@@ -1211,6 +1229,8 @@ pub(crate) async fn go_online(
 					restore_token.clone(),
 					#[cfg(target_os = "linux")]
 					cap_slot.clone(),
+					#[cfg(target_os = "linux")]
+					libav_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_gen.clone(),
 					last_req_store.clone(),
@@ -1866,6 +1886,12 @@ pub(crate) async fn go_online(
 					let nack_slot = nack_slot.clone();
 					#[cfg(windows)]
 					let native_idr = native_slot.clone();
+					// Wayland (in-process GStreamer): a keyframe request forces a key unit on the
+					// live pipeline — no restart.
+					#[cfg(target_os = "linux")]
+					let wl_cap = cap_slot.clone();
+					#[cfg(target_os = "linux")]
+					let libav_kf = libav_slot.clone();
 					// ffmpeg-fallback keyframe recovery for the MediaNack([0]) sentinel below:
 					// last_req_store is Some only on the ffmpeg path (native sessions clear it and
 					// use request_idr above); the restart channel re-issues that req so a fresh
@@ -1883,6 +1909,14 @@ pub(crate) async fn go_online(
 							#[cfg(windows)]
 							if let Some(h) = native_idr.lock().unwrap().as_ref() {
 								h.request_idr();
+							}
+							#[cfg(target_os = "linux")]
+							if let Some(c) = wl_cap.lock().unwrap().as_ref() {
+								c.request_keyframe();
+							}
+							#[cfg(target_os = "linux")]
+							if let Some(e) = libav_kf.lock().unwrap().as_ref() {
+								e.request_keyframe();
 							}
 							// ffmpeg fallback (no live CaptureHandle): a spawned CLI ffmpeg has no
 							// runtime force-keyframe hook, so re-issue the last StreamReq — a fresh
@@ -1957,14 +1991,15 @@ pub(crate) async fn go_online(
 						let mut clean_windows = 0u32;
 						Box::new(move |cs| {
 							use std::sync::atomic::Ordering;
-							let prev = fec_n.load(Ordering::Relaxed);
+							let prev = fec_n.load(Ordering::Relaxed) as f32 / 1000.0;
 							if cs.loss < pulsar_core::adapt::fec_policy::OFF_BELOW {
 								clean_windows += 1;
 							} else {
 								clean_windows = 0;
 							}
-							let n = pulsar_core::adapt::fec_policy::group_size(cs.loss, prev, clean_windows);
-							if n != prev {
+							let ratio = pulsar_core::adapt::fec_policy::parity_ratio(cs.loss, prev, clean_windows);
+							let n = (ratio * 1000.0).round() as u16;
+							if n != fec_n.load(Ordering::Relaxed) {
 								fec_n.store(n, Ordering::Relaxed);
 							}
 							tracing::info!(
@@ -1977,7 +2012,7 @@ pub(crate) async fn go_online(
 								nack_sent = cs.nack_sent,
 								nack_ok = cs.nack_ok,
 								fec_ok = cs.fec_ok,
-								fec_n = n,
+								fec_pct = n as f32 / 10.0,
 								"client stats"
 							);
 						})
@@ -2001,6 +2036,8 @@ pub(crate) async fn go_online(
 					fwd_slot: fwd_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_slot: cap_slot.clone(),
+					#[cfg(target_os = "linux")]
+					libav_slot: libav_slot.clone(),
 					#[cfg(target_os = "linux")]
 					cap_gen: cap_gen.clone(),
 					mode_watcher,

@@ -1067,9 +1067,10 @@ fn spawn_media_forwarders(
 	media_tx: &pulsar_core::SessionSender,
 	nack_slot: &Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u16>>>>>,
 	fwd_slot: &Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-	// FEC (Phase 2.1): `Some(group size atom)` when the client asked for parity — the video
-	// forwarder XORs every `n` datagrams into one parity frame (`n` read live, 0 = off).
-	fec_n: Option<Arc<std::sync::atomic::AtomicU8>>,
+	// FEC (Phase 2.1): `Some((rs, ratio ‰ atom))` when the client asked for parity — the video
+	// forwarder sends Reed-Solomon parity per frame (`rs`) or XOR groups of `1/ratio`
+	// datagrams; the ratio is read live (0 = off).
+	fec: Option<(bool, Arc<std::sync::atomic::AtomicU16>)>,
 ) -> Option<(u16, u16)> {
 	use pulsar_core::service::media;
 	let bind = || -> Option<(tokio::net::UdpSocket, u16)> {
@@ -1098,8 +1099,9 @@ fn spawn_media_forwarders(
 		// seq → datagram retransmit ring (linear scan is fine at this size).
 		let mut ring: std::collections::VecDeque<(u16, Vec<u8>)> =
 			std::collections::VecDeque::with_capacity(NACK_RING);
-		let mut fec = media::FecEncoder::new(0);
-		let mut fec_logged_n: u8 = 0;
+		let mut fec_xor = media::FecEncoder::new(0);
+		let mut fec_rs = media::RsFecEncoder::new(0.0);
+		let mut fec_logged: u16 = 0;
 		let mut buf = vec![0u8; 2048];
 		// 1 Hz throughput meter (intake pkts/bytes + session send failures) — the
 		// "video reaches the client mangled/not at all" debugging needs to know
@@ -1152,20 +1154,33 @@ fn spawn_media_forwarders(
 					if vtx.send(&media::frame(media::TAG_VIDEO, rtp)).await.is_err() {
 						break; // session gone
 					}
-					// FEC parity behind every complete group (zero-RTT repair on lossy paths).
-					if let Some(n) = fec_n.as_ref() {
-						let want = n.load(std::sync::atomic::Ordering::Relaxed);
-						if want != fec.n() {
-							fec.set_n(want);
-						}
-						if want != fec_logged_n {
-							fec_logged_n = want;
-							tracing::info!(group = want, "fec parity group size");
+					// FEC parity behind every frame / group (zero-RTT repair on lossy paths).
+					if let Some((rs, ratio)) = fec.as_ref() {
+						let milli = ratio.load(std::sync::atomic::Ordering::Relaxed);
+						if milli != fec_logged {
+							fec_logged = milli;
+							tracing::info!(pct = milli as f32 / 10.0, rs, "fec parity ratio");
 						}
 						if let Some(seq) = media::rtp_seq(rtp) {
-							if let Some(parity) = fec.push(seq, rtp) {
-								if vtx.send(&parity).await.is_err() {
-									break;
+							if *rs {
+								let want = milli as f32 / 1000.0;
+								if (want - fec_rs.ratio()).abs() > 1e-4 {
+									fec_rs.set_ratio(want);
+								}
+								for parity in fec_rs.push(seq, rtp) {
+									if vtx.send(&parity).await.is_err() {
+										break;
+									}
+								}
+							} else {
+								let n: u8 = if milli == 0 { 0 } else { (1000 / milli.max(1)).clamp(5, 32) as u8 };
+								if n != fec_xor.n() {
+									fec_xor.set_n(n);
+								}
+								if let Some(parity) = fec_xor.push(seq, rtp) {
+									if vtx.send(&parity).await.is_err() {
+										break;
+									}
 								}
 							}
 						}
@@ -1391,9 +1406,10 @@ pub(super) fn make_on_stream(
 	media_tx: pulsar_core::SessionSender,
 	nack_slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u16>>>>>,
 	fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-	fec_n: Arc<std::sync::atomic::AtomicU8>,
+	fec_n: Arc<std::sync::atomic::AtomicU16>,
 	#[cfg(target_os = "linux")] restore_token: Arc<Mutex<Option<String>>>,
 	#[cfg(target_os = "linux")] cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
+	#[cfg(target_os = "linux")] libav_slot: Arc<Mutex<Option<super::libav::LibavHost>>>,
 	#[cfg(target_os = "linux")] cap_gen: Arc<std::sync::atomic::AtomicU64>,
 	// Records the latest StreamReq so the host-side display-mode watcher can re-issue it to
 	// restart capture at the new geometry.  On Windows this is only populated when
@@ -1419,6 +1435,10 @@ pub(super) fn make_on_stream(
 	// bitrate-only re-stream (ABR) can be absorbed instead of tearing the live pipeline down.
 	#[cfg(target_os = "linux")]
 	let mut last_wl_req: Option<StreamReq> = None;
+	// The request the running in-process libav encode was started with (X11 hosts): a
+	// bitrate / recovery-only re-request is applied live on it instead of restarting.
+	#[cfg(target_os = "linux")]
+	let mut last_libav_req: Option<StreamReq> = None;
 	// The previous request that started a LIVE native (DXGI+NVENC) capture, kept so a re-stream
 	// that only changed `display_idx` can switch the monitor IN PLACE (CaptureHandle::switch_output)
 	// instead of tearing the whole pipeline down. `None` whenever the current stream isn't native
@@ -1450,19 +1470,51 @@ pub(super) fn make_on_stream(
 		// already live and ONLY the bitrate differs from the streaming request, keep the live
 		// pipeline running (must be BEFORE the forwarder/audio teardown below, else we'd strand gst
 		// on dead loopback ports). Real geometry/fps/codec/audio-toggle changes fall through.
+		// IN-PROCESS LIBAV FAST PATH (X11 hosts): the encoder runs inside the app — a
+		// bitrate step or a loss-recovery flip is applied live, no restart, no gap.
 		#[cfg(target_os = "linux")]
-		if pulsar_core::capture::is_wayland() && cap_slot.lock().unwrap().is_some() {
-			if let Some(prev) = last_wl_req.as_ref() {
+		{
+			let slot = libav_slot.lock().unwrap();
+			if let (Some(engine), Some(prev)) = (slot.as_ref(), last_libav_req.as_ref()) {
 				let mut probe = prev.clone();
 				probe.bitrate_kbps = req.bitrate_kbps;
-				// Same for a loss-recovery flip: gst-launch'd x264enc can't change its GOP
-				// live either, and the restart is the black-video hazard described above.
+				probe.loss_recovery = req.loss_recovery;
+				if probe == req && engine.is_alive() {
+					if req.bitrate_kbps > 0 && req.bitrate_kbps != prev.bitrate_kbps {
+						engine.set_bitrate(req.bitrate_kbps);
+					}
+					if req.loss_recovery != prev.loss_recovery {
+						engine.set_recovery(req.loss_recovery);
+					}
+					drop(slot);
+					last_libav_req = Some(req.clone());
+					tracing::info!(
+						bitrate_kbps = req.bitrate_kbps,
+						recovery = ?req.loss_recovery,
+						"libav restream applied live on the in-process encoder"
+					);
+					return;
+				}
+			}
+		}
+		#[cfg(target_os = "linux")]
+		if pulsar_core::capture::is_wayland() {
+			let slot = cap_slot.lock().unwrap();
+			if let (Some(cap), Some(prev)) = (slot.as_ref(), last_wl_req.as_ref()) {
+				let mut probe = prev.clone();
+				probe.bitrate_kbps = req.bitrate_kbps;
 				probe.loss_recovery = req.loss_recovery;
 				if probe == req {
+					// The pipeline is in-process now: apply the bitrate and the recovery mode
+					// LIVE on the running encoder (no restart, no portal churn).
+					let applied = if req.bitrate_kbps > 0 { cap.set_bitrate(req.bitrate_kbps) } else { false };
+					cap.set_short_gop(req.loss_recovery.is_active());
 					last_wl_req = Some(req.clone());
 					tracing::info!(
 						bitrate_kbps = req.bitrate_kbps,
-						"wayland restream absorbed (bitrate-only) — kept live capture"
+						applied,
+						recovery = ?req.loss_recovery,
+						"wayland restream applied live on the in-process pipeline"
 					);
 					return;
 				}
@@ -1537,7 +1589,12 @@ pub(super) fn make_on_stream(
 		*nack_slot.lock().unwrap() = None;
 		let lo = std::net::IpAddr::from([127, 0, 0, 1]);
 		let (vdest, adest) = if req.media_over_session {
-			match spawn_media_forwarders(&media_tx, &nack_slot, &fwd_slot, req.fec.then(|| fec_n.clone())) {
+			match spawn_media_forwarders(
+				&media_tx,
+				&nack_slot,
+				&fwd_slot,
+				(req.fec || req.fec_rs).then(|| (req.fec_rs, fec_n.clone())),
+			) {
 				Some((vp, ap)) => (
 					SocketAddr::new(lo, vp),
 					SocketAddr::new(lo, if req.audio_port > 0 { ap } else { 0 }),
@@ -1819,6 +1876,11 @@ pub(super) fn make_on_stream(
 		// client takes effect). The epoch bump inside also retires the PREVIOUS stream's
 		// encode fallback chain, if one is still walking its candidate list.
 		crate::process::drain_procs(&procs, &proc_epoch);
+		#[cfg(target_os = "linux")]
+		if let Some(engine) = libav_slot.lock().unwrap().take() {
+			engine.stop();
+			last_libav_req = None;
+		}
 		// The generation THIS stream's children (and its fallback chain) belong to.
 		let stream_epoch = proc_epoch.load(std::sync::atomic::Ordering::SeqCst);
 		// Same for the native capture thread, if the prior (re)stream used it.
@@ -2405,6 +2467,9 @@ pub(super) fn make_on_stream(
 				// find_output and causes a silent fallback + input-mapping desync (C8).
 				output_idx: clamped_display_idx,
 				low_latency: plan.low_latency,
+				// Periodic intra refresh instead of scheduled IDRs when the client asked for
+				// it (a Linux client that resumes on a partial picture); applied at (re)build.
+				intra_refresh: req.loss_recovery == pulsar_core::service::LossRecovery::IntraRefresh,
 				draw_mouse: true,
 				// Phase 2b co-op: when the session targets a specific WINDOW (client-picked via
 				// `req.window_hwnd`, or the game this session launched in game mode), capture that
@@ -2528,6 +2593,28 @@ pub(super) fn make_on_stream(
 		);
 		// encode_command always yields ("ffmpeg", args); run the bundled
 		// ffmpeg binary directly rather than relying on a system ffmpeg.
+		// In-process libav encode (Linux X11, decision 1): try it before the ffmpeg CLI so the
+		// controller's bitrate steps and keyframe requests apply live. A start failure (device,
+		// encoder or output) falls back to the CLI chain below, unchanged.
+		#[cfg(target_os = "linux")]
+		let libav_started = if !native_started && !pulsar_core::capture::is_wayland() {
+			match super::libav::Params::from_plan(&plan).map(super::libav::LibavHost::start) {
+				Some(Ok(engine)) => {
+					*libav_slot.lock().unwrap() = Some(engine);
+					last_libav_req = Some(req.clone());
+					true
+				}
+				Some(Err(e)) => {
+					tracing::warn!("libav host encode failed to start, using the ffmpeg CLI: {e}");
+					false
+				}
+				None => false,
+			}
+		} else {
+			false
+		};
+		#[cfg(not(target_os = "linux"))]
+		let libav_started = false;
 		let started = if native_started {
 			// G2: native NVENC has no ffmpeg meter — spawn a ~2 Hz reporter that reads the
 			// capture thread's encode-us EWMA + re-pushes the Stats label with the encode part
@@ -2570,6 +2657,8 @@ pub(super) fn make_on_stream(
 					}
 				});
 			}
+			true
+		} else if libav_started {
 			true
 		} else {
 			// Runtime-fallback candidate list, quality order: the resolved pick first, then

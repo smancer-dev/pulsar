@@ -112,6 +112,11 @@ libc = "0.2"
 # Windows kbdhook/Interception path). evdev/libc are already in Cargo.lock via pulsar-core.
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.12"
+# In-process libav host encode path (host/libav.rs, adaptive streaming): x11grab capture
+# → libavfilter scale/format → libavcodec encoder (x264 / NVENC / VA-API) → libavformat RTP,
+# all inside the app so the bitrate changes live and keyframes can be forced on request —
+# the ffmpeg CLI could only be restarted. Same binding + version family as pulsar-render.
+ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec", "avformat", "avdevice", "avfilter", "swscale"] }
 # Host cursor side-channel (cursor.rs): read the X pointer position (XFixes) + shape so the
 # client draws it over the cursorless KMS-captured video (Moonlight model). `xlib` for the
 # display/query-pointer, `xfixes` for the cursor image+hotspot. Same `x11` 2.21 the renderer uses.
