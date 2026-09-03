@@ -73,8 +73,8 @@ use handlers::{make_on_audio, make_on_file, make_on_stream};
 /// Transport features this host advertises in its `StreamCaps` reply: it can carry
 /// the RTP media inside the session (single socket) and honors NACK retransmits.
 fn media_features() -> Vec<String> {
-	use pulsar_core::service::media::{FEAT_MOS, FEAT_NACK};
-	vec![FEAT_MOS.to_string(), FEAT_NACK.to_string()]
+	use pulsar_core::service::media::{FEAT_FEC, FEAT_MOS, FEAT_NACK};
+	vec![FEAT_MOS.to_string(), FEAT_NACK.to_string(), FEAT_FEC.to_string()]
 }
 
 /// RAII guard that ensures per-session resources are released when the session task
@@ -902,6 +902,10 @@ pub(crate) async fn go_online(
 				// re-stream aborts + replaces them (same lifecycle as `procs`).
 				let fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
 					Arc::new(Mutex::new(Vec::new()));
+				// FEC group size for the video forwarder (0 = no parity): sized from the loss
+				// the client reports in its stats (adaptive streaming Phase 2.1 / 2.4), read
+				// live by the forwarder, only sent when the client asked (`StreamReq::fec`).
+				let fec_n: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
 				// Per-session: hold the screen capture so it can be stopped when this
 				// client disconnects. (Input injection is via uinput in `on_input`.)
@@ -1202,6 +1206,7 @@ pub(crate) async fn go_online(
 					media_tx.clone(),
 					nack_slot.clone(),
 					fwd_slot.clone(),
+					fec_n.clone(),
 					#[cfg(target_os = "linux")]
 					restore_token.clone(),
 					#[cfg(target_os = "linux")]
@@ -1890,7 +1895,10 @@ pub(crate) async fn go_online(
 								let due = last_kf_restart
 									.map(|t| t.elapsed() >= std::time::Duration::from_millis(1500))
 									.unwrap_or(true);
-								if !req.game_mode && due {
+								// Phase 0.4: once the client asked for a loss-recovery mode (short
+								// GOP / intra refresh) the stream heals itself within ≤ 0.5 s, so
+								// the restart — a visible gap on an already-lossy link — is skipped.
+								if !req.game_mode && !req.loss_recovery.is_active() && due {
 									// Full (a restart already queued / in flight) or Closed (session
 									// torn down) → skip; the next nack or the natural GOP still recovers.
 									if nack_restream_tx.try_send(req).is_ok() {
@@ -1941,6 +1949,39 @@ pub(crate) async fn go_online(
 					// File manager: FsList/FsGet from this client, answered through the
 					// same outbound queue (HOME-jailed; see fs_browse).
 					on_fs: Box::new(crate::fs_browse::make_on_fs(fs_out)),
+					// The client's adaptive controller's per-window feedback (Phase 0 / 2.4):
+					// logged next to the host's own encode stats, and the one input to the FEC
+					// parity sizing (Phase 2.1) — the forwarder reads `fec_n` live.
+					on_stats: {
+						let fec_n = fec_n.clone();
+						let mut clean_windows = 0u32;
+						Box::new(move |cs| {
+							use std::sync::atomic::Ordering;
+							let prev = fec_n.load(Ordering::Relaxed);
+							if cs.loss < pulsar_core::adapt::fec_policy::OFF_BELOW {
+								clean_windows += 1;
+							} else {
+								clean_windows = 0;
+							}
+							let n = pulsar_core::adapt::fec_policy::group_size(cs.loss, prev, clean_windows);
+							if n != prev {
+								fec_n.store(n, Ordering::Relaxed);
+							}
+							tracing::info!(
+								loss_pct = cs.loss * 100.0,
+								rtt = cs.rtt_ms,
+								jitter = cs.jitter_ms,
+								kbps = cs.kbps,
+								point = %cs.point,
+								recovery = ?cs.recovery,
+								nack_sent = cs.nack_sent,
+								nack_ok = cs.nack_ok,
+								fec_ok = cs.fec_ok,
+								fec_n = n,
+								"client stats"
+							);
+						})
+					},
 					// Host-initiated re-stream: fed by the display-mode watcher above.
 					// On Windows this fires only for ffmpeg-path sessions (native DXGI self-heals
 					// via ACCESS_LOST; last_req_store is only populated when native_started=false).

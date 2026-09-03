@@ -258,11 +258,15 @@ Games library + folder scan, gamepad-driven UI nav (`gamepadNav.svelte.ts`),
 auto-updater, relay mode, VNC-mode client path (`io_cmds.rs`), the SvelteKit UI
 and the Tauri bridge.
 
-**Next major task — adaptive streaming rework:** design + phased plan live in
-`../pulsar-core/docs/adaptive-streaming.md` (pointer in `../pulsar-core/AGENTS.md`).
-The client controller is `src-tauri/src/play/hold.rs` (bitrate-only, loss-only,
-2 s GOP in remote mode → mid-stream freezes on lossy paths); Phase 0 there first,
-then the shared `pulsar-core::adapt` ladder. Do not push behaviour changes untested.
+**Adaptive streaming (2026-09-03, local, awaiting the maintainer's test):** the shared
+controller is `pulsar_core::adapt` (design + status in `../pulsar-core/docs/adaptive-streaming.md`).
+Here: `src-tauri/src/play/hold.rs` measures (loss, 500 ms pings, per-frame arrivals, FEC
+parity) and actuates (`StreamReq` bitrate / resolution / fps / `loss_recovery` / `fec`);
+`adapt_memory.rs` remembers the last good rate per peer; the host (`host.rs`, `host/handlers.rs`)
+sizes FEC parity from the client's `Stats` and encodes with intra-refresh / short GOP on request;
+`pulsar-render` holds the last good frame on an unrepaired loss (`hold`), follows the RTT-derived
+reorder wait (`maxdelay`), and on Windows/macOS has a reorder buffer. Test with
+`scripts/netem.sh` + `scripts/validate-log.mjs`. Do not push behaviour changes untested.
 
 **Scaffolded / known gaps:** macOS virtual gamepad (no-op stub); HW encode on
 the Wayland/gst path (software x264 only); media-over-the-session for

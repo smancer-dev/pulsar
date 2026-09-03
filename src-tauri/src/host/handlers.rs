@@ -1067,6 +1067,9 @@ fn spawn_media_forwarders(
 	media_tx: &pulsar_core::SessionSender,
 	nack_slot: &Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u16>>>>>,
 	fwd_slot: &Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+	// FEC (Phase 2.1): `Some(group size atom)` when the client asked for parity — the video
+	// forwarder XORs every `n` datagrams into one parity frame (`n` read live, 0 = off).
+	fec_n: Option<Arc<std::sync::atomic::AtomicU8>>,
 ) -> Option<(u16, u16)> {
 	use pulsar_core::service::media;
 	let bind = || -> Option<(tokio::net::UdpSocket, u16)> {
@@ -1095,6 +1098,8 @@ fn spawn_media_forwarders(
 		// seq → datagram retransmit ring (linear scan is fine at this size).
 		let mut ring: std::collections::VecDeque<(u16, Vec<u8>)> =
 			std::collections::VecDeque::with_capacity(NACK_RING);
+		let mut fec = media::FecEncoder::new(0);
+		let mut fec_logged_n: u8 = 0;
 		let mut buf = vec![0u8; 2048];
 		// 1 Hz throughput meter (intake pkts/bytes + session send failures) — the
 		// "video reaches the client mangled/not at all" debugging needs to know
@@ -1146,6 +1151,24 @@ fn spawn_media_forwarders(
 					}
 					if vtx.send(&media::frame(media::TAG_VIDEO, rtp)).await.is_err() {
 						break; // session gone
+					}
+					// FEC parity behind every complete group (zero-RTT repair on lossy paths).
+					if let Some(n) = fec_n.as_ref() {
+						let want = n.load(std::sync::atomic::Ordering::Relaxed);
+						if want != fec.n() {
+							fec.set_n(want);
+						}
+						if want != fec_logged_n {
+							fec_logged_n = want;
+							tracing::info!(group = want, "fec parity group size");
+						}
+						if let Some(seq) = media::rtp_seq(rtp) {
+							if let Some(parity) = fec.push(seq, rtp) {
+								if vtx.send(&parity).await.is_err() {
+									break;
+								}
+							}
+						}
 					}
 				}
 				q = nack_rx.recv() => {
@@ -1224,7 +1247,11 @@ fn spawn_media_forwarders(
 fn live_change(prev: &StreamReq, req: &StreamReq) -> Option<(bool, bool)> {
 	let display_changed = prev.display_idx != req.display_idx;
 	let bitrate_changed = prev.bitrate_kbps != req.bitrate_kbps;
-	if !display_changed && !bitrate_changed {
+	// A loss-recovery flip (Phase 0.3) has no live knob on the native path — it recovers via
+	// the on-demand IDR already — so it is ABSORBED here (never a full rebuild, which would
+	// itself be a visible gap on the very link that is losing packets).
+	let recovery_changed = prev.loss_recovery != req.loss_recovery;
+	if !display_changed && !bitrate_changed && !recovery_changed {
 		return None;
 	}
 	// A STANDALONE bitrate change to "0" (auto → host default) must take the full path so the
@@ -1238,6 +1265,7 @@ fn live_change(prev: &StreamReq, req: &StreamReq) -> Option<(bool, bool)> {
 	let mut probe = prev.clone();
 	probe.display_idx = req.display_idx;
 	probe.bitrate_kbps = req.bitrate_kbps;
+	probe.loss_recovery = req.loss_recovery;
 	if probe == *req {
 		// Only signal a live bitrate apply for a concrete >0 target (set_bitrate(0) is meaningless);
 		// a coincident →0 is dropped here and the rebuilt encoder keeps the current live bitrate.
@@ -1363,6 +1391,7 @@ pub(super) fn make_on_stream(
 	media_tx: pulsar_core::SessionSender,
 	nack_slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u16>>>>>,
 	fwd_slot: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+	fec_n: Arc<std::sync::atomic::AtomicU8>,
 	#[cfg(target_os = "linux")] restore_token: Arc<Mutex<Option<String>>>,
 	#[cfg(target_os = "linux")] cap_slot: Arc<Mutex<Option<pulsar_core::capture::WaylandCapture>>>,
 	#[cfg(target_os = "linux")] cap_gen: Arc<std::sync::atomic::AtomicU64>,
@@ -1426,6 +1455,9 @@ pub(super) fn make_on_stream(
 			if let Some(prev) = last_wl_req.as_ref() {
 				let mut probe = prev.clone();
 				probe.bitrate_kbps = req.bitrate_kbps;
+				// Same for a loss-recovery flip: gst-launch'd x264enc can't change its GOP
+				// live either, and the restart is the black-video hazard described above.
+				probe.loss_recovery = req.loss_recovery;
 				if probe == req {
 					last_wl_req = Some(req.clone());
 					tracing::info!(
@@ -1505,7 +1537,7 @@ pub(super) fn make_on_stream(
 		*nack_slot.lock().unwrap() = None;
 		let lo = std::net::IpAddr::from([127, 0, 0, 1]);
 		let (vdest, adest) = if req.media_over_session {
-			match spawn_media_forwarders(&media_tx, &nack_slot, &fwd_slot) {
+			match spawn_media_forwarders(&media_tx, &nack_slot, &fwd_slot, req.fec.then(|| fec_n.clone())) {
 				Some((vp, ap)) => (
 					SocketAddr::new(lo, vp),
 					SocketAddr::new(lo, if req.audio_port > 0 { ap } else { 0 }),
@@ -1648,16 +1680,18 @@ pub(super) fn make_on_stream(
 			let validated = crate::process::validated_gst_encoders();
 			let (genc, gcodec) = crate::process::pick_gst(&validated, &enc_pref, &req.codec)
 				.unwrap_or((pipeline::gst::GstEncoder::X264, pipeline::VCodec::H264));
-			let fragment = pipeline::gst::encoder_fragment(genc, gcodec, bitrate, fps)
-				.unwrap_or_else(|| {
-					pipeline::gst::encoder_fragment(
-						pipeline::gst::GstEncoder::X264,
-						pipeline::VCodec::H264,
-						bitrate,
-						fps,
-					)
-					.expect("x264/h264 fragment always builds")
-				});
+			let fragment =
+				pipeline::gst::encoder_fragment_with(genc, gcodec, bitrate, fps, req.loss_recovery)
+					.unwrap_or_else(|| {
+						pipeline::gst::encoder_fragment_with(
+							pipeline::gst::GstEncoder::X264,
+							pipeline::VCodec::H264,
+							bitrate,
+							fps,
+							req.loss_recovery,
+						)
+						.expect("x264/h264 fragment always builds")
+					});
 			// Encode summary for the client's stats panel (the Wayland path never sent
 			// one before, so the panel showed nothing).
 			let fps_part = if eff_fps != req_fps {
@@ -2025,9 +2059,13 @@ pub(super) fn make_on_stream(
 					"x11 gst hw-encode candidates"
 				);
 				if let Some((genc, gcodec)) = crate::process::pick_gst(&hw, &enc_pref, &req.codec) {
-					if let Some(fragment) =
-						pipeline::gst::encoder_fragment(genc, gcodec, eff_bitrate, eff_fps)
-					{
+					if let Some(fragment) = pipeline::gst::encoder_fragment_with(
+						genc,
+						gcodec,
+						eff_bitrate,
+						eff_fps,
+						req.loss_recovery,
+					) {
 						// Encode-pace meter: an identity right AFTER the encoder (the
 						// fragment's first ` ! ` joins encoder→parse; props carry no `!`).
 						let metered =
@@ -2297,6 +2335,7 @@ pub(super) fn make_on_stream(
 			output_idx: ffmpeg_display_idx,
 			hdr: req.hdr,
 			yuv444: req.yuv444,
+			loss_recovery: req.loss_recovery,
 		};
 		// NATIVE WINDOWS path: DXGI Desktop Duplication + NVENC SDK → RTP
 		// (Sunshine-technique, steady client-fps). Used for NVENC on Windows
@@ -2608,6 +2647,7 @@ pub(super) fn make_on_stream(
 						output_idx: base.output_idx,
 						hdr: base.hdr,
 						yuv444: base.yuv444,
+						loss_recovery: base.loss_recovery,
 					};
 					pipeline::encode_command(&p).1
 				}

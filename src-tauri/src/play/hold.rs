@@ -1,41 +1,56 @@
 //! The client's full-duplex hold-loop, extracted verbatim from `start_remote_play`.
 //!
 //! `hold_session` owns the control `Session` for the lifetime of a remote-play tab:
-//! it forwards local input + side-channel data to the host, keepalives every ~2s
-//! (UDP has no disconnect signal), receives the host's chat/clipboard/stat pushes
-//! (surfacing them to the UI), watchdogs host silence, and re-requests the stream
-//! when the session menu changes resolution/encoder. On exit it tells the frontend
-//! (`play-ended`) and sends a clean `Bye`.
+//! it forwards local input + side-channel data to the host, pings every 500 ms (keepalive —
+//! UDP has no disconnect signal — and the RTT the adaptive controller runs on), receives
+//! the host's chat/clipboard/stat pushes (surfacing them to the UI), watchdogs host
+//! silence, runs the shared adaptive controller (`pulsar_core::adapt`) on 2 s windows, and re-requests
+//! the stream when the session menu or the controller changes a stream parameter. On exit
+//! it tells the frontend (`play-ended`) and sends a clean `Bye`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pulsar_core::service::{
-	decode_data, media, request_stream, send_data, send_input, send_keepalive, DataMsg, InputEvent,
-	QualityPref, StreamReq,
+	decode_data, media, request_stream, send_data, send_input, send_keepalive, ClientStats,
+	DataMsg, InputEvent, LossRecovery, QualityPref, StreamReq,
 };
 use pulsar_core::Session;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::Receiver;
 
+use pulsar_core::adapt::{Controller, Sample};
 use crate::events::{
 	AvatarPayload, DataPayload, FilePayload, FsEntriesPayload, PlayRtt, PlayStats,
 };
 use crate::state::Restream;
 
-/// Adaptive-bitrate floor (kbit/s) — never step below a usable desktop stream.
-const ADAPT_MIN_KBPS: u32 = 2_000;
-/// Sustained-loss threshold that triggers a step DOWN (per 2 s keepalive window).
-const ADAPT_LOSS_DOWN: f32 = 0.03;
-/// SEVERE loss (the current bitrate badly overruns the pipe — e.g. overshooting an unknown
-/// bottleneck or a relay drop cap). Above this we HALVE immediately and skip the cooldown so the
-/// stream converges in a few seconds instead of ~20 s of artifacts.
-const ADAPT_LOSS_SEVERE: f32 = 0.15;
-/// "Clean" threshold; this many consecutive clean windows step back UP.
-const ADAPT_LOSS_CLEAN: f32 = 0.005;
-const ADAPT_CLEAN_WINDOWS: u32 = 10; // ×2 s = 20 s stable before raising
-/// Don't re-step within this many seconds (each step restarts the host encoder).
-const ADAPT_COOLDOWN_S: u64 = 5;
+/// Keepalive/RTT ping cadence. 500 ms (was 2 s): the adaptive controller (`pulsar_core::adapt`)
+/// decides on 2 s windows and needs a few RTT samples per window to see a queue building
+/// (Phase 0.1) and to size the NACK repair window (Phase 0.5). Each Ping is a ~10-byte
+/// datagram; the host answers every one with a Pong and refreshes its liveness timer.
+const PING_MS: u64 = 500;
+/// How often unanswered NACKs are swept (re-NACKed once, then written off as a failed
+/// repair → keyframe request + renderer hold). 100 ms bounds the detect→request latency.
+const REPAIR_SWEEP_MS: u64 = 100;
+/// Bounds of the RTT-derived repair window (ms): how long a missing packet is waited for
+/// before the repair is declared failed — the same number the renderer uses as its RTP
+/// reorder `max_delay`, so both give up together. `1.5 × RTT + 100`, clamped.
+const REPAIR_MIN_MS: f32 = 100.0;
+const REPAIR_MAX_MS: f32 = 500.0;
+/// How long the renderer holds the last good frame after an unrepaired loss while the
+/// keyframe / refresh is on its way (Phase 0.5). Bounded so an intra-refresh stream, which
+/// never sends an IDR, resumes on the healing picture instead of freezing.
+const HOLD_MS: u32 = 300;
+
+/// The RTT-derived repair window in ms (see `REPAIR_MIN_MS`).
+fn repair_window_ms(rtt_ema_ms: f32) -> f32 {
+	if rtt_ema_ms <= 0.0 {
+		300.0
+	} else {
+		(rtt_ema_ms * 1.5 + 100.0).clamp(REPAIR_MIN_MS, REPAIR_MAX_MS)
+	}
+}
 
 /// Hold the control session open full-duplex: forward input + side-channel data,
 /// keepalive every ~2s (UDP has no disconnect signal), and receive the host's
@@ -66,6 +81,11 @@ pub(super) async fn hold_session(
 	// play.rs. Caps the adaptive controller's ceiling AND any user-picked manual bitrate so a
 	// relayed session never re-overshoots the relay's drop limit after a menu change / ramp-up.
 	cap_kbps: u32,
+	// The shared adaptive controller (`pulsar_core::adapt`), built by play.rs so the initial
+	// request already carries its start point; this loop feeds and actuates it.
+	mut ctl: Controller,
+	// What identifies the peer for the per-peer memory (`adapt_memory`): id or address.
+	peer_key: String,
 	cursor_external: bool,
 	req_hdr: bool,
 	init_quality: QualityPref,
@@ -90,6 +110,10 @@ pub(super) async fn hold_session(
 ) {
 	let mut keep = tokio::time::interval(std::time::Duration::from_secs(2));
 	keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	let mut ping = tokio::time::interval(std::time::Duration::from_millis(PING_MS));
+	ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	let mut repair = tokio::time::interval(std::time::Duration::from_millis(REPAIR_SWEEP_MS));
+	repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 	// ---- Media-over-session demux state (single-socket transport) ----
 	// Media frames arrive INSIDE this session ([tag][rtp…]); forward each datagram to
 	// the local consumer: the renderer's RTP port (video) / the viewer's audio port.
@@ -103,20 +127,38 @@ pub(super) async fn hold_session(
 	// One-shot diagnostic: did host media actually reach this client + get forwarded?
 	let mut first_video_logged = false;
 	// Video RTP gap tracking → NACK retransmit requests + the loss% the adaptive
-	// bitrate controller runs on. `missing` holds requested-but-not-yet-seen seqs.
+	// controller runs on. `missing` holds requested-but-not-yet-seen seqs: when first
+	// noticed, and whether the NACK was already re-sent once (the first NACK or its answer
+	// may itself have been lost).
 	let mut last_vseq: Option<u16> = None;
-	let mut missing: std::collections::HashMap<u16, std::time::Instant> =
+	let mut missing: std::collections::HashMap<u16, (std::time::Instant, bool)> =
 		std::collections::HashMap::new();
 	let (mut win_recv, mut win_lost) = (0u32, 0u32);
-	let mut clean_windows = 0u32;
-	let mut last_step = std::time::Instant::now();
-	// ABR ceiling memory: the bitrate at which loss last appeared. Without it the clean-creep
-	// climbed all the way back to base_kbps every ~20 s, slammed into the same bottleneck,
-	// and produced a periodic loss storm (seconds of corruption) — a sawtooth the user saw as
-	// "the picture breaks all the time". The climb now stops at ~85% of the last bad rate and
-	// only re-probes past it slowly (+10% after a long clean stretch at the cap).
-	let mut loss_ceiling: u32 = base_kbps.max(ADAPT_MIN_KBPS);
-	let mut at_cap_windows = 0u32;
+	// NACK bookkeeping per window (forwarded to the host in the stats JSON).
+	let (mut win_nack_sent, mut win_nack_ok) = (0u32, 0u32);
+	// Keepalive RTT samples of the current window + a smoothed RTT for the repair window.
+	let mut rtt_samples: Vec<f32> = Vec::with_capacity(8);
+	let mut rtt_ema: f32 = 0.0;
+	// The repair window last pushed to the renderer (ms) — re-sent only on a real change.
+	let mut sent_repair_ms: f32 = 0.0;
+	// Loss-recovery mode currently requested from the host (flipped once by the controller).
+	let mut cur_recovery = LossRecovery::Normal;
+	// FEC (Phase 2.1): the host sends XOR parity over the video packets once we report loss;
+	// the decoder keeps the recent packets and rebuilds a group's single missing one.
+	let mut fec_dec = media::FecDecoder::default();
+	let mut win_fec_ok = 0u32;
+	// Delay-gradient sampling (Phase 3): per video FRAME (RTP timestamp), the arrival time of
+	// its last packet on a session-local ms clock feeds the controller's trendline estimator.
+	let epoch = std::time::Instant::now();
+	let mono_ms = move || epoch.elapsed().as_secs_f64() * 1000.0;
+	let mut frame_ts: Option<u32> = None;
+	let mut frame_last_arrival_ms: f64 = 0.0;
+	// User pins from the session menu: an explicit resolution or fps switches the ladder off
+	// (bitrate-only), "Otomatik" hands that dimension back to the controller.
+	let mut manual_res = false;
+	let mut manual_fps = false;
+	// The last rate remembered for this peer (write-through when it changes).
+	let mut remembered_kbps: u32 = 0;
 	// Failed-repair keyframe request: when a NACKed packet never arrives (expired from
 	// `missing`), the reference chain is broken until the next keyframe — with long host
 	// GOPs that is seconds of smear. Ask the host for an immediate IDR instead (rate-limited).
@@ -172,12 +214,14 @@ pub(super) async fn hold_session(
 	let cur_audio_layout = pulsar_core::audio::ChannelLayout::Stereo;
 	// Starts at the INITIAL request's bitrate (0 = host default) so a menu-driven
 	// re-request doesn't silently reset an explicit starting target; the adaptive
-	// controller moves it within [ADAPT_MIN_KBPS, base_kbps].
+	// controller (`pulsar_core::adapt`) moves it within [FLOOR_KBPS, cap].
 	let mut cur_bitrate = base_kbps;
 	// A user-picked limit (session menu / overlay) disables the adaptive controller;
 	// picking "Otomatik" (0) re-enables it.
 	let mut manual_bitrate = false;
-	let adapt_enabled = mos && base_kbps > 0;
+	// The controller needs the media path's seq/timestamps → media-over-session only.
+	let adapt_enabled = mos;
+	let _ = (base_kbps, cap_kbps);
 	// Quality bias: seeded from the Settings → Display 'Varsayılan kalite' control
 	// (already resolved in play.rs: "hq"→Quality, "fast"→Latency, "auto"→mode default).
 	// The session overlay's quality picker (Restream::Quality) can override it live.
@@ -228,6 +272,37 @@ pub(super) async fn hold_session(
 		tokio::sync::oneshot::Sender<Vec<pulsar_core::service::WindowInfo>>,
 		tokio::time::Instant,
 	)> = None;
+	// The current stream state as a request (every re-request — menu or controller — sends
+	// the FULL state so nothing snaps back to a default).
+	macro_rules! make_req {
+		() => {
+			StreamReq {
+				port: video_port,
+				codec: cur_codec.clone(),
+				encoder: cur_encoder.clone(),
+				width: cur_w,
+				height: cur_h,
+				fps: cur_fps,
+				audio_port,
+				transmit_audio: cur_transmit,
+				mute_host: cur_mute,
+				game_mode,
+				bitrate_kbps: cur_bitrate,
+				quality: cur_quality,
+				hdr: cur_hdr,
+				yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
+				decode_codecs: decode_codecs.clone(),
+				media_over_session: mos,
+				cursor_external,
+				display_idx: cur_display,
+				window_hwnd: cur_window,
+				adapt: cur_adapt,
+				audio_layout: cur_audio_layout,
+				loss_recovery: cur_recovery,
+				fec: mos,
+			}
+		};
+	}
 	loop {
 		if !send_flag.load(Ordering::SeqCst) {
 			break;
@@ -257,6 +332,26 @@ pub(super) async fn hold_session(
 					// RTP datagram to its local consumer (renderer / audio viewer port).
 					// Checked FIRST — these are the highest-rate payloads on the session.
 					if let Some((tag, rtp)) = media::parse(&bytes) {
+						// FEC parity (Phase 2.1): rebuild the group's single missing packet — a
+						// repair with ZERO round-trips — and hand it to the renderer as if it had
+						// arrived (late: the reorder buffer slots it in). Also the only place we
+						// learn the host's group size, which the controller deducts from the
+						// encoder rate so the wire rate stays at the target.
+						if tag == media::TAG_FEC {
+							if let Some((seq, pkt)) = fec_dec.on_parity(rtp) {
+								if let Some(s) = fwd_sock.as_ref() {
+									let _ = s.send_to(&pkt, v_dest).await;
+								}
+								if missing.remove(&seq).is_some() {
+									win_lost = win_lost.saturating_sub(1);
+								}
+								win_fec_ok += 1;
+							}
+							if fec_dec.last_n() != ctl.fec_n() {
+								ctl.set_fec_n(fec_dec.last_n());
+							}
+							continue;
+						}
 						if let Some(s) = fwd_sock.as_ref() {
 							let dest = if tag == media::TAG_VIDEO { v_dest } else { a_dest };
 							if tag == media::TAG_VIDEO && !first_video_logged {
@@ -272,10 +367,25 @@ pub(super) async fn hold_session(
 						// NACK freshly-missing seqs so the host retransmits them.
 						if tag == media::TAG_VIDEO {
 							if let Some(seq) = media::rtp_seq(rtp) {
+								fec_dec.on_packet(seq, rtp);
+								// Frame boundary = a new RTP timestamp: the previous frame is
+								// complete, sample its send-vs-arrival delay for the estimator.
+								if rtp.len() >= 8 {
+									let ts = u32::from_be_bytes([rtp[4], rtp[5], rtp[6], rtp[7]]);
+									let now_ms = mono_ms();
+									if frame_ts != Some(ts) {
+										if let Some(prev) = frame_ts {
+											ctl.on_frame(prev, frame_last_arrival_ms);
+										}
+										frame_ts = Some(ts);
+									}
+									frame_last_arrival_ms = now_ms;
+								}
 								win_recv += 1;
 								if missing.remove(&seq).is_some() {
 									// A requested retransmit (or late reorder) arrived — not lost.
 									win_lost = win_lost.saturating_sub(1);
+									win_nack_ok += 1;
 								} else if let Some(last) = last_vseq {
 									let d = media::seq_forward(last, seq);
 									if d == 0 {
@@ -287,11 +397,12 @@ pub(super) async fn hold_session(
 											let mut nacks = Vec::with_capacity((d - 1) as usize);
 											for i in 1..d {
 												let m = last.wrapping_add(i);
-												missing.insert(m, now);
+												missing.insert(m, (now, false));
 												nacks.push(m);
 												win_lost += 1;
 											}
 											if host_nack {
+												win_nack_sent += nacks.len() as u32;
 												let _ = send_data(&sess, &DataMsg::MediaNack(nacks)).await;
 											}
 										}
@@ -301,6 +412,9 @@ pub(super) async fn hold_session(
 										// with a fresh RTP sequence base (every monitor/codec switch
 										// rebuilds it). Resync cleanly to the new base.
 										missing.clear();
+										fec_dec.reset();
+										ctl.on_stream_restart();
+										frame_ts = None;
 										last_vseq = Some(seq);
 									} else {
 										// Backward jump (d >= 0x8000). Compute the backward distance:
@@ -314,6 +428,9 @@ pub(super) async fn hold_session(
 											// packet re-tripped the discontinuity and NACK-flooded the
 											// session. Resync cleanly to the new base instead.
 											missing.clear();
+											fec_dec.reset();
+											ctl.on_stream_restart();
+											frame_ts = None;
 											last_vseq = Some(seq);
 										}
 										// else: small backward distance (≤128 seqs behind) = an
@@ -347,12 +464,28 @@ pub(super) async fn hold_session(
 						if let Some(t0) = ping_at.take() {
 							let rtt = t0.elapsed().as_secs_f64() * 1000.0;
 							let _ = app_ev.emit("play-rtt", PlayRtt { id, rtt });
+							rtt_samples.push(rtt as f32);
+							rtt_ema = if rtt_ema <= 0.0 { rtt as f32 } else { rtt_ema * 0.7 + rtt as f32 * 0.3 };
 							// Feed the native overlay's "Gecikme" tile the real NETWORK
-							// latency (it used to show the render present-gap).
+							// latency (it used to show the render present-gap), and size the
+							// renderer's RTP reorder wait from it (Phase 0.5): a NACK retransmit
+							// needs ~1 RTT to land, so a fixed 100 ms made every repair "too
+							// late" on any route slower than that.
 							{
 								use std::io::Write as _;
+								// The renderer waits one repair sweep LONGER than we do, so our
+								// `hold` (sent when the sweep writes the repair off) reaches it
+								// before its demuxer flushes past the hole and decodes the smear.
+								let want = repair_window_ms(rtt_ema) + REPAIR_SWEEP_MS as f32;
+								let changed = (want - sent_repair_ms).abs() > sent_repair_ms * 0.15 + 5.0;
 								if let Some(si) = render_stdin.lock().unwrap().as_mut() {
 									let _ = writeln!(si, "rtt {rtt:.1}");
+									if changed {
+										let _ = writeln!(si, "maxdelay {}", (want * 1000.0) as u32);
+									}
+								}
+								if changed {
+									sent_repair_ms = want;
 								}
 							}
 						}
@@ -639,116 +772,207 @@ pub(super) async fn hold_session(
 				}
 				None => break, // host closed the session
 			},
-			_ = keep.tick() => {
-				if send_keepalive(&mut sess).await.is_err() { break }
-				ping_at = Some(std::time::Instant::now());
-					// Host silent too long (a kick / drop without a clean UDP close) → end the
-					// session so the client tears down instead of freezing with input grabbed.
-					if last_inbound.elapsed() > std::time::Duration::from_secs(5) {
-						break;
-					}
-				// Retransmits that never arrived stay counted as lost; stop tracking them —
-				// and treat any expiry as a FAILED repair: the decoder's reference chain is
-				// broken until a keyframe, so request one now (MediaNack([0]) sentinel, max
-				// 1/s) instead of smearing until the host's next scheduled IDR.
-				let missing_before = missing.len();
-				missing.retain(|_, t| t.elapsed() < std::time::Duration::from_millis(300));
-				if missing.len() < missing_before
-					&& host_nack
-					&& last_kfreq.elapsed() >= std::time::Duration::from_secs(1)
-				{
-					last_kfreq = std::time::Instant::now();
-					let _ = send_data(&sess, &DataMsg::MediaNack(vec![0])).await;
+			// Keepalive + RTT probe (PING_MS). One Ping in flight at a time; an unanswered
+			// one is written off after 1 s so a late Pong can't be mis-timed against a newer Ping.
+			_ = ping.tick() => {
+				if ping_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(1)) {
+					if send_keepalive(&mut sess).await.is_err() { break }
+					ping_at = Some(std::time::Instant::now());
 				}
-				// ---- Adaptive bitrate (auto mode only): step DOWN on sustained loss,
-				// creep back UP after a long clean stretch. Each step re-requests the
-				// stream (the host restarts its encoder — brief, so steps are damped).
-				if last_switch_at.elapsed() < std::time::Duration::from_millis(2500) {
-					// A recent menu switch caused an encoder-rebuild gap — skip the adaptive step so
-					// that loss isn't mistaken for congestion (win_recv/win_lost are zeroed at the
-					// end of this tick anyway); also don't let it count toward a clean-stretch creep.
-					clean_windows = 0;
-				} else if adapt_enabled && !manual_bitrate {
-					let total = win_recv + win_lost;
-					let loss = if total > 0 { win_lost as f32 / total as f32 } else { 0.0 };
-					let mut new_kbps = None;
-					if total > 100 && loss > ADAPT_LOSS_SEVERE && cur_bitrate > ADAPT_MIN_KBPS {
-						// SEVERE loss = the current bitrate badly overruns the pipe (e.g. starting
-						// above an unknown bottleneck, or a sudden drop below the relay's per-session
-						// cap). HALVE immediately, BYPASSING the cooldown, so it converges in a couple
-						// of 2 s windows (~4 s) instead of ~20 s of garbage with the gentle 0.7× step.
-						loss_ceiling = cur_bitrate.max(ADAPT_MIN_KBPS);
-						at_cap_windows = 0;
-						new_kbps = Some((cur_bitrate / 2).max(ADAPT_MIN_KBPS));
-						clean_windows = 0;
-						last_step = std::time::Instant::now();
-					} else if total > 100
-						&& loss > ADAPT_LOSS_DOWN
-						&& last_step.elapsed().as_secs() >= ADAPT_COOLDOWN_S
-						&& cur_bitrate > ADAPT_MIN_KBPS
-					{
-						loss_ceiling = cur_bitrate.max(ADAPT_MIN_KBPS);
-						at_cap_windows = 0;
-						new_kbps = Some((cur_bitrate * 7 / 10).max(ADAPT_MIN_KBPS));
-						clean_windows = 0;
-					} else if loss < ADAPT_LOSS_CLEAN && total > 0 {
-						clean_windows += 1;
-						// Climb only to ~85% of the last loss-producing rate (see loss_ceiling
-						// above); re-probe past it by +10% only after a LONG clean stretch at
-						// the cap, so the old climb-to-base→storm sawtooth becomes tiny probes.
-						let cap = ((loss_ceiling as u64 * 85 / 100) as u32)
-							.clamp(ADAPT_MIN_KBPS, base_kbps);
-						if clean_windows >= ADAPT_CLEAN_WINDOWS {
-							if cur_bitrate < cap {
-								new_kbps = Some((cur_bitrate * 5 / 4).min(cap));
-								clean_windows = 0;
-							} else {
-								at_cap_windows += 1;
-								if at_cap_windows >= 3 && cap < base_kbps {
-									// ~3 clean cap-stretches (≈1 min) → probe 10% higher.
-									loss_ceiling =
-										(loss_ceiling * 11 / 10).min(base_kbps * 20 / 17);
-									at_cap_windows = 0;
-								}
-								clean_windows = 0;
+			},
+			// Repair sweep (REPAIR_SWEEP_MS): re-NACK once after ~1 RTT, then write the seq off
+			// as a FAILED repair after the RTT-derived window — the decoder's reference chain
+			// is broken until a keyframe / refresh, so (a) ask the host for an IDR now (the
+			// MediaNack([0]) sentinel, ≤ 1/s) and (b) tell the renderer to HOLD its last good
+			// frame for a bounded moment instead of showing the smear (Phase 0.5).
+			_ = repair.tick() => {
+				// Fast reflex (Phase 3): a queue that keeps filling between windows cuts the
+				// rate now, without waiting for the 2 s tick.
+				if adapt_enabled && !manual_bitrate {
+					if let Some(d) = ctl.poll_fast(mono_ms()) {
+						let mut changed = false;
+						if let Some(kbps) = d.bitrate {
+							cur_bitrate = kbps;
+							changed = true;
+						}
+						if let Some(p) = d.point {
+							if !manual_res {
+								cur_w = p.width;
+								cur_h = p.height;
+							}
+							if !manual_fps {
+								cur_fps = p.fps;
+							}
+							last_switch_at = std::time::Instant::now();
+							changed = true;
+						}
+						if changed {
+							tracing::info!(
+								kbps = cur_bitrate,
+								point = %ctl.point().label(),
+								reason = d.reason,
+								"abr fast step"
+							);
+							if request_stream(&mut sess, &make_req!()).await.is_err() {
+								break;
 							}
 						}
-					} else {
-						clean_windows = 0;
 					}
-					if let Some(kbps) = new_kbps {
-						tracing::info!(loss_pct = loss * 100.0, from = cur_bitrate, to = kbps, "adaptive bitrate step");
-						cur_bitrate = kbps;
-						last_step = std::time::Instant::now();
-						let req = StreamReq {
-							port: video_port,
-							codec: cur_codec.clone(),
-							encoder: cur_encoder.clone(),
-							width: cur_w,
-							height: cur_h,
-							fps: cur_fps,
-							audio_port,
-							transmit_audio: cur_transmit,
-							mute_host: cur_mute,
-							game_mode,
-							bitrate_kbps: cur_bitrate,
-							quality: cur_quality,
-							hdr: cur_hdr,
-							yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
-							decode_codecs: decode_codecs.clone(),
-							media_over_session: mos,
-							cursor_external,
-							display_idx: cur_display,
-							window_hwnd: cur_window,
-							adapt: cur_adapt,
-							audio_layout: cur_audio_layout,
-						};
-						if request_stream(&mut sess, &req).await.is_err() {
+				}
+				if !missing.is_empty() {
+					let window = std::time::Duration::from_secs_f32(repair_window_ms(rtt_ema) / 1000.0);
+					let renack_after = std::time::Duration::from_secs_f32((rtt_ema * 1.2 + 20.0).max(40.0) / 1000.0);
+					let mut expired = 0u32;
+					let mut renack: Vec<u16> = Vec::new();
+					missing.retain(|&seq, (t0, renacked)| {
+						let age = t0.elapsed();
+						if age >= window {
+							expired += 1;
+							false
+						} else {
+							if !*renacked && age >= renack_after {
+								*renacked = true;
+								renack.push(seq);
+							}
+							true
+						}
+					});
+					if host_nack && !renack.is_empty() {
+						win_nack_sent += renack.len() as u32;
+						let _ = send_data(&sess, &DataMsg::MediaNack(renack)).await;
+					}
+					if expired > 0 {
+						if host_nack && last_kfreq.elapsed() >= std::time::Duration::from_secs(1) {
+							last_kfreq = std::time::Instant::now();
+							let _ = send_data(&sess, &DataMsg::MediaNack(vec![0])).await;
+						}
+						use std::io::Write as _;
+						if let Some(si) = render_stdin.lock().unwrap().as_mut() {
+							let _ = writeln!(si, "hold {HOLD_MS}");
+						}
+						tracing::debug!(expired, "unrepaired video loss → keyframe request + renderer hold");
+					}
+				}
+			},
+			_ = keep.tick() => {
+				// Host silent too long (a kick / drop without a clean UDP close) → end the
+				// session so the client tears down instead of freezing with input grabbed.
+				if last_inbound.elapsed() > std::time::Duration::from_secs(5) {
+					break;
+				}
+				// ---- Adaptive controller (`pulsar_core::adapt`): one decision per 2 s window from
+				// loss (seq gaps after NACK repair) + the window's RTT samples. Actuates a
+				// bitrate step and/or the loss-recovery mode flip by re-requesting the stream
+				// (live NVENC reconfigure on the native path; an encoder restart elsewhere).
+				let sample = Sample {
+					recv: win_recv,
+					lost: win_lost,
+					rtt_ms: std::mem::take(&mut rtt_samples),
+					nack_sent: win_nack_sent,
+					nack_ok: win_nack_ok,
+					fec_ok: win_fec_ok,
+				};
+				if last_switch_at.elapsed() < std::time::Duration::from_millis(2500) {
+					// A recent menu switch / point change caused an encoder-rebuild gap — skip
+					// this window so that loss isn't mistaken for congestion (counters are
+					// zeroed below).
+				} else if adapt_enabled {
+					let d = ctl.tick(&sample);
+					let sig = ctl.last();
+					let mut rerequest = false;
+					if let Some(r) = d.recovery {
+						cur_recovery = r;
+						rerequest = true;
+					}
+					if let Some(kbps) = d.bitrate {
+						if !manual_bitrate {
+							cur_bitrate = kbps;
+							rerequest = true;
+						}
+					}
+					if let Some(p) = d.point {
+						if !manual_res {
+							cur_w = p.width;
+							cur_h = p.height;
+						}
+						if !manual_fps {
+							cur_fps = p.fps;
+						}
+						// The host rebuilds its encoder for a size/fps change: ignore the gap.
+						last_switch_at = std::time::Instant::now();
+						rerequest = true;
+					}
+					if d.is_change() {
+						tracing::info!(
+							loss_pct = sig.loss * 100.0,
+							eff_pct = sig.eff_loss * 100.0,
+							rtt = sig.rtt_ms,
+							excess = sig.excess_ms,
+							jitter = sig.jitter_ms,
+							delay = ?sig.delay,
+							trend = sig.trend,
+							target = ctl.target_kbps(),
+							kbps = cur_bitrate,
+							point = %ctl.point().label(),
+							ceiling = ctl.ceiling(),
+							probe_wait = ctl.probe_wait(),
+							noise_pct = ctl.noise_loss() * 100.0,
+							fec_n = ctl.fec_n(),
+							recovery = ?cur_recovery,
+							manual = manual_bitrate,
+							reason = d.reason,
+							"abr step"
+						);
+					} else {
+						tracing::debug!(
+							loss_pct = sig.loss * 100.0,
+							rtt = sig.rtt_ms,
+							excess = sig.excess_ms,
+							jitter = sig.jitter_ms,
+							delay = ?sig.delay,
+							trend = sig.trend,
+							target = ctl.target_kbps(),
+							kbps = cur_bitrate,
+							point = %ctl.point().label(),
+							ceiling = ctl.ceiling(),
+							nack_sent = sample.nack_sent,
+							nack_ok = sample.nack_ok,
+							fec_ok = sample.fec_ok,
+							"abr window"
+						);
+					}
+					// Per-peer memory: the rate that stayed clean for 30 s seeds the next
+					// session to this peer (60 % of it, then a fast startup probe).
+					let good = ctl.last_good_kbps();
+					if good > 0 && good != remembered_kbps {
+						remembered_kbps = good;
+						crate::adapt_memory::remember(&app_ev, &peer_key, good);
+					}
+					// Client → host feedback (Phase 0.3 / 2.4): what we measured and what we
+					// settled on, as JSON in the existing Stats side channel. Old hosts ignore
+					// it; a new host sizes its FEC parity from the loss.
+					let stats = ClientStats {
+						v: ClientStats::VERSION,
+						loss: sig.loss,
+						rtt_ms: sig.rtt_ms,
+						jitter_ms: sig.jitter_ms,
+						kbps: cur_bitrate,
+						recovery: cur_recovery,
+						nack_sent: sample.nack_sent,
+						nack_ok: sample.nack_ok,
+						fec_ok: sample.fec_ok,
+						point: if manual_res || manual_fps { String::new() } else { ctl.point().label() },
+					};
+					let _ = send_data(&sess, &DataMsg::Stats(stats.to_json())).await;
+					if rerequest {
+						if request_stream(&mut sess, &make_req!()).await.is_err() {
 							break;
 						}
 					}
 				}
 				(win_recv, win_lost) = (0, 0);
+				(win_nack_sent, win_nack_ok) = (0, 0);
+				win_fec_ok = 0;
 			},
 			q = restream_rx.recv() => match q {
 				// Session menu changed the resolution or encoder: merge it into the
@@ -759,10 +983,30 @@ pub(super) async fn hold_session(
 					// (a brief gap). Mark it so the adaptive controller ignores that gap's loss.
 					last_switch_at = std::time::Instant::now();
 					match cmd {
-						Restream::Resolution(w, h) => { cur_w = w; cur_h = h; }
+						// An explicit size pins the ladder's resolution; (0, 0) = "Otomatik"
+						// hands it back to the controller (which re-picks for its target).
+						Restream::Resolution(w, h) => {
+							manual_res = w != 0 && h != 0;
+							ctl.set_manual_point(manual_res || manual_fps);
+							if manual_res {
+								cur_w = w;
+								cur_h = h;
+							} else {
+								let p = ctl.point();
+								cur_w = p.width;
+								cur_h = p.height;
+								if !manual_fps {
+									cur_fps = p.fps;
+								}
+							}
+						}
 						Restream::Encoder(e) => { cur_encoder = e; }
 						Restream::Codec(c) => { cur_codec = c; }
-						Restream::Fps(f) => { cur_fps = f; }
+						Restream::Fps(f) => {
+							manual_fps = f != 0;
+							ctl.set_manual_point(manual_res || manual_fps);
+							cur_fps = if manual_fps { f } else { ctl.point().fps };
+						}
 						// A user-picked limit (b > 0) takes over and PAUSES the adaptive
 						// controller; "Otomatik" (0) hands control back to it.
 						Restream::Bitrate(b) => {
@@ -774,6 +1018,9 @@ pub(super) async fn hold_session(
 							} else {
 								base_kbps
 							};
+							// Keep the controller's notion of "current" in sync so a later
+							// return to auto continues from the user's rate, not a stale one.
+							ctl.set_target(cur_bitrate);
 						}
 						Restream::Quality(q) => { cur_quality = q; }
 						Restream::Audio(t, m) => {
@@ -798,30 +1045,7 @@ pub(super) async fn hold_session(
 							cur_adapt = a;
 						}
 					}
-					let req = StreamReq {
-						port: video_port,
-						codec: cur_codec.clone(),
-						encoder: cur_encoder.clone(),
-						width: cur_w,
-						height: cur_h,
-						fps: cur_fps,
-						audio_port,
-						transmit_audio: cur_transmit,
-						mute_host: cur_mute,
-						game_mode,
-						bitrate_kbps: cur_bitrate,
-						quality: cur_quality,
-						// Preserve the HDR/4:4:4 preference across live re-requests.
-						hdr: cur_hdr,
-						yuv444: std::env::var_os("PULSAR_YUV444").is_some(),
-						decode_codecs: decode_codecs.clone(),
-						media_over_session: mos,
-						cursor_external,
-						display_idx: cur_display,
-						window_hwnd: cur_window,
-						adapt: cur_adapt,
-						audio_layout: cur_audio_layout,
-					};
+					let req = make_req!();
 					let rs = request_stream(&mut sess, &req).await;
 					tracing::info!(display_idx = cur_display, ok = rs.is_ok(), "restream request_stream sent");
 					if rs.is_err() {

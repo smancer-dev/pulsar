@@ -62,6 +62,57 @@ static SWITCH_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 /// (possibly silent) new stream, clear the spinner and retry the reopen. Covers the host's
 /// restream gap + a couple of GOPs of slack.
 const SWITCH_TIMEOUT_MS: u64 = 6_000;
+/// RTP reorder wait (`AVFormatContext.max_delay`, µs) the app derives from the measured
+/// keepalive RTT (stdin `maxdelay <us>`, adaptive streaming Phase 0.5): a NACK retransmit
+/// needs ~1 RTT to land, so on a sequence gap the demuxer must wait at least that long before
+/// flushing past the hole — a fixed 100 ms made every repair "too late" on slower routes.
+/// libav reads the field on every fetch, so the decode loop applies changes live. 0 = not
+/// received yet → the open-time default. `PULSAR_MAXDELAY` (env) pins it for diagnosis.
+static MAX_DELAY_US: AtomicU64 = AtomicU64::new(0);
+/// Monotonic-ms deadline until which decoded frames are decoded but NOT presented (stdin
+/// `hold <ms>`, sent by the app the moment a NACK repair is written off): the presenter keeps
+/// the last good frame while the requested keyframe / the intra-refresh wave is on its way,
+/// instead of showing the reference-less smear. A keyframe packet clears it early; the
+/// deadline bounds it so an intra-refresh stream (no IDR ever) resumes on the healing
+/// picture. An active hold is never extended (bounded freeze by construction). 0 = off.
+static HOLD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// App → renderer: the RTT-derived RTP reorder wait (see `MAX_DELAY_US`).
+pub fn set_max_delay_us(us: u64) {
+	MAX_DELAY_US.store(us, Ordering::Relaxed);
+}
+
+/// Report the end of a loss hold on stdout (`vidsink-hold <how> <frames> <ms>`) — the app
+/// logs it, the validation script counts freezes from it — and on stderr for a terminal.
+fn report_hold_end(how: &str, frames: u32, started_ms: u64) {
+	let ms = if started_ms > 0 { mono_ms().saturating_sub(started_ms) } else { 0 };
+	println!("vidsink-hold {how} {frames} {ms}");
+	{
+		use std::io::Write;
+		let _ = std::io::stdout().flush();
+	}
+	eprintln!("pulsar-render: loss hold ended by {how} ({frames} frames, {ms} ms)");
+}
+
+/// App → renderer: an unrepaired loss happened — hold the last good frame for up to `ms`
+/// (or until the next keyframe). See `HOLD_UNTIL_MS`.
+pub fn hold_for_ms(ms: u64) {
+	let now = mono_ms();
+	let cur = HOLD_UNTIL_MS.load(Ordering::Relaxed);
+	if cur == 0 || cur < now {
+		HOLD_UNTIL_MS.store(now + ms.max(1), Ordering::Relaxed);
+	}
+}
+
+/// `max_delay` to open the demuxer with: the env pin, else the app-derived value if it
+/// already arrived, else 100 ms (the pre-Phase-0 default; LAN-sized).
+fn open_max_delay_us() -> u64 {
+	std::env::var("PULSAR_MAXDELAY")
+		.ok()
+		.and_then(|v| v.parse::<u64>().ok())
+		.or_else(|| Some(MAX_DELAY_US.load(Ordering::Relaxed)).filter(|&v| v > 0))
+		.unwrap_or(100_000)
+}
 
 /// Monotonic milliseconds since first use (for the switch deadline; no wall-clock jumps).
 fn mono_ms() -> u64 {
@@ -385,11 +436,9 @@ unsafe fn decode_once(sdp: &CString) {
 		// remote relay) the detect→NACK→retransmit→arrive loop measured past 40 ms, so every
 		// retransmit was already "too late" and the picture stayed corrupt until the next
 		// keyframe. 100 ms still only bites while a hole is being waited out.
-		// (env PULSAR_MAXDELAY overrides, µs.)
-		let maxdelay = std::env::var("PULSAR_MAXDELAY")
-			.ok()
-			.and_then(|v| v.parse::<u64>().ok())
-			.unwrap_or(100_000);
+		// (env PULSAR_MAXDELAY overrides, µs.) Since Phase 0.5 the app re-derives it from the
+		// measured RTT (`maxdelay` over stdin) and the decode loop applies it live.
+		let maxdelay = open_max_delay_us();
 		set(&mut opts, "max_delay", &maxdelay.to_string());
 		// Make avformat_find_stream_info (below) return ASAP instead of sitting in libav's
 		// default ~5 s analyze window. The codec is ALREADY known from the SDP (the m=video
@@ -455,10 +504,8 @@ unsafe fn decode_once(sdp: &CString) {
 					.and_then(|v| v.parse::<u64>().ok())
 					.unwrap_or(4_194_304);
 				set2(&mut retry_opts, "buffer_size", &bufsz2.to_string());
-				let maxdelay2 = std::env::var("PULSAR_MAXDELAY")
-					.ok()
-					.and_then(|v| v.parse::<u64>().ok())
-					.unwrap_or(40_000);
+				// Same value as the first attempt (this used to default to a stale 40 ms).
+				let maxdelay2 = open_max_delay_us();
 				set2(&mut retry_opts, "max_delay", &maxdelay2.to_string());
 				let analyzedur2 = std::env::var("PULSAR_ANALYZEDUR")
 					.ok()
@@ -562,7 +609,19 @@ unsafe fn decode_once(sdp: &CString) {
 			let mut au_since_open: u32 = 0;
 			let mut frames_since_open: u64 = 0;
 			let mut fallback_exhausted = false;
+			// The env pin wins over the app-derived reorder wait for the whole session.
+			let maxdelay_pinned = std::env::var_os("PULSAR_MAXDELAY").is_some();
+			// Frames withheld by an active hold (diagnostics, logged when the hold ends).
+			let mut held_frames: u32 = 0;
+			let mut hold_started_ms: u64 = 0;
 			while !STOP.load(Ordering::Relaxed) && !REOPEN.load(Ordering::Relaxed) {
+				// Apply the app's RTT-derived reorder wait live (libav reads max_delay per fetch).
+				if !maxdelay_pinned {
+					let want = MAX_DELAY_US.load(Ordering::Relaxed);
+					if want > 0 && (*fmt).max_delay as i64 != want as i64 {
+						(*fmt).max_delay = want.min(c_int::MAX as u64) as c_int;
+					}
+				}
 				let r = ff::av_read_frame(fmt, pkt);
 				// A switch that never produced its first keyframe within SWITCH_TIMEOUT_MS:
 				// intr_cb has aborted the (otherwise indefinite) read. Stop spinning, clear the
@@ -603,6 +662,14 @@ unsafe fn decode_once(sdp: &CString) {
 				let dec_t0 = if (*pkt).stream_index == vs {
 					// Tally received video bytes for the HUD bitrate (presenter reads this 1×/s).
 					VBYTES.fetch_add((*pkt).size.max(0) as u64, Ordering::Relaxed);
+					// A keyframe ends a loss hold early: everything decoded from here is clean.
+					if (*pkt).flags & ff::AV_PKT_FLAG_KEY != 0
+						&& HOLD_UNTIL_MS.swap(0, Ordering::Relaxed) != 0
+					{
+						report_hold_end("keyframe", held_frames, hold_started_ms);
+						held_frames = 0;
+						hold_started_ms = 0;
+					}
 					let t0 = std::time::Instant::now();
 					ff::avcodec_send_packet(dc, pkt);
 					au_since_open = au_since_open.saturating_add(1);
@@ -677,6 +744,27 @@ unsafe fn decode_once(sdp: &CString) {
 					} else {
 						ff::av_frame_unref(frame);
 						continue;
+					}
+					// Loss hold (Phase 0.5): the app wrote a NACK repair off — this frame (and the
+					// next ones, until a keyframe or the deadline) decoded against a missing
+					// reference. Keep the decoder fed (state stays continuous) but don't present.
+					{
+						let until = HOLD_UNTIL_MS.load(Ordering::Relaxed);
+						if until != 0 {
+							if mono_ms() < until {
+								if held_frames == 0 {
+									hold_started_ms = mono_ms();
+								}
+								held_frames += 1;
+								let mut nf = nf;
+								ff::av_frame_free(&mut nf);
+								continue;
+							}
+							HOLD_UNTIL_MS.store(0, Ordering::Relaxed);
+							report_hold_end("deadline", held_frames, hold_started_ms);
+							held_frames = 0;
+							hold_started_ms = 0;
+						}
 					}
 					{
 						let mut q = MBX.lock().unwrap();

@@ -510,6 +510,18 @@ pub fn run() {
 						RTT_AT_MS.store(video::mono_ms_pub(), Ordering::Relaxed);
 					}
 				}
+				// Adaptive streaming Phase 0.5: the RTT-derived RTP reorder wait (µs) and a
+				// bounded "hold the last good frame" after an unrepaired loss (ms).
+				Some("maxdelay") => {
+					if let Some(us) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+						video::set_max_delay_us(us);
+					}
+				}
+				Some("hold") => {
+					if let Some(ms) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+						video::hold_for_ms(ms);
+					}
+				}
 				// Live mode switch for cross-session reconnects (game→remote or remote→game).
 				// Updates the MODE_REMOTE atomic; the render loop re-reads it each frame so
 				// OverlayState.mode and the pace ceiling update on the very next frame paint

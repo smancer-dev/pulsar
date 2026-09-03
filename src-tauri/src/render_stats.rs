@@ -101,6 +101,17 @@ pub(crate) fn start_render_reader(
 				first_line_logged = true;
 				tracing::info!(%line, "renderer first stdout line");
 			}
+			// Loss hold bookkeeping from the renderer (adaptive streaming Phase 0.5):
+			// `vidsink-hold <keyframe|deadline> <frames> <ms>` — into the session log so the
+			// validation script can count freezes and their lengths.
+			if let Some(rest) = line.strip_prefix("vidsink-hold ") {
+				let mut it = rest.split_whitespace();
+				let end = it.next().unwrap_or("?").to_string();
+				let frames = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+				let ms = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+				tracing::info!(id = cur_id, end = %end, frames, ms, "renderer loss hold");
+				continue;
+			}
 			if let Some(rest) = line.strip_prefix("vidsink-fps ") {
 				let mut it = rest.split_whitespace();
 				let fps = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);

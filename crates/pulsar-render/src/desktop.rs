@@ -130,6 +130,15 @@ fn stdin_control() {
 					RTT_DMS.store((ms * 10.0) as u32, Ordering::Relaxed);
 				}
 			}
+			// Adaptive streaming Phase 0.5: the RTT-derived RTP reorder wait (µs) for the
+			// native depacketizer's jitter buffer. `hold` is a no-op here: the depacketizer
+			// already withholds everything after a gap until the next keyframe.
+			Some("maxdelay") => {
+				if let Some(us) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+					crate::stream::rtp::set_max_delay_us(us);
+				}
+			}
+			Some("hold") => {}
 			// Frame-pacing toggle (reflected to the overlay's segmented control; the real
 			// pacing lives in the video renderer — here we only mirror + re-emit on change).
 			Some("pace") => {

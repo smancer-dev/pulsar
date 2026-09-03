@@ -35,7 +35,9 @@ mod video;
 
 // Shared streaming types + RTP depacketizer for the native-decode backends (Win MF, mac VT).
 // Linux uses ffmpeg's own RTP demux, so it doesn't need this.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+// (Also compiled for `cargo test` on Linux: the depacketizer + reorder buffer are pure
+// Rust and their unit tests are the only coverage the Windows/macOS media path gets on CI.)
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod stream;
 
 // Windows: native zero-copy renderer (child HWND + D3D11 + Media Foundation decode).

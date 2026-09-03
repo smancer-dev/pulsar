@@ -1015,6 +1015,54 @@ pub(crate) async fn start_remote_play(
 	if cap_kbps > 0 {
 		tracing::info!(cap_kbps, req_kbps, "relayed session: clamped stream bitrate to per-session cap");
 	}
+	// ── The shared adaptive controller (`pulsar_core::adapt`, Phases 0–3) ────────────────
+	// Built here so the FIRST request already carries its start point and rate; hold.rs
+	// feeds it (loss / RTT / frame arrivals) and actuates its decisions.
+	let native_dims = {
+		// The client's configured maximum bounds the ladder (a deliberate 1080p default must
+		// not become 1440p because the host's monitor is); otherwise the host's primary display.
+		let disp = host_caps.displays.iter().find(|d| d.primary).or(host_caps.displays.first());
+		let (w, h) = if req_w > 0 && req_h > 0 {
+			(req_w, req_h)
+		} else {
+			disp.map(|d| (d.width, d.height)).unwrap_or((0, 0))
+		};
+		(w, h, req_fps)
+	};
+	let peer_key = target.clone();
+	// 0 (host default) means the cap is unknown: assume a generous LAN-class cap and let the
+	// controller find the path's real budget.
+	let cap_for_ctl = if req_kbps > 0 { req_kbps } else { 15_000 };
+	let hint = crate::adapt_memory::hint(&app, &peer_key)
+		.map(|k| (k * 3 / 5).clamp(pulsar_core::adapt::FLOOR_KBPS, cap_for_ctl));
+	let mut acfg = pulsar_core::adapt::Config::new(pulsar_core::adapt::codec_from_wire(&codec_h), cap_for_ctl);
+	acfg.native = native_dims;
+	acfg.start_kbps = hint.unwrap_or(0);
+	// Only the Linux libav renderer can resume on a partially intra-refreshed picture; the
+	// Windows/macOS depacketizer waits for an IDR and gets a short GOP instead.
+	acfg.ir_capable = cfg!(target_os = "linux");
+	let ctl = pulsar_core::adapt::Controller::new(acfg);
+	let (req_w, req_h, req_fps, req_kbps) = if mos {
+		// Media-over-session carries the per-packet measurements the controller runs on.
+		let p = ctl.point();
+		let top = ctl.points().first() == Some(&p);
+		let known_native = native_dims.0 > 0 && native_dims.1 > 0;
+		let (w, h) = if known_native || !top { (p.width, p.height) } else { (req_w, req_h) };
+		let fps = if req_fps > 0 || !top { p.fps } else { 0 };
+		(w, h, fps, ctl.encoder_kbps())
+	} else {
+		(req_w, req_h, req_fps, req_kbps)
+	};
+	tracing::info!(
+		native = ?native_dims,
+		cap = cap_for_ctl,
+		start = ctl.target_kbps(),
+		hint = ?hint,
+		point = %ctl.point().label(),
+		ladder = ?ctl.points().iter().map(|p| format!("{}:{}", p.label(), p.min_kbps)).collect::<Vec<_>>(),
+		req_w, req_h, req_fps, req_kbps,
+		"adaptive controller seeded"
+	);
 	let req = StreamReq {
 		port: video_port,
 		codec,
@@ -1070,6 +1118,11 @@ pub(crate) async fn start_remote_play(
 		// negotiates this down against its own captured endpoint. A surround picker can
 		// raise it later; carried across re-requests in hold.rs.
 		audio_layout: pulsar_core::audio::ChannelLayout::Stereo,
+		// Every session starts with the normal GOP; the hold-loop's controller flips this
+		// on the first sustained loss (adaptive streaming Phase 0).
+		loss_recovery: pulsar_core::service::LossRecovery::Normal,
+		// Ask for XOR parity (Phase 2.1) — the host sends it only once we report loss.
+		fec: mos,
 	};
 	if let Err(e) = request_stream(&mut sess, &req).await {
 		// Park ANY live pulsar-render child instead of killing it — regardless of whether
@@ -1799,6 +1852,8 @@ pub(crate) async fn start_remote_play(
 		req_fps,
 		req_kbps,
 		cap_kbps,
+		ctl,
+		peer_key,
 		req.cursor_external,
 		req_hdr,
 		req_quality,

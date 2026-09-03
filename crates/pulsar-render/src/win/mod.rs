@@ -378,6 +378,13 @@ fn stdin_control() {
 				}
 			}
 			*CAPS_SEED.lock().unwrap() = Some((codecs, encoders, codec, encoder, conn));
+		} else if let Some(rest) = l.strip_prefix("maxdelay ") {
+			// Adaptive streaming Phase 0.5: the app's RTT-derived RTP reorder wait (µs) for
+			// the depacketizer's jitter buffer. (`hold` is not needed here: the depacketizer
+			// already withholds everything after a gap until the next keyframe.)
+			if let Ok(us) = rest.trim().parse::<u64>() {
+				crate::stream::rtp::set_max_delay_us(us);
+			}
 		} else if let Some(rest) = l.strip_prefix("rtt ") {
 			// Keepalive RTT from the app — overrides the latency tile (linux.rs parity).
 			if let Ok(ms) = rest.trim().parse::<f32>() {

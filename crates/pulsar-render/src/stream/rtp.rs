@@ -19,8 +19,150 @@
 #![allow(dead_code)]
 
 use super::{AccessUnit, Codec};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
+
+// ── Reorder / jitter buffer (adaptive streaming Phase 0.5) ─────────────────────────────
+//
+// The Linux backend gets this from libav's RTP demuxer (`reorder_queue_size` + `max_delay`);
+// this depacketizer used to read straight off the socket, so a NACK retransmit — which by
+// construction arrives ~1 RTT AFTER the packets that followed the hole — was always "late"
+// and dropped, and every single loss was a wait-for-IDR. `Reorder` holds the packets that
+// arrive after a gap for up to `max_delay` (the app's RTT-derived value, stdin `maxdelay`)
+// and releases them in sequence once the hole is filled, or skips the hole when the wait
+// expires / the buffer fills. In-order streams pass straight through (no added latency).
+
+/// App-derived reorder wait (µs). 0 = not received yet → `DEFAULT_MAX_DELAY_US`.
+static MAX_DELAY_US: AtomicU64 = AtomicU64::new(0);
+const DEFAULT_MAX_DELAY_US: u64 = 100_000;
+/// Packets held behind a gap before flushing regardless (≈ 0.5 s at 8 Mbit / 1200 B —
+/// the same bound as the Linux demuxer's `reorder_queue_size`).
+pub const REORDER_CAP: usize = 512;
+
+/// App → renderer: the RTT-derived reorder wait (`maxdelay <us>` over stdin).
+pub fn set_max_delay_us(us: u64) {
+	MAX_DELAY_US.store(us, AtomicOrdering::Relaxed);
+}
+
+/// The reorder wait in effect: the `PULSAR_MAXDELAY` env pin, else the app's value, else
+/// the 100 ms default.
+pub fn max_delay() -> Duration {
+	let us = std::env::var("PULSAR_MAXDELAY")
+		.ok()
+		.and_then(|v| v.parse::<u64>().ok())
+		.or_else(|| Some(MAX_DELAY_US.load(AtomicOrdering::Relaxed)).filter(|&v| v > 0))
+		.unwrap_or(DEFAULT_MAX_DELAY_US);
+	Duration::from_micros(us)
+}
+
+/// Sequence-ordered jitter buffer in front of [`Depacketizer`]. Pure (time is passed in).
+pub struct Reorder {
+	/// The next sequence number expected in order. `None` until the first packet.
+	next: Option<u16>,
+	/// Packets ahead of `next` (a hole precedes them), sorted by forward distance from `next`,
+	/// each with its arrival time.
+	buf: Vec<(u16, Instant, Vec<u8>)>,
+	cap: usize,
+}
+
+impl Reorder {
+	pub fn new(cap: usize) -> Self {
+		Self { next: None, buf: Vec::new(), cap: cap.max(2) }
+	}
+
+	fn seq_of(p: &[u8]) -> Option<u16> {
+		(p.len() >= 12).then(|| ((p[2] as u16) << 8) | p[3] as u16)
+	}
+
+	/// Packets currently held behind a hole.
+	pub fn pending(&self) -> usize {
+		self.buf.len()
+	}
+
+	/// Feed one datagram; returns the packets that are deliverable now, in sequence order.
+	/// Duplicates and stale (backward) packets pass straight through — the depacketizer
+	/// already drops those without touching its state.
+	pub fn push(&mut self, pkt: Vec<u8>, now: Instant, max_delay: Duration) -> Vec<Vec<u8>> {
+		let mut out = Vec::new();
+		let Some(seq) = Self::seq_of(&pkt) else {
+			out.push(pkt);
+			return out;
+		};
+		match self.next {
+			None => {
+				self.next = Some(seq.wrapping_add(1));
+				out.push(pkt);
+			}
+			Some(next) => {
+				let d = seq.wrapping_sub(next);
+				if d == 0 {
+					// The expected packet (possibly the retransmit that fills the hole).
+					self.next = Some(seq.wrapping_add(1));
+					out.push(pkt);
+					self.drain(&mut out);
+				} else if d >= 0x8000 {
+					// Older than what we already released: stale / duplicate — pass through.
+					out.push(pkt);
+				} else {
+					// Ahead of a hole: hold it, sorted by distance from `next`.
+					if !self.buf.iter().any(|(s, _, _)| *s == seq) {
+						let pos = self
+							.buf
+							.iter()
+							.position(|(s, _, _)| s.wrapping_sub(next) > d)
+							.unwrap_or(self.buf.len());
+						self.buf.insert(pos, (seq, now, pkt));
+					}
+					if self.buf.len() >= self.cap {
+						self.skip(&mut out);
+					}
+				}
+			}
+		}
+		self.expire(now, max_delay, &mut out);
+		out
+	}
+
+	/// Time-based release (call on read timeouts): a head that has waited `max_delay` is
+	/// released past its hole.
+	pub fn poll(&mut self, now: Instant, max_delay: Duration) -> Vec<Vec<u8>> {
+		let mut out = Vec::new();
+		self.expire(now, max_delay, &mut out);
+		out
+	}
+
+	fn expire(&mut self, now: Instant, max_delay: Duration, out: &mut Vec<Vec<u8>>) {
+		while let Some((_, t, _)) = self.buf.first() {
+			if now.duration_since(*t) >= max_delay {
+				self.skip(out);
+			} else {
+				break;
+			}
+		}
+	}
+
+	/// Give up on the hole in front of the head: jump `next` to it and drain the run.
+	fn skip(&mut self, out: &mut Vec<Vec<u8>>) {
+		if let Some((s, _, _)) = self.buf.first() {
+			self.next = Some(*s);
+			self.drain(out);
+		}
+	}
+
+	/// Release every buffered packet that is now contiguous with `next`.
+	fn drain(&mut self, out: &mut Vec<Vec<u8>>) {
+		while let (Some(next), Some((s, _, _))) = (self.next, self.buf.first()) {
+			if *s != next {
+				break;
+			}
+			let (_, _, p) = self.buf.remove(0);
+			self.next = Some(next.wrapping_add(1));
+			out.push(p);
+		}
+	}
+}
 
 /// Depacketizer state machine: feed RTP packets, get complete access units.
 pub struct Depacketizer {
@@ -499,20 +641,32 @@ pub fn recv_loop(
 		);
 		return;
 	};
-	// Short read timeout so `stop` is honored promptly between datagrams.
-	let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+	// Short read timeout so `stop` is honored promptly between datagrams AND the reorder
+	// buffer's time-based release runs while the socket is quiet (a hole with nothing
+	// arriving behind it must still be skipped after `max_delay`).
+	let _ = sock.set_read_timeout(Some(Duration::from_millis(20)));
 
 	let mut depacketizer = Depacketizer::new(codec);
+	let mut reorder = Reorder::new(REORDER_CAP);
 	let mut buf = [0u8; 65536];
 	while !stop.load(Ordering::SeqCst) {
 		match sock.recv(&mut buf) {
 			Ok(n) => {
-				if let Some(au) = depacketizer.push(&buf[..n]) {
-					sink(au);
+				for p in reorder.push(buf[..n].to_vec(), Instant::now(), max_delay()) {
+					if let Some(au) = depacketizer.push(&p) {
+						sink(au);
+					}
 				}
 			}
 			Err(e) => match e.kind() {
-				std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => continue,
+				std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+					for p in reorder.poll(Instant::now(), max_delay()) {
+						if let Some(au) = depacketizer.push(&p) {
+							sink(au);
+						}
+					}
+					continue;
+				}
 				_ => {
 					eprintln!("pulsar-render(win): rtp recv error: {e}");
 					break;
@@ -787,5 +941,119 @@ mod tests {
 		// The AU contains ONLY n1 and n2 — the stale packet's bytes are absent.
 		let expect = vec![0, 0, 0, 1, 0x41, 1, 1, 0, 0, 0, 1, 0x41, 2, 2];
 		assert_eq!(au.data, expect, "stale bytes not spliced into the AU");
+	}
+}
+
+// ===========================================================================================
+#[cfg(test)]
+mod reorder_tests {
+	use super::*;
+
+	fn pkt(seq: u16) -> Vec<u8> {
+		let mut p = vec![0x80, 0x60, (seq >> 8) as u8, seq as u8, 0, 0, 0, 0, 0, 0, 0, 1];
+		p.push(seq as u8); // payload marker so we can tell packets apart
+		p
+	}
+	fn seqs(v: &[Vec<u8>]) -> Vec<u16> {
+		v.iter().map(|p| ((p[2] as u16) << 8) | p[3] as u16).collect()
+	}
+	const MD: Duration = Duration::from_millis(100);
+
+	#[test]
+	fn in_order_is_passthrough_with_no_buffering() {
+		let mut r = Reorder::new(REORDER_CAP);
+		let t = Instant::now();
+		for s in 0u16..50 {
+			let out = r.push(pkt(s), t, MD);
+			assert_eq!(seqs(&out), vec![s]);
+			assert_eq!(r.pending(), 0);
+		}
+	}
+
+	#[test]
+	fn gap_waits_for_the_retransmit_then_releases_in_order() {
+		let mut r = Reorder::new(REORDER_CAP);
+		let t = Instant::now();
+		assert_eq!(seqs(&r.push(pkt(10), t, MD)), vec![10]);
+		// 11 is lost; 12..15 arrive and are held.
+		for s in 12u16..=15 {
+			assert!(r.push(pkt(s), t + Duration::from_millis(5), MD).is_empty());
+		}
+		assert_eq!(r.pending(), 4);
+		// Nothing released while the wait is still running.
+		assert!(r.poll(t + Duration::from_millis(60), MD).is_empty());
+		// The NACK retransmit lands at +80 ms: the whole run comes out in sequence.
+		let out = r.push(pkt(11), t + Duration::from_millis(80), MD);
+		assert_eq!(seqs(&out), vec![11, 12, 13, 14, 15]);
+		assert_eq!(r.pending(), 0);
+		assert_eq!(seqs(&r.push(pkt(16), t + Duration::from_millis(81), MD)), vec![16]);
+	}
+
+	#[test]
+	fn gap_times_out_then_skips_and_the_late_packet_passes_as_stale() {
+		let mut r = Reorder::new(REORDER_CAP);
+		let t = Instant::now();
+		r.push(pkt(0), t, MD);
+		assert!(r.push(pkt(2), t, MD).is_empty());
+		assert!(r.push(pkt(3), t + Duration::from_millis(10), MD).is_empty());
+		// max_delay elapsed for the head (2): skip the hole, release 2,3.
+		let out = r.poll(t + MD, MD);
+		assert_eq!(seqs(&out), vec![2, 3]);
+		// The retransmit of 1 arrives too late: passed through (the depacketizer drops it).
+		assert_eq!(seqs(&r.push(pkt(1), t + Duration::from_millis(150), MD)), vec![1]);
+		// And the stream continues in order behind the skip.
+		assert_eq!(seqs(&r.push(pkt(4), t + Duration::from_millis(151), MD)), vec![4]);
+	}
+
+	#[test]
+	fn a_second_hole_behind_the_first_waits_its_own_turn() {
+		let mut r = Reorder::new(REORDER_CAP);
+		let t = Instant::now();
+		r.push(pkt(0), t, MD);
+		assert!(r.push(pkt(2), t, MD).is_empty()); // hole at 1
+		assert!(r.push(pkt(4), t + Duration::from_millis(50), MD).is_empty()); // hole at 3
+		// Filling 1 releases 2 only; 4 still waits for 3.
+		assert_eq!(seqs(&r.push(pkt(1), t + Duration::from_millis(60), MD)), vec![1, 2]);
+		assert_eq!(r.pending(), 1);
+		// 4 arrived at +50 ms → released past its hole at +150 ms, not before.
+		assert!(r.poll(t + Duration::from_millis(140), MD).is_empty());
+		assert_eq!(seqs(&r.poll(t + Duration::from_millis(150), MD)), vec![4]);
+	}
+
+	#[test]
+	fn buffer_cap_flushes_past_the_hole() {
+		let mut r = Reorder::new(8);
+		let t = Instant::now();
+		r.push(pkt(0), t, MD);
+		let mut out = Vec::new();
+		for s in 2u16..=9 {
+			out.extend(r.push(pkt(s), t, MD));
+		}
+		assert_eq!(seqs(&out), (2u16..=9).collect::<Vec<_>>(), "8 held packets → flushed");
+		assert_eq!(r.pending(), 0);
+	}
+
+	#[test]
+	fn sequence_wraparound_is_ordered_correctly() {
+		let mut r = Reorder::new(REORDER_CAP);
+		let t = Instant::now();
+		r.push(pkt(65533), t, MD);
+		r.push(pkt(65534), t, MD);
+		// 65535 lost; 0, 1 arrive (across the wrap) and wait; the retransmit releases all.
+		assert!(r.push(pkt(0), t, MD).is_empty());
+		assert!(r.push(pkt(1), t, MD).is_empty());
+		assert_eq!(seqs(&r.push(pkt(65535), t, MD)), vec![65535, 0, 1]);
+	}
+
+	#[test]
+	fn duplicates_of_held_packets_are_absorbed_and_stale_ones_pass_through() {
+		let mut r = Reorder::new(REORDER_CAP);
+		let t = Instant::now();
+		r.push(pkt(5), t, MD);
+		assert!(r.push(pkt(7), t, MD).is_empty());
+		assert!(r.push(pkt(7), t, MD).is_empty(), "duplicate of a held packet");
+		assert_eq!(r.pending(), 1);
+		assert_eq!(seqs(&r.push(pkt(3), t, MD)), vec![3], "stale packet passes through");
+		assert_eq!(seqs(&r.push(pkt(6), t, MD)), vec![6, 7]);
 	}
 }

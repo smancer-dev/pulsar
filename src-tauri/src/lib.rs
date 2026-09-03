@@ -14,6 +14,7 @@
 
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
+mod adapt_memory;
 mod audio_io;
 mod auth;
 mod avatar;
