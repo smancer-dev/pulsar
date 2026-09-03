@@ -471,7 +471,9 @@ unsafe fn open_output(p: &Params, ec: *mut ff::AVCodecContext) -> Result<(*mut f
 	let url = format!("rtp://{}?pkt_size=1200", p.dest);
 	let mut octx: *mut ff::AVFormatContext = ptr::null_mut();
 	let url_c = cstr(&url);
-	let r = ff::avformat_alloc_output_context2(&mut octx, ptr::null(), cstr("rtp").as_ptr(), url_c.as_ptr());
+	// `null_mut` coerces to both the `*mut AVOutputFormat` (FFmpeg 4.4) and the `*const`
+	// (≥ 5) the binding declares.
+	let r = ff::avformat_alloc_output_context2(&mut octx, ptr::null_mut(), cstr("rtp").as_ptr(), url_c.as_ptr());
 	if r < 0 || octx.is_null() {
 		return Err(format!("rtp muxer alloc failed: {}", averr(r)));
 	}
@@ -607,14 +609,15 @@ unsafe fn run(p: &Params, rx: Receiver<Cmd>, ready: Sender<Result<(), String>>) 
 				pts += 1;
 				// Keyframe on request, or on the recovery cadence (~0.5 s).
 				let cadence = if recovery.is_active() { (p.fps / 2).max(1) } else { u32::MAX };
+				// `pict_type = I` is what libx264 / NVENC read (with `forced-idr` it becomes a
+				// real IDR); no frame flag needed — and `AV_FRAME_FLAG_KEY` only exists from
+				// FFmpeg 6.1 (the Linux release builds use Ubuntu 22.04's 4.4).
 				if force_key || frames_since_key >= cadence {
 					(*filt).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
-					(*filt).flags |= ff::AV_FRAME_FLAG_KEY as c_int;
 					force_key = false;
 					frames_since_key = 0;
 				} else {
 					(*filt).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_NONE;
-					(*filt).flags &= !(ff::AV_FRAME_FLAG_KEY as c_int);
 					frames_since_key += 1;
 				}
 				let t0 = std::time::Instant::now();
